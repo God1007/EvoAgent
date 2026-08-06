@@ -1,0 +1,8 @@
+{
+  "name": "code-quality",
+  "version": "1.0.0",
+  "description": "Detects unfinished TODO/FIXME markers in added production code",
+  "entrypoint": "skill.py",
+  "sha256": "8984a52b230dd01d6daff432db396a93d706a469e7c7fa7ab3ce9bd59f5ca7ee",
+  "permissions": []
+}

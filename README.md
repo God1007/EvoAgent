@@ -45,26 +45,84 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 ## 工作原理
 
 ```mermaid
-flowchart TD
-    A["GitHub Webhook / Web Console / REST API"] --> B["ReviewService"]
-    B --> C["TaskStore<br/>SQLite or PostgreSQL"]
-    B --> D["TaskQueue<br/>In-process or Redis Streams"]
-    D --> E["ReviewHarness"]
-    E --> F["Parse Unified Diff"]
-    F --> G["Planner"]
-    G --> H1["Security Agent"]
-    G --> H2["Reliability Agent"]
-    G --> H3["LLM Agent"]
-    G --> H4["Dynamic Skills"]
-    H1 --> I["Critic + Test"]
-    H2 --> I
-    H3 --> I
-    H4 --> I
-    I --> J["Synthesizer"]
-    J --> K["Fix Assessment + Verifier"]
-    K --> L["Structured Report"]
-    L --> M["GitHub Comment"]
-    L --> N["Verified Fix Branch / Draft PR"]
+%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 28, "rankSpacing": 42}}}%%
+flowchart TB
+    subgraph INTAKE["01 · CHANGE INTAKE"]
+        direction LR
+        GH["GitHub Webhook"]
+        WEB["Web Console"]
+        API["REST API"]
+
+        GH ~~~ WEB ~~~ API
+    end
+
+    subgraph RUNTIME["02 · DURABLE RUNTIME"]
+        direction LR
+        SERVICE(["ReviewService"])
+        QUEUE["Task Queue<br/>Memory · Redis Streams"]
+        HARNESS(["Review Harness<br/>Budget · Retry · Checkpoint"])
+        PARSER["Unified Diff Parser"]
+        STORE[("Task Store<br/>SQLite · PostgreSQL")]
+
+        SERVICE --> QUEUE --> HARNESS --> PARSER
+        SERVICE -. "persist" .-> STORE
+        HARNESS -. "trace" .-> STORE
+    end
+
+    subgraph REVIEW["03 · MULTI-AGENT REVIEW"]
+        direction LR
+        PLAN["Planner"]
+        SEC["Security"]
+        REL["Reliability"]
+        LLM["LLM"]
+        SKILL["Dynamic Skills"]
+        EVIDENCE["Evidence Gate<br/>Critic · Test"]
+        SYNTH["Synthesizer"]
+        VERIFY{"Release Verifier"}
+
+        PLAN --> SEC
+        PLAN --> REL
+        PLAN --> LLM
+        PLAN --> SKILL
+        SEC --> EVIDENCE
+        REL --> EVIDENCE
+        LLM --> EVIDENCE
+        SKILL --> EVIDENCE
+        EVIDENCE --> SYNTH --> VERIFY
+    end
+
+    subgraph DELIVERY["04 · VERIFIED DELIVERY"]
+        direction LR
+        REPORT["Structured Report"]
+        COMMENT["PR Comment"]
+        FIX["Fix Branch<br/>Draft Pull Request"]
+
+        REPORT --> COMMENT
+        REPORT --> FIX
+    end
+
+    INTAKE -->|submit change| RUNTIME
+    RUNTIME -->|parsed diff| REVIEW
+    REVIEW -->|approved findings| DELIVERY
+
+    classDef entry fill:#ECFEFF,stroke:#0891B2,color:#164E63,stroke-width:1.5px;
+    classDef core fill:#0F766E,stroke:#115E59,color:#FFFFFF,stroke-width:2px;
+    classDef infra fill:#F8FAFC,stroke:#94A3B8,color:#334155,stroke-width:1.25px;
+    classDef agent fill:#F0FDFA,stroke:#14B8A6,color:#134E4A,stroke-width:1.5px;
+    classDef gate fill:#FFF7ED,stroke:#F97316,color:#7C2D12,stroke-width:2px;
+    classDef output fill:#F5F3FF,stroke:#8B5CF6,color:#4C1D95,stroke-width:1.5px;
+
+    class GH,WEB,API entry;
+    class SERVICE,HARNESS core;
+    class QUEUE,PARSER,STORE infra;
+    class PLAN,SEC,REL,LLM,SKILL,EVIDENCE,SYNTH agent;
+    class VERIFY gate;
+    class REPORT,COMMENT,FIX output;
+
+    style INTAKE fill:#F8FAFC,stroke:#CBD5E1,stroke-width:1px,color:#475569;
+    style RUNTIME fill:#F0FDFA,stroke:#99F6E4,stroke-width:1px,color:#115E59;
+    style REVIEW fill:#F8FAFC,stroke:#CBD5E1,stroke-width:1px,color:#475569;
+    style DELIVERY fill:#FAF5FF,stroke:#DDD6FE,stroke-width:1px,color:#5B21B6;
 ```
 
 Harness 管理的任务状态如下：
@@ -304,14 +362,67 @@ Webhook 使用 HMAC-SHA256 签名认证，不使用管理台 Bearer Token。服�
 “Evo”指的是受控的审查能力演进，而不是让 Agent 直接改写生产代码。
 
 ```mermaid
-flowchart LR
-    A["误报 / 漏报 / 坏修复"] --> B["失败案例库"]
-    B --> C["生成候选 Prompt"]
-    C --> D["Validation 回放"]
-    D --> E["Holdout 非退化门禁"]
-    E -->|Pass| F["激活 / 灰度 / 影子流量"]
-    E -->|Fail| G["拒绝并保留评测记录"]
-    F --> H["监控与回滚"]
+%%{init: {"flowchart": {"curve": "basis", "nodeSpacing": 30, "rankSpacing": 48}}}%%
+flowchart TB
+    subgraph SIGNALS["01 · LEARNING SIGNALS"]
+        direction LR
+        FEEDBACK["Human Feedback<br/>误报 · 漏报 · 坏修复"]
+        CASES[("Failure Cases")]
+        CANDIDATE["Candidate Prompt<br/>or Skill Version"]
+
+        FEEDBACK --> CASES --> CANDIDATE
+    end
+
+    subgraph LAB["02 · EVALUATION LAB"]
+        direction LR
+        VALIDATION["Validation Replay<br/>Precision · Recall · F1"]
+        HOLDOUT["Holdout Replay<br/>High-risk · Clean accuracy"]
+
+        VALIDATION --> HOLDOUT
+    end
+
+    GATE{"Release Gate"}
+
+    subgraph RELEASE["03 · SAFE RELEASE"]
+        direction LR
+        CANARY["Canary + Shadow"]
+        MONITOR["Production Signals"]
+        STABLE(["Stable Version"])
+        ROLLBACK["Automatic Rollback"]
+
+        CANARY --> MONITOR
+        MONITOR -->|healthy| STABLE
+        MONITOR -->|regression| ROLLBACK --> STABLE
+    end
+
+    DEFERRED["Deferred<br/>wait for data or model"]
+    REJECTED["Rejected<br/>retain evaluation record"]
+
+    SIGNALS -->|candidate| LAB
+    LAB -->|metrics| GATE
+    GATE -->|PASS| RELEASE
+    GATE -->|DEFER| DEFERRED
+    GATE -->|REJECT| REJECTED
+
+    classDef signal fill:#ECFEFF,stroke:#0891B2,color:#164E63,stroke-width:1.5px;
+    classDef data fill:#F8FAFC,stroke:#64748B,color:#334155,stroke-width:1.25px;
+    classDef eval fill:#F0FDFA,stroke:#14B8A6,color:#134E4A,stroke-width:1.5px;
+    classDef gate fill:#FFF7ED,stroke:#F97316,color:#7C2D12,stroke-width:2px;
+    classDef pass fill:#ECFDF5,stroke:#10B981,color:#065F46,stroke-width:1.75px;
+    classDef warn fill:#FFFBEB,stroke:#F59E0B,color:#78350F,stroke-width:1.5px;
+    classDef fail fill:#FEF2F2,stroke:#EF4444,color:#7F1D1D,stroke-width:1.5px;
+
+    class FEEDBACK signal;
+    class CASES data;
+    class CANDIDATE,VALIDATION,HOLDOUT eval;
+    class GATE gate;
+    class CANARY,MONITOR,STABLE pass;
+    class DEFERRED warn;
+    class REJECTED,ROLLBACK fail;
+
+    style SIGNALS fill:#F0FDFA,stroke:#99F6E4,stroke-width:1px,color:#115E59;
+    style LAB fill:#F8FAFC,stroke:#CBD5E1,stroke-width:1px,color:#475569;
+    style RELEASE fill:#F0FDF4,stroke:#BBF7D0,stroke-width:1px,color:#166534;
 ```
 
 候选版本会与当前版本回放同一批样本，并比较：

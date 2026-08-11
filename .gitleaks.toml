@@ -1,0 +1,18 @@
+# EvoAgent gitleaks configuration.
+#
+# Extends the upstream default ruleset so real credentials are still detected
+# everywhere, and adds a narrowly-scoped allowlist for the synthetic,
+# non-functional secret-shaped values that the test suite deliberately uses to
+# exercise the secret-detection rules.
+title = "EvoAgent gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic, non-functional secret-shaped fixtures used by the test suite."
+regexTarget = "line"
+regexes = [
+  # tests/test_reviewer.py: proves .lock paths short-circuit before rules run.
+  '''token = "abcdef123456"''',
+]

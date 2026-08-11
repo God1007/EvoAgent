@@ -24,7 +24,7 @@ jobs:
         with:
           inputs: requirements.lock
           require-hashes: true
-          disable-pip: true
+          no-deps: true
 
   secrets:
     name: Secret scan

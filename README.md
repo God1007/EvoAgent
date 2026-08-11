@@ -7,7 +7,10 @@
 让安全、可靠性、AI 与自定义 Skill 协同审查每一次代码变更，  
 并把人工反馈沉淀为可评测、可灰度、可回滚的审查能力。
 
-[![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![CI](https://github.com/God1007/EvoAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/God1007/EvoAgent/actions/workflows/ci.yml)
+[![Security](https://github.com/God1007/EvoAgent/actions/workflows/security.yml/badge.svg)](https://github.com/God1007/EvoAgent/actions/workflows/security.yml)
+[![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![PostgreSQL](https://img.shields.io/badge/Storage-SQLite%20%7C%20PostgreSQL-4169E1?logo=postgresql&logoColor=white)](#运行模式)
 [![Redis](https://img.shields.io/badge/Queue-In--Process%20%7C%20Redis-DC382D?logo=redis&logoColor=white)](#运行模式)
@@ -150,7 +153,7 @@ PENDING → PLANNING → EXECUTING → REVIEWING → SUCCESS
 
 ### 环境要求
 
-- Python 3.11
+- Python 3.11 或 3.12
 - pip
 - Docker 与 Docker Compose（仅完整生产模式需要）
 
@@ -160,7 +163,7 @@ PENDING → PLANNING → EXECUTING → REVIEWING → SUCCESS
 git clone <your-repository-url>
 cd EvoAgent-py
 
-python -m pip install -r requirements.txt
+python -m pip install --require-hashes -r requirements.lock
 cp .env.example .env
 python -m evoagent
 ```
@@ -482,6 +485,9 @@ curl -X POST 'http://127.0.0.1:8080/v1/skills/reload'
 
 如果未配置 `EVOAGENT_DATABASE_URL` 和 `EVOAGENT_REDIS_URL`，系统会自动使用本地模式。
 
+> [!IMPORTANT]
+> 死信队列、指数退避重试与重放的**持久化保证仅在 `redis-streams` 队列下成立**。本地进程内队列（`/health` 中 `queue` 为 `memory-ephemeral`、`queue_durable` 为 `false`）是非持久的：进程退出会丢失待处理、执行中、待重试与死信任务，仅适用于单进程开发环境。配置了 PostgreSQL 却未配置 Redis 时，服务会在启动时打印非持久告警。
+
 ## 生产部署
 
 ### 1. 创建环境文件
@@ -529,6 +535,7 @@ curl http://127.0.0.1:8080/health
   "reviewer": "multi-agent-collaboration",
   "runtime": "langgraph",
   "queue": "redis-streams",
+  "queue_durable": true,
   "llm_provider": "local",
   "llm_model": ""
 }
@@ -644,16 +651,43 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 ├── tests/                        # 单元与集成测试
 ├── scripts/                      # 数据导入、评测和报告脚本
 ├── evaluation_data/              # 版本化评测数据
+├── docs/adr/                     # 架构决策记录
+├── pyproject.toml                # 包元数据与质量工具统一配置
+├── requirements.lock            # 运行依赖及跨平台哈希
+├── requirements-dev.lock        # 开发工具与运行依赖锁
 ├── docker-compose.yml
 └── .env.example
 ```
+
+## 工程质量基线
+
+一期工程门禁在本地与 GitHub Actions 使用同一组命令：
+
+```bash
+python -m pip install "pip<26"
+python -m pip install --require-hashes -r requirements-dev.lock
+python -m pip install --no-deps -e .
+make check
+```
+
+`make check` 会依次执行：
+
+- Ruff lint 与格式检查；
+- mypy 生产代码类型检查；
+- Python 3.11 / 3.12 兼容性测试与 70% 核心行覆盖率门禁；
+- 锁定依赖漏洞审计；
+- sdist / wheel 构建验证。
+
+当前整体行覆盖率约 83%，其中 `reviewer`、`fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
+
+GitHub 额外执行 Gitleaks、CodeQL 和每周依赖审计。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)，边界适配器的集成测试范围与后续收敛计划记录在 [`docs/adr/0001-engineering-quality-gates.md`](docs/adr/0001-engineering-quality-gates.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
 
 ## 测试与评测
 
 运行测试：
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pytest --cov=evoagent --cov-report=term-missing
 ```
 
 运行内置的 100 条受控 PR Diff 端到端基准：
@@ -682,10 +716,11 @@ output/evaluation/evaluation-report.md
 
 - 默认只分析 Diff 新增行，不执行被审查仓库的代码；
 - LLM 密钥、GitHub Token 和认证密钥只从环境变量读取；
+- 对外部传入的 GitHub URL（如 Webhook 中的 `diff_url`）强制 HTTPS 与 GitHub 域名白名单校验，跨域名重定向会剥离 Authorization，并对响应大小设上限，避免 Token 外泄与内存放大；
 - Webhook Secret 与登录 Secret 用途不同，不能混用；
 - 动态 Skill 不获得宿主权限，并运行在受限进程中；
 - 自动修复不写入原 PR Head，只创建独立分支和 Draft PR；
-- 只有配置测试命令后，才会在隔离副本中执行仓库测试；
+- 只有配置测试命令后，才会在仓库副本中执行测试：配置容器镜像时以禁网、只读根、丢弃 capability、CPU/内存/进程数限额的容器运行（推荐用于不可信 PR 代码）；未配置镜像时以宿主回退模式运行，施加 CPU/内存/文件大小/进程数 `rlimit` 且超时会终止整个进程组，但不具备网络隔离，仅适用于可信仓库；
 - 私有仓库、评论回写和自动修复应使用最小权限 Token；
 - 公网部署必须启用认证，并通过反向代理限制暴露路径。
 
@@ -696,6 +731,10 @@ output/evaluation/evaluation-report.md
 - 自动修复刻意保持保守，目前只覆盖少量能够安全转换的规则；
 - 免费模型端点可能限流、下线或更换模型名称；
 - 生产激活前应使用带独立真值的真实仓库样本补充 Validation 与 Holdout 数据集。
+
+## 许可证
+
+本项目基于 [MIT License](LICENSE) 开源，可自由使用、修改与分发，需保留版权与许可声明。
 
 ---
 

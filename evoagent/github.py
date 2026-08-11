@@ -1,15 +1,15 @@
+import base64
 import hashlib
 import hmac
 import json
-import urllib.error
-import urllib.request
-import urllib.parse
-import base64
 import random
 import threading
 import time
-from datetime import datetime, timezone
-from typing import Dict
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from typing import Any, ClassVar
 
 
 def verify_signature(secret: str, body: bytes, signature: str) -> bool:
@@ -19,34 +19,94 @@ def verify_signature(secret: str, body: bytes, signature: str) -> bool:
     return hmac.compare_digest(expected, signature)
 
 
+# Only these GitHub-owned hosts may ever receive a request carrying the token.
+# `github.com` serves `.diff`/`.patch` links, `codeload.github.com` serves the
+# archive redirect, and `api.github.com` serves the REST API.
+DEFAULT_GITHUB_HOSTS = frozenset({"api.github.com", "github.com", "codeload.github.com"})
+
+
+def _validate_github_url(url: str, allowed_hosts: frozenset[str]) -> str:
+    """Reject any URL that is not an https request to an allowed GitHub host.
+
+    A pull_request webhook payload supplies `diff_url`/`issue_url` verbatim, so
+    an attacker with a valid signature could otherwise point the client (and its
+    Authorization header) at an arbitrary host. Enforcing scheme, host and the
+    absence of embedded credentials closes that SSRF / token-exfiltration path.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "https":
+        raise ValueError("refusing non-https GitHub URL: %s" % url)
+    if parts.username or parts.password:
+        raise ValueError("refusing GitHub URL with embedded credentials")
+    host = (parts.hostname or "").lower()
+    if host not in allowed_hosts:
+        raise ValueError("refusing GitHub URL to unexpected host: %s" % (host or "<none>"))
+    if parts.port not in (None, 443):
+        raise ValueError("refusing GitHub URL to unexpected port: %s" % parts.port)
+    return host
+
+
+def _read_capped(response, limit: int) -> bytes:
+    """Read at most `limit` bytes, raising if the response is larger."""
+    body = response.read(limit + 1)
+    if len(body) > limit:
+        raise RuntimeError("GitHub response exceeded the %d byte limit" % limit)
+    return body
+
+
+class _RestrictedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validate redirect targets and drop the token on cross-host redirects."""
+
+    def __init__(self, allowed_hosts: frozenset[str]):
+        self.allowed_hosts = allowed_hosts
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _validate_github_url(newurl, self.allowed_hosts)
+        new_request = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_request is not None:
+            origin = urllib.parse.urlsplit(req.full_url).hostname
+            target = urllib.parse.urlsplit(newurl).hostname
+            if origin != target:
+                new_request.remove_header("Authorization")
+        return new_request
+
+
 class GitHubClient:
-    def __init__(self, token: str, timeout: int = 30, max_attempts: int = 4):
+    def __init__(
+        self,
+        token: str,
+        timeout: int = 30,
+        max_attempts: int = 4,
+        allowed_hosts: frozenset[str] | None = None,
+        max_response_bytes: int = 25 * 1024 * 1024,
+        max_archive_bytes: int = 1024 * 1024 * 1024,
+    ):
         self.token = token
         self.timeout = timeout
         self.max_attempts = max_attempts
+        self.allowed_hosts = allowed_hosts or DEFAULT_GITHUB_HOSTS
+        self.max_response_bytes = max_response_bytes
+        self.max_archive_bytes = max_archive_bytes
+        self._opener = urllib.request.build_opener(_RestrictedRedirectHandler(self.allowed_hosts))
 
-    def _headers(self, accept: str = "application/vnd.github+json") -> Dict[str, str]:
-        headers = {"Accept": accept, "User-Agent": "EvoAgent/0.1", "X-GitHub-Api-Version": "2022-11-28"}
+    def _headers(self, accept: str = "application/vnd.github+json") -> dict[str, str]:
+        headers = {
+            "Accept": accept,
+            "User-Agent": "EvoAgent/0.1",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
         return headers
 
-    def fetch_diff(self, url: str) -> str:
+    def fetch_diff(self, url: str, max_bytes: int | None = None) -> str:
         body = self._request(
-            "GET", url, accept="application/vnd.github.v3.diff", raw=True
+            "GET", url, accept="application/vnd.github.v3.diff", raw=True, max_bytes=max_bytes
         )
         return body.decode("utf-8", errors="replace")
 
     def post_comment(self, api_url: str, markdown: str) -> None:
-        url = api_url.rstrip("/") + "/comments"
-        request = urllib.request.Request(
-            url,
-            data=json.dumps({"body": markdown}).encode("utf-8"),
-            headers=dict(self._headers(), **{"Content-Type": "application/json"}),
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=self.timeout):
-            return None
+        self._json("POST", api_url.rstrip("/") + "/comments", {"body": markdown})
 
     def upsert_comment(self, api_url: str, markdown: str, marker: str) -> None:
         """Update this service's existing review comment instead of creating duplicates."""
@@ -63,19 +123,27 @@ class GitHubClient:
         return self._request(method, url, payload)
 
     def _request(
-        self, method: str, url: str, payload=None,
-        accept: str = "application/vnd.github+json", raw: bool = False,
+        self,
+        method: str,
+        url: str,
+        payload=None,
+        accept: str = "application/vnd.github+json",
+        raw: bool = False,
+        max_bytes: int | None = None,
     ):
+        _validate_github_url(url, self.allowed_hosts)
+        limit = self.max_response_bytes if max_bytes is None else max_bytes
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         for attempt in range(1, self.max_attempts + 1):
             request = urllib.request.Request(
-                url, data=data,
+                url,
+                data=data,
                 headers=dict(self._headers(accept), **{"Content-Type": "application/json"}),
                 method=method,
             )
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    body = response.read()
+                with self._opener.open(request, timeout=self.timeout) as response:
+                    body = _read_capped(response, limit)
                     if raw:
                         return body
                     return json.loads(body.decode("utf-8")) if body else {}
@@ -86,8 +154,7 @@ class GitHubClient:
                 if not retryable or attempt >= self.max_attempts:
                     detail = exc.read(1000).decode("utf-8", errors="replace")
                     raise RuntimeError(
-                        "GitHub API %s %s returned HTTP %d: %s"
-                        % (method, url, exc.code, detail)
+                        "GitHub API %s %s returned HTTP %d: %s" % (method, url, exc.code, detail)
                     ) from exc
                 retry_after = exc.headers.get("Retry-After")
                 reset = exc.headers.get("X-RateLimit-Reset")
@@ -108,9 +175,11 @@ class GitHubClient:
 
     def get_file(self, repository: str, path: str, ref: str) -> dict:
         quoted = urllib.parse.quote(path, safe="/")
-        result = self._json("GET", "https://api.github.com/repos/%s/contents/%s?ref=%s" % (
-            repository, quoted, urllib.parse.quote(ref, safe="")
-        ))
+        result = self._json(
+            "GET",
+            "https://api.github.com/repos/%s/contents/%s?ref=%s"
+            % (repository, quoted, urllib.parse.quote(ref, safe="")),
+        )
         result["decoded_content"] = base64.b64decode(result["content"]).decode("utf-8")
         return result
 
@@ -123,26 +192,41 @@ class GitHubClient:
             raise PermissionError("GitHub installation is not authorized for this repository")
 
     def create_branch(self, repository: str, branch: str, sha: str) -> None:
-        self._json("POST", "https://api.github.com/repos/%s/git/refs" % repository,
-                   {"ref": "refs/heads/" + branch, "sha": sha})
+        self._json(
+            "POST",
+            "https://api.github.com/repos/%s/git/refs" % repository,
+            {"ref": "refs/heads/" + branch, "sha": sha},
+        )
 
-    def commit_file(self, repository: str, path: str, branch: str, content: str, sha: str, message: str) -> dict:
+    def commit_file(
+        self, repository: str, path: str, branch: str, content: str, sha: str, message: str
+    ) -> dict:
         quoted = urllib.parse.quote(path, safe="/")
-        return self._json("PUT", "https://api.github.com/repos/%s/contents/%s" % (repository, quoted), {
-            "message": message, "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
-            "sha": sha, "branch": branch,
-        })
+        return self._json(
+            "PUT",
+            "https://api.github.com/repos/%s/contents/%s" % (repository, quoted),
+            {
+                "message": message,
+                "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+                "sha": sha,
+                "branch": branch,
+            },
+        )
 
     def create_atomic_commit(
-        self, repository: str, branch: str, parent_sha: str,
-        files: Dict[str, str], message: str,
+        self,
+        repository: str,
+        branch: str,
+        parent_sha: str,
+        files: dict[str, str],
+        message: str,
     ) -> dict:
         parent = self._json(
-            "GET", "https://api.github.com/repos/%s/git/commits/%s"
-            % (repository, parent_sha)
+            "GET", "https://api.github.com/repos/%s/git/commits/%s" % (repository, parent_sha)
         )
         tree = self._json(
-            "POST", "https://api.github.com/repos/%s/git/trees" % repository,
+            "POST",
+            "https://api.github.com/repos/%s/git/trees" % repository,
             {
                 "base_tree": parent["tree"]["sha"],
                 "tree": [
@@ -152,34 +236,54 @@ class GitHubClient:
             },
         )
         commit = self._json(
-            "POST", "https://api.github.com/repos/%s/git/commits" % repository,
+            "POST",
+            "https://api.github.com/repos/%s/git/commits" % repository,
             {"message": message, "tree": tree["sha"], "parents": [parent_sha]},
         )
         self.create_branch(repository, branch, commit["sha"])
         return commit
 
     def create_draft_pull_request(
-        self, repository: str, title: str, head: str, base: str, body: str,
+        self,
+        repository: str,
+        title: str,
+        head: str,
+        base: str,
+        body: str,
     ) -> dict:
         return self._json(
-            "POST", "https://api.github.com/repos/%s/pulls" % repository,
+            "POST",
+            "https://api.github.com/repos/%s/pulls" % repository,
             {"title": title, "head": head, "base": base, "body": body, "draft": True},
         )
 
     def download_archive(self, repository: str, ref: str) -> bytes:
         return self._request(
-            "GET", "https://api.github.com/repos/%s/zipball/%s"
+            "GET",
+            "https://api.github.com/repos/%s/zipball/%s"
             % (repository, urllib.parse.quote(ref, safe="")),
-            accept="application/vnd.github+json", raw=True,
+            accept="application/vnd.github+json",
+            raw=True,
+            max_bytes=self.max_archive_bytes,
         )
 
 
 class GitHubAppAuthenticator:
-    _cache = {}
+    _cache: ClassVar[dict[tuple[str, int], dict[str, Any]]] = {}
     _lock = threading.Lock()
-    def __init__(self, app_id: str, private_key_path: str):
+
+    def __init__(
+        self,
+        app_id: str,
+        private_key_path: str,
+        allowed_hosts: frozenset[str] | None = None,
+        max_response_bytes: int = 1024 * 1024,
+    ):
         self.app_id = app_id
         self.private_key_path = private_key_path
+        self.allowed_hosts = allowed_hosts or DEFAULT_GITHUB_HOSTS
+        self.max_response_bytes = max_response_bytes
+        self._opener = urllib.request.build_opener(_RestrictedRedirectHandler(self.allowed_hosts))
 
     def app_jwt(self) -> str:
         try:
@@ -189,7 +293,9 @@ class GitHubAppAuthenticator:
         with open(self.private_key_path, "rb") as handle:
             key = handle.read()
         now = int(time.time())
-        return jwt.encode({"iat": now - 60, "exp": now + 540, "iss": self.app_id}, key, algorithm="RS256")
+        return jwt.encode(
+            {"iat": now - 60, "exp": now + 540, "iss": self.app_id}, key, algorithm="RS256"
+        )
 
     def installation_token(self, installation_id: int) -> str:
         cache_key = (self.app_id, int(installation_id))
@@ -197,15 +303,22 @@ class GitHubAppAuthenticator:
             cached = self._cache.get(cache_key)
             if cached and cached["expires_at"] > time.time() + 120:
                 return cached["token"]
+        url = "https://api.github.com/app/installations/%d/access_tokens" % installation_id
+        _validate_github_url(url, self.allowed_hosts)
         request = urllib.request.Request(
-            "https://api.github.com/app/installations/%d/access_tokens" % installation_id,
-            data=b"{}", method="POST",
-            headers={"Authorization": "Bearer " + self.app_jwt(), "Accept": "application/vnd.github+json",
-                     "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "EvoAgent/0.3",
-                     "Content-Type": "application/json"},
+            url,
+            data=b"{}",
+            method="POST",
+            headers={
+                "Authorization": "Bearer " + self.app_jwt(),
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "EvoAgent/0.3",
+                "Content-Type": "application/json",
+            },
         )
-        with urllib.request.urlopen(request, timeout=30) as response:
-            result = json.loads(response.read().decode("utf-8"))
+        with self._opener.open(request, timeout=30) as response:
+            result = json.loads(_read_capped(response, self.max_response_bytes).decode("utf-8"))
         expires = result.get("expires_at", "")
         try:
             expires_at = datetime.fromisoformat(expires.replace("Z", "+00:00")).timestamp()

@@ -1,5 +1,7 @@
 """Versioned skill registry with manifest validation and process isolation."""
+
 import ast
+import builtins
 import hashlib
 import hmac
 import json
@@ -9,15 +11,19 @@ import sys
 import tempfile
 import threading
 from dataclasses import dataclass
-from typing import Dict, List
 
-from .models import Finding, Severity
+from .models import Finding
 from .reviewer import Reviewer
 
-
 FORBIDDEN_IMPORTS = {
-    "ctypes", "multiprocessing", "socket", "subprocess", "urllib", "http",
-    "ftplib", "telnetlib",
+    "ctypes",
+    "multiprocessing",
+    "socket",
+    "subprocess",
+    "urllib",
+    "http",
+    "ftplib",
+    "telnetlib",
 }
 
 
@@ -33,8 +39,12 @@ class SkillInfo:
 
 class SandboxedSkillReviewer(Reviewer):
     def __init__(
-        self, name: str, module_path: str, timeout_seconds: int = 30,
-        memory_mb: int = 256, container_image: str = "",
+        self,
+        name: str,
+        module_path: str,
+        timeout_seconds: int = 30,
+        memory_mb: int = 256,
+        container_image: str = "",
     ):
         self.name = name
         self.module_path = os.path.abspath(module_path)
@@ -43,7 +53,7 @@ class SandboxedSkillReviewer(Reviewer):
         self.container_image = container_image
         self.runner = os.path.join(os.path.dirname(__file__), "skill_runner.py")
 
-    def review(self, diff, parsed) -> List[Finding]:
+    def review(self, diff, parsed) -> list[Finding]:
         payload = {
             "diff": diff,
             "parsed": {
@@ -57,7 +67,8 @@ class SandboxedSkillReviewer(Reviewer):
         }
         with tempfile.TemporaryDirectory(prefix="evoagent-skill-") as workdir:
             env = {
-                key: value for key, value in os.environ.items()
+                key: value
+                for key, value in os.environ.items()
                 if key in {"PATH", "SYSTEMROOT", "WINDIR", "LANG", "LC_ALL", "TMP", "TEMP"}
             }
             env["PYTHONHASHSEED"] = "0"
@@ -67,20 +78,42 @@ class SandboxedSkillReviewer(Reviewer):
                     package_root = os.path.dirname(os.path.dirname(self.runner))
                     skill_root = os.path.dirname(self.module_path)
                     command = [
-                        "docker", "run", "--rm", "-i", "--network", "none",
-                        "--read-only", "--cap-drop", "ALL", "--security-opt",
-                        "no-new-privileges", "--pids-limit", "64",
-                        "--memory", "%dm" % self.memory_mb, "--cpus", "0.5",
-                        "-v", package_root + ":/app:ro",
-                        "-v", skill_root + ":/skill:ro",
-                        self.container_image, "python", "-I",
+                        "docker",
+                        "run",
+                        "--rm",
+                        "-i",
+                        "--network",
+                        "none",
+                        "--read-only",
+                        "--cap-drop",
+                        "ALL",
+                        "--security-opt",
+                        "no-new-privileges",
+                        "--pids-limit",
+                        "64",
+                        "--memory",
+                        "%dm" % self.memory_mb,
+                        "--cpus",
+                        "0.5",
+                        "-v",
+                        package_root + ":/app:ro",
+                        "-v",
+                        skill_root + ":/skill:ro",
+                        self.container_image,
+                        "python",
+                        "-I",
                         "/app/evoagent/skill_runner.py",
                         "/skill/" + os.path.basename(self.module_path),
                     ]
                 result = subprocess.run(
                     command,
-                    input=json.dumps(payload), text=True, capture_output=True,
-                    cwd=workdir, env=env, timeout=self.timeout_seconds, check=False,
+                    input=json.dumps(payload),
+                    text=True,
+                    capture_output=True,
+                    cwd=workdir,
+                    env=env,
+                    timeout=self.timeout_seconds,
+                    check=False,
                 )
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError("skill %s exceeded its time limit" % self.name) from exc
@@ -90,20 +123,19 @@ class SandboxedSkillReviewer(Reviewer):
             )
         try:
             values = json.loads(result.stdout)
-            findings = []
-            for value in values:
-                item = dict(value)
-                item["severity"] = Severity(item["severity"])
-                findings.append(Finding(**item))
-            return findings
+            return [Finding.from_dict(value) for value in values]
         except Exception as exc:
             raise RuntimeError("skill %s returned invalid output" % self.name) from exc
 
 
 class SkillRegistry:
     def __init__(
-        self, skills_dir: str, sandbox: bool = True, timeout_seconds: int = 30,
-        memory_mb: int = 256, signing_key: str = "",
+        self,
+        skills_dir: str,
+        sandbox: bool = True,
+        timeout_seconds: int = 30,
+        memory_mb: int = 256,
+        signing_key: str = "",
         container_image: str = "",
     ):
         self.skills_dir = skills_dir
@@ -112,28 +144,31 @@ class SkillRegistry:
         self.memory_mb = memory_mb
         self.signing_key = signing_key.encode("utf-8")
         self.container_image = container_image
-        self._skills: Dict[str, Reviewer] = {}
-        self._info: Dict[str, SkillInfo] = {}
+        self._skills: dict[str, Reviewer] = {}
+        self._info: dict[str, SkillInfo] = {}
         self._lock = threading.RLock()
 
     def register(
-        self, name: str, reviewer: Reviewer, version: str = "1.0.0",
-        description: str = "", source: str = "builtin", sandboxed: bool = False,
+        self,
+        name: str,
+        reviewer: Reviewer,
+        version: str = "1.0.0",
+        description: str = "",
+        source: str = "builtin",
+        sandboxed: bool = False,
         permissions: tuple = (),
     ) -> None:
         if not name.replace("-", "_").isidentifier():
             raise ValueError("invalid skill name: %s" % name)
         with self._lock:
             self._skills[name] = reviewer
-            self._info[name] = SkillInfo(
-                name, version, description, source, sandboxed, permissions
-            )
+            self._info[name] = SkillInfo(name, version, description, source, sandboxed, permissions)
 
-    def reviewers(self) -> List[Reviewer]:
+    def reviewers(self) -> list[Reviewer]:
         with self._lock:
             return list(self._skills.values())
 
-    def list(self) -> List[dict]:
+    def list(self) -> list[dict]:
         with self._lock:
             values = []
             for item in self._info.values():
@@ -142,7 +177,7 @@ class SkillRegistry:
                 values.append(value)
             return values
 
-    def reload(self) -> List[dict]:
+    def reload(self) -> builtins.list[dict]:
         if not os.path.isdir(self.skills_dir):
             os.makedirs(self.skills_dir, exist_ok=True)
             return self.list()
@@ -152,21 +187,28 @@ class SkillRegistry:
             manifest_path = os.path.join(entry.path, "skill.json")
             if not os.path.isfile(manifest_path):
                 continue
-            with open(manifest_path, "r", encoding="utf-8") as handle:
+            with open(manifest_path, encoding="utf-8") as handle:
                 manifest = json.load(handle)
             module_path = os.path.abspath(os.path.join(entry.path, manifest.get("entrypoint", "")))
             if not module_path.startswith(os.path.abspath(entry.path) + os.sep):
                 raise ValueError("skill entrypoint escapes its directory: %s" % entry.name)
             self._validate_manifest(manifest, module_path)
             reviewer = SandboxedSkillReviewer(
-                manifest["name"], module_path, self.timeout_seconds, self.memory_mb,
+                manifest["name"],
+                module_path,
+                self.timeout_seconds,
+                self.memory_mb,
                 self.container_image,
             )
             if not self.sandbox:
                 raise ValueError("dynamic skills require EVOAGENT_SKILL_SANDBOX=true")
             self.register(
-                manifest["name"], reviewer, manifest["version"],
-                manifest.get("description", "Dynamic review skill"), module_path, True,
+                manifest["name"],
+                reviewer,
+                manifest["version"],
+                manifest.get("description", "Dynamic review skill"),
+                module_path,
+                True,
                 tuple(manifest.get("permissions", [])),
             )
         return self.list()

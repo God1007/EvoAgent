@@ -30,15 +30,18 @@ class Metrics:
         with self._lock:
             lines = []
             for name, value in sorted(self.counters.items()):
-                lines.extend(["# TYPE evoagent_%s counter" % name, "evoagent_%s %s" % (name, value)])
+                lines.extend(
+                    ["# TYPE evoagent_%s counter" % name, "evoagent_%s %s" % (name, value)]
+                )
             for name, value in sorted(self.duration_sum.items()):
-                lines.extend([
-                    "# TYPE evoagent_%s_seconds summary" % name,
-                    "evoagent_%s_seconds_sum %s" % (name, value),
-                    "evoagent_%s_seconds_count %s" % (name, self.duration_count[name]),
-                ])
+                lines.extend(
+                    [
+                        "# TYPE evoagent_%s_seconds summary" % name,
+                        "evoagent_%s_seconds_sum %s" % (name, value),
+                        "evoagent_%s_seconds_count %s" % (name, self.duration_count[name]),
+                    ]
+                )
         return "\n".join(lines) + "\n"
 
 
 metrics = Metrics()
-

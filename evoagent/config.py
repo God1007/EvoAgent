@@ -1,6 +1,11 @@
 import os
+import sys
 from dataclasses import dataclass
-from typing import Dict
+from typing import Any
+
+SOURCE_SKILLS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "skills"))
+INSTALLED_SKILLS_DIR = os.path.join(sys.prefix, "share", "evoagent", "skills")
+DEFAULT_SKILLS_DIR = SOURCE_SKILLS_DIR if os.path.isdir(SOURCE_SKILLS_DIR) else INSTALLED_SKILLS_DIR
 
 
 def _int(name: str, default: int) -> int:
@@ -38,7 +43,7 @@ class Settings:
     database_url: str = ""
     redis_url: str = ""
     async_workers: int = 2
-    skills_dir: str = "skills"
+    skills_dir: str = DEFAULT_SKILLS_DIR
     github_app_id: str = ""
     github_app_slug: str = ""
     github_private_key_path: str = ""
@@ -69,6 +74,12 @@ class Settings:
     skill_container_image: str = ""
     repair_test_command: str = ""
     repair_verify_timeout_seconds: int = 120
+    repair_container_image: str = ""
+    repair_memory_mb: int = 1024
+    repair_pids_limit: int = 256
+    repair_cpus: float = 1.0
+    repair_require_container: bool = False
+    repair_max_output_bytes: int = 16000
     otel_endpoint: str = ""
     otel_service_name: str = "evoagent"
     alert_failure_rate: float = 0.20
@@ -79,7 +90,7 @@ class Settings:
     alert_email_to: str = ""
     continuous_eval_seconds: int = 0
 
-    def resolved_llm(self) -> Dict[str, object]:
+    def resolved_llm(self) -> dict[str, Any]:
         """Resolve a named provider to the existing OpenAI-compatible transport."""
         provider = self.llm_provider.strip().lower()
         if provider in {"", "local", "none"}:
@@ -155,7 +166,9 @@ class Settings:
         if not 0.0 <= self.eval_min_improvement <= 1.0:
             raise ValueError("EVOAGENT_EVAL_MIN_IMPROVEMENT must be between 0 and 1")
         if self.eval_min_holdout_cases > self.eval_max_cases:
-            raise ValueError("EVOAGENT_EVAL_MIN_HOLDOUT_CASES cannot exceed EVOAGENT_EVAL_MAX_CASES")
+            raise ValueError(
+                "EVOAGENT_EVAL_MIN_HOLDOUT_CASES cannot exceed EVOAGENT_EVAL_MAX_CASES"
+            )
         if not 0.0 <= self.eval_max_metric_regression <= 1.0:
             raise ValueError("EVOAGENT_EVAL_MAX_METRIC_REGRESSION must be between 0 and 1")
         if self.auth_required and len(self.auth_secret.encode("utf-8")) < 32:
@@ -185,11 +198,13 @@ class Settings:
             database_url=os.getenv("EVOAGENT_DATABASE_URL", ""),
             redis_url=os.getenv("EVOAGENT_REDIS_URL", ""),
             async_workers=_int("EVOAGENT_ASYNC_WORKERS", 2),
-            skills_dir=os.getenv("EVOAGENT_SKILLS_DIR", "skills"),
+            skills_dir=os.getenv("EVOAGENT_SKILLS_DIR", DEFAULT_SKILLS_DIR),
             github_app_id=os.getenv("EVOAGENT_GITHUB_APP_ID", ""),
             github_app_slug=os.getenv("EVOAGENT_GITHUB_APP_SLUG", ""),
             github_private_key_path=os.getenv("EVOAGENT_GITHUB_PRIVATE_KEY_PATH", ""),
-            public_base_url=os.getenv("EVOAGENT_PUBLIC_BASE_URL", "http://127.0.0.1:8080").rstrip("/"),
+            public_base_url=os.getenv("EVOAGENT_PUBLIC_BASE_URL", "http://127.0.0.1:8080").rstrip(
+                "/"
+            ),
             llm_provider=os.getenv("EVOAGENT_LLM_PROVIDER", "local"),
             deepseek_api_key=os.getenv("EVOAGENT_DEEPSEEK_API_KEY", ""),
             openrouter_api_key=os.getenv("EVOAGENT_OPENROUTER_API_KEY", ""),
@@ -199,9 +214,7 @@ class Settings:
             eval_min_cases=_int("EVOAGENT_EVAL_MIN_CASES", 3),
             eval_min_improvement=float(os.getenv("EVOAGENT_EVAL_MIN_IMPROVEMENT", "0.01")),
             eval_min_holdout_cases=_non_negative_int("EVOAGENT_EVAL_MIN_HOLDOUT_CASES", 2),
-            eval_max_metric_regression=float(
-                os.getenv("EVOAGENT_EVAL_MAX_METRIC_REGRESSION", "0")
-            ),
+            eval_max_metric_regression=float(os.getenv("EVOAGENT_EVAL_MAX_METRIC_REGRESSION", "0")),
             auth_required=_bool("EVOAGENT_AUTH_REQUIRED", False),
             auth_secret=os.getenv("EVOAGENT_AUTH_SECRET", ""),
             bootstrap_admin_username=os.getenv("EVOAGENT_BOOTSTRAP_ADMIN_USERNAME", ""),
@@ -218,6 +231,12 @@ class Settings:
             skill_container_image=os.getenv("EVOAGENT_SKILL_CONTAINER_IMAGE", ""),
             repair_test_command=os.getenv("EVOAGENT_REPAIR_TEST_COMMAND", ""),
             repair_verify_timeout_seconds=_int("EVOAGENT_REPAIR_VERIFY_TIMEOUT_SECONDS", 120),
+            repair_container_image=os.getenv("EVOAGENT_REPAIR_CONTAINER_IMAGE", ""),
+            repair_memory_mb=_int("EVOAGENT_REPAIR_MEMORY_MB", 1024),
+            repair_pids_limit=_int("EVOAGENT_REPAIR_PIDS_LIMIT", 256),
+            repair_cpus=float(os.getenv("EVOAGENT_REPAIR_CPUS", "1.0")),
+            repair_require_container=_bool("EVOAGENT_REPAIR_REQUIRE_CONTAINER", False),
+            repair_max_output_bytes=_int("EVOAGENT_REPAIR_MAX_OUTPUT_BYTES", 16000),
             otel_endpoint=os.getenv("EVOAGENT_OTEL_ENDPOINT", ""),
             otel_service_name=os.getenv("EVOAGENT_OTEL_SERVICE_NAME", "evoagent"),
             alert_failure_rate=float(os.getenv("EVOAGENT_ALERT_FAILURE_RATE", "0.20")),
@@ -226,7 +245,5 @@ class Settings:
             alert_webhook_url=os.getenv("EVOAGENT_ALERT_WEBHOOK_URL", ""),
             alert_smtp_host=os.getenv("EVOAGENT_ALERT_SMTP_HOST", ""),
             alert_email_to=os.getenv("EVOAGENT_ALERT_EMAIL_TO", ""),
-            continuous_eval_seconds=_non_negative_int(
-                "EVOAGENT_CONTINUOUS_EVAL_SECONDS", 0
-            ),
+            continuous_eval_seconds=_non_negative_int("EVOAGENT_CONTINUOUS_EVAL_SECONDS", 0),
         )

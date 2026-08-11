@@ -5,15 +5,15 @@ executor so a developer checkout remains usable without optional dependencies.
 Checkpoints are owned by the application store and therefore work with either
 executor and survive worker restarts.
 """
+
 import threading
 import time
-from typing import Any, Dict, Optional, TypedDict
+from typing import Any, TypedDict, cast
 
 from .diff_parser import ParsedDiff, parse_unified_diff
 from .models import ChangedLine, Finding, ReviewReport, Severity, TaskState, TraceEvent
 from .reviewer import Reviewer
 from .store import TaskStore, utc_now
-
 
 ALLOWED = {
     TaskState.PENDING: {TaskState.PLANNING, TaskState.FAILED, TaskState.CANCELLED},
@@ -26,11 +26,11 @@ ALLOWED = {
 class RuntimeState(TypedDict, total=False):
     task_id: str
     repository: str
-    pull_request: Optional[int]
+    pull_request: int | None
     diff: str
-    parsed: Dict[str, Any]
+    parsed: dict[str, Any]
     findings: list
-    report: Dict[str, Any]
+    report: dict[str, Any]
 
 
 class BudgetExceeded(RuntimeError):
@@ -45,8 +45,13 @@ class ReviewHarness:
     node_order = ("planning", "executing", "reviewing")
 
     def __init__(
-        self, store: TaskStore, reviewer: Reviewer, max_steps: int = 8,
-        timeout_seconds: int = 120, node_retries: int = 2, observability=None,
+        self,
+        store: TaskStore,
+        reviewer: Reviewer,
+        max_steps: int = 8,
+        timeout_seconds: int = 120,
+        node_retries: int = 2,
+        observability=None,
     ):
         self.store = store
         self.reviewer = reviewer
@@ -61,6 +66,7 @@ class ReviewHarness:
     def _build_graph(self):
         try:
             from langgraph.graph import END, START, StateGraph
+
             builder = StateGraph(RuntimeState)
             builder.add_node("planning", self._planning)
             builder.add_node("executing", self._executing)
@@ -75,14 +81,20 @@ class ReviewHarness:
             return None
 
     def run(
-        self, task_id: str, repository: str, pull_request: Optional[int], diff: str,
+        self,
+        task_id: str,
+        repository: str,
+        pull_request: int | None,
+        diff: str,
     ) -> ReviewReport:
         task = self.store.get(task_id)
         if task and task.get("state") == TaskState.SUCCESS.value and task.get("report"):
             return self._report_from_dict(task["report"])
         state: RuntimeState = {
-            "task_id": task_id, "repository": repository,
-            "pull_request": pull_request, "diff": diff,
+            "task_id": task_id,
+            "repository": repository,
+            "pull_request": pull_request,
+            "diff": diff,
         }
         self._ctx.started = time.monotonic()
         self._ctx.step = max([item["step"] for item in (task or {}).get("trace", [])] or [0])
@@ -97,15 +109,16 @@ class ReviewHarness:
             self._ctx.state = TaskState.REVIEWING
         try:
             if self.graph is not None:
-                result = self.graph.invoke(state)
+                result: dict[str, Any] = dict(self.graph.invoke(state))
             else:
-                result = state
+                result = dict(state)
                 for node in (self._planning, self._executing, self._reviewing):
-                    result.update(node(result))
+                    result.update(node(cast(RuntimeState, result)))
             report = self._report_from_dict(result["report"])
             self._ctx.step += 1
             self.store.succeed(
-                task_id, report,
+                task_id,
+                report,
                 TraceEvent(self._ctx.step, TaskState.SUCCESS, "Review completed", utc_now()),
             )
             return report
@@ -118,7 +131,8 @@ class ReviewHarness:
         except Exception as exc:
             self._ctx.step += 1
             self.store.fail(
-                task_id, str(exc),
+                task_id,
+                str(exc),
                 TraceEvent(self._ctx.step, TaskState.FAILED, "Review failed: %s" % exc, utc_now()),
             )
             try:
@@ -130,11 +144,15 @@ class ReviewHarness:
             raise
 
     def resume(
-        self, task_id: str, repository: str, pull_request: Optional[int], diff: str,
+        self,
+        task_id: str,
+        repository: str,
+        pull_request: int | None,
+        diff: str,
     ) -> ReviewReport:
         return self.run(task_id, repository, pull_request, diff)
 
-    def _planning(self, state: RuntimeState) -> Dict[str, Any]:
+    def _planning(self, state: RuntimeState) -> dict[str, Any]:
         cached = self._completed(state["task_id"], "planning")
         if cached is not None:
             return cached
@@ -148,26 +166,25 @@ class ReviewHarness:
 
         return self._run_node(state["task_id"], "planning", work)
 
-    def _executing(self, state: RuntimeState) -> Dict[str, Any]:
+    def _executing(self, state: RuntimeState) -> dict[str, Any]:
         cached = self._completed(state["task_id"], "executing")
         if cached is not None:
             return cached
 
         def work():
             parsed = self._deserialize_parsed(state["parsed"])
-            self._transition(
-                TaskState.EXECUTING, "Reviewing %d changed files" % len(parsed.files)
-            )
+            self._transition(TaskState.EXECUTING, "Reviewing %d changed files" % len(parsed.files))
             contextual = getattr(self.reviewer, "review_with_context", None)
             findings = (
                 contextual(state["task_id"], state["diff"], parsed)
-                if contextual else self.reviewer.review(state["diff"], parsed)
+                if contextual
+                else self.reviewer.review(state["diff"], parsed)
             )
             return {"findings": [item.to_dict() for item in findings]}
 
         return self._run_node(state["task_id"], "executing", work)
 
-    def _reviewing(self, state: RuntimeState) -> Dict[str, Any]:
+    def _reviewing(self, state: RuntimeState) -> dict[str, Any]:
         cached = self._completed(state["task_id"], "reviewing")
         if cached is not None:
             return cached
@@ -180,16 +197,20 @@ class ReviewHarness:
             )
             risk = self._risk(findings)
             report = ReviewReport(
-                repository=state["repository"], pull_request=state.get("pull_request"),
-                summary=self._summary(findings, len(parsed.files), risk), risk=risk,
-                findings=findings, files_reviewed=parsed.files, reviewer=self.reviewer.name,
+                repository=state["repository"],
+                pull_request=state.get("pull_request"),
+                summary=self._summary(findings, len(parsed.files), risk),
+                risk=risk,
+                findings=findings,
+                files_reviewed=parsed.files,
+                reviewer=self.reviewer.name,
             )
             return {"report": report.to_dict()}
 
         return self._run_node(state["task_id"], "reviewing", work)
 
-    def _run_node(self, task_id: str, node: str, callback) -> Dict[str, Any]:
-        last_error = None
+    def _run_node(self, task_id: str, node: str, callback) -> dict[str, Any]:
+        last_error: Exception | None = None
         existing = self.store.load_checkpoints(task_id).get(node, {})
         start_attempt = int(existing.get("attempt", 0))
         for offset in range(1, self.node_retries + 2):
@@ -198,8 +219,11 @@ class ReviewHarness:
             try:
                 if self.observability:
                     with self.observability.span(
-                        "review.%s" % node, task_id, task_id=task_id,
-                        node=node, attempt=attempt,
+                        "review.%s" % node,
+                        task_id,
+                        task_id=task_id,
+                        node=node,
+                        attempt=attempt,
                     ):
                         output = callback()
                 else:
@@ -210,12 +234,12 @@ class ReviewHarness:
                 raise
             except Exception as exc:
                 last_error = exc
-                self.store.save_checkpoint(
-                    task_id, node, {}, "failed", attempt, str(exc)
-                )
+                self.store.save_checkpoint(task_id, node, {}, "failed", attempt, str(exc))
+        if last_error is None:
+            raise RuntimeError("review node failed without an exception")
         raise last_error
 
-    def _completed(self, task_id: str, node: str) -> Optional[Dict[str, Any]]:
+    def _completed(self, task_id: str, node: str) -> dict[str, Any] | None:
         checkpoint = self.store.load_checkpoints(task_id).get(node)
         if checkpoint and checkpoint["status"] == "completed":
             return checkpoint["state"]
@@ -247,7 +271,7 @@ class ReviewHarness:
             raise BudgetExceeded("task execution budget exceeded")
 
     @staticmethod
-    def _serialize_parsed(parsed: ParsedDiff) -> Dict[str, Any]:
+    def _serialize_parsed(parsed: ParsedDiff) -> dict[str, Any]:
         return {
             "files": parsed.files,
             "added_lines": [
@@ -257,22 +281,22 @@ class ReviewHarness:
         }
 
     @staticmethod
-    def _deserialize_parsed(value: Dict[str, Any]) -> ParsedDiff:
+    def _deserialize_parsed(value: dict[str, Any]) -> ParsedDiff:
         return ParsedDiff(
             list(value["files"]), [ChangedLine(**item) for item in value["added_lines"]]
         )
 
     @staticmethod
-    def _finding_from_dict(value: Dict[str, Any]) -> Finding:
-        item = dict(value)
-        item["severity"] = Severity(item["severity"])
-        return Finding(**item)
+    def _finding_from_dict(value: dict[str, Any]) -> Finding:
+        return Finding.from_dict(value)
 
     @classmethod
-    def _report_from_dict(cls, value: Dict[str, Any]) -> ReviewReport:
+    def _report_from_dict(cls, value: dict[str, Any]) -> ReviewReport:
         return ReviewReport(
-            repository=value["repository"], pull_request=value.get("pull_request"),
-            summary=value["summary"], risk=value["risk"],
+            repository=value["repository"],
+            pull_request=value.get("pull_request"),
+            summary=value["summary"],
+            risk=value["risk"],
             findings=[cls._finding_from_dict(item) for item in value.get("findings", [])],
             files_reviewed=list(value.get("files_reviewed", [])),
             reviewer=value.get("reviewer", "unknown"),
@@ -290,7 +314,11 @@ class ReviewHarness:
     @staticmethod
     def _summary(findings, file_count: int, risk: str) -> str:
         if not findings:
-            return "Reviewed %d file(s); no actionable issue was detected in added lines." % file_count
+            return (
+                "Reviewed %d file(s); no actionable issue was detected in added lines." % file_count
+            )
         return "Reviewed %d file(s); found %d actionable issue(s). Overall risk: %s." % (
-            file_count, len(findings), risk,
+            file_count,
+            len(findings),
+            risk,
         )

@@ -3,18 +3,18 @@ import json
 import mimetypes
 import os
 import re
+import sys
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict
+from typing import Any
 
-from .config import Settings
 from .auth import Principal
+from .config import Settings
 from .github import verify_signature
 from .metrics import metrics
 from .report import to_markdown
 from .service import ReviewService
-
 
 TASK = re.compile(r"^/v1/tasks/([0-9a-f-]+)$")
 REPORT = re.compile(r"^/v1/tasks/([0-9a-f-]+)/report$")
@@ -23,7 +23,9 @@ FEEDBACK = re.compile(r"^/v1/tasks/([0-9a-f-]+)/feedback$")
 CANCEL = re.compile(r"^/v1/tasks/([0-9a-f-]+)/cancel$")
 RESUME = re.compile(r"^/v1/tasks/([0-9a-f-]+)/resume$")
 ROLLBACK = re.compile(r"^/v1/skills/([A-Za-z0-9_-]+)/versions/(\d+)/activate$")
-WEB_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "web"))
+SOURCE_WEB_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "web"))
+INSTALLED_WEB_ROOT = os.path.join(sys.prefix, "share", "evoagent", "web")
+WEB_ROOT = SOURCE_WEB_ROOT if os.path.isdir(SOURCE_WEB_ROOT) else INSTALLED_WEB_ROOT
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -45,9 +47,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _principal(self, permission: str = "read") -> Principal:
         if not self.settings.auth_required:
-            return Principal(
-                "local", "local-development", self.settings.default_tenant_id, "admin"
-            )
+            return Principal("local", "local-development", self.settings.default_tenant_id, "admin")
         principal = self.service.auth.authenticate(self.headers.get("Authorization", ""))
         self.service.auth.require(principal, (permission,))
         return principal
@@ -59,12 +59,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send_json(401, {"error": str(exc)})
             return None
 
-    def _send_json(self, status: int, value: Dict[str, Any]) -> None:
+    def _send_json(self, status: int, value: dict[str, Any]) -> None:
         body = json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
         self._headers(status, "application/json; charset=utf-8", len(body))
         self.wfile.write(body)
 
-    def _send_text(self, status: int, text: str, content_type: str = "text/plain; charset=utf-8") -> None:
+    def _send_text(
+        self, status: int, text: str, content_type: str = "text/plain; charset=utf-8"
+    ) -> None:
         body = text.encode("utf-8")
         self._headers(status, content_type, len(body))
         self.wfile.write(body)
@@ -81,7 +83,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
         content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
-        if content_type.startswith("text/") or content_type in {"application/javascript", "application/json"}:
+        if content_type.startswith("text/") or content_type in {
+            "application/javascript",
+            "application/json",
+        }:
             content_type += "; charset=utf-8"
         self._headers(200, content_type, len(body))
         self.wfile.write(body)
@@ -90,18 +95,18 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
-            raise ValueError("invalid Content-Length")
+            raise ValueError("invalid Content-Length") from None
         limit = self.settings.max_diff_bytes + 256 * 1024
         if length <= 0 or length > limit:
             raise ValueError("request body is empty or too large")
         return self.rfile.read(length)
 
     @staticmethod
-    def _read_json(body: bytes) -> Dict[str, Any]:
+    def _read_json(body: bytes) -> dict[str, Any]:
         try:
             value = json.loads(body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            raise ValueError("request body must be valid UTF-8 JSON")
+            raise ValueError("request body must be valid UTF-8 JSON") from None
         if not isinstance(value, dict):
             raise ValueError("JSON root must be an object")
         return value
@@ -123,11 +128,18 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._serve_file("app.js")
             return
         if path == "/health":
-            self._send_json(200, {"status": "ok", "reviewer": self.service.reviewer.name,
-                                  "runtime": self.service.harness.name,
-                                  "queue": self.service.queue.backend,
-                                  "llm_provider": self.service.llm_config.get("provider", "local"),
-                                  "llm_model": self.service.llm_config.get("model", "")})
+            self._send_json(
+                200,
+                {
+                    "status": "ok",
+                    "reviewer": self.service.reviewer.name,
+                    "runtime": self.service.harness.name,
+                    "queue": self.service.queue.backend,
+                    "queue_durable": self.service.queue.durable,
+                    "llm_provider": self.service.llm_config.get("provider", "local"),
+                    "llm_model": self.service.llm_config.get("model", ""),
+                },
+            )
             return
         principal = self._authenticate_or_send("read")
         if principal is None:
@@ -136,14 +148,25 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send_text(200, metrics.prometheus(), "text/plain; version=0.0.4; charset=utf-8")
             return
         if path == "/api/dashboard":
-            self._send_json(200, {"stats": self.service.store.dashboard_stats(principal.tenant_id),
-                                  "tasks": self.service.store.list_tasks(10, principal.tenant_id),
-                                  "queue": self.service.queue.backend,
-                                  "orchestrator": self.service.reviewer.name})
+            self._send_json(
+                200,
+                {
+                    "stats": self.service.store.dashboard_stats(principal.tenant_id),
+                    "tasks": self.service.store.list_tasks(10, principal.tenant_id),
+                    "queue": self.service.queue.backend,
+                    "orchestrator": self.service.reviewer.name,
+                },
+            )
             return
         if path == "/api/tasks":
-            self._send_json(200, {"tasks": self.service.store.list_tasks(
-                int(query.get("limit", [50])[0]), principal.tenant_id)})
+            self._send_json(
+                200,
+                {
+                    "tasks": self.service.store.list_tasks(
+                        int(query.get("limit", [50])[0]), principal.tenant_id
+                    )
+                },
+            )
             return
         if path == "/api/skills":
             self._send_json(200, {"skills": self.service.registry.list()})
@@ -152,47 +175,60 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not principal.can("audit"):
                 self._send_json(403, {"error": "permission denied"})
                 return
-            self._send_json(200, {"cases": self.service.store.list_failure_cases(
-                False, 100, principal.tenant_id
-            )})
+            self._send_json(
+                200,
+                {"cases": self.service.store.list_failure_cases(False, 100, principal.tenant_id)},
+            )
             return
         if path == "/api/audit":
             if not principal.can("audit"):
                 self._send_json(403, {"error": "permission denied"})
                 return
-            self._send_json(200, {"events": self.service.store.list_audit(
-                principal.tenant_id, int(query.get("limit", [100])[0])
-            )})
+            self._send_json(
+                200,
+                {
+                    "events": self.service.store.list_audit(
+                        principal.tenant_id, int(query.get("limit", [100])[0])
+                    )
+                },
+            )
             return
         if path == "/api/alerts":
             self._send_json(200, {"alerts": self.service.store.list_alerts(principal.tenant_id)})
             return
         if path == "/api/deployments/llm-review":
-            self._send_json(200, {"deployment": self.service.store.get_deployment(
-                principal.tenant_id, "llm-review"
-            )})
+            self._send_json(
+                200,
+                {
+                    "deployment": self.service.store.get_deployment(
+                        principal.tenant_id, "llm-review"
+                    )
+                },
+            )
             return
         if path == "/api/queue/dead-letters":
             if not principal.can("manage"):
                 self._send_json(403, {"error": "permission denied"})
                 return
-            self._send_json(200, {"messages": self.service.queue.dead_letters(
-                int(query.get("limit", [100])[0])
-            )})
+            self._send_json(
+                200,
+                {"messages": self.service.queue.dead_letters(int(query.get("limit", [100])[0]))},
+            )
             return
         if path == "/v1/evaluation/cases":
             split = query.get("split", ["validation"])[0]
             if split == "holdout":
                 self._send_json(403, {"error": "holdout cases are not exposed through the API"})
                 return
-            self._send_json(200, {
-                "cases": self.service.store.list_evaluation_cases(split, True, 100)
-            })
+            self._send_json(
+                200, {"cases": self.service.store.list_evaluation_cases(split, True, 100)}
+            )
             return
         if path == "/v1/evolution/runs":
-            self._send_json(200, {
-                "runs": self.service.store.list_evolution_runs(int(query.get("limit", [50])[0]))
-            })
+            self._send_json(
+                200,
+                {"runs": self.service.store.list_evolution_runs(int(query.get("limit", [50])[0]))},
+            )
             return
         if path == "/v1/evolution/status":
             status = self.service.evolution.status()
@@ -205,7 +241,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send_json(503, {"error": "EVOAGENT_GITHUB_APP_SLUG is not configured"})
                 return
             self.send_response(302)
-            self.send_header("Location", "https://github.com/apps/%s/installations/new" % self.settings.github_app_slug)
+            self.send_header(
+                "Location",
+                "https://github.com/apps/%s/installations/new" % self.settings.github_app_slug,
+            )
             self.end_headers()
             return
         if path == "/github/setup":
@@ -214,7 +253,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             except ValueError:
                 self._send_json(400, {"error": "missing installation_id"})
                 return
-            self.service.store.save_installation(installation_id, query.get("account", ["github-app"])[0])
+            self.service.store.save_installation(
+                installation_id, query.get("account", ["github-app"])[0]
+            )
             self.send_response(302)
             self.send_header("Location", "/#github")
             self.end_headers()
@@ -250,7 +291,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 payload = self._read_json(body)
                 try:
                     result = self.service.auth.login(
-                        str(payload.get("username", "")), str(payload.get("password", "")),
+                        str(payload.get("username", "")),
+                        str(payload.get("password", "")),
                         str(payload.get("tenant_id", "")),
                     )
                 except PermissionError as exc:
@@ -269,12 +311,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                     result = self.service.enqueue_review(*args, tenant_id=principal.tenant_id)
                     self._send_json(202, result)
                 else:
-                    self._send_json(201, self.service.create_review(
-                        *args, tenant_id=principal.tenant_id
-                    ))
+                    self._send_json(
+                        201, self.service.create_review(*args, tenant_id=principal.tenant_id)
+                    )
                 self.service.store.audit(
-                    principal.tenant_id, principal.username, "review.create",
-                    str(payload.get("repository", "")), {"async": query.get("async", ["false"])[0]},
+                    principal.tenant_id,
+                    principal.username,
+                    "review.create",
+                    str(payload.get("repository", "")),
+                    {"async": query.get("async", ["false"])[0]},
                 )
                 return
             if path == "/webhooks/github":
@@ -284,8 +329,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not self.settings.github_webhook_secret:
                     self._send_json(503, {"error": "GitHub webhook secret is not configured"})
                     return
-                if not verify_signature(self.settings.github_webhook_secret, body,
-                                        self.headers.get("X-Hub-Signature-256", "")):
+                if not verify_signature(
+                    self.settings.github_webhook_secret,
+                    body,
+                    self.headers.get("X-Hub-Signature-256", ""),
+                ):
                     self._send_json(401, {"error": "invalid webhook signature"})
                     return
                 payload = self._read_json(body)
@@ -294,16 +342,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                     try:
                         event_time = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
                     except ValueError:
-                        raise ValueError("invalid pull_request.updated_at")
-                    age = abs((datetime.now(timezone.utc) - event_time).total_seconds())
+                        raise ValueError("invalid pull_request.updated_at") from None
+                    age = abs((datetime.now(UTC) - event_time).total_seconds())
                     if age > self.settings.webhook_max_age_seconds:
                         self._send_json(409, {"error": "webhook is outside the replay window"})
                         return
                 delivery_id = self.headers.get("X-GitHub-Delivery", "")
                 digest = hashlib.sha256(body).hexdigest()
-                self._send_json(202, self.service.handle_github_pull_request(
-                    payload, delivery_id, digest
-                ))
+                self._send_json(
+                    202, self.service.handle_github_pull_request(payload, delivery_id, digest)
+                )
                 return
             match = FIX.match(path)
             if match:
@@ -316,8 +364,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                     match.group(1), installation_id, principal.tenant_id
                 )
                 self.service.store.audit(
-                    principal.tenant_id, principal.username, "repair.create",
-                    match.group(1), {"branch": result.get("branch")},
+                    principal.tenant_id,
+                    principal.username,
+                    "repair.create",
+                    match.group(1),
+                    {"branch": result.get("branch")},
                 )
                 self._send_json(201, result)
                 return
@@ -325,10 +376,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             if match:
                 principal = self._principal("review")
                 payload = self._read_json(body)
-                self._send_json(201, self.service.record_feedback(
-                    match.group(1), str(payload.get("category", "")), payload.get("finding"),
-                    str(payload.get("note", "")), principal.tenant_id,
-                ))
+                self._send_json(
+                    201,
+                    self.service.record_feedback(
+                        match.group(1),
+                        str(payload.get("category", "")),
+                        payload.get("finding"),
+                        str(payload.get("note", "")),
+                        principal.tenant_id,
+                    ),
+                )
                 return
             match = CANCEL.match(path)
             if match:
@@ -350,27 +407,31 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             if path == "/v1/skills/reload":
                 principal = self._principal("manage")
-                self._send_json(200, {"skills": self.service.reload_skills(),
-                                      "note": "New tasks now use the reloaded skill set."})
+                self._send_json(
+                    200,
+                    {
+                        "skills": self.service.reload_skills(),
+                        "note": "New tasks now use the reloaded skill set.",
+                    },
+                )
                 return
             if path == "/v1/deployments/llm-review":
                 principal = self._principal("manage")
                 payload = self._read_json(body)
-                result = self.service.releases.configure(
-                    principal.tenant_id, "llm-review", payload
-                )
+                result = self.service.releases.configure(principal.tenant_id, "llm-review", payload)
                 self.service.store.audit(
-                    principal.tenant_id, principal.username, "deployment.configure",
-                    "llm-review", payload,
+                    principal.tenant_id,
+                    principal.username,
+                    "deployment.configure",
+                    "llm-review",
+                    payload,
                 )
                 self._send_json(201, result)
                 return
             if path == "/v1/queue/dead-letters/replay":
                 principal = self._principal("manage")
                 payload = self._read_json(body)
-                ok = self.service.queue.replay_dead_letter(
-                    str(payload.get("message_id", ""))
-                )
+                ok = self.service.queue.replay_dead_letter(str(payload.get("message_id", "")))
                 self._send_json(202 if ok else 404, {"replayed": ok})
                 return
             if path == "/v1/evaluation/cases":
@@ -388,7 +449,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             if path == "/v1/evolution/auto":
                 self._principal("manage")
                 payload = self._read_json(body)
-                result = self.service.evolution.auto_propose(str(payload.get("skill_name", "llm-review")))
+                result = self.service.evolution.auto_propose(
+                    str(payload.get("skill_name", "llm-review"))
+                )
                 if result["decision"] == "activated":
                     self.service.reload_skills()
                 self._send_json(201, result)
@@ -397,7 +460,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._principal("manage")
                 payload = self._read_json(body)
                 result = self.service.evolution.propose(
-                    str(payload.get("skill_name", "")), str(payload.get("prompt", "")),
+                    str(payload.get("skill_name", "")),
+                    str(payload.get("prompt", "")),
                     float(payload["regression_score"]) if "regression_score" in payload else None,
                 )
                 if result["decision"] == "activated":
@@ -425,12 +489,27 @@ class ApiHandler(BaseHTTPRequestHandler):
 def run() -> None:
     settings = Settings.from_env()
     service = ReviewService(settings)
-    handler = type("ConfiguredApiHandler", (ApiHandler,), {"service": service, "settings": settings})
+    handler = type(
+        "ConfiguredApiHandler", (ApiHandler,), {"service": service, "settings": settings}
+    )
     server = ThreadingHTTPServer((settings.host, settings.port), handler)
     print("EvoAgent dashboard: http://%s:%d" % (settings.host, settings.port))
-    print("Persistence: %s | Queue: %s | Orchestrator: %s" % (
-        "postgresql" if settings.database_url else "sqlite", service.queue.backend, service.reviewer.name
-    ))
+    print(
+        "Persistence: %s | Queue: %s | Orchestrator: %s"
+        % (
+            "postgresql" if settings.database_url else "sqlite",
+            service.queue.backend,
+            service.reviewer.name,
+        )
+    )
+    exposed = settings.host not in {"127.0.0.1", "localhost", "::1"}
+    if (settings.database_url or exposed) and not service.queue.durable:
+        print(
+            "WARNING: this deployment looks production-facing but the task queue is "
+            "'%s' (non-durable). Set EVOAGENT_REDIS_URL for durable, crash-safe "
+            "delivery; otherwise pending/in-flight/dead-letter tasks are lost on restart."
+            % service.queue.backend
+        )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

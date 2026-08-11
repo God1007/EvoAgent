@@ -1,10 +1,9 @@
 import json
 import re
-import socket
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from .diff_parser import ParsedDiff
 from .models import Finding, Severity
@@ -14,7 +13,7 @@ class Reviewer(ABC):
     name = "reviewer"
 
     @abstractmethod
-    def review(self, diff: str, parsed: ParsedDiff) -> List[Finding]:
+    def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
         raise NotImplementedError
 
 
@@ -43,7 +42,9 @@ class LocalRuleReviewer(Reviewer):
         (
             "SEC-HARDCODED-SECRET",
             Severity.HIGH,
-            re.compile(r"(?i)\b(password|passwd|api[_-]?key|secret|token)\b\s*=\s*['\"][^'\"]{4,}['\"]"),
+            re.compile(
+                r"(?i)\b(password|passwd|api[_-]?key|secret|token)\b\s*=\s*['\"][^'\"]{4,}['\"]"
+            ),
             "疑似硬编码凭据",
             "凭据进入代码仓库后可能通过历史记录、构建日志或制品泄露。",
             "从密钥管理服务或环境变量读取，并立即轮换已经提交的凭据。",
@@ -78,8 +79,8 @@ class LocalRuleReviewer(Reviewer):
         ),
     ]
 
-    def review(self, diff: str, parsed: ParsedDiff) -> List[Finding]:
-        findings: List[Finding] = []
+    def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
+        findings: list[Finding] = []
         seen = set()
         for line in parsed.added_lines:
             if line.path.endswith((".lock", ".min.js", ".map")):
@@ -108,9 +109,14 @@ class OpenAICompatibleReviewer(Reviewer):
     name = "openai-compatible"
 
     def __init__(
-        self, base_url: str, api_key: str, model: str, timeout: int = 60,
-        system_prompt: str = "", provider: str = "openai-compatible",
-        extra_headers: Optional[Dict[str, str]] = None,
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout: int = 60,
+        system_prompt: str = "",
+        provider: str = "openai-compatible",
+        extra_headers: dict[str, str] | None = None,
     ):
         self.base_url = base_url
         self.api_key = api_key
@@ -121,7 +127,7 @@ class OpenAICompatibleReviewer(Reviewer):
         self.name = "%s:%s" % (provider, model)
         self.extra_headers = extra_headers or {}
 
-    def review(self, diff: str, parsed: ParsedDiff) -> List[Finding]:
+    def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
         schema = (
             'Return JSON only: {"findings":[{"rule_id":"...","severity":"critical|high|medium|low",'
             '"title":"...","explanation":"...","path":"...","line":1,"evidence":"...",'
@@ -132,7 +138,12 @@ class OpenAICompatibleReviewer(Reviewer):
             "model": self.model,
             "temperature": 0,
             "messages": [
-                {"role": "system", "content": (self.system_prompt or "You are a senior secure code reviewer.") + " " + schema},
+                {
+                    "role": "system",
+                    "content": (self.system_prompt or "You are a senior secure code reviewer.")
+                    + " "
+                    + schema,
+                },
                 {"role": "user", "content": "Review this unified diff:\n\n" + diff},
             ],
             "response_format": {"type": "json_object"},
@@ -154,16 +165,20 @@ class OpenAICompatibleReviewer(Reviewer):
                 body = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read(1000).decode("utf-8", errors="replace")
-            raise RuntimeError("%s API returned HTTP %d: %s" % (self.provider, exc.code, detail)) from exc
-        except (urllib.error.URLError, socket.timeout, ValueError, KeyError) as exc:
+            raise RuntimeError(
+                "%s API returned HTTP %d: %s" % (self.provider, exc.code, detail)
+            ) from exc
+        except (TimeoutError, urllib.error.URLError, ValueError, KeyError) as exc:
             raise RuntimeError("%s review request failed: %s" % (self.provider, exc)) from exc
         try:
             content = body["choices"][0]["message"]["content"]
             result = json.loads(content)
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("%s returned an invalid JSON review response" % self.provider) from exc
+            raise RuntimeError(
+                "%s returned an invalid JSON review response" % self.provider
+            ) from exc
         valid_locations = {(item.path, item.line) for item in parsed.added_lines}
-        findings: List[Finding] = []
+        findings: list[Finding] = []
         for raw in result.get("findings", []):
             path, line = str(raw.get("path", "")), int(raw.get("line", 0))
             if (path, line) not in valid_locations:
@@ -192,12 +207,12 @@ class OpenAICompatibleReviewer(Reviewer):
 class CompositeReviewer(Reviewer):
     name = "composite"
 
-    def __init__(self, reviewers: List[Reviewer]):
+    def __init__(self, reviewers: list[Reviewer]):
         self.reviewers = reviewers
         self.name = "+".join(item.name for item in reviewers)
 
-    def review(self, diff: str, parsed: ParsedDiff) -> List[Finding]:
-        merged: Dict[Any, Finding] = {}
+    def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
+        merged: dict[Any, Finding] = {}
         errors = []
         for reviewer in self.reviewers:
             try:
@@ -209,4 +224,6 @@ class CompositeReviewer(Reviewer):
         if not merged and errors and len(errors) == len(self.reviewers):
             raise errors[0]
         order = {Severity.CRITICAL: 0, Severity.HIGH: 1, Severity.MEDIUM: 2, Severity.LOW: 3}
-        return sorted(merged.values(), key=lambda item: (order[item.severity], item.path, item.line))
+        return sorted(
+            merged.values(), key=lambda item: (order[item.severity], item.path, item.line)
+        )

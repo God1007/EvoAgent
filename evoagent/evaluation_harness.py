@@ -1,16 +1,17 @@
 """End-to-end PR diff evaluation with reproducible matching and repair gates."""
+
 import hashlib
 import json
 import re
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any
 
 from .diff_parser import parse_unified_diff
-from .models import Finding, Severity
+from .models import Finding
 from .reviewer import Reviewer
 from .verifier import RepairVerifier
-
 
 SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
@@ -60,9 +61,9 @@ def dataset_fingerprint(cases: Iterable[dict]) -> str:
     return digest.hexdigest()
 
 
-def load_jsonl(path: str) -> List[dict]:
+def load_jsonl(path: str) -> list[dict]:
     cases = []
-    with open(path, "r", encoding="utf-8") as handle:
+    with open(path, encoding="utf-8") as handle:
         for line_number, raw in enumerate(handle, 1):
             if not raw.strip():
                 continue
@@ -90,9 +91,7 @@ def validate_case(case: dict, line_number: int = 0) -> None:
         raise ValueError("%s does not contain a scoreable unified diff" % prefix)
     if not isinstance(case["expected_findings"], list):
         raise ValueError("%s expected_findings must be an array" % prefix)
-    added_locations = {
-        (_normalized_path(item.path), int(item.line)) for item in parsed.added_lines
-    }
+    added_locations = {(_normalized_path(item.path), int(item.line)) for item in parsed.added_lines}
     for expected in case["expected_findings"]:
         for field in ("path", "start_line", "end_line", "cwe", "severity"):
             if field not in expected:
@@ -116,9 +115,11 @@ def _normalized_path(path: str) -> str:
 
 
 def _candidate_edges(
-    expected: List[dict], predicted: List[Finding], line_tolerance: int,
-) -> Dict[int, List[Tuple[int, int]]]:
-    edges: Dict[int, List[Tuple[int, int]]] = {}
+    expected: list[dict],
+    predicted: list[Finding],
+    line_tolerance: int,
+) -> dict[int, list[tuple[int, int]]]:
+    edges: dict[int, list[tuple[int, int]]] = {}
     for expected_index, truth in enumerate(expected):
         start = int(truth["start_line"])
         end = int(truth["end_line"])
@@ -141,11 +142,13 @@ def _candidate_edges(
 
 
 def one_to_one_match(
-    expected: List[dict], predicted: List[Finding], line_tolerance: int = 2,
-) -> List[Match]:
+    expected: list[dict],
+    predicted: list[Finding],
+    line_tolerance: int = 2,
+) -> list[Match]:
     """Maximum-cardinality bipartite matching with deterministic edge ordering."""
     edges = _candidate_edges(expected, predicted, line_tolerance)
-    prediction_owner: Dict[int, int] = {}
+    prediction_owner: dict[int, int] = {}
 
     def assign(expected_index: int, visited: set) -> bool:
         for predicted_index, _distance in edges.get(expected_index, []):
@@ -166,8 +169,7 @@ def one_to_one_match(
     matches = []
     for predicted_index, expected_index in prediction_owner.items():
         distance = next(
-            distance for index, distance in edges[expected_index]
-            if index == predicted_index
+            distance for index, distance in edges[expected_index] if index == predicted_index
         )
         matches.append(Match(expected_index, predicted_index, distance))
     return sorted(matches, key=lambda item: (item.expected_index, item.predicted_index))
@@ -180,7 +182,7 @@ class FixtureRepairer:
     The same evaluator and gates can consume either implementation.
     """
 
-    def repair(self, case: dict, finding: Finding) -> Dict[str, Any]:
+    def repair(self, case: dict, finding: Finding) -> dict[str, Any]:
         validation = dict(case.get("repair_validation") or {})
         path = finding.path
         content = str((case.get("after_files") or {}).get(path, ""))
@@ -198,14 +200,10 @@ class FixtureRepairer:
         compile_result = RepairVerifier().verify_contents({path: repaired})
         compile_passed = bool(compile_result["passed"])
         checks.append({"name": "compile", "passed": compile_passed})
-        risk_removed = bool(risk_pattern) and not re.search(
-            risk_pattern, repaired, re.MULTILINE
-        )
+        risk_removed = bool(risk_pattern) and not re.search(risk_pattern, repaired, re.MULTILINE)
         checks.append({"name": "risk-removed", "passed": risk_removed})
         required = list(validation.get("required_after_patterns") or [])
-        regression_passed = all(
-            re.search(pattern, repaired, re.MULTILINE) for pattern in required
-        )
+        regression_passed = all(re.search(pattern, repaired, re.MULTILINE) for pattern in required)
         checks.append({"name": "regression-tests", "passed": regression_passed})
         return {
             "passed": all(item["passed"] for item in checks),
@@ -224,15 +222,16 @@ class FixtureRepairer:
         if rule == "SEC-HARDCODED-SECRET":
             value = re.sub(
                 r"(?m)^(\s*)(password|passwd|api_key|secret|token)\s*=\s*['\"][^'\"]+['\"]",
-                lambda match: '%s%s = os.environ["%s"]' % (
-                    match.group(1), match.group(2), match.group(2).upper()
+                lambda match: (
+                    '%s%s = os.environ["%s"]'
+                    % (match.group(1), match.group(2), match.group(2).upper())
                 ),
                 content,
             )
             return FixtureRepairer._ensure_import(value, "os")
         if rule == "SEC-SQL-CONCAT":
             return re.sub(
-                r'(?m)^(\s*)cursor\.execute\(.+$',
+                r"(?m)^(\s*)cursor\.execute\(.+$",
                 r'\1cursor.execute("SELECT * FROM users WHERE id = ?", (value,))',
                 content,
             )
@@ -257,12 +256,14 @@ class FixtureRepairer:
 
 class EndToEndEvaluationHarness:
     def __init__(
-        self, line_tolerance: int = 2, repairer: Optional[FixtureRepairer] = None,
+        self,
+        line_tolerance: int = 2,
+        repairer: FixtureRepairer | None = None,
     ):
         self.line_tolerance = line_tolerance
         self.repairer = repairer
 
-    def run(self, reviewer: Reviewer, cases: List[dict], name: str = "") -> Dict[str, Any]:
+    def run(self, reviewer: Reviewer, cases: list[dict], name: str = "") -> dict[str, Any]:
         started = time.monotonic()
         totals = self._empty_totals()
         case_results = []
@@ -278,9 +279,9 @@ class EndToEndEvaluationHarness:
             for item in selected:
                 self._accumulate(split_totals, item)
             by_split[split] = self._metrics(split_totals)
-        source_kinds = sorted({
-            str((case.get("source") or {}).get("kind", "unknown")) for case in cases
-        })
+        source_kinds = sorted(
+            {str((case.get("source") or {}).get("kind", "unknown")) for case in cases}
+        )
         return {
             "schema_version": 1,
             "name": name or reviewer.name,
@@ -299,7 +300,7 @@ class EndToEndEvaluationHarness:
             "case_results": case_results,
         }
 
-    def _run_case(self, reviewer: Reviewer, case: dict) -> Dict[str, Any]:
+    def _run_case(self, reviewer: Reviewer, case: dict) -> dict[str, Any]:
         expected = list(case["expected_findings"])
         result = {
             "id": case["id"],
@@ -344,27 +345,31 @@ class EndToEndEvaluationHarness:
                 result["severity_hits"] += int(severity_hit)
                 result["high_hits"] += int(high)
                 matched_expected.add(match.expected_index)
-                result["matches"].append({
-                    "expected_index": match.expected_index,
-                    "predicted_index": match.predicted_index,
-                    "path": finding.path,
-                    "line": finding.line,
-                    "cwe": RULE_TO_CWE.get(finding.rule_id, finding.rule_id),
-                    "rule_id": finding.rule_id,
-                    "expected_severity": truth["severity"],
-                    "predicted_severity": finding.severity.value,
-                    "severity_hit": severity_hit,
-                    "location_distance": match.location_distance,
-                })
+                result["matches"].append(
+                    {
+                        "expected_index": match.expected_index,
+                        "predicted_index": match.predicted_index,
+                        "path": finding.path,
+                        "line": finding.line,
+                        "cwe": RULE_TO_CWE.get(finding.rule_id, finding.rule_id),
+                        "rule_id": finding.rule_id,
+                        "expected_severity": truth["severity"],
+                        "predicted_severity": finding.severity.value,
+                        "severity_hit": severity_hit,
+                        "location_distance": match.location_distance,
+                    }
+                )
                 if self.repairer is not None:
                     result["repair_attempted"] += 1
                     repair = self.repairer.repair(case, finding)
                     result["repair_passed"] += int(repair["passed"])
-                    result["repair"].append({
-                        "expected_index": match.expected_index,
-                        "passed": repair["passed"],
-                        "checks": repair["checks"],
-                    })
+                    result["repair"].append(
+                        {
+                            "expected_index": match.expected_index,
+                            "passed": repair["passed"],
+                            "checks": repair["checks"],
+                        }
+                    )
             result["e2e_success"] = bool(
                 expected
                 and len(matched_expected) == len(expected)
@@ -376,22 +381,38 @@ class EndToEndEvaluationHarness:
         return result
 
     @staticmethod
-    def _empty_totals() -> Dict[str, int]:
+    def _empty_totals() -> dict[str, int]:
         return {
-            "cases": 0, "risk_cases": 0, "clean_cases": 0, "tp": 0, "fp": 0,
-            "fn": 0, "severity_hits": 0, "high_total": 0, "high_hits": 0,
-            "clean_hits": 0, "execution_successes": 0, "repair_attempted": 0,
-            "repair_passed": 0, "e2e_successes": 0,
+            "cases": 0,
+            "risk_cases": 0,
+            "clean_cases": 0,
+            "tp": 0,
+            "fp": 0,
+            "fn": 0,
+            "severity_hits": 0,
+            "high_total": 0,
+            "high_hits": 0,
+            "clean_hits": 0,
+            "execution_successes": 0,
+            "repair_attempted": 0,
+            "repair_passed": 0,
+            "e2e_successes": 0,
         }
 
     @staticmethod
-    def _accumulate(totals: Dict[str, int], result: dict) -> None:
+    def _accumulate(totals: dict[str, int], result: dict) -> None:
         totals["cases"] += 1
         totals["risk_cases"] += int(result["expected"] > 0)
         totals["clean_cases"] += int(result["expected"] == 0)
         for field in (
-            "tp", "fp", "fn", "severity_hits", "high_total", "high_hits",
-            "repair_attempted", "repair_passed",
+            "tp",
+            "fp",
+            "fn",
+            "severity_hits",
+            "high_total",
+            "high_hits",
+            "repair_attempted",
+            "repair_passed",
         ):
             totals[field] += int(result[field])
         totals["clean_hits"] += int(result["clean_hit"])
@@ -399,15 +420,13 @@ class EndToEndEvaluationHarness:
         totals["e2e_successes"] += int(result["e2e_success"])
 
     @staticmethod
-    def _metrics(totals: Dict[str, int]) -> Dict[str, Any]:
+    def _metrics(totals: dict[str, int]) -> dict[str, Any]:
         def ratio(numerator: int, denominator: int, empty: float = 1.0) -> float:
             return round(numerator / denominator, 4) if denominator else empty
 
         precision = ratio(totals["tp"], totals["tp"] + totals["fp"], 0.0)
         recall = ratio(totals["tp"], totals["tp"] + totals["fn"], 1.0)
-        f1 = round(
-            2 * precision * recall / (precision + recall), 4
-        ) if precision + recall else 0.0
+        f1 = round(2 * precision * recall / (precision + recall), 4) if precision + recall else 0.0
         return {
             **totals,
             "precision": precision,
@@ -416,26 +435,29 @@ class EndToEndEvaluationHarness:
             "severity_accuracy": ratio(totals["severity_hits"], totals["tp"]),
             "high_risk_recall": ratio(totals["high_hits"], totals["high_total"]),
             "clean_accuracy": ratio(totals["clean_hits"], totals["clean_cases"]),
-            "execution_success_rate": ratio(
-                totals["execution_successes"], totals["cases"], 0.0
-            ),
-            "safe_fix_rate": ratio(
-                totals["repair_passed"], totals["repair_attempted"], 0.0
-            ),
-            "e2e_security_fix_rate": ratio(
-                totals["e2e_successes"], totals["risk_cases"], 0.0
-            ),
+            "execution_success_rate": ratio(totals["execution_successes"], totals["cases"], 0.0),
+            "safe_fix_rate": ratio(totals["repair_passed"], totals["repair_attempted"], 0.0),
+            "e2e_security_fix_rate": ratio(totals["e2e_successes"], totals["risk_cases"], 0.0),
         }
 
 
 def comparison_summary(
-    baseline: dict, candidate: dict, minimum_f1_improvement: float = 0.02,
-    minimum_execution_success: float = 0.98, minimum_safe_fix_rate: float = 0.75,
+    baseline: dict,
+    candidate: dict,
+    minimum_f1_improvement: float = 0.02,
+    minimum_execution_success: float = 0.98,
+    minimum_safe_fix_rate: float = 0.75,
     minimum_e2e_fix_rate: float = 0.60,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     metrics = (
-        "precision", "recall", "f1", "severity_accuracy", "high_risk_recall",
-        "clean_accuracy", "execution_success_rate", "safe_fix_rate",
+        "precision",
+        "recall",
+        "f1",
+        "severity_accuracy",
+        "high_risk_recall",
+        "clean_accuracy",
+        "execution_success_rate",
+        "safe_fix_rate",
         "e2e_security_fix_rate",
     )
     quantitative_gates = {
@@ -448,27 +470,21 @@ def comparison_summary(
         },
         "high_risk_recall_non_regression": {
             "passed": (
-                candidate["metrics"]["high_risk_recall"]
-                >= baseline["metrics"]["high_risk_recall"]
+                candidate["metrics"]["high_risk_recall"] >= baseline["metrics"]["high_risk_recall"]
             ),
         },
         "clean_accuracy_non_regression": {
             "passed": (
-                candidate["metrics"]["clean_accuracy"]
-                >= baseline["metrics"]["clean_accuracy"]
+                candidate["metrics"]["clean_accuracy"] >= baseline["metrics"]["clean_accuracy"]
             ),
         },
         "holdout_f1_non_regression": {
             "passed": (
-                candidate["by_split"]["holdout"]["f1"]
-                >= baseline["by_split"]["holdout"]["f1"]
+                candidate["by_split"]["holdout"]["f1"] >= baseline["by_split"]["holdout"]["f1"]
             ),
         },
         "execution_success": {
-            "passed": (
-                candidate["metrics"]["execution_success_rate"]
-                >= minimum_execution_success
-            ),
+            "passed": (candidate["metrics"]["execution_success_rate"] >= minimum_execution_success),
             "minimum": minimum_execution_success,
         },
         "safe_fix_rate": {
@@ -476,9 +492,7 @@ def comparison_summary(
             "minimum": minimum_safe_fix_rate,
         },
         "e2e_security_fix_rate": {
-            "passed": (
-                candidate["metrics"]["e2e_security_fix_rate"] >= minimum_e2e_fix_rate
-            ),
+            "passed": (candidate["metrics"]["e2e_security_fix_rate"] >= minimum_e2e_fix_rate),
             "minimum": minimum_e2e_fix_rate,
         },
     }
@@ -490,25 +504,19 @@ def comparison_summary(
     }
     gates = dict(quantitative_gates)
     gates["production_data_provenance"] = provenance_gate
-    quantitative_passed = all(
-        item["passed"] for item in quantitative_gates.values()
-    )
+    quantitative_passed = all(item["passed"] for item in quantitative_gates.values())
     return {
         "dataset_sha256": candidate["dataset"]["sha256"],
         "baseline": baseline["name"],
         "candidate": candidate["name"],
         "deltas": {
-            metric: round(
-                candidate["metrics"][metric] - baseline["metrics"][metric], 4
-            )
+            metric: round(candidate["metrics"][metric] - baseline["metrics"][metric], 4)
             for metric in metrics
         },
         "release_gate": {
             "passed": all(item["passed"] for item in gates.values()),
             "quantitative_passed": quantitative_passed,
-            "production_activation_allowed": (
-                quantitative_passed and provenance_gate["passed"]
-            ),
+            "production_activation_allowed": (quantitative_passed and provenance_gate["passed"]),
             "gates": gates,
         },
     }

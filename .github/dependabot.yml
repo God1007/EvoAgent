@@ -1,0 +1,29 @@
+version: 2
+# NOTE: dependabot updates pyproject.toml ranges but cannot regenerate the
+# hash-pinned requirements.lock / requirements-dev.lock (the files CI and Docker
+# actually install with --require-hashes). After merging a pip bump, run
+# `make lock` to refresh the locks. tests/test_dependencies.py fails if a bumped
+# pyproject bound no longer matches the pinned lock version.
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    groups:
+      python-dependencies:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+

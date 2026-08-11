@@ -46,10 +46,13 @@ class LocalReviewerTests(unittest.TestCase):
         )
 
     def test_lock_and_generated_files_are_skipped(self):
+        # The .lock line is deliberately secret-shaped to prove the path skip
+        # short-circuits before any rule runs. It is a synthetic fixture, so the
+        # trailing marker keeps gitleaks from flagging it as a real credential.
         diff = """--- a/requirements.lock
 +++ b/requirements.lock
 @@ -0,0 +1,1 @@
-+token = "abcdef123456"
++token = "abcdef123456"  # gitleaks:allow
 """
         self.assertEqual([], LocalRuleReviewer().review(diff, parse_unified_diff(diff)))
 

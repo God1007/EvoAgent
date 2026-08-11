@@ -23,17 +23,20 @@ class HarnessTests(unittest.TestCase):
         report = ReviewHarness(self.store, LocalRuleReviewer()).run(task_id, "demo/repo", 7, diff)
         task = self.store.get(task_id)
         self.assertEqual("SUCCESS", task["state"])
-        self.assertEqual(["PLANNING", "EXECUTING", "REVIEWING", "SUCCESS"], [x["state"] for x in task["trace"]])
+        self.assertEqual(
+            ["PLANNING", "EXECUTING", "REVIEWING", "SUCCESS"], [x["state"] for x in task["trace"]]
+        )
         self.assertEqual("high", report.risk)
 
     def test_invalid_diff_is_recorded_as_failure(self):
         task_id = "bad-task"
         self.store.create(task_id, "demo/repo", None, {"source": "test"})
         with self.assertRaises(ValueError):
-            ReviewHarness(self.store, LocalRuleReviewer()).run(task_id, "demo/repo", None, "not a diff")
+            ReviewHarness(self.store, LocalRuleReviewer()).run(
+                task_id, "demo/repo", None, "not a diff"
+            )
         self.assertEqual("FAILED", self.store.get(task_id)["state"])
 
 
 if __name__ == "__main__":
     unittest.main()
-

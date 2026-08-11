@@ -1,14 +1,14 @@
 import json
 import sqlite3
 import threading
-from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 from .models import ReviewReport, TaskState, TraceEvent
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class TaskStore:
@@ -105,7 +105,9 @@ class TaskStore:
             )
             self._ensure_column(conn, "tasks", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
             self._ensure_column(conn, "tasks", "cancel_requested", "INTEGER NOT NULL DEFAULT 0")
-            self._ensure_column(conn, "installations", "tenant_id", "TEXT NOT NULL DEFAULT 'default'")
+            self._ensure_column(
+                conn, "installations", "tenant_id", "TEXT NOT NULL DEFAULT 'default'"
+            )
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS checkpoints (
                     task_id TEXT NOT NULL,
@@ -205,18 +207,11 @@ class TaskStore:
                 )"""
             )
             self._ensure_column(
-                conn, "deployments", "max_disagreement_rate",
-                "REAL NOT NULL DEFAULT 0.2"
+                conn, "deployments", "max_disagreement_rate", "REAL NOT NULL DEFAULT 0.2"
             )
-            self._ensure_column(
-                conn, "deployments", "auto_promote", "INTEGER NOT NULL DEFAULT 0"
-            )
-            self._ensure_column(
-                conn, "deployments", "shadow_samples", "INTEGER NOT NULL DEFAULT 0"
-            )
-            self._ensure_column(
-                conn, "deployments", "disagreements", "INTEGER NOT NULL DEFAULT 0"
-            )
+            self._ensure_column(conn, "deployments", "auto_promote", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "deployments", "shadow_samples", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "deployments", "disagreements", "INTEGER NOT NULL DEFAULT 0")
             conn.execute(
                 """CREATE TABLE IF NOT EXISTS release_observations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -244,7 +239,9 @@ class TaskStore:
                     UNIQUE(tenant_id, alert_key, status)
                 )"""
             )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant_created ON tasks(tenant_id, created_at)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_tenant_created ON tasks(tenant_id, created_at)"
+            )
 
     @staticmethod
     def _ensure_column(conn: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
@@ -253,8 +250,12 @@ class TaskStore:
             conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, declaration))
 
     def create(
-        self, task_id: str, repository: str, pull_request: Optional[int],
-        payload: Dict[str, Any], tenant_id: str = "default",
+        self,
+        task_id: str,
+        repository: str,
+        pull_request: int | None,
+        payload: dict[str, Any],
+        tenant_id: str = "default",
     ) -> None:
         now = utc_now()
         with self._lock, self._connect() as conn:
@@ -262,8 +263,16 @@ class TaskStore:
                 "INSERT INTO tasks(id,state,repository,pull_request,input_json,report_json,error,"
                 "created_at,updated_at,tenant_id,cancel_requested) "
                 "VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, 0)",
-                (task_id, TaskState.PENDING.value, repository, pull_request,
-                 json.dumps(payload), now, now, tenant_id),
+                (
+                    task_id,
+                    TaskState.PENDING.value,
+                    repository,
+                    pull_request,
+                    json.dumps(payload),
+                    now,
+                    now,
+                    tenant_id,
+                ),
             )
 
     def transition(self, task_id: str, event: TraceEvent) -> None:
@@ -281,7 +290,12 @@ class TaskStore:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "UPDATE tasks SET state = ?, report_json = ?, updated_at = ? WHERE id = ?",
-                (TaskState.SUCCESS.value, json.dumps(report.to_dict(), ensure_ascii=False), event.created_at, task_id),
+                (
+                    TaskState.SUCCESS.value,
+                    json.dumps(report.to_dict(), ensure_ascii=False),
+                    event.created_at,
+                    task_id,
+                ),
             )
             conn.execute(
                 "INSERT INTO trace_events(task_id, step, state, message, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -299,7 +313,7 @@ class TaskStore:
                 (task_id, event.step, event.state.value, event.message, event.created_at),
             )
 
-    def get(self, task_id: str, tenant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def get(self, task_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
         with self._connect() as conn:
             if tenant_id is None:
                 row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -310,11 +324,13 @@ class TaskStore:
             if row is None:
                 return None
             events = conn.execute(
-                "SELECT step, state, message, created_at FROM trace_events WHERE task_id = ? ORDER BY id", (task_id,)
+                "SELECT step, state, message, created_at FROM trace_events WHERE task_id = ? ORDER BY id",
+                (task_id,),
             ).fetchall()
             messages = conn.execute(
                 "SELECT sender,recipient,kind,correlation_id,content_json,created_at "
-                "FROM agent_messages WHERE task_id=? ORDER BY id", (task_id,)
+                "FROM agent_messages WHERE task_id=? ORDER BY id",
+                (task_id,),
             ).fetchall()
         value = dict(row)
         value["input"] = json.loads(value.pop("input_json"))
@@ -328,22 +344,29 @@ class TaskStore:
             value["collaboration"].append(item)
         return value
 
-    def record_agent_message(self, task_id: str, message: Dict[str, Any]) -> None:
+    def record_agent_message(self, task_id: str, message: dict[str, Any]) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO agent_messages(task_id,sender,recipient,kind,correlation_id,"
                 "content_json,created_at) VALUES (?,?,?,?,?,?,?)",
-                (task_id, message["sender"], message["recipient"], message["kind"],
-                 message.get("correlation_id", ""),
-                 json.dumps(message.get("content", {}), ensure_ascii=False), utc_now()),
+                (
+                    task_id,
+                    message["sender"],
+                    message["recipient"],
+                    message["kind"],
+                    message.get("correlation_id", ""),
+                    json.dumps(message.get("content", {}), ensure_ascii=False),
+                    utc_now(),
+                ),
             )
 
-    def list_tasks(self, limit: int = 50, tenant_id: Optional[str] = None) -> list:
+    def list_tasks(self, limit: int = 50, tenant_id: str | None = None) -> list:
         with self._connect() as conn:
             if tenant_id is None:
                 rows = conn.execute(
                     "SELECT id,state,repository,pull_request,error,created_at,updated_at,tenant_id "
-                    "FROM tasks ORDER BY created_at DESC LIMIT ?", (max(1, min(limit, 200)),)
+                    "FROM tasks ORDER BY created_at DESC LIMIT ?",
+                    (max(1, min(limit, 200)),),
                 ).fetchall()
             else:
                 rows = conn.execute(
@@ -353,7 +376,7 @@ class TaskStore:
                 ).fetchall()
         return [dict(item) for item in rows]
 
-    def record_failure_case(self, task_id: str, category: str, payload: Dict[str, Any]) -> None:
+    def record_failure_case(self, task_id: str, category: str, payload: dict[str, Any]) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO failure_cases(task_id, category, payload_json, created_at) VALUES (?, ?, ?, ?)",
@@ -361,11 +384,13 @@ class TaskStore:
             )
 
     def list_failure_cases(
-        self, unresolved_only: bool = False, limit: int = 100,
-        tenant_id: Optional[str] = None,
+        self,
+        unresolved_only: bool = False,
+        limit: int = 100,
+        tenant_id: str | None = None,
     ) -> list:
         query = "SELECT f.* FROM failure_cases f"
-        params = []
+        params: list[Any] = []
         clauses = []
         if tenant_id is not None:
             query += " JOIN tasks t ON t.id=f.task_id"
@@ -398,9 +423,14 @@ class TaskStore:
             )
 
     def save_evaluation_case(
-        self, name: str, split: str, diff: str, expected: list,
-        source: str = "manual", active: bool = True,
-    ) -> Dict[str, Any]:
+        self,
+        name: str,
+        split: str,
+        diff: str,
+        expected: list,
+        source: str = "manual",
+        active: bool = True,
+    ) -> dict[str, Any]:
         expected_json = json.dumps(expected, ensure_ascii=False)
         with self._lock, self._connect() as conn:
             existing = conn.execute(
@@ -431,10 +461,13 @@ class TaskStore:
         return value
 
     def list_evaluation_cases(
-        self, split: Optional[str] = None, active_only: bool = True, limit: int = 100,
+        self,
+        split: str | None = None,
+        active_only: bool = True,
+        limit: int = 100,
     ) -> list:
         clauses = []
-        params = []
+        params: list[Any] = []
         if split:
             clauses.append("split = ?")
             params.append(split)
@@ -455,15 +488,21 @@ class TaskStore:
             values.append(value)
         return values
 
-    def save_evolution_run(self, run: Dict[str, Any]) -> Dict[str, Any]:
+    def save_evolution_run(self, run: dict[str, Any]) -> dict[str, Any]:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO evolution_runs(id,skill_name,candidate_version,baseline_version,decision,"
                 "candidate_score,baseline_score,metrics_json,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
                 (
-                    run["id"], run["skill_name"], run["candidate_version"], run.get("baseline_version"),
-                    run["decision"], run["candidate_score"], run["baseline_score"],
-                    json.dumps(run["metrics"], ensure_ascii=False), run["created_at"],
+                    run["id"],
+                    run["skill_name"],
+                    run["candidate_version"],
+                    run.get("baseline_version"),
+                    run["decision"],
+                    run["candidate_score"],
+                    run["baseline_score"],
+                    json.dumps(run["metrics"], ensure_ascii=False),
+                    run["created_at"],
                 ),
             )
         return run
@@ -481,23 +520,36 @@ class TaskStore:
             values.append(value)
         return values
 
-    def save_skill_version(self, skill_name: str, prompt: str, score: float, activate: bool = False) -> Dict[str, Any]:
+    def save_skill_version(
+        self, skill_name: str, prompt: str, score: float, activate: bool = False
+    ) -> dict[str, Any]:
         with self._lock, self._connect() as conn:
             row = conn.execute(
-                "SELECT COALESCE(MAX(version), 0) AS version FROM skill_versions WHERE skill_name = ?", (skill_name,)
+                "SELECT COALESCE(MAX(version), 0) AS version FROM skill_versions WHERE skill_name = ?",
+                (skill_name,),
             ).fetchone()
             version = int(row["version"]) + 1
             parent = self.get_active_skill_version(skill_name)
             if activate:
-                conn.execute("UPDATE skill_versions SET active = 0 WHERE skill_name = ?", (skill_name,))
+                conn.execute(
+                    "UPDATE skill_versions SET active = 0 WHERE skill_name = ?", (skill_name,)
+                )
             conn.execute(
                 "INSERT INTO skill_versions(skill_name, version, prompt, score, active, parent_version, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (skill_name, version, prompt, score, int(activate), parent["version"] if parent else None, utc_now()),
+                (
+                    skill_name,
+                    version,
+                    prompt,
+                    score,
+                    int(activate),
+                    parent["version"] if parent else None,
+                    utc_now(),
+                ),
             )
         return {"skill_name": skill_name, "version": version, "score": score, "active": activate}
 
-    def get_active_skill_version(self, skill_name: str) -> Optional[Dict[str, Any]]:
+    def get_active_skill_version(self, skill_name: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM skill_versions WHERE skill_name = ? AND active = 1 ORDER BY version DESC LIMIT 1",
@@ -508,20 +560,23 @@ class TaskStore:
     def list_skill_versions(self, skill_name: str) -> list:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM skill_versions WHERE skill_name = ? ORDER BY version DESC", (skill_name,)
+                "SELECT * FROM skill_versions WHERE skill_name = ? ORDER BY version DESC",
+                (skill_name,),
             ).fetchall()
         return [dict(item) for item in rows]
 
     def activate_skill_version(self, skill_name: str, version: int) -> bool:
         with self._lock, self._connect() as conn:
             exists = conn.execute(
-                "SELECT 1 FROM skill_versions WHERE skill_name = ? AND version = ?", (skill_name, version)
+                "SELECT 1 FROM skill_versions WHERE skill_name = ? AND version = ?",
+                (skill_name, version),
             ).fetchone()
             if not exists:
                 return False
             conn.execute("UPDATE skill_versions SET active = 0 WHERE skill_name = ?", (skill_name,))
             conn.execute(
-                "UPDATE skill_versions SET active = 1 WHERE skill_name = ? AND version = ?", (skill_name, version)
+                "UPDATE skill_versions SET active = 1 WHERE skill_name = ? AND version = ?",
+                (skill_name, version),
             )
         return True
 
@@ -535,7 +590,7 @@ class TaskStore:
                 (installation_id, account_login, utc_now(), tenant_id),
             )
 
-    def installation_tenant(self, installation_id: int) -> Optional[str]:
+    def installation_tenant(self, installation_id: int) -> str | None:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT tenant_id FROM installations WHERE installation_id=?", (installation_id,)
@@ -543,8 +598,13 @@ class TaskStore:
         return str(row["tenant_id"]) if row else None
 
     def save_checkpoint(
-        self, task_id: str, node: str, state: Dict[str, Any], status: str = "completed",
-        attempt: int = 1, error: str = "",
+        self,
+        task_id: str,
+        node: str,
+        state: dict[str, Any],
+        status: str = "completed",
+        attempt: int = 1,
+        error: str = "",
     ) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
@@ -552,15 +612,23 @@ class TaskStore:
                 "VALUES (?,?,?,?,?,?,?) ON CONFLICT(task_id,node) DO UPDATE SET "
                 "status=excluded.status,attempt=excluded.attempt,state_json=excluded.state_json,"
                 "error=excluded.error,updated_at=excluded.updated_at",
-                (task_id, node, status, attempt, json.dumps(state, ensure_ascii=False),
-                 error[:2000] or None, utc_now()),
+                (
+                    task_id,
+                    node,
+                    status,
+                    attempt,
+                    json.dumps(state, ensure_ascii=False),
+                    error[:2000] or None,
+                    utc_now(),
+                ),
             )
 
-    def load_checkpoints(self, task_id: str) -> Dict[str, Dict[str, Any]]:
+    def load_checkpoints(self, task_id: str) -> dict[str, dict[str, Any]]:
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT node,status,attempt,state_json,error,updated_at FROM checkpoints "
-                "WHERE task_id=? ORDER BY updated_at", (task_id,)
+                "WHERE task_id=? ORDER BY updated_at",
+                (task_id,),
             ).fetchall()
         result = {}
         for row in rows:
@@ -576,11 +644,9 @@ class TaskStore:
                 (task_id, diff, utc_now()),
             )
 
-    def update_task_input(self, task_id: str, updates: Dict[str, Any]) -> None:
+    def update_task_input(self, task_id: str, updates: dict[str, Any]) -> None:
         with self._lock, self._connect() as conn:
-            row = conn.execute(
-                "SELECT input_json FROM tasks WHERE id=?", (task_id,)
-            ).fetchone()
+            row = conn.execute("SELECT input_json FROM tasks WHERE id=?", (task_id,)).fetchone()
             if not row:
                 raise ValueError("task not found")
             value = json.loads(row["input_json"])
@@ -590,14 +656,14 @@ class TaskStore:
                 (json.dumps(value, ensure_ascii=False), utc_now(), task_id),
             )
 
-    def get_task_payload(self, task_id: str) -> Optional[str]:
+    def get_task_payload(self, task_id: str) -> str | None:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT diff FROM task_payloads WHERE task_id=?", (task_id,)
             ).fetchone()
         return str(row["diff"]) if row else None
 
-    def request_cancel(self, task_id: str, tenant_id: Optional[str] = None) -> bool:
+    def request_cancel(self, task_id: str, tenant_id: str | None = None) -> bool:
         query = "UPDATE tasks SET cancel_requested=1,updated_at=? WHERE id=?"
         params = [utc_now(), task_id]
         if tenant_id is not None:
@@ -609,7 +675,9 @@ class TaskStore:
 
     def is_cancelled(self, task_id: str) -> bool:
         with self._connect() as conn:
-            row = conn.execute("SELECT cancel_requested FROM tasks WHERE id=?", (task_id,)).fetchone()
+            row = conn.execute(
+                "SELECT cancel_requested FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
         return bool(row and row["cancel_requested"])
 
     def cancel(self, task_id: str, event: TraceEvent) -> None:
@@ -624,7 +692,11 @@ class TaskStore:
             )
 
     def claim_webhook(
-        self, delivery_id: str, tenant_id: str, event_type: str, payload_sha256: str,
+        self,
+        delivery_id: str,
+        tenant_id: str,
+        event_type: str,
+        payload_sha256: str,
     ) -> bool:
         if not delivery_id:
             raise ValueError("X-GitHub-Delivery is required")
@@ -642,17 +714,19 @@ class TaskStore:
                     (delivery_id,),
                 ).fetchone()
                 if row and row["payload_sha256"] != payload_sha256:
-                    raise ValueError("delivery id was already used with a different payload")
+                    raise ValueError(
+                        "delivery id was already used with a different payload"
+                    ) from None
                 return False
 
-    def complete_webhook(self, delivery_id: str, task_id: Optional[str]) -> None:
+    def complete_webhook(self, delivery_id: str, task_id: str | None) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "UPDATE webhook_deliveries SET task_id=? WHERE delivery_id=?",
                 (task_id, delivery_id),
             )
 
-    def get_webhook(self, delivery_id: str) -> Optional[Dict[str, Any]]:
+    def get_webhook(self, delivery_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM webhook_deliveries WHERE delivery_id=?", (delivery_id,)
@@ -660,8 +734,12 @@ class TaskStore:
         return dict(row) if row else None
 
     def create_user(
-        self, user_id: str, username: str, password_hash: str,
-        tenant_id: str, role: str,
+        self,
+        user_id: str,
+        username: str,
+        password_hash: str,
+        tenant_id: str,
+        role: str,
     ) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
@@ -675,7 +753,7 @@ class TaskStore:
                 (row["id"], tenant_id, role),
             )
 
-    def get_user(self, username: str) -> Optional[Dict[str, Any]]:
+    def get_user(self, username: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT id,username,password_hash,active FROM users WHERE username=?", (username,)
@@ -698,7 +776,10 @@ class TaskStore:
             )
 
     def repository_allowed(
-        self, tenant_id: str, repository: str, require_auto_fix: bool = False,
+        self,
+        tenant_id: str,
+        repository: str,
+        require_auto_fix: bool = False,
     ) -> bool:
         with self._connect() as conn:
             total = conn.execute(
@@ -713,15 +794,25 @@ class TaskStore:
         return bool(row and (not require_auto_fix or row["auto_fix"]))
 
     def audit(
-        self, tenant_id: str, actor: str, action: str, resource: str,
-        detail: Optional[Dict[str, Any]] = None,
+        self,
+        tenant_id: str,
+        actor: str,
+        action: str,
+        resource: str,
+        detail: dict[str, Any] | None = None,
     ) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO audit_log(tenant_id,actor,action,resource,detail_json,created_at) "
                 "VALUES (?,?,?,?,?,?)",
-                (tenant_id, actor, action, resource,
-                 json.dumps(detail or {}, ensure_ascii=False), utc_now()),
+                (
+                    tenant_id,
+                    actor,
+                    action,
+                    resource,
+                    json.dumps(detail or {}, ensure_ascii=False),
+                    utc_now(),
+                ),
             )
 
     def list_audit(self, tenant_id: str, limit: int = 100) -> list:
@@ -738,7 +829,7 @@ class TaskStore:
             values.append(item)
         return values
 
-    def save_deployment(self, tenant_id: str, skill_name: str, config: Dict[str, Any]) -> None:
+    def save_deployment(self, tenant_id: str, skill_name: str, config: dict[str, Any]) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO deployments(tenant_id,skill_name,stable_version,candidate_version,"
@@ -748,19 +839,31 @@ class TaskStore:
                 "canary_percent=excluded.canary_percent,shadow_percent=excluded.shadow_percent,"
                 "max_error_rate=excluded.max_error_rate,min_samples=excluded.min_samples,"
                 "status=excluded.status,samples=0,errors=0,updated_at=excluded.updated_at",
-                (tenant_id, skill_name, config.get("stable_version"), config.get("candidate_version"),
-                 int(config.get("canary_percent", 0)), int(config.get("shadow_percent", 0)),
-                 float(config.get("max_error_rate", .1)), int(config.get("min_samples", 20)),
-                 config.get("status", "running"), utc_now()),
+                (
+                    tenant_id,
+                    skill_name,
+                    config.get("stable_version"),
+                    config.get("candidate_version"),
+                    int(config.get("canary_percent", 0)),
+                    int(config.get("shadow_percent", 0)),
+                    float(config.get("max_error_rate", 0.1)),
+                    int(config.get("min_samples", 20)),
+                    config.get("status", "running"),
+                    utc_now(),
+                ),
             )
             conn.execute(
                 "UPDATE deployments SET max_disagreement_rate=?,auto_promote=?,"
                 "shadow_samples=0,disagreements=0 WHERE tenant_id=? AND skill_name=?",
-                (float(config.get("max_disagreement_rate", .2)),
-                 int(bool(config.get("auto_promote", False))), tenant_id, skill_name),
+                (
+                    float(config.get("max_disagreement_rate", 0.2)),
+                    int(bool(config.get("auto_promote", False))),
+                    tenant_id,
+                    skill_name,
+                ),
             )
 
-    def get_deployment(self, tenant_id: str, skill_name: str) -> Optional[Dict[str, Any]]:
+    def get_deployment(self, tenant_id: str, skill_name: str) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM deployments WHERE tenant_id=? AND skill_name=?",
@@ -769,8 +872,11 @@ class TaskStore:
         return dict(row) if row else None
 
     def record_deployment_result(
-        self, tenant_id: str, skill_name: str, failed: bool,
-    ) -> Optional[Dict[str, Any]]:
+        self,
+        tenant_id: str,
+        skill_name: str,
+        failed: bool,
+    ) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "UPDATE deployments SET samples=samples+1,errors=errors+?,updated_at=? "
@@ -798,19 +904,32 @@ class TaskStore:
         return value
 
     def record_shadow_observation(
-        self, tenant_id: str, skill_name: str, task_id: str, lane: str,
-        primary: Dict[str, Any], candidate: Optional[Dict[str, Any]],
-        disagreement: float, candidate_failed: bool = False,
-    ) -> Optional[Dict[str, Any]]:
+        self,
+        tenant_id: str,
+        skill_name: str,
+        task_id: str,
+        lane: str,
+        primary: dict[str, Any],
+        candidate: dict[str, Any] | None,
+        disagreement: float,
+        candidate_failed: bool = False,
+    ) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO release_observations(tenant_id,skill_name,task_id,lane,"
                 "primary_json,candidate_json,disagreement,candidate_failed,created_at) "
                 "VALUES (?,?,?,?,?,?,?,?,?)",
-                (tenant_id, skill_name, task_id, lane,
-                 json.dumps(primary, ensure_ascii=False),
-                 json.dumps(candidate, ensure_ascii=False) if candidate is not None else None,
-                 float(disagreement), int(candidate_failed), utc_now()),
+                (
+                    tenant_id,
+                    skill_name,
+                    task_id,
+                    lane,
+                    json.dumps(primary, ensure_ascii=False),
+                    json.dumps(candidate, ensure_ascii=False) if candidate is not None else None,
+                    float(disagreement),
+                    int(candidate_failed),
+                    utc_now(),
+                ),
             )
             conn.execute(
                 "UPDATE deployments SET shadow_samples=shadow_samples+1,"
@@ -826,12 +945,12 @@ class TaskStore:
                 return None
             value = dict(row)
             disagreement_rate = (
-                value["disagreements"] / value["shadow_samples"]
-                if value["shadow_samples"] else 0.0
+                value["disagreements"] / value["shadow_samples"] if value["shadow_samples"] else 0.0
             )
             error_rate = value["errors"] / value["samples"] if value["samples"] else 0.0
             if (
-                value["status"] == "running" and value["auto_promote"]
+                value["status"] == "running"
+                and value["auto_promote"]
                 and value["shadow_samples"] >= value["min_samples"]
                 and disagreement_rate <= value["max_disagreement_rate"]
                 and error_rate <= value["max_error_rate"]
@@ -847,7 +966,10 @@ class TaskStore:
         return value
 
     def list_release_observations(
-        self, tenant_id: str, skill_name: str, limit: int = 100,
+        self,
+        tenant_id: str,
+        skill_name: str,
+        limit: int = 100,
     ) -> list:
         with self._connect() as conn:
             rows = conn.execute(
@@ -865,7 +987,11 @@ class TaskStore:
         return values
 
     def create_alert(
-        self, tenant_id: str, alert_key: str, severity: str, message: str,
+        self,
+        tenant_id: str,
+        alert_key: str,
+        severity: str,
+        message: str,
     ) -> None:
         now = utc_now()
         with self._lock, self._connect() as conn:
@@ -884,7 +1010,7 @@ class TaskStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def dashboard_stats(self, tenant_id: Optional[str] = None) -> Dict[str, Any]:
+    def dashboard_stats(self, tenant_id: str | None = None) -> dict[str, Any]:
         with self._connect() as conn:
             clause = " WHERE tenant_id=?" if tenant_id is not None else ""
             params = (tenant_id,) if tenant_id is not None else ()
@@ -903,11 +1029,17 @@ class TaskStore:
             else:
                 failures = conn.execute(
                     "SELECT COUNT(*) AS n FROM failure_cases f JOIN tasks t ON t.id=f.task_id "
-                    "WHERE f.resolved=0 AND t.tenant_id=?", (tenant_id,)
+                    "WHERE f.resolved=0 AND t.tenant_id=?",
+                    (tenant_id,),
                 ).fetchone()["n"]
-            active_skills = conn.execute("SELECT COUNT(*) AS n FROM skill_versions WHERE active = 1").fetchone()["n"]
+            active_skills = conn.execute(
+                "SELECT COUNT(*) AS n FROM skill_versions WHERE active = 1"
+            ).fetchone()["n"]
         return {
-            "tasks_total": total, "tasks_success": success, "tasks_failed": failed,
+            "tasks_total": total,
+            "tasks_success": success,
+            "tasks_failed": failed,
             "success_rate": round(success / total, 4) if total else 0.0,
-            "unresolved_failure_cases": failures, "active_skill_versions": active_skills,
+            "unresolved_failure_cases": failures,
+            "active_skill_versions": active_skills,
         }

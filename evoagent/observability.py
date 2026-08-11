@@ -1,9 +1,8 @@
 """Tracing helpers that degrade cleanly when OpenTelemetry is not installed."""
+
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Optional
-
 
 trace_id_var: ContextVar[str] = ContextVar("trace_id", default="")
 logger = logging.getLogger("evoagent")
@@ -17,9 +16,11 @@ class Observability:
             from opentelemetry.sdk.resources import Resource
             from opentelemetry.sdk.trace import TracerProvider
             from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
             provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
             if endpoint:
                 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
                 provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
             trace.set_tracer_provider(provider)
             self.tracer = trace.get_tracer(service_name)
@@ -49,7 +50,7 @@ class Observability:
 
 
 class AlertManager:
-    def __init__(self, store, failure_rate: float = .2, min_samples: int = 10):
+    def __init__(self, store, failure_rate: float = 0.2, min_samples: int = 10):
         self.store = store
         self.failure_rate = failure_rate
         self.min_samples = min_samples
@@ -60,7 +61,9 @@ class AlertManager:
             rate = stats["tasks_failed"] / stats["tasks_total"]
             if rate > self.failure_rate:
                 self.store.create_alert(
-                    tenant_id, "review-failure-rate", "critical",
+                    tenant_id,
+                    "review-failure-rate",
+                    "critical",
                     "Review failure rate %.1f%% exceeds the %.1f%% threshold."
                     % (rate * 100, self.failure_rate * 100),
                 )

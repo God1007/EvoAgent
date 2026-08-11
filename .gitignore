@@ -2,7 +2,16 @@ __pycache__/
 *.py[cod]
 *.db
 .env
+.venv/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
 .DS_Store
 log/*.log
 output/

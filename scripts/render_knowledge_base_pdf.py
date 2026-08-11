@@ -4,8 +4,8 @@ import html
 import os
 import re
 import textwrap
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Iterable, List, Sequence
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
@@ -16,7 +16,6 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
     HRFlowable,
-    KeepTogether,
     PageBreak,
     Paragraph,
     Preformatted,
@@ -25,7 +24,6 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
-
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "docs" / "EvoAgent知识库.md"
@@ -211,7 +209,7 @@ def callout(text: str, style: ParagraphStyle, background=PALE_YELLOW) -> Table:
 
 
 def wrap_code(lines: Sequence[str], width: int = 92) -> str:
-    wrapped: List[str] = []
+    wrapped: list[str] = []
     for raw in lines:
         expanded = raw.expandtabs(4).rstrip()
         if not expanded:
@@ -250,18 +248,15 @@ def code_block(lines: Sequence[str], style: ParagraphStyle) -> Table:
     return table
 
 
-def split_table_row(line: str) -> List[str]:
+def split_table_row(line: str) -> list[str]:
     return [cell.strip() for cell in line.strip().strip("|").split("|")]
 
 
-def table_widths(rows: Sequence[Sequence[str]]) -> List[float]:
+def table_widths(rows: Sequence[Sequence[str]]) -> list[float]:
     columns = max(len(row) for row in rows)
     maxima = []
     for column in range(columns):
-        length = max(
-            len(row[column]) if column < len(row) else 0
-            for row in rows
-        )
+        length = max(len(row[column]) if column < len(row) else 0 for row in rows)
         maxima.append(max(6, min(length, 32)))
     total = sum(maxima)
     return [CONTENT_WIDTH * value / total for value in maxima]
@@ -271,12 +266,7 @@ def markdown_table(rows: Sequence[Sequence[str]], style_map: dict) -> Table:
     rendered = []
     for row_index, row in enumerate(rows):
         style = style_map["table_header"] if row_index == 0 else style_map["table_body"]
-        rendered.append(
-            [
-                Paragraph(inline_markup(cell), style)
-                for cell in row
-            ]
-        )
+        rendered.append([Paragraph(inline_markup(cell), style) for cell in row])
     table = Table(rendered, colWidths=table_widths(rows), repeatRows=1)
     table.setStyle(
         TableStyle(
@@ -296,11 +286,11 @@ def markdown_table(rows: Sequence[Sequence[str]], style_map: dict) -> Table:
     return table
 
 
-def parse_markdown(lines: Sequence[str], style_map: dict) -> List:
-    story: List = []
+def parse_markdown(lines: Sequence[str], style_map: dict) -> list:
+    story: list = []
     index = 0
     major_seen = False
-    paragraph_buffer: List[str] = []
+    paragraph_buffer: list[str] = []
 
     def flush_paragraph() -> None:
         if not paragraph_buffer:
@@ -321,7 +311,7 @@ def parse_markdown(lines: Sequence[str], style_map: dict) -> List:
         if stripped.startswith("```"):
             flush_paragraph()
             index += 1
-            block: List[str] = []
+            block: list[str] = []
             while index < len(lines) and not lines[index].strip().startswith("```"):
                 block.append(lines[index].rstrip("\n"))
                 index += 1
@@ -332,7 +322,7 @@ def parse_markdown(lines: Sequence[str], style_map: dict) -> List:
 
         if stripped.startswith("|") and "|" in stripped[1:]:
             flush_paragraph()
-            raw_rows: List[List[str]] = []
+            raw_rows: list[list[str]] = []
             while index < len(lines):
                 candidate = lines[index].strip()
                 if not (candidate.startswith("|") and "|" in candidate[1:]):

@@ -2,18 +2,19 @@ import hashlib
 import json
 import threading
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 from .diff_parser import parse_unified_diff
+from .reviewer import Reviewer
 from .store import utc_now
-
 
 DEFAULT_PROMPT = (
     "Review the unified diff. Return JSON findings with severity, fix and test. "
     "Report only actionable defects introduced by added lines."
 )
 
-DEFAULT_EVALUATION_CASES = [
+DEFAULT_EVALUATION_CASES: list[dict[str, Any]] = [
     {
         "name": "security-dynamic-execution",
         "diff": "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old\n+result = eval(user_input)\n",
@@ -21,7 +22,7 @@ DEFAULT_EVALUATION_CASES = [
     },
     {
         "name": "security-hardcoded-secret",
-        "diff": "--- a/config.py\n+++ b/config.py\n@@ -1 +1 @@\n-old\n+api_key = \"production-secret\"\n",
+        "diff": '--- a/config.py\n+++ b/config.py\n@@ -1 +1 @@\n-old\n+api_key = "production-secret"\n',
         "expected": [{"path": "config.py", "line": 1, "min_severity": "high"}],
     },
     {
@@ -31,7 +32,7 @@ DEFAULT_EVALUATION_CASES = [
     },
     {
         "name": "clean-parameterized-query",
-        "diff": "--- a/db.py\n+++ b/db.py\n@@ -1 +1 @@\n-old\n+cursor.execute(\"SELECT * FROM users WHERE id = ?\", (user_id,))\n",
+        "diff": '--- a/db.py\n+++ b/db.py\n@@ -1 +1 @@\n-old\n+cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))\n',
         "expected": [],
     },
     {
@@ -48,7 +49,7 @@ DEFAULT_EVALUATION_CASES = [
     {
         "name": "holdout-clean-environment-secret",
         "split": "holdout",
-        "diff": "--- a/config.py\n+++ b/config.py\n@@ -1 +1 @@\n-old\n+api_key = os.environ[\"API_KEY\"]\n",
+        "diff": '--- a/config.py\n+++ b/config.py\n@@ -1 +1 @@\n-old\n+api_key = os.environ["API_KEY"]\n',
         "expected": [],
     },
 ]
@@ -59,18 +60,18 @@ SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 class RegressionEvaluator:
     """Replay a fixed dataset against one prompt and compute objective review metrics."""
 
-    def __init__(self, reviewer_factory: Callable[[str], object]):
+    def __init__(self, reviewer_factory: Callable[[str], Reviewer]):
         self.reviewer_factory = reviewer_factory
 
-    def run(self, prompt: str, cases: List[dict]) -> Dict[str, Any]:
+    def run(self, prompt: str, cases: list[dict]) -> dict[str, Any]:
         reviewer = self.reviewer_factory(prompt)
         reviewer_name = str(getattr(reviewer, "name", reviewer.__class__.__name__))
         true_positive = false_positive = false_negative = 0
         severity_hits = matched = clean_hits = clean_total = 0
         high_severity_hits = high_severity_total = 0
         expected_total = predicted_total = 0
-        errors = []
-        case_results = []
+        errors: list[dict[str, Any]] = []
+        case_results: list[dict[str, Any]] = []
 
         for case in cases:
             expected_items = list(case.get("expected", []))
@@ -79,7 +80,7 @@ class RegressionEvaluator:
             try:
                 parsed = parse_unified_diff(case["diff"])
                 findings = reviewer.review(case["diff"], parsed)
-                predicted = {}
+                predicted: dict[tuple[str, int, str], str] = {}
                 for finding in findings:
                     key = (finding.path, int(finding.line), finding.rule_id)
                     current = predicted.get(key)
@@ -96,7 +97,8 @@ class RegressionEvaluator:
                     rule_id = str(expected.get("rule_id", "")).strip()
                     minimum = str(expected.get("min_severity", "low")).lower()
                     candidates = [
-                        key for key in unmatched
+                        key
+                        for key in unmatched
                         if key[0] == path and key[1] == line and (not rule_id or key[2] == rule_id)
                     ]
                     if not candidates:
@@ -125,10 +127,18 @@ class RegressionEvaluator:
                 high_severity_hits += high_hits
                 if not expected_items:
                     clean_hits += int(not predicted)
-                case_results.append({
-                    "id": case.get("id"), "name": case["name"], "tp": tp, "fp": fp, "fn": fn,
-                    "findings": len(predicted), "severity_hits": severity_ok, "error": None,
-                })
+                case_results.append(
+                    {
+                        "id": case.get("id"),
+                        "name": case["name"],
+                        "tp": tp,
+                        "fp": fp,
+                        "fn": fn,
+                        "findings": len(predicted),
+                        "severity_hits": severity_ok,
+                        "error": None,
+                    }
+                )
             except Exception as exc:
                 # A failed replay is a missed positive (or a failed clean case), not a
                 # successful empty prediction. This keeps partial outages from inflating scores.
@@ -139,29 +149,40 @@ class RegressionEvaluator:
                     for item in expected_items
                 )
                 errors.append({"name": case["name"], "error": str(exc)[:500]})
-                case_results.append({
-                    "id": case.get("id"), "name": case["name"], "tp": 0, "fp": 0,
-                    "fn": len(expected_items), "findings": 0, "severity_hits": 0,
-                    "error": str(exc)[:500],
-                })
+                case_results.append(
+                    {
+                        "id": case.get("id"),
+                        "name": case["name"],
+                        "tp": 0,
+                        "fp": 0,
+                        "fn": len(expected_items),
+                        "findings": 0,
+                        "severity_hits": 0,
+                        "error": str(exc)[:500],
+                    }
+                )
 
         precision = (
             true_positive / (true_positive + false_positive)
-            if true_positive + false_positive else (1.0 if true_positive + false_negative == 0 else 0.0)
+            if true_positive + false_positive
+            else (1.0 if true_positive + false_negative == 0 else 0.0)
         )
         recall = (
             true_positive / (true_positive + false_negative)
-            if true_positive + false_negative else 1.0
+            if true_positive + false_negative
+            else 1.0
         )
         f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-        severity_accuracy = severity_hits / matched if matched else (1.0 if not false_negative else 0.0)
+        severity_accuracy = (
+            severity_hits / matched if matched else (1.0 if not false_negative else 0.0)
+        )
         clean_accuracy = clean_hits / clean_total if clean_total else 1.0
         high_severity_recall = (
             high_severity_hits / high_severity_total if high_severity_total else 1.0
         )
         successful_cases = len(cases) - len(errors)
         success_rate = successful_cases / len(cases) if cases else 0.0
-        components = []
+        components: list[tuple[float, float]] = []
         if expected_total:
             components.extend(((f1, 0.65), (severity_accuracy, 0.15)))
         if clean_total:
@@ -169,7 +190,8 @@ class RegressionEvaluator:
         score = (
             sum(value * weight for value, weight in components)
             / sum(weight for _, weight in components)
-            if components else 0.0
+            if components
+            else 0.0
         )
         score *= success_rate
         return {
@@ -200,9 +222,14 @@ class EvolutionEngine:
     FORBIDDEN = ("ignore previous", "disable safety", "bypass", "直接执行生产")
 
     def __init__(
-        self, store, reviewer_factory: Optional[Callable[[str], object]] = None,
-        min_cases: int = 3, max_cases: int = 5, min_improvement: float = 0.01,
-        min_holdout_cases: int = 0, max_metric_regression: float = 0.0,
+        self,
+        store,
+        reviewer_factory: Callable[[str], Reviewer] | None = None,
+        min_cases: int = 3,
+        max_cases: int = 5,
+        min_improvement: float = 0.01,
+        min_holdout_cases: int = 0,
+        max_metric_regression: float = 0.0,
         seed_defaults: bool = True,
     ):
         self.store = store
@@ -219,8 +246,12 @@ class EvolutionEngine:
     def _seed_default_cases(self) -> None:
         for case in DEFAULT_EVALUATION_CASES:
             self.store.save_evaluation_case(
-                case["name"], case.get("split", "validation"), case["diff"],
-                case["expected"], "builtin", True
+                case["name"],
+                case.get("split", "validation"),
+                case["diff"],
+                case["expected"],
+                "builtin",
+                True,
             )
 
     @staticmethod
@@ -260,7 +291,11 @@ class EvolutionEngine:
             seen.add(identity)
 
     def add_evaluation_case(
-        self, name: str, diff: str, expected: list, split: str = "validation",
+        self,
+        name: str,
+        diff: str,
+        expected: list,
+        split: str = "validation",
         source: str = "manual",
     ) -> dict:
         name = name.strip()
@@ -268,11 +303,13 @@ class EvolutionEngine:
         self.validate_case(name, diff, expected, split)
         return self.store.save_evaluation_case(name, split, diff, expected, source[:120], True)
 
-    def safety_evaluate(self, prompt: str) -> Dict[str, Any]:
+    def safety_evaluate(self, prompt: str) -> dict[str, Any]:
         normalized = prompt.strip()
         lowered = normalized.lower()
-        safety = bool(normalized) and len(normalized) <= 12000 and not any(
-            token in lowered for token in self.FORBIDDEN
+        safety = (
+            bool(normalized)
+            and len(normalized) <= 12000
+            and not any(token in lowered for token in self.FORBIDDEN)
         )
         required = ("diff", "severity", "fix", "test", "json")
         completeness = sum(token in lowered for token in required) / len(required)
@@ -282,7 +319,7 @@ class EvolutionEngine:
             "missing_terms": [token for token in required if token not in lowered],
         }
 
-    def status(self) -> Dict[str, Any]:
+    def status(self) -> dict[str, Any]:
         cases = self.store.list_evaluation_cases("validation", True, self.max_cases)
         holdout = self.store.list_evaluation_cases("holdout", True, self.max_cases)
         return {
@@ -304,8 +341,11 @@ class EvolutionEngine:
         }
 
     def propose(
-        self, skill_name: str, prompt: str, regression_score: Optional[float] = None,
-    ) -> Dict[str, Any]:
+        self,
+        skill_name: str,
+        prompt: str,
+        regression_score: float | None = None,
+    ) -> dict[str, Any]:
         skill_name = skill_name.strip()
         if not skill_name or len(skill_name) > 120:
             raise ValueError("skill_name is required and must be at most 120 characters")
@@ -313,8 +353,11 @@ class EvolutionEngine:
             return self._propose(skill_name, prompt, regression_score)
 
     def _propose(
-        self, skill_name: str, prompt: str, regression_score: Optional[float],
-    ) -> Dict[str, Any]:
+        self,
+        skill_name: str,
+        prompt: str,
+        regression_score: float | None,
+    ) -> dict[str, Any]:
         safety = self.safety_evaluate(prompt)
         active = self.store.get_active_skill_version(skill_name)
         if active and prompt.strip() == active["prompt"].strip():
@@ -357,11 +400,17 @@ class EvolutionEngine:
             decision = "rejected"
             reason = "candidate prompt failed the deterministic safety/completeness gate"
         elif self.reviewer_factory is None:
-            reason = "candidate saved but no LLM provider is configured; replay evaluation was not run"
+            reason = (
+                "candidate saved but no LLM provider is configured; replay evaluation was not run"
+            )
         elif len(cases) < self.min_cases:
-            reason = "candidate saved but the validation dataset is smaller than the activation minimum"
+            reason = (
+                "candidate saved but the validation dataset is smaller than the activation minimum"
+            )
         elif len(holdout_cases) < self.min_holdout_cases:
-            reason = "candidate saved but the holdout dataset is smaller than the activation minimum"
+            reason = (
+                "candidate saved but the holdout dataset is smaller than the activation minimum"
+            )
         else:
             evaluator = RegressionEvaluator(self.reviewer_factory)
             baseline_metrics = evaluator.run(baseline_prompt, cases)
@@ -370,21 +419,29 @@ class EvolutionEngine:
                 baseline_holdout = evaluator.run(baseline_prompt, holdout_cases)
                 candidate_holdout = evaluator.run(prompt, holdout_cases)
             no_errors = not (
-                baseline_metrics["errors"] or candidate_metrics["errors"]
-                or baseline_holdout["errors"] or candidate_holdout["errors"]
+                baseline_metrics["errors"]
+                or candidate_metrics["errors"]
+                or baseline_holdout["errors"]
+                or candidate_holdout["errors"]
             )
-            improved = candidate_metrics["score"] >= baseline_metrics["score"] + self.min_improvement
+            improved = (
+                candidate_metrics["score"] >= baseline_metrics["score"] + self.min_improvement
+            )
             validation_safe = self._non_regressing(candidate_metrics, baseline_metrics)
             holdout_safe = self._non_regressing(candidate_holdout, baseline_holdout)
-            gates.update({
-                "evaluation_success": no_errors,
-                "validation_improvement": improved,
-                "validation_non_regression": validation_safe,
-                "holdout_non_regression": holdout_safe,
-            })
+            gates.update(
+                {
+                    "evaluation_success": no_errors,
+                    "validation_improvement": improved,
+                    "validation_non_regression": validation_safe,
+                    "holdout_non_regression": holdout_safe,
+                }
+            )
             if no_errors and improved and validation_safe and holdout_safe:
                 decision = "activated"
-                reason = "candidate improved on validation and passed the non-regression holdout gate"
+                reason = (
+                    "candidate improved on validation and passed the non-regression holdout gate"
+                )
             else:
                 decision = "rejected"
                 reasons = []
@@ -448,20 +505,26 @@ class EvolutionEngine:
         with self._lock:
             return self.store.activate_skill_version(skill_name, version)
 
-    def auto_propose(self, skill_name: str = "llm-review") -> Dict[str, Any]:
+    def auto_propose(self, skill_name: str = "llm-review") -> dict[str, Any]:
         cases = self.store.list_failure_cases(True, 100)
         active = self.store.get_active_skill_version(skill_name)
         base = active["prompt"] if active else DEFAULT_PROMPT
-        counts = {}
+        counts: dict[str, int] = {}
         for case in cases:
             counts[case["category"]] = counts.get(case["category"], 0) + 1
         directives = []
         if counts.get("false_positive"):
-            directives.append("Avoid style-only findings and require direct evidence from an added line.")
+            directives.append(
+                "Avoid style-only findings and require direct evidence from an added line."
+            )
         if counts.get("missed_issue"):
-            directives.append("Check boundary conditions, authorization, input validation and error paths explicitly.")
+            directives.append(
+                "Check boundary conditions, authorization, input validation and error paths explicitly."
+            )
         if counts.get("bad_fix"):
-            directives.append("Propose minimal fixes that preserve behavior and always include a regression test.")
+            directives.append(
+                "Propose minimal fixes that preserve behavior and always include a regression test."
+            )
         if counts.get("execution_error"):
             directives.append("Keep output valid JSON and follow the requested schema exactly.")
         additions = [directive for directive in directives if directive.lower() not in base.lower()]
@@ -479,9 +542,7 @@ class EvolutionEngine:
                 "failure_cases_used": len(cases),
                 "learned_categories": counts,
             }
-        candidate = base.rstrip() + (
-            "\n\nLearned constraints:\n- " + "\n- ".join(additions)
-        )
+        candidate = base.rstrip() + ("\n\nLearned constraints:\n- " + "\n- ".join(additions))
         result = self.propose(skill_name, candidate)
         result["failure_cases_used"] = len(cases)
         result["learned_categories"] = counts
@@ -490,18 +551,29 @@ class EvolutionEngine:
         return result
 
     @staticmethod
-    def _empty_metrics(case_count: int) -> Dict[str, Any]:
+    def _empty_metrics(case_count: int) -> dict[str, Any]:
         return {
             "schema_version": 2,
             "reviewer": "",
-            "score": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0,
-            "severity_accuracy": 0.0, "high_severity_recall": 0.0, "clean_accuracy": 0.0,
-            "cases": case_count, "positive_cases": 0, "clean_cases": 0,
-            "expected_findings": 0, "predicted_findings": 0,
-            "successful_cases": 0, "success_rate": 0.0, "errors": [], "case_results": [],
+            "score": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "severity_accuracy": 0.0,
+            "high_severity_recall": 0.0,
+            "clean_accuracy": 0.0,
+            "cases": case_count,
+            "positive_cases": 0,
+            "clean_cases": 0,
+            "expected_findings": 0,
+            "predicted_findings": 0,
+            "successful_cases": 0,
+            "success_rate": 0.0,
+            "errors": [],
+            "case_results": [],
         }
 
-    def _non_regressing(self, candidate: Dict[str, Any], baseline: Dict[str, Any]) -> bool:
+    def _non_regressing(self, candidate: dict[str, Any], baseline: dict[str, Any]) -> bool:
         protected = ["score", "precision", "recall", "high_severity_recall"]
         if baseline.get("positive_cases", 0):
             protected.append("severity_accuracy")
@@ -514,10 +586,9 @@ class EvolutionEngine:
         )
 
     @staticmethod
-    def _redact_holdout_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    def _redact_holdout_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
         redacted = {
-            key: value for key, value in metrics.items()
-            if key not in {"errors", "case_results"}
+            key: value for key, value in metrics.items() if key not in {"errors", "case_results"}
         }
         redacted["error_count"] = len(metrics.get("errors", []))
         return redacted
@@ -527,7 +598,7 @@ class EvolutionEngine:
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
     @classmethod
-    def _dataset_fingerprint(cls, cases: List[dict]) -> str:
+    def _dataset_fingerprint(cls, cases: list[dict]) -> str:
         canonical = [
             {
                 "name": case.get("name"),

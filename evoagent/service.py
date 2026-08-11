@@ -1,10 +1,11 @@
 import hashlib
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any
 
 from .agents import FilteredAgent, MultiAgentCoordinator
 from .auth import AuthManager
 from .config import Settings
+from .diff_parser import parse_unified_diff
 from .evolution import EvolutionEngine
 from .fixer import SafeFixer
 from .github import GitHubAppAuthenticator, GitHubClient
@@ -15,11 +16,10 @@ from .observability import AlertManager, Observability
 from .postgres_store import create_store
 from .report import to_markdown
 from .reviewer import LocalRuleReviewer, OpenAICompatibleReviewer
-from .diff_parser import parse_unified_diff
+from .rollout import ReleaseManager
 from .skills import SkillRegistry
 from .store import utc_now
 from .task_queue import PermanentTaskError, TaskQueue
-from .rollout import ReleaseManager
 from .verifier import RepairVerifier
 
 
@@ -31,40 +31,63 @@ class ReviewService:
         self.store = create_store(settings.database_url, settings.db_path)
         self.observability = Observability(settings.otel_service_name, settings.otel_endpoint)
         self.registry = SkillRegistry(
-            settings.skills_dir, settings.skill_sandbox, settings.skill_timeout_seconds,
-            settings.skill_memory_mb, settings.skill_signing_key,
+            settings.skills_dir,
+            settings.skill_sandbox,
+            settings.skill_timeout_seconds,
+            settings.skill_memory_mb,
+            settings.skill_signing_key,
             settings.skill_container_image,
         )
         local = LocalRuleReviewer()
         self.registry.register(
-            "security-review", FilteredAgent("security-agent", local, ("SEC-",)),
-            "1.0.0", "Security, injection and secret detection",
+            "security-review",
+            FilteredAgent("security-agent", local, ("SEC-",)),
+            "1.0.0",
+            "Security, injection and secret detection",
         )
         self.registry.register(
-            "reliability-review", FilteredAgent("reliability-agent", local, ("REL-",)),
-            "1.0.0", "Reliability and observability review",
+            "reliability-review",
+            FilteredAgent("reliability-agent", local, ("REL-",)),
+            "1.0.0",
+            "Reliability and observability review",
         )
         if self.llm_config:
             active = self.store.get_active_skill_version("llm-review")
             self.registry.register(
                 "llm-review",
                 self._build_llm_reviewer(active["prompt"] if active else ""),
-                "1.0.0", "Context-aware AI code review via %s" % self.llm_config["provider"],
+                "1.0.0",
+                "Context-aware AI code review via %s" % self.llm_config["provider"],
             )
         self.registry.reload()
         coordinator = MultiAgentCoordinator(self.registry.reviewers(), store=self.store)
         self.reviewer = coordinator
         self.harness = ReviewHarness(
-            self.store, self.reviewer, settings.max_steps, settings.timeout_seconds,
+            self.store,
+            self.reviewer,
+            settings.max_steps,
+            settings.timeout_seconds,
             observability=self.observability,
         )
         self.github = GitHubClient(settings.github_token)
-        self.fixer = SafeFixer(RepairVerifier(
-            settings.repair_test_command, settings.repair_verify_timeout_seconds
-        ))
+        self.fixer = SafeFixer(
+            RepairVerifier(
+                settings.repair_test_command,
+                settings.repair_verify_timeout_seconds,
+                container_image=settings.repair_container_image,
+                memory_mb=settings.repair_memory_mb,
+                pids_limit=settings.repair_pids_limit,
+                cpus=settings.repair_cpus,
+                require_container=settings.repair_require_container,
+                max_output_bytes=settings.repair_max_output_bytes,
+            )
+        )
         self.auth = AuthManager(
-            self.store, settings.auth_secret, settings.session_ttl_seconds,
-            settings.bootstrap_admin_username, settings.bootstrap_admin_password,
+            self.store,
+            settings.auth_secret,
+            settings.session_ttl_seconds,
+            settings.bootstrap_admin_username,
+            settings.bootstrap_admin_password,
             settings.default_tenant_id,
         )
         self.releases = ReleaseManager(self.store)
@@ -81,8 +104,11 @@ class ReviewService:
             max_metric_regression=settings.eval_max_metric_regression,
         )
         self.queue = TaskQueue(
-            self._process_queued, settings.async_workers, settings.redis_url,
-            settings.queue_max_attempts, settings.queue_lease_seconds,
+            self._process_queued,
+            settings.async_workers,
+            settings.redis_url,
+            settings.queue_max_attempts,
+            settings.queue_lease_seconds,
             self._on_dead_letter,
         )
 
@@ -107,36 +133,55 @@ class ReviewService:
             return None
         versions = self.store.list_skill_versions("llm-review")
         candidate = next(
-            (item for item in versions
-             if int(item["version"]) == int(deployment["candidate_version"])), None
+            (
+                item
+                for item in versions
+                if int(item["version"]) == int(deployment["candidate_version"])
+            ),
+            None,
         )
         return self._build_llm_reviewer(candidate["prompt"]) if candidate else None
 
     def _run_review(
-        self, task_id: str, repository: str, pull_request: Optional[int],
-        diff: str, tenant_id: str,
+        self,
+        task_id: str,
+        repository: str,
+        pull_request: int | None,
+        diff: str,
+        tenant_id: str,
     ):
         task = self.store.get(task_id, tenant_id) or {}
         deployment = self.store.get_deployment(tenant_id, "llm-review")
-        if (
-            (task.get("input") or {}).get("release_lane") == "canary"
-            or (deployment and deployment.get("status") == "promoted")
+        if (task.get("input") or {}).get("release_lane") == "canary" or (
+            deployment and deployment.get("status") == "promoted"
         ):
             candidate = self._candidate_reviewer(tenant_id)
             if candidate:
-                canary_reviewer = MultiAgentCoordinator([
-                    item for item in self.registry.reviewers()
-                    if not isinstance(item, OpenAICompatibleReviewer)
-                ] + [candidate], store=self.store)
+                canary_reviewer = MultiAgentCoordinator(
+                    [
+                        item
+                        for item in self.registry.reviewers()
+                        if not isinstance(item, OpenAICompatibleReviewer)
+                    ]
+                    + [candidate],
+                    store=self.store,
+                )
                 harness = ReviewHarness(
-                    self.store, canary_reviewer, self.settings.max_steps,
-                    self.settings.timeout_seconds, observability=self.observability,
+                    self.store,
+                    canary_reviewer,
+                    self.settings.max_steps,
+                    self.settings.timeout_seconds,
+                    observability=self.observability,
                 )
                 return harness.run(task_id, repository, pull_request, diff)
         return self.harness.run(task_id, repository, pull_request, diff)
 
     def _run_shadow(
-        self, task_id: str, tenant_id: str, diff: str, primary_report,
+        self,
+        task_id: str,
+        tenant_id: str,
+        diff: str,
+        primary_report,
     ) -> None:
         task = self.store.get(task_id, tenant_id) or {}
         if not (task.get("input") or {}).get("shadow"):
@@ -144,34 +189,37 @@ class ReviewService:
         candidate = self._candidate_reviewer(tenant_id)
         if not candidate:
             self.store.audit(
-                tenant_id, "system", "shadow.skipped", task_id,
+                tenant_id,
+                "system",
+                "shadow.skipped",
+                task_id,
                 {"reason": "candidate reviewer is unavailable"},
             )
             return
         lane = (task.get("input") or {}).get("release_lane", "stable")
-        primary = {
+        primary: dict[str, object] = {
             "risk": primary_report.risk,
-            "finding_keys": sorted(
-                "%s:%s:%s" % (item.path, item.line, item.rule_id)
-                for item in primary_report.findings
-            ),
+            "finding_keys": sorted(item.fingerprint() for item in primary_report.findings),
         }
         try:
             parsed = parse_unified_diff(diff)
             findings = candidate.review(diff, parsed)
-            candidate_result = {
-                "finding_keys": sorted(
-                    "%s:%s:%s" % (item.path, item.line, item.rule_id)
-                    for item in findings
-                )
+            candidate_result: dict[str, object] = {
+                "finding_keys": sorted(item.fingerprint() for item in findings)
             }
             rollout = self.releases.observe_shadow(
                 tenant_id, "llm-review", task_id, lane, primary, candidate_result
             )
             self.store.audit(
-                tenant_id, "system", "shadow.completed", task_id,
-                {"findings": len(findings), "candidate_output_used": False,
-                 "rollout_status": (rollout or {}).get("status")},
+                tenant_id,
+                "system",
+                "shadow.completed",
+                task_id,
+                {
+                    "findings": len(findings),
+                    "candidate_output_used": False,
+                    "rollout_status": (rollout or {}).get("status"),
+                },
             )
             metrics.inc("shadow_reviews_total")
         except Exception as exc:
@@ -189,12 +237,16 @@ class ReviewService:
             self.registry.register(
                 "llm-review",
                 self._build_llm_reviewer(active["prompt"] if active else ""),
-                "1.0.0", "Context-aware AI code review via %s" % self.llm_config["provider"],
+                "1.0.0",
+                "Context-aware AI code review via %s" % self.llm_config["provider"],
             )
         skills = self.registry.reload()
         self.reviewer = MultiAgentCoordinator(self.registry.reviewers(), store=self.store)
         self.harness = ReviewHarness(
-            self.store, self.reviewer, self.settings.max_steps, self.settings.timeout_seconds,
+            self.store,
+            self.reviewer,
+            self.settings.max_steps,
+            self.settings.timeout_seconds,
             observability=self.observability,
         )
         return skills
@@ -209,47 +261,80 @@ class ReviewService:
             raise ValueError("diff exceeds maximum size of %d bytes" % self.settings.max_diff_bytes)
 
     def _create_task(
-        self, repository: str, diff: str, pull_request: Optional[int], source: str,
+        self,
+        repository: str,
+        diff: str,
+        pull_request: int | None,
+        source: str,
         tenant_id: str = "default",
     ) -> str:
         task_id = str(uuid.uuid4())
         encoded = diff.encode("utf-8")
         assignment = self.releases.assignment(tenant_id, "llm-review", task_id)
-        self.store.create(task_id, repository, pull_request, {
-            "source": source, "diff_bytes": len(encoded), "diff_sha256": hashlib.sha256(encoded).hexdigest(),
-            "release_lane": assignment["lane"], "shadow": assignment["shadow"],
-        }, tenant_id)
+        self.store.create(
+            task_id,
+            repository,
+            pull_request,
+            {
+                "source": source,
+                "diff_bytes": len(encoded),
+                "diff_sha256": hashlib.sha256(encoded).hexdigest(),
+                "release_lane": assignment["lane"],
+                "shadow": assignment["shadow"],
+            },
+            tenant_id,
+        )
         self.store.save_task_payload(task_id, diff)
         return task_id
 
     def _create_deferred_task(
-        self, repository: str, pull_request: Optional[int], source: str,
-        tenant_id: str, payload: Dict[str, Any],
+        self,
+        repository: str,
+        pull_request: int | None,
+        source: str,
+        tenant_id: str,
+        payload: dict[str, Any],
     ) -> str:
         task_id = str(uuid.uuid4())
         assignment = self.releases.assignment(tenant_id, "llm-review", task_id)
-        self.store.create(task_id, repository, pull_request, {
-            "source": source, "diff_pending": True,
-            "release_lane": assignment["lane"], "shadow": assignment["shadow"],
-            **payload,
-        }, tenant_id)
+        self.store.create(
+            task_id,
+            repository,
+            pull_request,
+            {
+                "source": source,
+                "diff_pending": True,
+                "release_lane": assignment["lane"],
+                "shadow": assignment["shadow"],
+                **payload,
+            },
+            tenant_id,
+        )
         return task_id
 
     def create_review(
-        self, repository: str, diff: str, pull_request: Optional[int] = None,
-        source: str = "api", tenant_id: str = "default",
-    ) -> Dict[str, Any]:
+        self,
+        repository: str,
+        diff: str,
+        pull_request: int | None = None,
+        source: str = "api",
+        tenant_id: str = "default",
+    ) -> dict[str, Any]:
         self._validate_review(repository, diff)
         self._authorize_repository(tenant_id, repository)
         task_id = self._create_task(repository, diff, pull_request, source, tenant_id)
         try:
-            with self.observability.span(
-                "review", task_id, task_id=task_id, tenant_id=tenant_id,
-                repository=repository,
-            ), metrics.timer("review_duration"):
-                report = self._run_review(
-                    task_id, repository, pull_request, diff, tenant_id
-                )
+            with (
+                self.observability.span(
+                    "review",
+                    task_id,
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                    repository=repository,
+                ),
+                metrics.timer("review_duration"),
+            ):
+                report = self._run_review(task_id, repository, pull_request, diff, tenant_id)
             self._run_shadow(task_id, tenant_id, diff, report)
             metrics.inc("reviews_total")
             lane = (self.store.get(task_id, tenant_id).get("input") or {}).get(
@@ -265,22 +350,33 @@ class ReviewService:
             raise
 
     def enqueue_review(
-        self, repository: str, diff: str, pull_request: Optional[int] = None,
-        source: str = "api", github_issue_url: str = "", installation_id: Optional[int] = None,
+        self,
+        repository: str,
+        diff: str,
+        pull_request: int | None = None,
+        source: str = "api",
+        github_issue_url: str = "",
+        installation_id: int | None = None,
         tenant_id: str = "default",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         self._validate_review(repository, diff)
         self._authorize_repository(tenant_id, repository)
         task_id = self._create_task(repository, diff, pull_request, source, tenant_id)
-        self.queue.submit({
-            "task_id": task_id, "repository": repository, "pull_request": pull_request,
-            "github_issue_url": github_issue_url, "installation_id": installation_id,
-            "tenant_id": tenant_id,
-        }, message_id=task_id)
+        self.queue.submit(
+            {
+                "task_id": task_id,
+                "repository": repository,
+                "pull_request": pull_request,
+                "github_issue_url": github_issue_url,
+                "installation_id": installation_id,
+                "tenant_id": tenant_id,
+            },
+            message_id=task_id,
+        )
         metrics.inc("reviews_enqueued_total")
         return {"task_id": task_id, "state": "PENDING", "queue": self.queue.backend}
 
-    def _process_queued(self, payload: Dict[str, Any]) -> None:
+    def _process_queued(self, payload: dict[str, Any]) -> None:
         task_id = payload["task_id"]
         task = self.store.get(task_id)
         if not task:
@@ -290,25 +386,41 @@ class ReviewService:
         if diff is None and payload.get("diff_url"):
             client = (
                 self.github_client_for_installation(payload.get("installation_id"))
-                if payload.get("installation_id") else self.github
+                if payload.get("installation_id")
+                else self.github
             )
             client.ensure_repository_access(payload["repository"])
-            diff = client.fetch_diff(payload["diff_url"])
+            diff = client.fetch_diff(
+                payload["diff_url"], max_bytes=self.settings.max_diff_bytes + 4096
+            )
             self._validate_review(payload["repository"], diff)
             encoded = diff.encode("utf-8")
             self.store.save_task_payload(task_id, diff)
-            self.store.update_task_input(task_id, {
-                "diff_pending": False, "diff_bytes": len(encoded),
-                "diff_sha256": hashlib.sha256(encoded).hexdigest(),
-            })
+            self.store.update_task_input(
+                task_id,
+                {
+                    "diff_pending": False,
+                    "diff_bytes": len(encoded),
+                    "diff_sha256": hashlib.sha256(encoded).hexdigest(),
+                },
+            )
         if diff is None:
             raise PermanentTaskError("task payload no longer exists")
         try:
-            with self.observability.span(
-                "review.async", task_id, task_id=task_id, tenant_id=tenant_id,
-            ), metrics.timer("review_duration"):
+            with (
+                self.observability.span(
+                    "review.async",
+                    task_id,
+                    task_id=task_id,
+                    tenant_id=tenant_id,
+                ),
+                metrics.timer("review_duration"),
+            ):
                 report = self._run_review(
-                    task_id, payload["repository"], payload.get("pull_request"), diff,
+                    task_id,
+                    payload["repository"],
+                    payload.get("pull_request"),
+                    diff,
                     tenant_id,
                 )
             self._run_shadow(task_id, tenant_id, diff, report)
@@ -318,7 +430,8 @@ class ReviewService:
             if payload.get("github_issue_url") and self.settings.auto_post_review:
                 client = self.github_client_for_installation(payload.get("installation_id"))
                 client.upsert_comment(
-                    payload["github_issue_url"], to_markdown(report.to_dict()),
+                    payload["github_issue_url"],
+                    to_markdown(report.to_dict()),
                     "<!-- evoagent-review:%s -->" % task_id,
                 )
         except Exception:
@@ -328,43 +441,52 @@ class ReviewService:
             self.alerts.evaluate(tenant_id)
             raise
 
-    def _on_dead_letter(self, payload: Dict[str, Any], error: str) -> None:
+    def _on_dead_letter(self, payload: dict[str, Any], error: str) -> None:
         task_id = payload.get("task_id", "")
         tenant_id = payload.get("tenant_id", "default")
         task = self.store.get(task_id, tenant_id) if task_id else None
         if task and task.get("state") not in {
-            TaskState.SUCCESS.value, TaskState.FAILED.value, TaskState.CANCELLED.value,
+            TaskState.SUCCESS.value,
+            TaskState.FAILED.value,
+            TaskState.CANCELLED.value,
         }:
-            step = max(
-                [int(item.get("step", 0)) for item in task.get("trace", [])] or [0]
-            ) + 1
+            step = max([int(item.get("step", 0)) for item in task.get("trace", [])] or [0]) + 1
             self.store.fail(
-                task_id, error,
+                task_id,
+                error,
                 TraceEvent(
-                    step, TaskState.FAILED,
-                    "Task entered the dead-letter queue: %s" % error, utc_now(),
+                    step,
+                    TaskState.FAILED,
+                    "Task entered the dead-letter queue: %s" % error,
+                    utc_now(),
                 ),
             )
         self.store.create_alert(
-            tenant_id, "dlq:%s" % (task_id or "unknown"), "critical",
+            tenant_id,
+            "dlq:%s" % (task_id or "unknown"),
+            "critical",
             "Task %s entered the dead-letter queue: %s" % (task_id, error),
         )
         metrics.inc("dead_letters_total")
 
     def handle_github_pull_request(
-        self, payload: Dict[str, Any], delivery_id: str,
-        payload_sha256: str, tenant_id: str = "",
-    ) -> Dict[str, Any]:
+        self,
+        payload: dict[str, Any],
+        delivery_id: str,
+        payload_sha256: str,
+        tenant_id: str = "",
+    ) -> dict[str, Any]:
         installation_id = (payload.get("installation") or {}).get("id")
-        tenant_id = tenant_id or (
-            self.store.installation_tenant(installation_id) if installation_id else None
-        ) or self.settings.default_tenant_id
-        if not self.store.claim_webhook(
-            delivery_id, tenant_id, "pull_request", payload_sha256
-        ):
+        tenant_id = (
+            tenant_id
+            or (self.store.installation_tenant(installation_id) if installation_id else None)
+            or self.settings.default_tenant_id
+        )
+        if not self.store.claim_webhook(delivery_id, tenant_id, "pull_request", payload_sha256):
             existing = self.store.get_webhook(delivery_id) or {}
             return {
-                "duplicate": True, "task_id": existing.get("task_id"),
+                "duplicate": True,
+                "task_id": existing.get("task_id"),
                 "state": "PENDING" if existing.get("task_id") else "ACCEPTED",
             }
         action = payload.get("action")
@@ -379,22 +501,35 @@ class ReviewService:
             raise ValueError("invalid GitHub pull_request payload")
         self._authorize_repository(tenant_id, repository)
         task_id = self._create_deferred_task(
-            repository, number, "github-webhook", tenant_id,
+            repository,
+            number,
+            "github-webhook",
+            tenant_id,
             {"diff_url": diff_url},
         )
-        self.queue.submit({
-            "task_id": task_id, "repository": repository, "pull_request": number,
-            "github_issue_url": pull.get("issue_url", ""),
-            "installation_id": installation_id, "tenant_id": tenant_id,
-            "diff_url": diff_url,
-        }, message_id=task_id)
+        self.queue.submit(
+            {
+                "task_id": task_id,
+                "repository": repository,
+                "pull_request": number,
+                "github_issue_url": pull.get("issue_url", ""),
+                "installation_id": installation_id,
+                "tenant_id": tenant_id,
+                "diff_url": diff_url,
+            },
+            message_id=task_id,
+        )
         metrics.inc("reviews_enqueued_total")
-        result = {"task_id": task_id, "state": "PENDING", "queue": self.queue.backend}
-        self.store.complete_webhook(delivery_id, result["task_id"])
+        result: dict[str, object] = {
+            "task_id": task_id,
+            "state": "PENDING",
+            "queue": self.queue.backend,
+        }
+        self.store.complete_webhook(delivery_id, task_id)
         result["will_post_to_github"] = self.settings.auto_post_review
         return result
 
-    def github_client_for_installation(self, installation_id: Optional[int] = None) -> GitHubClient:
+    def github_client_for_installation(self, installation_id: int | None = None) -> GitHubClient:
         if installation_id is None:
             return self.github
         if not self.settings.github_app_id or not self.settings.github_private_key_path:
@@ -405,8 +540,10 @@ class ReviewService:
         return GitHubClient(token)
 
     def create_fix(
-        self, task_id: str, installation_id: Optional[int] = None,
-        tenant_id: Optional[str] = None,
+        self,
+        task_id: str,
+        installation_id: int | None = None,
+        tenant_id: str | None = None,
     ) -> dict:
         task = self.store.get(task_id, tenant_id)
         if not task or not task.get("report"):
@@ -418,14 +555,20 @@ class ReviewService:
             raise PermissionError("automatic repair is not enabled for this repository")
         result = self.fixer.create_fix_commits(
             self.github_client_for_installation(installation_id),
-            task["repository"], task["pull_request"], task["report"],
+            task["repository"],
+            task["pull_request"],
+            task["report"],
         )
         metrics.inc("fix_runs_total")
         return result
 
     def record_feedback(
-        self, task_id: str, category: str, finding: Optional[dict], note: str,
-        tenant_id: Optional[str] = None,
+        self,
+        task_id: str,
+        category: str,
+        finding: dict | None,
+        note: str,
+        tenant_id: str | None = None,
     ) -> dict:
         if not self.store.get(task_id, tenant_id):
             raise ValueError("task not found")
@@ -435,7 +578,7 @@ class ReviewService:
         metrics.inc("feedback_total")
         return {"recorded": True, "category": category}
 
-    def resume_task(self, task_id: str, tenant_id: Optional[str] = None) -> dict:
+    def resume_task(self, task_id: str, tenant_id: str | None = None) -> dict:
         task = self.store.get(task_id, tenant_id)
         if not task:
             raise ValueError("task not found")
@@ -444,14 +587,18 @@ class ReviewService:
         diff = self.store.get_task_payload(task_id)
         if diff is None:
             raise ValueError("task payload is no longer available")
-        self.queue.submit({
-            "task_id": task_id, "repository": task["repository"],
-            "pull_request": task.get("pull_request"),
-            "tenant_id": task.get("tenant_id", "default"),
-        }, message_id=task_id)
+        self.queue.submit(
+            {
+                "task_id": task_id,
+                "repository": task["repository"],
+                "pull_request": task.get("pull_request"),
+                "tenant_id": task.get("tenant_id", "default"),
+            },
+            message_id=task_id,
+        )
         return {"task_id": task_id, "state": "PENDING", "resumed": True}
 
-    def cancel_task(self, task_id: str, tenant_id: Optional[str] = None) -> bool:
+    def cancel_task(self, task_id: str, tenant_id: str | None = None) -> bool:
         return self.store.request_cancel(task_id, tenant_id)
 
     def _authorize_repository(self, tenant_id: str, repository: str) -> None:

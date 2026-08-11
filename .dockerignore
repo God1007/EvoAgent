@@ -1,7 +1,18 @@
 __pycache__
 *.pyc
 *.db
+.coverage
+.DS_Store
 .git
+.github
 .env
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.venv
+build
+dist
+docs
+output
 tests
 

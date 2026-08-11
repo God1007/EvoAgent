@@ -1,12 +1,28 @@
-"""Durable task delivery with ACK, leases, retry backoff and a dead-letter queue."""
+"""Task delivery with retry backoff and a dead-letter queue.
+
+Two backends with **different durability guarantees**:
+
+* ``redis-streams`` (production): durable. Messages survive process restarts;
+  delivery uses consumer-group ACK and lease-based reclaim of stale (crashed
+  worker) messages via ``XAUTOCLAIM``, so in-flight work is not lost.
+* ``memory-ephemeral`` (single process / development): **not durable**. Work is
+  held only in an in-process executor queue and the dead-letter list, so any
+  pending, in-flight, retry-scheduled, or dead-lettered task is lost if the
+  process exits. There is no ACK or lease recovery in this backend.
+
+Both backends share the same retry-with-backoff and dead-letter API surface;
+only the Redis backend provides at-least-once durable delivery.
+"""
+
 import json
 import queue
 import socket
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, Optional
+from typing import Any
 
 
 class PermanentTaskError(RuntimeError):
@@ -19,19 +35,29 @@ class TaskQueue:
     GROUP = "evoagent-workers"
 
     def __init__(
-        self, handler: Callable[[Dict[str, Any]], None], workers: int = 2,
-        redis_url: str = "", max_attempts: int = 3, lease_seconds: int = 60,
-        on_dead_letter: Optional[Callable[[Dict[str, Any], str], None]] = None,
+        self,
+        handler: Callable[[dict[str, Any]], None],
+        workers: int = 2,
+        redis_url: str = "",
+        max_attempts: int = 3,
+        lease_seconds: int = 60,
+        on_dead_letter: Callable[[dict[str, Any], str], None] | None = None,
+        backoff_base: float = 1.0,
+        backoff_cap: float = 10.0,
     ):
         self.handler = handler
         self.redis_url = redis_url
         self.max_attempts = max_attempts
         self.lease_seconds = lease_seconds
         self.on_dead_letter = on_dead_letter
-        self._executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="evoagent-worker")
-        self._redis = None
-        self._memory: queue.Queue = queue.Queue()
-        self._memory_dlq = []
+        self.backoff_base = backoff_base
+        self.backoff_cap = backoff_cap
+        self._executor = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="evoagent-worker"
+        )
+        self._redis: Any = None
+        self._memory: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._memory_dlq: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self.consumer = "%s-%s" % (socket.gethostname(), uuid.uuid4().hex[:8])
@@ -52,11 +78,17 @@ class TaskQueue:
 
     @property
     def backend(self) -> str:
-        return "redis-streams" if self._redis else "memory-acked"
+        return "redis-streams" if self._redis else "memory-ephemeral"
 
-    def submit(self, payload: Dict[str, Any], message_id: str = "") -> str:
-        envelope = {
-            "message_id": message_id or str(payload.get("task_id") or uuid.uuid4()),
+    @property
+    def durable(self) -> bool:
+        """Whether the active backend survives a process restart."""
+        return self._redis is not None
+
+    def submit(self, payload: dict[str, Any], message_id: str = "") -> str:
+        message_identifier = message_id or str(payload.get("task_id") or uuid.uuid4())
+        envelope: dict[str, Any] = {
+            "message_id": message_identifier,
             "attempt": 0,
             "payload": payload,
             "submitted_at": time.time(),
@@ -65,9 +97,9 @@ class TaskQueue:
             self._redis.xadd(self.STREAM, {"envelope": json.dumps(envelope, ensure_ascii=False)})
         else:
             self._executor.submit(self._deliver, envelope)
-        return envelope["message_id"]
+        return message_identifier
 
-    def _deliver(self, envelope: Dict[str, Any]) -> bool:
+    def _deliver(self, envelope: dict[str, Any]) -> bool:
         envelope["attempt"] = int(envelope.get("attempt", 0)) + 1
         try:
             self.handler(envelope["payload"])
@@ -79,17 +111,17 @@ class TaskQueue:
             if envelope["attempt"] >= self.max_attempts:
                 self._dead_letter(envelope, str(exc))
             elif self._redis:
-                self._redis.xadd(self.STREAM, {
-                    "envelope": json.dumps(envelope, ensure_ascii=False)
-                })
+                self._redis.xadd(
+                    self.STREAM, {"envelope": json.dumps(envelope, ensure_ascii=False)}
+                )
             else:
-                delay = min(2 ** (envelope["attempt"] - 1), 10)
+                delay = min(self.backoff_base * 2 ** (envelope["attempt"] - 1), self.backoff_cap)
                 timer = threading.Timer(delay, self._submit_memory, args=(envelope,))
                 timer.daemon = True
                 timer.start()
             return False
 
-    def _submit_memory(self, envelope: Dict[str, Any]) -> None:
+    def _submit_memory(self, envelope: dict[str, Any]) -> None:
         if not self._stop.is_set():
             self._executor.submit(self._deliver, envelope)
 
@@ -105,8 +137,10 @@ class TaskQueue:
                         envelope = json.loads(fields["envelope"])
                     except Exception as exc:
                         envelope = {
-                            "message_id": redis_id, "attempt": self.max_attempts,
-                            "payload": {}, "submitted_at": time.time(),
+                            "message_id": redis_id,
+                            "attempt": self.max_attempts,
+                            "payload": {},
+                            "submitted_at": time.time(),
                         }
                         self._dead_letter(envelope, "invalid queue envelope: %s" % exc)
                         self._redis.xack(self.STREAM, self.GROUP, redis_id)
@@ -122,8 +156,12 @@ class TaskQueue:
     def _reclaim_stale(self) -> None:
         try:
             result = self._redis.xautoclaim(
-                self.STREAM, self.GROUP, self.consumer,
-                min_idle_time=self.lease_seconds * 1000, start_id="0-0", count=10,
+                self.STREAM,
+                self.GROUP,
+                self.consumer,
+                min_idle_time=self.lease_seconds * 1000,
+                start_id="0-0",
+                count=10,
             )
             entries = result[1] if len(result) > 1 else []
             for redis_id, fields in entries:
@@ -134,7 +172,7 @@ class TaskQueue:
             # Redis versions without XAUTOCLAIM still process new entries.
             return
 
-    def _dead_letter(self, envelope: Dict[str, Any], error: str) -> None:
+    def _dead_letter(self, envelope: dict[str, Any], error: str) -> None:
         item = {**envelope, "error": error[:2000], "failed_at": time.time()}
         if self._redis:
             self._redis.xadd(self.DLQ, {"envelope": json.dumps(item, ensure_ascii=False)})

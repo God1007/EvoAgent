@@ -4,13 +4,13 @@ The manifest must contain repository, pull_request, split, expected_findings and
 repair_validation. Public PR content alone is not ground truth, so unlabelled
 records are intentionally rejected.
 """
+
 import argparse
 import json
 import os
 import sys
 import urllib.error
 import urllib.request
-
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -35,8 +35,7 @@ def fetch_diff(repository, pull_request, token=""):
             return response.read().decode("utf-8", errors="replace"), url
     except urllib.error.HTTPError as exc:
         raise RuntimeError(
-            "GitHub returned HTTP %d for %s#%d"
-            % (exc.code, repository, pull_request)
+            "GitHub returned HTTP %d for %s#%d" % (exc.code, repository, pull_request)
         ) from exc
 
 
@@ -48,25 +47,20 @@ def main():
     args = parser.parse_args()
     token = os.environ.get("GITHUB_TOKEN", "")
     records = []
-    with open(args.manifest, "r", encoding="utf-8") as handle:
+    with open(args.manifest, encoding="utf-8") as handle:
         for line_number, raw in enumerate(handle, 1):
             if not raw.strip():
                 continue
             item = json.loads(raw)
             if "expected_findings" not in item:
                 raise ValueError(
-                    "manifest line %d has no human-reviewed expected_findings"
-                    % line_number
+                    "manifest line %d has no human-reviewed expected_findings" % line_number
                 )
-            diff, _api_url = fetch_diff(
-                str(item["repository"]), int(item["pull_request"]), token
-            )
+            diff, _api_url = fetch_diff(str(item["repository"]), int(item["pull_request"]), token)
             parsed = parse_unified_diff(diff)
             record = {
                 "schema_version": 1,
-                "id": item.get(
-                    "id", "%s#%s" % (item["repository"], item["pull_request"])
-                ),
+                "id": item.get("id", "%s#%s" % (item["repository"], item["pull_request"])),
                 "repository": item["repository"],
                 "pull_request": int(item["pull_request"]),
                 "split": item["split"],
@@ -87,9 +81,7 @@ def main():
             if len(records) >= args.limit:
                 break
     if len(records) < args.limit:
-        raise ValueError(
-            "manifest produced %d records; %d required" % (len(records), args.limit)
-        )
+        raise ValueError("manifest produced %d records; %d required" % (len(records), args.limit))
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     with open(args.output, "w", encoding="utf-8", newline="\n") as handle:
         for record in records:

@@ -1,22 +1,21 @@
 import re
 from dataclasses import dataclass
-from typing import List
 
 from .models import ChangedLine
 
 
 @dataclass
 class ParsedDiff:
-    files: List[str]
-    added_lines: List[ChangedLine]
+    files: list[str]
+    added_lines: list[ChangedLine]
 
 
 HUNK = re.compile(r"^@@ -(?:\d+)(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
 def parse_unified_diff(diff: str) -> ParsedDiff:
-    files: List[str] = []
-    added: List[ChangedLine] = []
+    files: list[str] = []
+    added: list[ChangedLine] = []
     current_path = ""
     new_line = 0
     in_hunk = False
@@ -48,4 +47,3 @@ def parse_unified_diff(diff: str) -> ParsedDiff:
             new_line += 1
 
     return ParsedDiff(files=files, added_lines=added)
-

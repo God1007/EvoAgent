@@ -5,11 +5,11 @@ specialists produce evidence, a critic challenges each claim, a test agent
 checks reproducibility, a synthesizer resolves conflicts, a fix agent checks
 remediation quality, and a verifier makes the final release decision.
 """
+
 import hashlib
-import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, TypedDict
+from dataclasses import asdict, dataclass
+from typing import Any, TypedDict, cast
 
 from .diff_parser import ParsedDiff
 from .models import Finding, Severity
@@ -21,7 +21,7 @@ class AgentMessage:
     sender: str
     recipient: str
     kind: str
-    content: Dict[str, Any]
+    content: dict[str, Any]
     correlation_id: str = ""
 
     def to_dict(self) -> dict:
@@ -32,20 +32,21 @@ class AgentMessage:
 class ReviewAssignment:
     agent: str
     objective: str
-    files: List[str]
-    risk_domains: List[str]
+    files: list[str]
+    risk_domains: list[str]
 
 
 @dataclass
 class ReviewPlan:
-    languages: List[str]
-    changed_files: List[str]
+    languages: list[str]
+    changed_files: list[str]
     risk_level: str
-    assignments: List[ReviewAssignment]
+    assignments: list[ReviewAssignment]
 
     def to_dict(self) -> dict:
         return {
-            "languages": self.languages, "changed_files": self.changed_files,
+            "languages": self.languages,
+            "changed_files": self.changed_files,
             "risk_level": self.risk_level,
             "assignments": [asdict(item) for item in self.assignments],
         }
@@ -55,7 +56,7 @@ class ReviewPlan:
 class Critique:
     finding_key: str
     accepted: bool
-    objections: List[str]
+    objections: list[str]
     confidence_adjustment: float
 
 
@@ -72,15 +73,23 @@ class CollaborationState(TypedDict, total=False):
     parsed: ParsedDiff
     task_id: str
     plan: ReviewPlan
-    specialist_findings: List[Finding]
-    critiques: Dict[str, Critique]
-    reproductions: Dict[str, Reproduction]
-    synthesized: List[Finding]
-    fix_ready: Dict[str, bool]
-    verified: List[Finding]
+    specialist_findings: list[Finding]
+    critiques: dict[str, Critique]
+    reproductions: dict[str, Reproduction]
+    synthesized: list[Finding]
+    fix_ready: dict[str, bool]
+    verified: list[Finding]
 
 
 def finding_key(finding: Finding) -> str:
+    """Per-run correlation key that stays unique for co-located findings.
+
+    This intentionally includes the line number so two findings with identical
+    evidence on different lines do not collapse into one dict entry while the
+    critic/test/fix agents correlate their work within a single review run. For a
+    line-independent identity that is stable across PR revisions, use
+    ``Finding.fingerprint()`` instead (see ``models.Finding``).
+    """
     raw = "%s:%s:%s" % (finding.path, finding.line, finding.rule_id)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
@@ -91,9 +100,10 @@ class FilteredAgent(Reviewer):
         self.reviewer = reviewer
         self.prefixes = prefixes
 
-    def review(self, diff: str, parsed: ParsedDiff) -> List[Finding]:
+    def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
         return [
-            item for item in self.reviewer.review(diff, parsed)
+            item
+            for item in self.reviewer.review(diff, parsed)
             if item.rule_id.startswith(self.prefixes)
         ]
 
@@ -101,14 +111,20 @@ class FilteredAgent(Reviewer):
 class PlannerAgent:
     name = "planner-agent"
 
-    def plan(self, parsed: ParsedDiff, specialists: List[Reviewer]) -> ReviewPlan:
+    def plan(self, parsed: ParsedDiff, specialists: list[Reviewer]) -> ReviewPlan:
         extensions = {path.rsplit(".", 1)[-1].lower() for path in parsed.files if "." in path}
-        languages = sorted({
-            "python" if ext == "py" else
-            "javascript" if ext in {"js", "jsx", "ts", "tsx"} else
-            "configuration" if ext in {"yml", "yaml", "json", "toml"} else ext
-            for ext in extensions
-        })
+        languages = sorted(
+            {
+                "python"
+                if ext == "py"
+                else "javascript"
+                if ext in {"js", "jsx", "ts", "tsx"}
+                else "configuration"
+                if ext in {"yml", "yaml", "json", "toml"}
+                else ext
+                for ext in extensions
+            }
+        )
         sensitive = any(
             token in path.lower()
             for path in parsed.files
@@ -127,7 +143,8 @@ class PlannerAgent:
             for agent in specialists
         ]
         return ReviewPlan(
-            languages=languages or ["unknown"], changed_files=list(parsed.files),
+            languages=languages or ["unknown"],
+            changed_files=list(parsed.files),
             risk_level="high" if sensitive or len(parsed.files) > 10 else "normal",
             assignments=assignments,
         )
@@ -142,8 +159,12 @@ class CriticAgent:
         if (finding.path, finding.line) not in valid_locations:
             objections.append("location is not an added line")
         source_line = next(
-            (line.content for line in parsed.added_lines
-             if line.path == finding.path and line.line == finding.line), ""
+            (
+                line.content
+                for line in parsed.added_lines
+                if line.path == finding.path and line.line == finding.line
+            ),
+            "",
         )
         if finding.evidence and finding.evidence.strip() not in source_line.strip():
             objections.append("quoted evidence does not match the changed line")
@@ -153,7 +174,7 @@ class CriticAgent:
             objections.append("remediation is not actionable")
         if len(finding.test.strip()) < 8:
             objections.append("test strategy is not actionable")
-        adjustment = -.35 if objections else .05
+        adjustment = -0.35 if objections else 0.05
         return Critique(finding_key(finding), not objections, objections, adjustment)
 
 
@@ -162,8 +183,12 @@ class TestAgent:
 
     def reproduce(self, finding: Finding, parsed: ParsedDiff) -> Reproduction:
         line = next(
-            (item.content for item in parsed.added_lines
-             if item.path == finding.path and item.line == finding.line), ""
+            (
+                item.content
+                for item in parsed.added_lines
+                if item.path == finding.path and item.line == finding.line
+            ),
+            "",
         )
         signatures = {
             "SEC-EVAL": ("eval(" in line or "exec(" in line),
@@ -177,7 +202,8 @@ class TestAgent:
         }
         reproducible = signatures.get(finding.rule_id, bool(line and finding.evidence))
         return Reproduction(
-            finding_key(finding), reproducible,
+            finding_key(finding),
+            reproducible,
             "static changed-line reproduction",
             line.strip()[:240] if reproducible else "No matching changed-line evidence.",
         )
@@ -187,10 +213,12 @@ class SynthesizerAgent:
     name = "synthesizer-agent"
 
     def synthesize(
-        self, findings: List[Finding], critiques: Dict[str, Critique],
-        reproductions: Dict[str, Reproduction],
-    ) -> List[Finding]:
-        merged: Dict[tuple, Finding] = {}
+        self,
+        findings: list[Finding],
+        critiques: dict[str, Critique],
+        reproductions: dict[str, Reproduction],
+    ) -> list[Finding]:
+        merged: dict[tuple, Finding] = {}
         for finding in findings:
             key = finding_key(finding)
             critique = critiques[key]
@@ -198,7 +226,10 @@ class SynthesizerAgent:
             adjusted = max(0.0, min(1.0, finding.confidence + critique.confidence_adjustment))
             if not critique.accepted:
                 continue
-            if finding.severity in {Severity.CRITICAL, Severity.HIGH} and not reproduction.reproducible:
+            if (
+                finding.severity in {Severity.CRITICAL, Severity.HIGH}
+                and not reproduction.reproducible
+            ):
                 continue
             finding.confidence = adjusted
             identity = (finding.path, finding.line, finding.rule_id)
@@ -206,7 +237,9 @@ class SynthesizerAgent:
             if current is None or finding.confidence > current.confidence:
                 merged[identity] = finding
         order = {Severity.CRITICAL: 0, Severity.HIGH: 1, Severity.MEDIUM: 2, Severity.LOW: 3}
-        return sorted(merged.values(), key=lambda item: (order[item.severity], item.path, item.line))
+        return sorted(
+            merged.values(), key=lambda item: (order[item.severity], item.path, item.line)
+        )
 
 
 class FixAgent:
@@ -222,9 +255,12 @@ class VerifierAgent:
     name = "verifier-agent"
 
     def verify(
-        self, finding: Finding, reproduction: Reproduction, fix_ready: bool,
+        self,
+        finding: Finding,
+        reproduction: Reproduction,
+        fix_ready: bool,
     ) -> bool:
-        if not fix_ready or finding.confidence < .55:
+        if not fix_ready or finding.confidence < 0.55:
             return False
         if finding.severity in {Severity.CRITICAL, Severity.HIGH}:
             return reproduction.reproducible
@@ -233,10 +269,14 @@ class VerifierAgent:
 
 class MultiAgentCoordinator(Reviewer):
     """Planner/specialist/critic/test/synthesis/fix/verifier collaboration graph."""
+
     name = "multi-agent-collaboration"
 
     def __init__(
-        self, agents: List[Reviewer], max_workers: int = 4, store=None,
+        self,
+        agents: list[Reviewer],
+        max_workers: int = 4,
+        store=None,
     ):
         self.agents = agents
         self.max_workers = max_workers
@@ -252,6 +292,7 @@ class MultiAgentCoordinator(Reviewer):
     def _build_graph(self):
         try:
             from langgraph.graph import END, START, StateGraph
+
             graph = StateGraph(CollaborationState)
             graph.add_node("planner", self._plan_node)
             graph.add_node("specialists", self._specialist_node)
@@ -272,42 +313,56 @@ class MultiAgentCoordinator(Reviewer):
         except ImportError:
             return None
 
-    def review(self, diff: str, parsed: ParsedDiff) -> List[Finding]:
+    def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
         return self.review_with_context("", diff, parsed)
 
     def review_with_context(
-        self, task_id: str, diff: str, parsed: ParsedDiff,
-    ) -> List[Finding]:
+        self,
+        task_id: str,
+        diff: str,
+        parsed: ParsedDiff,
+    ) -> list[Finding]:
         state: CollaborationState = {
-            "task_id": task_id, "diff": diff, "parsed": parsed,
+            "task_id": task_id,
+            "diff": diff,
+            "parsed": parsed,
         }
         if self.graph:
-            result = self.graph.invoke(state)
+            result: dict[str, Any] = dict(self.graph.invoke(state))
         else:
-            result = state
+            result = dict(state)
             for node in (
-                self._plan_node, self._specialist_node, self._critic_node,
-                self._test_node, self._synthesize_node, self._fix_node,
+                self._plan_node,
+                self._specialist_node,
+                self._critic_node,
+                self._test_node,
+                self._synthesize_node,
+                self._fix_node,
                 self._verify_node,
             ):
-                result.update(node(result))
+                result.update(node(cast(CollaborationState, result)))
         return result["verified"]
 
     def _emit(
-        self, state: CollaborationState, sender: str, recipient: str,
-        kind: str, content: Dict[str, Any], correlation_id: str = "",
+        self,
+        state: CollaborationState,
+        sender: str,
+        recipient: str,
+        kind: str,
+        content: dict[str, Any],
+        correlation_id: str = "",
     ) -> None:
         message = AgentMessage(sender, recipient, kind, content, correlation_id)
         if self.store is not None and state.get("task_id"):
             self.store.record_agent_message(state["task_id"], message.to_dict())
 
-    def _plan_node(self, state: CollaborationState) -> Dict[str, Any]:
+    def _plan_node(self, state: CollaborationState) -> dict[str, Any]:
         plan = self.planner.plan(state["parsed"], self.agents)
         self._emit(state, self.planner.name, "specialists", "review_plan", plan.to_dict())
         return {"plan": plan}
 
-    def _specialist_node(self, state: CollaborationState) -> Dict[str, Any]:
-        findings: List[Finding] = []
+    def _specialist_node(self, state: CollaborationState) -> dict[str, Any]:
+        findings: list[Finding] = []
         failures = []
         with ThreadPoolExecutor(
             max_workers=min(self.max_workers, max(1, len(self.agents)))
@@ -322,72 +377,96 @@ class MultiAgentCoordinator(Reviewer):
                     output = future.result()
                     findings.extend(output)
                     self._emit(
-                        state, agent.name, self.critic.name, "specialist_evidence",
+                        state,
+                        agent.name,
+                        self.critic.name,
+                        "specialist_evidence",
                         {"findings": [item.to_dict() for item in output]},
                     )
                 except Exception as exc:
                     failures.append("%s: %s" % (agent.name, exc))
                     self._emit(
-                        state, agent.name, self.planner.name, "agent_failure",
+                        state,
+                        agent.name,
+                        self.planner.name,
+                        "agent_failure",
                         {"error": str(exc)[:1000]},
                     )
         if failures and not findings and len(failures) == len(self.agents):
             raise RuntimeError("all review agents failed: " + "; ".join(failures))
         return {"specialist_findings": findings}
 
-    def _critic_node(self, state: CollaborationState) -> Dict[str, Any]:
+    def _critic_node(self, state: CollaborationState) -> dict[str, Any]:
         critiques = {}
         for finding in state["specialist_findings"]:
             critique = self.critic.challenge(finding, state["parsed"])
             critiques[critique.finding_key] = critique
             self._emit(
-                state, self.critic.name, self.test_agent.name, "critique",
-                asdict(critique), critique.finding_key,
+                state,
+                self.critic.name,
+                self.test_agent.name,
+                "critique",
+                asdict(critique),
+                critique.finding_key,
             )
         return {"critiques": critiques}
 
-    def _test_node(self, state: CollaborationState) -> Dict[str, Any]:
+    def _test_node(self, state: CollaborationState) -> dict[str, Any]:
         reproductions = {}
         for finding in state["specialist_findings"]:
             reproduction = self.test_agent.reproduce(finding, state["parsed"])
             reproductions[reproduction.finding_key] = reproduction
             self._emit(
-                state, self.test_agent.name, self.synthesizer.name, "reproduction",
-                asdict(reproduction), reproduction.finding_key,
+                state,
+                self.test_agent.name,
+                self.synthesizer.name,
+                "reproduction",
+                asdict(reproduction),
+                reproduction.finding_key,
             )
         return {"reproductions": reproductions}
 
-    def _synthesize_node(self, state: CollaborationState) -> Dict[str, Any]:
+    def _synthesize_node(self, state: CollaborationState) -> dict[str, Any]:
         findings = self.synthesizer.synthesize(
             state["specialist_findings"], state["critiques"], state["reproductions"]
         )
         self._emit(
-            state, self.synthesizer.name, self.fix_agent.name, "arbitration",
+            state,
+            self.synthesizer.name,
+            self.fix_agent.name,
+            "arbitration",
             {"accepted_findings": [item.to_dict() for item in findings]},
         )
         return {"synthesized": findings}
 
-    def _fix_node(self, state: CollaborationState) -> Dict[str, Any]:
+    def _fix_node(self, state: CollaborationState) -> dict[str, Any]:
         fix_ready = {
-            finding_key(item): self.fix_agent.assess(item)
-            for item in state["synthesized"]
+            finding_key(item): self.fix_agent.assess(item) for item in state["synthesized"]
         }
         self._emit(
-            state, self.fix_agent.name, self.verifier.name, "fix_assessment",
+            state,
+            self.fix_agent.name,
+            self.verifier.name,
+            "fix_assessment",
             {"decisions": fix_ready},
         )
         return {"fix_ready": fix_ready}
 
-    def _verify_node(self, state: CollaborationState) -> Dict[str, Any]:
+    def _verify_node(self, state: CollaborationState) -> dict[str, Any]:
         verified = [
-            item for item in state["synthesized"]
+            item
+            for item in state["synthesized"]
             if self.verifier.verify(
-                item, state["reproductions"][finding_key(item)],
+                item,
+                state["reproductions"][finding_key(item)],
                 state["fix_ready"][finding_key(item)],
             )
         ]
         self._emit(
-            state, self.verifier.name, "review-report", "verification_decision",
+            state,
+            self.verifier.name,
+            "review-report",
+            "verification_decision",
             {"approved_findings": [item.to_dict() for item in verified]},
         )
         return {"verified": verified}

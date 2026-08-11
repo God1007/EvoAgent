@@ -24,12 +24,8 @@ class EndToEndEvaluationTests(unittest.TestCase):
         self.assertEqual(100, len(cases))
         self.assertEqual(40, sum(bool(item["expected_findings"]) for item in cases))
         self.assertEqual(60, sum(not item["expected_findings"] for item in cases))
-        validation_repos = {
-            item["repository"] for item in cases if item["split"] == "validation"
-        }
-        holdout_repos = {
-            item["repository"] for item in cases if item["split"] == "holdout"
-        }
+        validation_repos = {item["repository"] for item in cases if item["split"] == "validation"}
+        holdout_repos = {item["repository"] for item in cases if item["split"] == "holdout"}
         self.assertEqual(8, len(validation_repos))
         self.assertEqual(2, len(holdout_repos))
         self.assertFalse(validation_repos & holdout_repos)
@@ -39,15 +35,27 @@ class EndToEndEvaluationTests(unittest.TestCase):
         )
 
     def test_one_to_one_matching_counts_duplicate_prediction_once(self):
-        expected = [{
-            "path": "src/a.py", "start_line": 10, "end_line": 12,
-            "cwe": "CWE-95", "severity": "critical",
-        }]
+        expected = [
+            {
+                "path": "src/a.py",
+                "start_line": 10,
+                "end_line": 12,
+                "cwe": "CWE-95",
+                "severity": "critical",
+            }
+        ]
         predicted = [
             Finding(
-                "SEC-EVAL", Severity.CRITICAL, "a", "long enough explanation",
-                "src/a.py", line, "eval(x)", "replace eval safely",
-                "add malicious input test", 0.9,
+                "SEC-EVAL",
+                Severity.CRITICAL,
+                "a",
+                "long enough explanation",
+                "src/a.py",
+                line,
+                "eval(x)",
+                "replace eval safely",
+                "add malicious input test",
+                0.9,
             )
             for line in (10, 11)
         ]
@@ -60,16 +68,22 @@ class EndToEndEvaluationTests(unittest.TestCase):
         candidate = EndToEndEvaluationHarness(repairer=FixtureRepairer()).run(
             candidate_reviewer(), cases
         )
-        self.assertEqual((25, 5, 15), (
-            baseline["metrics"]["tp"],
-            baseline["metrics"]["fp"],
-            baseline["metrics"]["fn"],
-        ))
-        self.assertEqual((33, 7, 7), (
-            candidate["metrics"]["tp"],
-            candidate["metrics"]["fp"],
-            candidate["metrics"]["fn"],
-        ))
+        self.assertEqual(
+            (25, 5, 15),
+            (
+                baseline["metrics"]["tp"],
+                baseline["metrics"]["fp"],
+                baseline["metrics"]["fn"],
+            ),
+        )
+        self.assertEqual(
+            (33, 7, 7),
+            (
+                candidate["metrics"]["tp"],
+                candidate["metrics"]["fp"],
+                candidate["metrics"]["fn"],
+            ),
+        )
         self.assertEqual(0.7143, baseline["metrics"]["f1"])
         self.assertEqual(0.825, candidate["metrics"]["f1"])
         self.assertEqual(0.9474, candidate["metrics"]["high_risk_recall"])
@@ -88,6 +102,7 @@ class EndToEndEvaluationTests(unittest.TestCase):
         os.close(handle)
         try:
             import json
+
             with open(path, "w", encoding="utf-8") as output:
                 for case in cases:
                     output.write(json.dumps(case, ensure_ascii=False) + "\n")

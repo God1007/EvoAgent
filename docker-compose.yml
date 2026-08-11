@@ -35,9 +35,9 @@ services:
       EVOAGENT_ASYNC_WORKERS: 4
       EVOAGENT_SKILLS_DIR: /app/skills
       EVOAGENT_AUTH_REQUIRED: "true"
-      EVOAGENT_AUTH_SECRET: ${EVOAGENT_AUTH_SECRET:-local-only-change-this-secret-123456}
+      EVOAGENT_AUTH_SECRET: ${EVOAGENT_AUTH_SECRET:?set EVOAGENT_AUTH_SECRET in .env}
       EVOAGENT_BOOTSTRAP_ADMIN_USERNAME: ${EVOAGENT_BOOTSTRAP_ADMIN_USERNAME:-admin}
-      EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD: ${EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD:-evoagent-local-admin}
+      EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD: ${EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD:?set EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD in .env}
     env_file:
       - path: .env
         required: false
@@ -46,6 +46,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
   postgres_data:

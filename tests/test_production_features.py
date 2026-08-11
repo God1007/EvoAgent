@@ -12,7 +12,6 @@ from evoagent.store import TaskStore
 from evoagent.task_queue import TaskQueue
 from evoagent.verifier import RepairVerifier
 
-
 DIFF = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
 
 
@@ -27,8 +26,11 @@ class ProductionFeatureTests(unittest.TestCase):
 
     def test_login_rbac_and_tenant_task_isolation(self):
         auth = AuthManager(
-            self.store, "a" * 32, bootstrap_username="alice",
-            bootstrap_password="correct-horse", default_tenant_id="tenant-a",
+            self.store,
+            "a" * 32,
+            bootstrap_username="alice",
+            bootstrap_password="correct-horse",
+            default_tenant_id="tenant-a",
         )
         token = auth.login("alice", "correct-horse")["access_token"]
         principal = auth.authenticate("Bearer " + token)
@@ -64,16 +66,16 @@ class ProductionFeatureTests(unittest.TestCase):
 
         self.store.create("task", "org/repo", 1, {})
         with self.assertRaises(RuntimeError):
-            ReviewHarness(
-                self.store, BrokenReviewer(), node_retries=0
-            ).run("task", "org/repo", 1, DIFF)
+            ReviewHarness(self.store, BrokenReviewer(), node_retries=0).run(
+                "task", "org/repo", 1, DIFF
+            )
         checkpoints = self.store.load_checkpoints("task")
         self.assertEqual("completed", checkpoints["planning"]["status"])
         self.assertEqual("failed", checkpoints["executing"]["status"])
 
-        report = ReviewHarness(
-            self.store, LocalRuleReviewer(), node_retries=0
-        ).resume("task", "org/repo", 1, DIFF)
+        report = ReviewHarness(self.store, LocalRuleReviewer(), node_retries=0).resume(
+            "task", "org/repo", 1, DIFF
+        )
         self.assertEqual("high", report.risk)
         planning_events = [
             item for item in self.store.get("task")["trace"] if item["state"] == "PLANNING"
@@ -89,7 +91,7 @@ class ProductionFeatureTests(unittest.TestCase):
         for _ in range(100):
             if queue.dead_letters():
                 break
-            time.sleep(.01)
+            time.sleep(0.01)
         letters = queue.dead_letters()
         queue.close()
         self.assertEqual("dead", letters[0]["message_id"])
@@ -108,16 +110,40 @@ class ProductionFeatureTests(unittest.TestCase):
 
     def test_canary_assignment_and_error_budget_rollback(self):
         release = ReleaseManager(self.store)
-        release.configure("tenant", "skill", {
-            "stable_version": 1, "candidate_version": 2,
-            "canary_percent": 100, "shadow_percent": 100,
-            "min_samples": 2, "max_error_rate": .25,
-        })
+        release.configure(
+            "tenant",
+            "skill",
+            {
+                "stable_version": 1,
+                "candidate_version": 2,
+                "canary_percent": 100,
+                "shadow_percent": 100,
+                "min_samples": 2,
+                "max_error_rate": 0.25,
+            },
+        )
         self.assertEqual("canary", release.assignment("tenant", "skill", "task")["lane"])
         release.observe("tenant", "skill", True)
         result = release.observe("tenant", "skill", False)
         self.assertEqual("rolled_back", result["status"])
         self.assertTrue(self.store.list_alerts("tenant"))
+
+    def test_rollout_rejects_invalid_percentage_types(self):
+        release = ReleaseManager(self.store)
+        for value in (True, "not-a-number", [], {}):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "canary_percent must be an integer"),
+            ):
+                release.configure(
+                    "tenant",
+                    "skill",
+                    {
+                        "candidate_version": 2,
+                        "canary_percent": value,
+                        "shadow_percent": 0,
+                    },
+                )
 
     def test_repair_verifier_blocks_invalid_python(self):
         result = RepairVerifier().verify_contents({"app.py": "def broken(:\n"})

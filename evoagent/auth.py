@@ -1,4 +1,5 @@
 """Authentication, signed sessions and tenant-aware role checks."""
+
 import base64
 import hashlib
 import hmac
@@ -6,9 +7,8 @@ import json
 import os
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional
-
 
 ROLE_PERMISSIONS = {
     "admin": {"read", "review", "fix", "manage", "audit"},
@@ -17,7 +17,7 @@ ROLE_PERMISSIONS = {
 }
 
 
-def hash_password(password: str, salt: Optional[bytes] = None) -> str:
+def hash_password(password: str, salt: bytes | None = None) -> str:
     if len(password) < 10:
         raise ValueError("password must contain at least 10 characters")
     salt = salt or os.urandom(16)
@@ -62,8 +62,12 @@ class Principal:
 
 class AuthManager:
     def __init__(
-        self, store, secret: str, ttl_seconds: int = 3600,
-        bootstrap_username: str = "", bootstrap_password: str = "",
+        self,
+        store,
+        secret: str,
+        ttl_seconds: int = 3600,
+        bootstrap_username: str = "",
+        bootstrap_password: str = "",
         default_tenant_id: str = "default",
     ):
         self.store = store
@@ -73,11 +77,13 @@ class AuthManager:
         if bootstrap_username and bootstrap_password:
             self.store.create_user(
                 str(uuid.uuid5(uuid.NAMESPACE_URL, "evoagent:" + bootstrap_username)),
-                bootstrap_username, hash_password(bootstrap_password),
-                default_tenant_id, "admin",
+                bootstrap_username,
+                hash_password(bootstrap_password),
+                default_tenant_id,
+                "admin",
             )
 
-    def login(self, username: str, password: str, tenant_id: str = "") -> Dict[str, object]:
+    def login(self, username: str, password: str, tenant_id: str = "") -> dict[str, object]:
         user = self.store.get_user(username)
         if not user or not user["active"] or not verify_password(password, user["password_hash"]):
             raise PermissionError("invalid username or password")
@@ -87,20 +93,31 @@ class AuthManager:
             raise PermissionError("user is not a member of the requested tenant")
         now = int(time.time())
         payload = {
-            "sub": user["id"], "username": user["username"], "tenant": selected,
-            "role": memberships[selected], "iat": now, "exp": now + self.ttl_seconds,
+            "sub": user["id"],
+            "username": user["username"],
+            "tenant": selected,
+            "role": memberships[selected],
+            "iat": now,
+            "exp": now + self.ttl_seconds,
         }
         token = self._encode(payload)
-        return {"access_token": token, "token_type": "Bearer", "expires_in": self.ttl_seconds,
-                "tenant_id": selected, "role": memberships[selected]}
+        return {
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_in": self.ttl_seconds,
+            "tenant_id": selected,
+            "role": memberships[selected],
+        }
 
     def authenticate(self, authorization: str) -> Principal:
         if not authorization.startswith("Bearer "):
             raise PermissionError("Bearer token is required")
         payload = self._decode(authorization[7:].strip())
         return Principal(
-            str(payload["sub"]), str(payload["username"]),
-            str(payload["tenant"]), str(payload["role"]),
+            str(payload["sub"]),
+            str(payload["username"]),
+            str(payload["tenant"]),
+            str(payload["role"]),
         )
 
     @staticmethod
@@ -109,14 +126,14 @@ class AuthManager:
         if missing:
             raise PermissionError("permission denied")
 
-    def _encode(self, payload: Dict[str, object]) -> str:
+    def _encode(self, payload: dict[str, object]) -> str:
         header = _b64(b'{"alg":"HS256","typ":"JWT"}')
         body = _b64(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
         signing_input = (header + "." + body).encode("ascii")
         signature = _b64(hmac.new(self.secret, signing_input, hashlib.sha256).digest())
         return header + "." + body + "." + signature
 
-    def _decode(self, token: str) -> Dict[str, object]:
+    def _decode(self, token: str) -> dict[str, object]:
         try:
             header, body, supplied = token.split(".", 2)
             signing_input = (header + "." + body).encode("ascii")

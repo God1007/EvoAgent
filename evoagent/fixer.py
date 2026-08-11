@@ -1,16 +1,21 @@
 import ast
 import re
-from datetime import datetime, timezone
-from typing import Dict, List
+from datetime import UTC, datetime
+from typing import Any, TypedDict
 
 from .github import GitHubClient
 from .verifier import RepairVerifier
 
 
+class FixResult(TypedDict):
+    content: str
+    rules: list[str]
+
+
 class SafeFixer:
     """Creates conservative fixes on a dedicated branch; never writes to the PR head."""
 
-    def propose_line(self, line: str, finding: dict) -> str:
+    def propose_line(self, line: str, finding: dict[str, Any]) -> str:
         rule = finding.get("rule_id")
         if rule == "REL-DEBUG-PRINT":
             return ""
@@ -19,18 +24,26 @@ class SafeFixer:
         if rule == "SEC-HARDCODED-SECRET":
             match = re.match(r"(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(['\"]).+?\3\s*$", line)
             if match:
-                return '%s%s = os.environ["%s"]' % (match.group(1), match.group(2), match.group(2).upper())
+                return '%s%s = os.environ["%s"]' % (
+                    match.group(1),
+                    match.group(2),
+                    match.group(2).upper(),
+                )
         return line
 
-    def apply(self, content: str, findings: List[dict], path: str) -> Dict[str, object]:
+    def apply(self, content: str, findings: list[dict[str, Any]], path: str) -> FixResult:
         if path.endswith(".py") and hasattr(ast, "unparse"):
             structured = self._apply_python_ast(content, findings, path)
             if structured["rules"]:
                 return structured
         lines = content.splitlines()
-        changed = []
+        changed: list[str] = []
         needs_os = False
-        for finding in sorted((x for x in findings if x.get("path") == path), key=lambda x: x.get("line", 0), reverse=True):
+        for finding in sorted(
+            (x for x in findings if x.get("path") == path),
+            key=lambda x: x.get("line", 0),
+            reverse=True,
+        ):
             index = int(finding.get("line", 0)) - 1
             if index < 0 or index >= len(lines):
                 continue
@@ -38,19 +51,28 @@ class SafeFixer:
             if replacement != lines[index]:
                 needs_os = needs_os or "os.environ" in replacement
                 lines[index] = replacement
-                changed.append(finding.get("rule_id"))
+                rule_id = finding.get("rule_id")
+                if isinstance(rule_id, str):
+                    changed.append(rule_id)
         if needs_os and not any(re.match(r"\s*(import os|from os import)", line) for line in lines):
             lines.insert(0, "import os")
-        return {"content": "\n".join(lines) + ("\n" if content.endswith("\n") else ""), "rules": changed}
+        return {
+            "content": "\n".join(lines) + ("\n" if content.endswith("\n") else ""),
+            "rules": changed,
+        }
 
     def _apply_python_ast(
-        self, content: str, findings: List[dict], path: str,
-    ) -> Dict[str, object]:
+        self,
+        content: str,
+        findings: list[dict[str, Any]],
+        path: str,
+    ) -> FixResult:
         targets = {
             (int(item.get("line", 0)), item.get("rule_id"))
-            for item in findings if item.get("path") == path
+            for item in findings
+            if item.get("path") == path
         }
-        changed = []
+        changed: list[str] = []
         needs_os = False
 
         class Transformer(ast.NodeTransformer):
@@ -92,9 +114,11 @@ class SafeFixer:
                     node.value = ast.Subscript(
                         value=ast.Attribute(
                             value=ast.Name(id="os", ctx=ast.Load()),
-                            attr="environ", ctx=ast.Load(),
+                            attr="environ",
+                            ctx=ast.Load(),
                         ),
-                        slice=ast.Constant(name.upper()), ctx=ast.Load(),
+                        slice=ast.Constant(name.upper()),
+                        ctx=ast.Load(),
                     )
                     needs_os = True
                     changed.append("SEC-HARDCODED-SECRET")
@@ -120,18 +144,24 @@ class SafeFixer:
         compile(value, path, "exec")
         return {"content": value, "rules": sorted(set(changed))}
 
-    def __init__(self, verifier: RepairVerifier = None):
+    def __init__(self, verifier: RepairVerifier | None = None):
         self.verifier = verifier or RepairVerifier()
 
-    def create_fix_commits(self, client: GitHubClient, repository: str, pull_request: int, report: dict) -> dict:
+    def create_fix_commits(
+        self,
+        client: GitHubClient,
+        repository: str,
+        pull_request: int,
+        report: dict[str, Any],
+    ) -> dict[str, Any]:
         pull = client.get_pull_request(repository, pull_request)
         source_ref = pull["head"]["ref"]
         source_sha = pull["head"]["sha"]
         source_repository = pull["head"].get("repo", {}).get("full_name") or repository
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
         branch = "evoagent/fix-pr-%d-%s" % (pull_request, stamp)
-        planned = []
-        by_path = {}
+        planned: list[tuple[str, dict[str, Any], FixResult]] = []
+        by_path: dict[str, list[dict[str, Any]]] = {}
         for finding in report.get("findings", []):
             by_path.setdefault(finding["path"], []).append(finding)
         for path, findings in by_path.items():
@@ -141,41 +171,55 @@ class SafeFixer:
                 continue
             planned.append((path, current, result))
         if not planned:
-            return {"branch": None, "source_sha": source_sha, "commits": [],
-                    "note": "No finding was eligible for deterministic automatic repair."}
-        verification = self.verifier.verify_contents({
-            path: result["content"] for path, _current, result in planned
-        })
+            return {
+                "branch": None,
+                "source_sha": source_sha,
+                "commits": [],
+                "note": "No finding was eligible for deterministic automatic repair.",
+            }
+        verification = self.verifier.verify_contents(
+            {path: result["content"] for path, _current, result in planned}
+        )
         files = {path: result["content"] for path, _current, result in planned}
         if verification["passed"] and self.verifier.test_command:
             archive = client.download_archive(source_repository, source_sha)
             verification = self.verifier.verify_archive(archive, files)
         if not verification["passed"]:
             return {
-                "branch": None, "source_sha": source_sha, "commits": [],
+                "branch": None,
+                "source_sha": source_sha,
+                "commits": [],
                 "verification": verification,
                 "note": "Repair was blocked because compilation or tests failed.",
             }
         commit = client.create_atomic_commit(
-            repository, branch, source_sha, files,
+            repository,
+            branch,
+            source_sha,
+            files,
             "fix: apply verified EvoAgent repairs for PR #%d" % pull_request,
         )
         draft = client.create_draft_pull_request(
             repository,
             "fix: verified EvoAgent repairs for #%d" % pull_request,
-            branch, pull.get("base", {}).get("ref", "main"),
+            branch,
+            pull.get("base", {}).get("ref", "main"),
             "Automated deterministic repair. All configured compile and test gates passed.",
         )
-        commits = [{
-            "paths": sorted(files),
-            "rules": sorted({
-                rule for _path, _current, result in planned for rule in result["rules"]
-            }),
-            "sha": commit.get("sha"),
-        }]
-        return {"branch": branch, "source_sha": source_sha, "commits": commits,
-                "draft_pull_request": {
-                    "number": draft.get("number"), "url": draft.get("html_url")
-                },
-                "verification": verification,
-                "note": "Verified repairs were published as one atomic commit in a draft pull request."}
+        commits = [
+            {
+                "paths": sorted(files),
+                "rules": sorted(
+                    {rule for _path, _current, result in planned for rule in result["rules"]}
+                ),
+                "sha": commit.get("sha"),
+            }
+        ]
+        return {
+            "branch": branch,
+            "source_sha": source_sha,
+            "commits": commits,
+            "draft_pull_request": {"number": draft.get("number"), "url": draft.get("html_url")},
+            "verification": verification,
+            "note": "Verified repairs were published as one atomic commit in a draft pull request.",
+        }

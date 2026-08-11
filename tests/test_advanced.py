@@ -1,3 +1,4 @@
+import ast
 import os
 import tempfile
 import time
@@ -13,9 +14,18 @@ from evoagent.store import TaskStore
 
 def settings(path):
     return Settings(
-        host="127.0.0.1", port=8080, db_path=path, max_diff_bytes=10000,
-        max_steps=8, timeout_seconds=10, llm_base_url="", llm_api_key="", llm_model="",
-        github_webhook_secret="", github_token="", auto_post_review=False,
+        host="127.0.0.1",
+        port=8080,
+        db_path=path,
+        max_diff_bytes=10000,
+        max_steps=8,
+        timeout_seconds=10,
+        llm_base_url="",
+        llm_api_key="",
+        llm_model="",
+        github_webhook_secret="",
+        github_token="",
+        auto_post_review=False,
         skills_dir="skills",
     )
 
@@ -37,7 +47,13 @@ class AdvancedFeatureTests(unittest.TestCase):
         ]
         result = SafeFixer().apply(content, findings, "app.py")
         self.assertIn("import os", result["content"])
-        self.assertIn('password = os.environ["PASSWORD"]', result["content"])
+        tree = ast.parse(result["content"])
+        assignment = next(node for node in tree.body if isinstance(node, ast.Assign))
+        self.assertEqual(
+            "Subscript(value=Attribute(value=Name(id='os', ctx=Load()), "
+            "attr='environ', ctx=Load()), slice=Constant(value='PASSWORD'), ctx=Load())",
+            ast.dump(assignment.value),
+        )
         self.assertIn("eval(user_input)", result["content"])
         self.assertNotIn("print(result)", result["content"])
         self.assertEqual({"SEC-HARDCODED-SECRET", "REL-DEBUG-PRINT"}, set(result["rules"]))
@@ -75,8 +91,11 @@ class AdvancedFeatureTests(unittest.TestCase):
         store = TaskStore(self.path)
         diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
         store.save_evaluation_case(
-            "eval-case", "validation", diff,
-            [{"path": "a.py", "line": 1, "min_severity": "high"}], "test",
+            "eval-case",
+            "validation",
+            diff,
+            [{"path": "a.py", "line": 1, "min_severity": "high"}],
+            "test",
         )
 
         class PromptAwareReviewer:
@@ -87,14 +106,28 @@ class AdvancedFeatureTests(unittest.TestCase):
                 if "improved" not in self.prompt:
                     return []
                 line = parsed.added_lines[0]
-                return [Finding(
-                    "SEC-EVAL", Severity.CRITICAL, "eval", "danger", line.path, line.line,
-                    line.content, "replace it", "add a test", 0.9,
-                )]
+                return [
+                    Finding(
+                        "SEC-EVAL",
+                        Severity.CRITICAL,
+                        "eval",
+                        "danger",
+                        line.path,
+                        line.line,
+                        line.content,
+                        "replace it",
+                        "add a test",
+                        0.9,
+                    )
+                ]
 
         engine = EvolutionEngine(
-            store, reviewer_factory=PromptAwareReviewer, min_cases=1,
-            max_cases=1, min_improvement=0.01, seed_defaults=False,
+            store,
+            reviewer_factory=PromptAwareReviewer,
+            min_cases=1,
+            max_cases=1,
+            min_improvement=0.01,
+            seed_defaults=False,
         )
         result = engine.propose(
             "llm-review",
@@ -149,23 +182,35 @@ class AdvancedFeatureTests(unittest.TestCase):
             "id": 1,
             "name": "semantic-match",
             "diff": "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n",
-            "expected": [{
-                "path": "a.py", "line": 1, "rule_id": "SEC-EVAL",
-                "min_severity": "high",
-            }],
+            "expected": [
+                {
+                    "path": "a.py",
+                    "line": 1,
+                    "rule_id": "SEC-EVAL",
+                    "min_severity": "high",
+                }
+            ],
         }
 
         class WrongRuleReviewer:
             def review(self, _diff, parsed):
                 line = parsed.added_lines[0]
-                return [Finding(
-                    "REL-DEBUG-PRINT", Severity.CRITICAL, "wrong", "wrong category",
-                    line.path, line.line, line.content, "fix", "test", 0.9,
-                )]
+                return [
+                    Finding(
+                        "REL-DEBUG-PRINT",
+                        Severity.CRITICAL,
+                        "wrong",
+                        "wrong category",
+                        line.path,
+                        line.line,
+                        line.content,
+                        "fix",
+                        "test",
+                        0.9,
+                    )
+                ]
 
-        metrics = RegressionEvaluator(lambda _prompt: WrongRuleReviewer()).run(
-            "prompt", [case]
-        )
+        metrics = RegressionEvaluator(lambda _prompt: WrongRuleReviewer()).run("prompt", [case])
         self.assertEqual(0, metrics["case_results"][0]["tp"])
         self.assertEqual(1, metrics["case_results"][0]["fp"])
         self.assertEqual(1, metrics["case_results"][0]["fn"])
@@ -175,11 +220,18 @@ class AdvancedFeatureTests(unittest.TestCase):
         validation_diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
         holdout_diff = "--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n-old\n+safe_call(data)\n"
         store.save_evaluation_case(
-            "validation-positive", "validation", validation_diff,
-            [{"path": "a.py", "line": 1, "min_severity": "high"}], "test",
+            "validation-positive",
+            "validation",
+            validation_diff,
+            [{"path": "a.py", "line": 1, "min_severity": "high"}],
+            "test",
         )
         store.save_evaluation_case(
-            "secret-holdout-clean", "holdout", holdout_diff, [], "test",
+            "secret-holdout-clean",
+            "holdout",
+            holdout_diff,
+            [],
+            "test",
         )
 
         class HoldoutAwareReviewer:
@@ -189,20 +241,44 @@ class AdvancedFeatureTests(unittest.TestCase):
             def review(self, diff, parsed):
                 line = parsed.added_lines[0]
                 if "eval(data)" in diff and "candidate" in self.prompt:
-                    return [Finding(
-                        "SEC-EVAL", Severity.CRITICAL, "eval", "danger", line.path,
-                        line.line, line.content, "fix", "test", 0.9,
-                    )]
+                    return [
+                        Finding(
+                            "SEC-EVAL",
+                            Severity.CRITICAL,
+                            "eval",
+                            "danger",
+                            line.path,
+                            line.line,
+                            line.content,
+                            "fix",
+                            "test",
+                            0.9,
+                        )
+                    ]
                 if "safe_call(data)" in diff and "candidate" in self.prompt:
-                    return [Finding(
-                        "FAKE", Severity.HIGH, "false positive", "not a defect", line.path,
-                        line.line, line.content, "fix", "test", 0.9,
-                    )]
+                    return [
+                        Finding(
+                            "FAKE",
+                            Severity.HIGH,
+                            "false positive",
+                            "not a defect",
+                            line.path,
+                            line.line,
+                            line.content,
+                            "fix",
+                            "test",
+                            0.9,
+                        )
+                    ]
                 return []
 
         engine = EvolutionEngine(
-            store, reviewer_factory=HoldoutAwareReviewer, min_cases=1, max_cases=2,
-            min_holdout_cases=1, seed_defaults=False,
+            store,
+            reviewer_factory=HoldoutAwareReviewer,
+            min_cases=1,
+            max_cases=2,
+            min_holdout_cases=1,
+            seed_defaults=False,
         )
         result = engine.propose(
             "llm-review",
@@ -227,21 +303,19 @@ class AdvancedFeatureTests(unittest.TestCase):
         store = TaskStore(self.path)
         diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
         expected = [{"path": "a.py", "line": 1, "min_severity": "high"}]
-        first = store.save_evaluation_case(
-            "stable-case-v1", "validation", diff, expected, "test"
-        )
+        first = store.save_evaluation_case("stable-case-v1", "validation", diff, expected, "test")
         repeated = store.save_evaluation_case(
             "stable-case-v1", "validation", diff, expected, "test"
         )
         self.assertEqual(first["id"], repeated["id"])
         with self.assertRaisesRegex(ValueError, "immutable"):
-            store.save_evaluation_case(
-                "stable-case-v1", "validation", diff, [], "test"
-            )
+            store.save_evaluation_case("stable-case-v1", "validation", diff, [], "test")
 
     def test_async_multi_agent_review(self):
         service = ReviewService(settings(self.path))
-        diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1,2 @@\n-old\n+eval(data)\n+# TODO finish validation\n"
+        diff = (
+            "--- a/a.py\n+++ b/a.py\n@@ -1 +1,2 @@\n-old\n+eval(data)\n+# TODO finish validation\n"
+        )
         result = service.enqueue_review("org/repo", diff, 2)
         task = None
         for _ in range(50):
@@ -251,8 +325,10 @@ class AdvancedFeatureTests(unittest.TestCase):
             time.sleep(0.02)
         service.queue.close()
         self.assertEqual("SUCCESS", task["state"])
-        self.assertEqual({"SEC-EVAL", "QUALITY-UNFINISHED"},
-                         {item["rule_id"] for item in task["report"]["findings"]})
+        self.assertEqual(
+            {"SEC-EVAL", "QUALITY-UNFINISHED"},
+            {item["rule_id"] for item in task["report"]["findings"]},
+        )
 
 
 if __name__ == "__main__":

@@ -76,6 +76,31 @@ class Finding:
         )
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
+    def scoped_fingerprint(self, repository: str, symbol: str = "") -> str:
+        """Repository-scoped identity for cross-PR / cross-repo de-duplication.
+
+        ``fingerprint`` identifies a finding *within a single review*, but two
+        different repositories can legitimately produce the same file, rule and
+        evidence. The session and repository-memory layers must therefore bind
+        the repository (and, once the code graph lands, a normalised symbol) so a
+        finding in repo A is never confused with an identical-looking finding in
+        repo B. ``symbol`` defaults to the file path as a stable proxy until
+        real symbol extraction is available.
+
+        Composition follows the roadmap: repository + rule_id + normalised
+        symbol + title + semantic-evidence hash, JSON-encoded so no field value
+        can be confused with a delimiter.
+        """
+        normalized_evidence = _WHITESPACE.sub(" ", self.evidence).strip()
+        normalized_title = _WHITESPACE.sub(" ", self.title).strip()
+        normalized_symbol = symbol or self.path
+        raw = json.dumps(
+            [repository, self.rule_id, normalized_symbol, normalized_title, normalized_evidence],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
         value["severity"] = self.severity.value

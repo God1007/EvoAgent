@@ -10,6 +10,7 @@
 [![CI](https://github.com/God1007/EvoAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/God1007/EvoAgent/actions/workflows/ci.yml)
 [![Security](https://github.com/God1007/EvoAgent/actions/workflows/security.yml/badge.svg)](https://github.com/God1007/EvoAgent/actions/workflows/security.yml)
 [![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Coverage](https://img.shields.io/badge/coverage-~83%25-brightgreen)](docs/evaluation.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![PostgreSQL](https://img.shields.io/badge/Storage-SQLite%20%7C%20PostgreSQL-4169E1?logo=postgresql&logoColor=white)](#运行模式)
@@ -576,6 +577,57 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 | `POST` | `/v1/tasks/{id}/feedback` | 记录误报、漏报、坏修复或已接受反馈 |
 | `POST` | `/v1/tasks/{id}/fix` | 创建经过验证的修复分支和 Draft PR |
 
+### PR 会话（多轮连续审查）
+
+同一个 Pull Request 的多次 push 会归属到同一个 **会话（Session）**，每次 `synchronize`
+追加一个 **轮次（Turn）**。系统用仓库维度、行号无关的 Finding 指纹在轮次间做连续性判定：
+仍存在的问题会被 **携带（still-open）** 而非重复播报，已消失的问题会被 **自动关闭（resolved）**，
+文件搬移或缩进变化的问题会被识别为 **移动（moved）**。PR 评论使用稳定的会话 Marker
+持续原地更新，并附带「新增/仍存在/已修复/移动」连续性摘要。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/v1/sessions?repository={owner/repo}&pull_request={n}` | 按 PR 获取会话时间线 |
+| `GET` | `/v1/sessions/{session_id}` | 获取会话时间线（各轮次与 Finding 状态） |
+| `POST` | `/v1/sessions/{session_id}/input` | 为 input-required 会话补充人类输入并恢复 |
+
+> 说明：符号级增量复查（仅重跑受影响符号以节省 token）依赖阶段三的代码知识图谱；
+> 当前会话层已实现跨轮次的 Finding 连续性、状态流转与稳定评论。
+
+### 代码知识图谱（影响面 / Blast Radius）
+
+基于标准库 `ast` 的轻量 Python 符号图谱：抽取模块限定的函数/类/方法符号，构建
+按名解析的调用边与模块导入边，回答「改了这些文件，哪些符号在影响半径内」。用于
+增量复查的优先级排序与「你依赖的函数刚被改动」提示。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/v1/codegraph/impact` | 传入 `{files:{path:source}, changed:[path]}`，返回变更符号、受影响符号（逆向调用可达）与导入相关文件 |
+
+> 限制：当前仅支持 Python，调用边按短名解析（偏向多连而非漏连），多语言与精确
+> 解析（Tree-sitter/SCIP）为后续工作。
+
+### Proof Runner（证据等级 L1–L4）
+
+把「这是个 bug」的判断升级为可执行证据。在沙箱化的 `RepairVerifier` 中运行
+「补丁前失败、补丁后通过」的最小复现，并按证据阶梯给出结论，同时返回补丁前后
+命令输出与统一 diff：
+
+- **L1 静态**：仅静态信号或无可运行复现；
+- **L2 已复现**：复现命令在原始代码上失败，问题真实可见；
+- **L3 修复已验证**：应用补丁后同一复现通过；
+- **L4 回归洁净**：达到 L3 且回归套件仍通过。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/v1/proofs` | 传入 `{original, patched, reproduction_command, regression_command?}`，返回证据等级、逐步结果与补丁 diff |
+
+> 复现契约：命令必须在 `original` 上失败、在 `patched` 上通过。仅「原始代码上真实
+> 非零退出」才算复现；超时/启动失败等基础设施问题一律判为「不确定」而不冒充证据。
+> 由于该路径同时运行不可信 PR 代码与调用方提供的命令，**证据运行强制要求容器隔离**：
+> 未配置 `EVOAGENT_REPAIR_CONTAINER_IMAGE` 时该步返回 error 并停留在 L1，绝不在宿主机执行。
+> 强隔离 microVM（Firecracker/Kata）与托管静态分析（CodeQL）为后续工作。
+
 ### GitHub、Skill 与演进
 
 | 方法 | 路径 | 说明 |
@@ -680,7 +732,9 @@ make check
 
 当前整体行覆盖率约 83%，其中 `reviewer`、`fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
 
-GitHub 额外执行 Gitleaks、CodeQL 和每周依赖审计。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)，边界适配器的集成测试范围与后续收敛计划记录在 [`docs/adr/0001-engineering-quality-gates.md`](docs/adr/0001-engineering-quality-gates.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
+GitHub 额外执行 Gitleaks、CodeQL、依赖审计和 Docker 构建冒烟测试（构建镜像、启动容器并校验 `/health` 与 `/v1/reviews`）。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)，边界适配器的集成测试范围与后续收敛计划记录在 [`docs/adr/0001-engineering-quality-gates.md`](docs/adr/0001-engineering-quality-gates.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
+
+更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)。
 
 ## 测试与评测
 

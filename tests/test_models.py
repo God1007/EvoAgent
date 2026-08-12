@@ -70,6 +70,39 @@ class FindingFingerprintTests(unittest.TestCase):
         self.assertEqual(finding.fingerprint(), finding.to_dict()["fingerprint"])
 
 
+class ScopedFingerprintTests(unittest.TestCase):
+    def test_same_finding_differs_across_repositories(self):
+        finding = _finding()
+        self.assertNotEqual(
+            finding.scoped_fingerprint("org/a"),
+            finding.scoped_fingerprint("org/b"),
+        )
+
+    def test_same_repo_and_finding_is_stable_across_lines(self):
+        self.assertEqual(
+            _finding(line=1).scoped_fingerprint("org/a"),
+            _finding(line=900).scoped_fingerprint("org/a"),
+        )
+
+    def test_symbol_override_participates_in_identity(self):
+        finding = _finding()
+        self.assertNotEqual(
+            finding.scoped_fingerprint("org/a", symbol="mod.f"),
+            finding.scoped_fingerprint("org/a", symbol="mod.g"),
+        )
+
+    def test_symbol_defaults_to_path(self):
+        finding = _finding(path="app/x.py")
+        self.assertEqual(
+            finding.scoped_fingerprint("org/a"),
+            finding.scoped_fingerprint("org/a", symbol="app/x.py"),
+        )
+
+    def test_scoped_differs_from_unscoped(self):
+        finding = _finding()
+        self.assertNotEqual(finding.fingerprint(), finding.scoped_fingerprint("org/a"))
+
+
 class FindingFromDictTests(unittest.TestCase):
     def test_round_trip_preserves_fields_and_drops_derived_key(self):
         original = _finding()

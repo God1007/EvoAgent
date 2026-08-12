@@ -78,6 +78,7 @@ class RepairVerifier:
         if not self.test_command:
             return {
                 "passed": True,
+                "status": "skipped",
                 "checks": [],
                 "note": "No repository test command configured.",
                 "duration_seconds": 0.0,
@@ -87,17 +88,24 @@ class RepairVerifier:
             raise ValueError("verification worktree does not exist")
         started = time.monotonic()
         if self.container_image:
-            passed, detail = self._run_in_container(root)
+            status, detail = self._run_in_container(root)
         elif self.require_container:
-            passed, detail = (
-                False,
+            status, detail = (
+                "error",
                 "container isolation is required but no repair container image is configured.",
             )
         else:
-            passed, detail = self._run_on_host(root)
+            status, detail = self._run_on_host(root)
+        passed = status == "passed"
+        # ``status`` distinguishes a genuine non-zero test result ("failed") from
+        # non-verdict outcomes ("timeout"/"error") so callers such as the Proof
+        # Runner never misread an infra failure as a reproduced bug.
         return {
             "passed": passed,
-            "checks": [{"name": "repository-tests", "passed": passed, "detail": detail}],
+            "status": status,
+            "checks": [
+                {"name": "repository-tests", "passed": passed, "status": status, "detail": detail}
+            ],
             "duration_seconds": round(time.monotonic() - started, 4),
         }
 
@@ -176,7 +184,7 @@ class RepairVerifier:
                 pass
         process.kill()
 
-    def _run_on_host(self, root: str) -> tuple[bool, str]:
+    def _run_on_host(self, root: str) -> tuple[str, str]:
         env = {
             key: value
             for key, value in os.environ.items()
@@ -201,10 +209,12 @@ class RepairVerifier:
                 command = ["/bin/sh", "-c", prelude]
             returncode, detail, timed_out = self._execute(command, cwd=root, env=env)
         if timed_out:
-            return False, "verification exceeded %d seconds" % self.timeout_seconds
-        return returncode == 0, detail
+            return "timeout", "verification exceeded %d seconds" % self.timeout_seconds
+        if returncode is None:
+            return "error", detail
+        return ("passed" if returncode == 0 else "failed"), detail
 
-    def _run_in_container(self, root: str) -> tuple[bool, str]:
+    def _run_in_container(self, root: str) -> tuple[str, str]:
         name = "evoagent-verify-%s" % uuid.uuid4().hex[:12]
         file_bytes = self.max_file_mb * 1024 * 1024
         command = [
@@ -245,8 +255,10 @@ class RepairVerifier:
             subprocess.run(
                 ["docker", "rm", "-f", name], capture_output=True, text=True, check=False
             )
-            return False, "verification exceeded %d seconds" % self.timeout_seconds
-        return returncode == 0, detail
+            return "timeout", "verification exceeded %d seconds" % self.timeout_seconds
+        if returncode is None:
+            return "error", detail
+        return ("passed" if returncode == 0 else "failed"), detail
 
     def verify_archive(self, archive: bytes, files: dict[str, str]) -> dict:
         """Verify changed files inside an isolated copy of the complete repository."""

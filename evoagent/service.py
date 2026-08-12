@@ -4,6 +4,7 @@ from typing import Any
 
 from .agents import FilteredAgent, MultiAgentCoordinator
 from .auth import AuthManager
+from .codegraph import build_graph
 from .config import Settings
 from .diff_parser import parse_unified_diff
 from .evolution import EvolutionEngine
@@ -14,9 +15,11 @@ from .metrics import metrics
 from .models import TaskState, TraceEvent
 from .observability import AlertManager, Observability
 from .postgres_store import create_store
+from .proof import ProofRunner
 from .report import to_markdown
 from .reviewer import LocalRuleReviewer, OpenAICompatibleReviewer
 from .rollout import ReleaseManager
+from .session import classify_findings, continuity_summary, open_snapshot
 from .skills import SkillRegistry
 from .store import utc_now
 from .task_queue import PermanentTaskError, TaskQueue
@@ -231,6 +234,144 @@ class ReviewService:
             )
             metrics.inc("shadow_reviews_failed_total")
 
+    def _record_session_turn(self, payload: dict[str, Any], report) -> str:
+        """Classify this turn's findings for continuity and persist the snapshot.
+
+        Returns a short markdown continuity footer for the PR comment, or an
+        empty string when there is no session context or this is the first turn.
+        """
+        session_id = payload.get("session_id")
+        turn_id = payload.get("turn_id")
+        if not session_id or not turn_id:
+            return ""
+        repository = payload["repository"]
+        previous = self.store.previous_open_snapshot(session_id, turn_id)
+        classified = classify_findings(repository, previous, list(report.findings))
+        summary = continuity_summary(classified)
+        snapshots = open_snapshot(repository, classified)
+        self.store.complete_session_turn(
+            session_id,
+            turn_id,
+            payload.get("task_id"),
+            snapshots,
+            summary,
+            payload.get("head_sha"),
+        )
+        metrics.inc("session_turns_total")
+        if not previous:
+            return ""
+        return self._continuity_note(summary)
+
+    @staticmethod
+    def _continuity_note(summary: dict[str, int]) -> str:
+        return "> **会话连续性** — 新增 %d · 仍存在 %d · 已修复 %d · 移动 %d（当前未解决 %d）" % (
+            summary["new"],
+            summary["still_open"],
+            summary["resolved"],
+            summary["moved"],
+            summary["open"],
+        )
+
+    def get_session_timeline(
+        self, session_id: str, tenant_id: str | None = None
+    ) -> dict[str, Any] | None:
+        return self.store.get_session_timeline(session_id, tenant_id)
+
+    def get_session_for_pull_request(
+        self, repository: str, pull_request: int, tenant_id: str = "default"
+    ) -> dict[str, Any] | None:
+        session = self.store.get_session(tenant_id, repository, pull_request)
+        if not session:
+            return None
+        return self.store.get_session_timeline(session["id"], tenant_id)
+
+    def provide_session_input(
+        self, session_id: str, message: str, tenant_id: str | None = None
+    ) -> dict[str, Any]:
+        """Record a human reply to an input-required session and reopen it."""
+        timeline = self.store.get_session_timeline(session_id, tenant_id)
+        if timeline is None:
+            raise ValueError("session not found")
+        self.store.resolve_session_input(session_id)
+        self.store.audit(
+            tenant_id or timeline.get("tenant_id", "default"),
+            "user",
+            "session.input.provided",
+            session_id,
+            {"message": message[:2000]},
+        )
+        return {"session_id": session_id, "status": "open"}
+
+    def analyze_impact(self, sources: dict[str, Any], changed_paths: list[Any]) -> dict[str, Any]:
+        """Build a Python code graph from the supplied sources and return the
+        blast radius of the changed files (impacted symbols + importing files)."""
+        if not isinstance(sources, dict) or not isinstance(changed_paths, list):
+            raise ValueError("'files' object and 'changed' list are required")
+        clean = {
+            path: text
+            for path, text in sources.items()
+            if isinstance(path, str) and isinstance(text, str)
+        }
+        if len(clean) > 5000:
+            raise ValueError("too many files to analyse in a single request")
+        total = sum(len(text.encode("utf-8")) for text in clean.values())
+        if total > self.settings.max_diff_bytes * 10:
+            raise ValueError("source payload exceeds the maximum analysable size")
+        graph = build_graph(clean)
+        return graph.impact_of([path for path in changed_paths if isinstance(path, str)])
+
+    def _proof_verifier(self, command: str) -> RepairVerifier:
+        # The proof path runs BOTH untrusted PR code and an operator/attacker
+        # supplied command, so it is strictly more dangerous than a repo-test
+        # run. Container isolation is therefore forced here regardless of the
+        # global repair setting: without a configured image the run reports
+        # ``error`` and the ladder stays at L1 rather than shelling out on host.
+        return RepairVerifier(
+            command,
+            self.settings.repair_verify_timeout_seconds,
+            container_image=self.settings.repair_container_image,
+            memory_mb=self.settings.repair_memory_mb,
+            pids_limit=self.settings.repair_pids_limit,
+            cpus=self.settings.repair_cpus,
+            require_container=True,
+            max_output_bytes=self.settings.repair_max_output_bytes,
+        )
+
+    def run_proof(
+        self,
+        original_files: dict[str, Any],
+        patched_files: dict[str, Any],
+        reproduction_command: str = "",
+        regression_command: str = "",
+    ) -> dict[str, Any]:
+        """Grade a claim on the evidence ladder by running a before/after
+        reproduction (and optional regression) in the sandboxed verifier."""
+        if not isinstance(original_files, dict) or not isinstance(patched_files, dict):
+            raise ValueError("'original' and 'patched' file maps are required")
+        original = {
+            path: text
+            for path, text in original_files.items()
+            if isinstance(path, str) and isinstance(text, str)
+        }
+        patched = {
+            path: text
+            for path, text in patched_files.items()
+            if isinstance(path, str) and isinstance(text, str)
+        }
+        total = sum(
+            len(text.encode("utf-8")) for text in list(original.values()) + list(patched.values())
+        )
+        if total > self.settings.max_diff_bytes * 10:
+            raise ValueError("proof payload exceeds the maximum analysable size")
+        result = ProofRunner(self._proof_verifier).prove(
+            original,
+            patched,
+            str(reproduction_command or ""),
+            str(regression_command or ""),
+        )
+        metrics.inc("proof_runs_total")
+        return result
+
     def reload_skills(self) -> list:
         if self.llm_config:
             active = self.store.get_active_skill_version("llm-review")
@@ -427,13 +568,18 @@ class ReviewService:
             metrics.inc("reviews_total")
             lane = (task.get("input") or {}).get("release_lane", "stable")
             self.releases.observe(tenant_id, "llm-review", False, lane)
+            continuity = self._record_session_turn(payload, report)
             if payload.get("github_issue_url") and self.settings.auto_post_review:
                 client = self.github_client_for_installation(payload.get("installation_id"))
-                client.upsert_comment(
-                    payload["github_issue_url"],
-                    to_markdown(report.to_dict()),
-                    "<!-- evoagent-review:%s -->" % task_id,
+                body = to_markdown(report.to_dict())
+                if continuity:
+                    body += "\n\n" + continuity
+                marker = (
+                    "<!-- evoagent-session:%s -->" % payload["session_id"]
+                    if payload.get("session_id")
+                    else "<!-- evoagent-review:%s -->" % task_id
                 )
+                client.upsert_comment(payload["github_issue_url"], body, marker)
         except Exception:
             metrics.inc("reviews_failed_total")
             lane = (task.get("input") or {}).get("release_lane", "stable")
@@ -500,12 +646,20 @@ class ReviewService:
         if not repository or not isinstance(number, int) or not diff_url:
             raise ValueError("invalid GitHub pull_request payload")
         self._authorize_repository(tenant_id, repository)
+        head_sha = (pull.get("head") or {}).get("sha")
+        session = self.store.start_session_turn(tenant_id, repository, number, head_sha, action)
         task_id = self._create_deferred_task(
             repository,
             number,
             "github-webhook",
             tenant_id,
-            {"diff_url": diff_url},
+            {
+                "diff_url": diff_url,
+                "session_id": session["session_id"],
+                "turn_id": session["turn_id"],
+                "head_sha": head_sha,
+                "trigger": action,
+            },
         )
         self.queue.submit(
             {
@@ -516,6 +670,9 @@ class ReviewService:
                 "installation_id": installation_id,
                 "tenant_id": tenant_id,
                 "diff_url": diff_url,
+                "session_id": session["session_id"],
+                "turn_id": session["turn_id"],
+                "head_sha": head_sha,
             },
             message_id=task_id,
         )
@@ -524,6 +681,8 @@ class ReviewService:
             "task_id": task_id,
             "state": "PENDING",
             "queue": self.queue.backend,
+            "session_id": session["session_id"],
+            "turn": session["sequence"],
         }
         self.store.complete_webhook(delivery_id, task_id)
         result["will_post_to_github"] = self.settings.auto_post_review

@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import threading
+import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -240,6 +241,53 @@ class TaskStore:
                 )"""
             )
             conn.execute(
+                """CREATE TABLE IF NOT EXISTS review_sessions (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL,
+                    repository TEXT NOT NULL,
+                    pull_request INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    latest_head_sha TEXT,
+                    pending_input TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(tenant_id, repository, pull_request)
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS session_turns (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    task_id TEXT,
+                    head_sha TEXT,
+                    trigger TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    summary_json TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(session_id, sequence),
+                    FOREIGN KEY(session_id) REFERENCES review_sessions(id)
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS session_findings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(turn_id) REFERENCES session_turns(id)
+                )"""
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_session_turns_session "
+                "ON session_turns(session_id, sequence)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_session_findings_turn ON session_findings(turn_id)"
+            )
+            conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tasks_tenant_created ON tasks(tenant_id, created_at)"
             )
 
@@ -358,6 +406,189 @@ class TaskStore:
                     json.dumps(message.get("content", {}), ensure_ascii=False),
                     utc_now(),
                 ),
+            )
+
+    def start_session_turn(
+        self,
+        tenant_id: str,
+        repository: str,
+        pull_request: int,
+        head_sha: str | None,
+        trigger: str,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Open (or reuse) the session for a PR and append a new turn.
+
+        Returns the session/turn ids plus the previous turn's open-finding
+        snapshot so the caller can classify the current findings for continuity.
+        """
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            # Atomic get-or-create: INSERT OR IGNORE closes the SELECT/INSERT race
+            # so a concurrent opened+synchronize pair cannot create two sessions.
+            new_id = str(uuid.uuid4())
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO review_sessions(id,tenant_id,repository,pull_request,"
+                "status,latest_head_sha,created_at,updated_at) VALUES (?,?,?,?,'open',?,?,?)",
+                (new_id, tenant_id, repository, pull_request, head_sha, now, now),
+            )
+            is_new = cursor.rowcount > 0
+            row = conn.execute(
+                "SELECT id, latest_head_sha FROM review_sessions "
+                "WHERE tenant_id=? AND repository=? AND pull_request=?",
+                (tenant_id, repository, pull_request),
+            ).fetchone()
+            session_id = row["id"]
+            previous_head = None if is_new else row["latest_head_sha"]
+            sequence = (
+                int(
+                    conn.execute(
+                        "SELECT COALESCE(MAX(sequence),0) AS m FROM session_turns WHERE session_id=?",
+                        (session_id,),
+                    ).fetchone()["m"]
+                )
+                + 1
+            )
+            turn_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO session_turns(id,session_id,task_id,head_sha,trigger,sequence,created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (turn_id, session_id, task_id, head_sha, trigger, sequence, now),
+            )
+            previous = self._previous_open_snapshot(conn, session_id, turn_id)
+        return {
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "sequence": sequence,
+            "is_new_session": is_new,
+            "previous_head_sha": previous_head,
+            "previous_findings": previous,
+        }
+
+    @staticmethod
+    def _previous_open_snapshot(
+        conn: sqlite3.Connection, session_id: str, current_turn_id: str
+    ) -> list[dict[str, Any]]:
+        # Diff against the most recent *completed, strictly-earlier* turn. Using
+        # the sequence (not just "not me") makes classification deterministic even
+        # when a later push finishes its review before an earlier one.
+        row = conn.execute(
+            "SELECT id FROM session_turns WHERE session_id=? AND summary_json IS NOT NULL "
+            "AND sequence < (SELECT sequence FROM session_turns WHERE id=?) "
+            "ORDER BY sequence DESC LIMIT 1",
+            (session_id, current_turn_id),
+        ).fetchone()
+        if row is None:
+            return []
+        rows = conn.execute(
+            "SELECT snapshot_json FROM session_findings WHERE turn_id=? ORDER BY id",
+            (row["id"],),
+        ).fetchall()
+        return [json.loads(item["snapshot_json"]) for item in rows]
+
+    def complete_session_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        task_id: str | None,
+        open_snapshots: list[dict[str, Any]],
+        summary: dict[str, Any],
+        head_sha: str | None = None,
+    ) -> None:
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM session_findings WHERE turn_id=?", (turn_id,))
+            for snap in open_snapshots:
+                conn.execute(
+                    "INSERT INTO session_findings(session_id,turn_id,fingerprint,status,"
+                    "snapshot_json,created_at) VALUES (?,?,?,?,?,?)",
+                    (
+                        session_id,
+                        turn_id,
+                        snap.get("fingerprint", ""),
+                        snap.get("status", ""),
+                        json.dumps(snap, ensure_ascii=False),
+                        now,
+                    ),
+                )
+            conn.execute(
+                "UPDATE session_turns SET task_id=COALESCE(?, task_id), summary_json=?, "
+                "head_sha=COALESCE(?, head_sha) WHERE id=?",
+                (task_id, json.dumps(summary, ensure_ascii=False), head_sha, turn_id),
+            )
+            conn.execute(
+                "UPDATE review_sessions SET latest_head_sha=COALESCE(?, latest_head_sha), "
+                "updated_at=? WHERE id=?",
+                (head_sha, now, session_id),
+            )
+
+    def previous_open_snapshot(self, session_id: str, turn_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            return self._previous_open_snapshot(conn, session_id, turn_id)
+
+    def get_session(
+        self, tenant_id: str, repository: str, pull_request: int
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM review_sessions "
+                "WHERE tenant_id=? AND repository=? AND pull_request=?",
+                (tenant_id, repository, pull_request),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def get_session_timeline(
+        self, session_id: str, tenant_id: str | None = None, turn_limit: int = 200
+    ) -> dict[str, Any] | None:
+        turn_limit = max(1, min(turn_limit, 500))
+        with self._connect() as conn:
+            if tenant_id is None:
+                srow = conn.execute(
+                    "SELECT * FROM review_sessions WHERE id=?", (session_id,)
+                ).fetchone()
+            else:
+                srow = conn.execute(
+                    "SELECT * FROM review_sessions WHERE id=? AND tenant_id=?",
+                    (session_id, tenant_id),
+                ).fetchone()
+            if srow is None:
+                return None
+            # Most recent turns only, returned in chronological order.
+            turns = conn.execute(
+                "SELECT id,task_id,head_sha,trigger,sequence,summary_json,created_at "
+                "FROM session_turns WHERE session_id=? ORDER BY sequence DESC LIMIT ?",
+                (session_id, turn_limit),
+            ).fetchall()
+            turns = list(reversed(turns))
+            timeline = dict(srow)
+            turn_list = []
+            for turn in turns:
+                item = dict(turn)
+                summary = item.pop("summary_json")
+                item["summary"] = json.loads(summary) if summary else None
+                findings = conn.execute(
+                    "SELECT snapshot_json FROM session_findings WHERE turn_id=? ORDER BY id",
+                    (item["id"],),
+                ).fetchall()
+                item["findings"] = [json.loads(row["snapshot_json"]) for row in findings]
+                turn_list.append(item)
+            timeline["turns"] = turn_list
+            return timeline
+
+    def set_session_input_required(self, session_id: str, prompt: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE review_sessions SET status='input-required', pending_input=?, "
+                "updated_at=? WHERE id=?",
+                (prompt[:4000], utc_now(), session_id),
+            )
+
+    def resolve_session_input(self, session_id: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE review_sessions SET status='open', pending_input=NULL, "
+                "updated_at=? WHERE id=?",
+                (utc_now(), session_id),
             )
 
     def list_tasks(self, limit: int = 50, tenant_id: str | None = None) -> list:

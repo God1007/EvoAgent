@@ -6,6 +6,7 @@ dependency so local development can remain zero-config.
 """
 
 import json
+import uuid
 from typing import Any
 
 from .models import ReviewReport, TaskState, TraceEvent
@@ -98,6 +99,23 @@ class PostgresTaskStore:
                 severity TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
                 created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
                 UNIQUE(tenant_id,alert_key,status))""",
+            """CREATE TABLE IF NOT EXISTS review_sessions (
+                id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, repository TEXT NOT NULL,
+                pull_request INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'open',
+                latest_head_sha TEXT, pending_input TEXT, created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL, UNIQUE(tenant_id,repository,pull_request))""",
+            """CREATE TABLE IF NOT EXISTS session_turns (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES review_sessions(id),
+                task_id TEXT, head_sha TEXT, trigger TEXT NOT NULL, sequence INTEGER NOT NULL,
+                summary_json JSONB, created_at TIMESTAMPTZ NOT NULL,
+                UNIQUE(session_id, sequence))""",
+            """CREATE TABLE IF NOT EXISTS session_findings (
+                id BIGSERIAL PRIMARY KEY, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL, status TEXT NOT NULL, snapshot_json JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL)""",
+            "CREATE INDEX IF NOT EXISTS idx_session_turns_session "
+            "ON session_turns(session_id, sequence)",
+            "CREATE INDEX IF NOT EXISTS idx_session_findings_turn ON session_findings(turn_id)",
         ]
         with self._connect() as conn:
             with conn.cursor() as cur:
@@ -217,6 +235,190 @@ class PostgresTaskStore:
                     json.dumps(message.get("content", {}), ensure_ascii=False),
                     utc_now(),
                 ),
+            )
+
+    def start_session_turn(
+        self,
+        tenant_id: str,
+        repository: str,
+        pull_request: int,
+        head_sha: str | None,
+        trigger: str,
+        task_id: str | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self._connect() as conn:
+            # Serialize get-or-create + sequence allocation per PR so concurrent
+            # opened/synchronize deliveries cannot duplicate a session or collide
+            # on a turn sequence (READ COMMITTED would otherwise allow both).
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                ("session:%s:%s:%s" % (tenant_id, repository, pull_request),),
+            )
+            new_id = str(uuid.uuid4())
+            inserted = conn.execute(
+                "INSERT INTO review_sessions(id,tenant_id,repository,pull_request,status,"
+                "latest_head_sha,created_at,updated_at) VALUES (%s,%s,%s,%s,'open',%s,%s,%s) "
+                "ON CONFLICT(tenant_id,repository,pull_request) DO NOTHING RETURNING id",
+                (new_id, tenant_id, repository, pull_request, head_sha, now, now),
+            ).fetchone()
+            is_new = inserted is not None
+            row = conn.execute(
+                "SELECT id, latest_head_sha FROM review_sessions "
+                "WHERE tenant_id=%s AND repository=%s AND pull_request=%s",
+                (tenant_id, repository, pull_request),
+            ).fetchone()
+            session_id = row["id"]
+            previous_head = None if is_new else row["latest_head_sha"]
+            sequence = (
+                int(
+                    conn.execute(
+                        "SELECT COALESCE(MAX(sequence),0) AS m FROM session_turns WHERE session_id=%s",
+                        (session_id,),
+                    ).fetchone()["m"]
+                )
+                + 1
+            )
+            turn_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO session_turns(id,session_id,task_id,head_sha,trigger,sequence,created_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (turn_id, session_id, task_id, head_sha, trigger, sequence, now),
+            )
+            previous = self._previous_open_snapshot(conn, session_id, turn_id)
+        return {
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "sequence": sequence,
+            "is_new_session": is_new,
+            "previous_head_sha": previous_head,
+            "previous_findings": previous,
+        }
+
+    @staticmethod
+    def _previous_open_snapshot(
+        conn, session_id: str, current_turn_id: str
+    ) -> list[dict[str, Any]]:
+        row = conn.execute(
+            "SELECT id FROM session_turns WHERE session_id=%s AND summary_json IS NOT NULL "
+            "AND sequence < (SELECT sequence FROM session_turns WHERE id=%s) "
+            "ORDER BY sequence DESC LIMIT 1",
+            (session_id, current_turn_id),
+        ).fetchone()
+        if not row:
+            return []
+        rows = conn.execute(
+            "SELECT snapshot_json FROM session_findings WHERE turn_id=%s ORDER BY id",
+            (row["id"],),
+        ).fetchall()
+        return [item["snapshot_json"] for item in rows]
+
+    def previous_open_snapshot(self, session_id: str, turn_id: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            return self._previous_open_snapshot(conn, session_id, turn_id)
+
+    def complete_session_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        task_id: str | None,
+        open_snapshots: list[dict[str, Any]],
+        summary: dict[str, Any],
+        head_sha: str | None = None,
+    ) -> None:
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("DELETE FROM session_findings WHERE turn_id=%s", (turn_id,))
+            for snap in open_snapshots:
+                conn.execute(
+                    "INSERT INTO session_findings(session_id,turn_id,fingerprint,status,"
+                    "snapshot_json,created_at) VALUES (%s,%s,%s,%s,%s::jsonb,%s)",
+                    (
+                        session_id,
+                        turn_id,
+                        snap.get("fingerprint", ""),
+                        snap.get("status", ""),
+                        json.dumps(snap, ensure_ascii=False),
+                        now,
+                    ),
+                )
+            conn.execute(
+                "UPDATE session_turns SET task_id=COALESCE(%s, task_id), summary_json=%s::jsonb, "
+                "head_sha=COALESCE(%s, head_sha) WHERE id=%s",
+                (task_id, json.dumps(summary, ensure_ascii=False), head_sha, turn_id),
+            )
+            conn.execute(
+                "UPDATE review_sessions SET latest_head_sha=COALESCE(%s, latest_head_sha), "
+                "updated_at=%s WHERE id=%s",
+                (head_sha, now, session_id),
+            )
+
+    def get_session(
+        self, tenant_id: str, repository: str, pull_request: int
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM review_sessions "
+                "WHERE tenant_id=%s AND repository=%s AND pull_request=%s",
+                (tenant_id, repository, pull_request),
+            ).fetchone()
+            if not row:
+                return None
+            value = dict(row)
+            value["created_at"] = value["created_at"].isoformat()
+            value["updated_at"] = value["updated_at"].isoformat()
+            return value
+
+    def get_session_timeline(
+        self, session_id: str, tenant_id: str | None = None, turn_limit: int = 200
+    ) -> dict[str, Any] | None:
+        turn_limit = max(1, min(turn_limit, 500))
+        with self._connect() as conn:
+            query = "SELECT * FROM review_sessions WHERE id=%s"
+            params: list[Any] = [session_id]
+            if tenant_id is not None:
+                query += " AND tenant_id=%s"
+                params.append(tenant_id)
+            srow = conn.execute(query, params).fetchone()
+            if not srow:
+                return None
+            turns = conn.execute(
+                "SELECT id,task_id,head_sha,trigger,sequence,summary_json,created_at "
+                "FROM session_turns WHERE session_id=%s ORDER BY sequence DESC LIMIT %s",
+                (session_id, turn_limit),
+            ).fetchall()
+            turns = list(reversed(turns))
+            timeline = dict(srow)
+            timeline["created_at"] = timeline["created_at"].isoformat()
+            timeline["updated_at"] = timeline["updated_at"].isoformat()
+            turn_list = []
+            for turn in turns:
+                item = dict(turn)
+                item["summary"] = item.pop("summary_json")
+                item["created_at"] = item["created_at"].isoformat()
+                findings = conn.execute(
+                    "SELECT snapshot_json FROM session_findings WHERE turn_id=%s ORDER BY id",
+                    (item["id"],),
+                ).fetchall()
+                item["findings"] = [row["snapshot_json"] for row in findings]
+                turn_list.append(item)
+            timeline["turns"] = turn_list
+            return timeline
+
+    def set_session_input_required(self, session_id: str, prompt: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE review_sessions SET status='input-required', pending_input=%s, "
+                "updated_at=%s WHERE id=%s",
+                (prompt[:4000], utc_now(), session_id),
+            )
+
+    def resolve_session_input(self, session_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE review_sessions SET status='open', pending_input=NULL, "
+                "updated_at=%s WHERE id=%s",
+                (utc_now(), session_id),
             )
 
     def list_tasks(self, limit: int = 50, tenant_id: str | None = None) -> list:

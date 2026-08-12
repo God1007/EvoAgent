@@ -66,3 +66,44 @@ jobs:
       - name: Run test suite
         run: python -m pytest -q
 
+  docker-smoke:
+    name: Docker build + smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build image
+        run: docker build -t evoagent:ci .
+      - name: Run container
+        run: |
+          docker run -d --name evoagent-ci \
+            -e EVOAGENT_HOST=0.0.0.0 \
+            -p 8080:8080 evoagent:ci
+      - name: Wait for /health and assert it is ok
+        run: |
+          for attempt in $(seq 1 30); do
+            if body=$(curl -fsS http://127.0.0.1:8080/health 2>/dev/null); then
+              echo "health payload: $body"
+              echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('status')=='ok' else 1)"
+              echo "smoke test passed"
+              exit 0
+            fi
+            echo "attempt $attempt: /health not ready yet"
+            sleep 2
+          done
+          echo "::error::/health did not become ready"
+          docker logs evoagent-ci || true
+          exit 1
+      - name: Verify the quick-start review endpoint responds
+        run: |
+          curl -fsS -X POST http://127.0.0.1:8080/v1/reviews \
+            -H 'Content-Type: application/json' \
+            -d '{"repository":"demo/api","pull_request":1,"diff":"diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n+password = \"secret\"\n+eval(user_input)"}' \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('state')=='SUCCESS' else 1)"
+          echo "review endpoint smoke test passed"
+      - name: Tear down
+        if: always()
+        run: docker rm -f evoagent-ci || true
+

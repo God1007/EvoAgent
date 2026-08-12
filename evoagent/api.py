@@ -22,6 +22,8 @@ FIX = re.compile(r"^/v1/tasks/([0-9a-f-]+)/fix$")
 FEEDBACK = re.compile(r"^/v1/tasks/([0-9a-f-]+)/feedback$")
 CANCEL = re.compile(r"^/v1/tasks/([0-9a-f-]+)/cancel$")
 RESUME = re.compile(r"^/v1/tasks/([0-9a-f-]+)/resume$")
+SESSION = re.compile(r"^/v1/sessions/([0-9a-f-]+)$")
+SESSION_INPUT = re.compile(r"^/v1/sessions/([0-9a-f-]+)/input$")
 ROLLBACK = re.compile(r"^/v1/skills/([A-Za-z0-9_-]+)/versions/(\d+)/activate$")
 SOURCE_WEB_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "web"))
 INSTALLED_WEB_ROOT = os.path.join(sys.prefix, "share", "evoagent", "web")
@@ -260,6 +262,32 @@ class ApiHandler(BaseHTTPRequestHandler):
             self.send_header("Location", "/#github")
             self.end_headers()
             return
+        if path == "/v1/sessions":
+            repository = query.get("repository", [""])[0]
+            raw_pr = query.get("pull_request", [""])[0]
+            try:
+                pull_request = int(raw_pr)
+            except ValueError:
+                self._send_json(400, {"error": "repository and integer pull_request are required"})
+                return
+            timeline = self.service.get_session_for_pull_request(
+                repository, pull_request, principal.tenant_id
+            )
+            if not timeline:
+                self._send_json(404, {"error": "session not found"})
+                return
+            self._send_json(200, timeline)
+            return
+        session_match = SESSION.match(path)
+        if session_match:
+            timeline = self.service.get_session_timeline(
+                session_match.group(1), principal.tenant_id
+            )
+            if not timeline:
+                self._send_json(404, {"error": "session not found"})
+                return
+            self._send_json(200, timeline)
+            return
         report_match = REPORT.match(path)
         task_match = TASK.match(path)
         if report_match:
@@ -404,6 +432,43 @@ class ApiHandler(BaseHTTPRequestHandler):
                     principal.tenant_id, principal.username, "task.resume", match.group(1)
                 )
                 self._send_json(202, result)
+                return
+            match = SESSION_INPUT.match(path)
+            if match:
+                principal = self._principal("review")
+                payload = self._read_json(body)
+                result = self.service.provide_session_input(
+                    match.group(1),
+                    str(payload.get("message", "")),
+                    principal.tenant_id,
+                )
+                self._send_json(201, result)
+                return
+            if path == "/v1/codegraph/impact":
+                principal = self._principal("review")
+                payload = self._read_json(body)
+                result = self.service.analyze_impact(
+                    payload.get("files", {}), payload.get("changed", [])
+                )
+                self._send_json(201, result)
+                return
+            if path == "/v1/proofs":
+                principal = self._principal("fix")
+                payload = self._read_json(body)
+                result = self.service.run_proof(
+                    payload.get("original", {}),
+                    payload.get("patched", {}),
+                    str(payload.get("reproduction_command", "")),
+                    str(payload.get("regression_command", "")),
+                )
+                self.service.store.audit(
+                    principal.tenant_id,
+                    principal.username,
+                    "proof.run",
+                    result.get("evidence_label", ""),
+                    {"level": result.get("evidence_level")},
+                )
+                self._send_json(201, result)
                 return
             if path == "/v1/skills/reload":
                 principal = self._principal("manage")

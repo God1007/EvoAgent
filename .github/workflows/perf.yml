@@ -1,0 +1,90 @@
+name: Performance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  loadgen-gate:
+    name: Load-test regression gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.lock
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements-dev.lock
+          python -m pip install --no-deps -e .
+      - name: Boot the server
+        run: |
+          EVOAGENT_HOST=127.0.0.1 EVOAGENT_PORT=8080 EVOAGENT_AUTH_REQUIRED=false \
+            python -m evoagent > server.log 2>&1 &
+          echo $! > server.pid
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
+              echo "server ready"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::server did not become ready"; cat server.log; exit 1
+      - name: Read-mix perf gate (p99 + zero server errors)
+        run: |
+          python scripts/loadgen.py --base-url http://127.0.0.1:8080 \
+            --scenario steady --duration 30 --rate 300 --concurrency 32 --warmup 3 \
+            --p99-ms 150 --max-error-rate 0.001 --json perf-steady.json
+      - name: Async-intake perf gate
+        run: |
+          python scripts/loadgen.py --base-url http://127.0.0.1:8080 \
+            --scenario intake --duration 20 --rate 150 --concurrency 32 --warmup 3 \
+            --p99-ms 500 --max-error-rate 0.001 --json perf-intake.json
+      - name: Upload perf reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-reports
+          path: perf-*.json
+      - name: Tear down
+        if: always()
+        run: kill "$(cat server.pid)" 2>/dev/null || true
+
+  microbench:
+    name: Hot-path micro-benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.lock
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements-dev.lock
+          python -m pip install --no-deps -e .
+      - name: Run micro-benchmarks with regression budgets
+        run: python scripts/microbench.py --check --json microbench.json
+      - name: Upload micro-benchmark report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: microbench-report
+          path: microbench.json

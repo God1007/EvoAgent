@@ -197,6 +197,17 @@ class TaskQueue:
                 return True
         return False
 
+    def depth(self) -> int:
+        """Best-effort backlog size for observability. For Redis this is the
+        stream length (approximate: includes un-trimmed acked entries); for the
+        in-memory backend it is the executor queue size. Returns -1 if unknown."""
+        try:
+            if self._redis:
+                return int(self._redis.xlen(self.STREAM))
+            return self._memory.qsize()
+        except Exception:  # pragma: no cover - defensive probe isolation
+            return -1
+
     def close(self) -> None:
         self._stop.set()
         self._executor.shutdown(wait=False)

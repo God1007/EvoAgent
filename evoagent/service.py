@@ -1,9 +1,13 @@
 import hashlib
+import threading
+import time
 import uuid
 from typing import Any
 
 from .agents import FilteredAgent, MultiAgentCoordinator
 from .auth import AuthManager
+from .backpressure import ConcurrencyLimiter, RateLimiter
+from .circuit_breaker import CircuitBreaker
 from .codegraph import build_graph
 from .config import Settings
 from .diff_parser import parse_unified_diff
@@ -30,8 +34,26 @@ class ReviewService:
     def __init__(self, settings: Settings):
         self.settings = settings
         settings.validate_evolution()
+        # Outbound dependency breakers (created early so reviewers/clients built
+        # below can wrap their GitHub/LLM calls). They fail fast during outages.
+        self.github_breaker = CircuitBreaker(
+            "github",
+            settings.breaker_failure_threshold,
+            settings.breaker_reset_seconds,
+        )
+        self.llm_breaker = CircuitBreaker(
+            "llm",
+            settings.breaker_failure_threshold,
+            settings.breaker_reset_seconds,
+        )
         self.llm_config = settings.resolved_llm()
-        self.store = create_store(settings.database_url, settings.db_path)
+        self.store = create_store(
+            settings.database_url,
+            settings.db_path,
+            settings.pg_pool_min,
+            settings.pg_pool_max,
+            settings.pg_pool_timeout,
+        )
         self.observability = Observability(settings.otel_service_name, settings.otel_endpoint)
         self.registry = SkillRegistry(
             settings.skills_dir,
@@ -72,7 +94,7 @@ class ReviewService:
             settings.timeout_seconds,
             observability=self.observability,
         )
-        self.github = GitHubClient(settings.github_token)
+        self.github = GitHubClient(settings.github_token, breaker=self.github_breaker)
         self.fixer = SafeFixer(
             RepairVerifier(
                 settings.repair_test_command,
@@ -114,6 +136,96 @@ class ReviewService:
             settings.queue_lease_seconds,
             self._on_dead_letter,
         )
+        metrics.register_gauge_source("queue_depth", self.queue.depth)
+        # Admission control: per-client rate limit + a bounded gate for the
+        # CPU/sandbox-heavy endpoints so overload sheds instead of collapsing.
+        self.rate_limiter = RateLimiter(
+            settings.rate_limit_rps,
+            settings.rate_limit_burst or settings.rate_limit_rps,
+        )
+        self.heavy_gate = ConcurrencyLimiter(settings.max_inflight_heavy)
+        metrics.register_gauge_source("heavy_in_flight", self.heavy_gate.in_flight)
+        metrics.register_gauge_source("breaker_github_state", self.github_breaker.state_code)
+        metrics.register_gauge_source("breaker_llm_state", self.llm_breaker.state_code)
+        self._readiness_lock = threading.Lock()
+        self._readiness_cache: tuple[float, tuple[bool, dict[str, Any]]] | None = None
+        self._readiness_ttl = 1.0
+        self._register_pool_metrics()
+
+    def close(self) -> None:
+        """Release owned resources (queue threads, DB pool) on shutdown."""
+        self.queue.close()
+        store_close = getattr(self.store, "close", None)
+        if callable(store_close):
+            store_close()
+
+    def _register_pool_metrics(self) -> None:
+        """Expose Postgres pool utilization. Registered in both branches (with a
+        constant 0 when unpooled) so the gauge set is consistent. Gated on the
+        pool's existence, not a probe call, so a transient stats hiccup can't
+        permanently disable the gauges. Stat key names vary across psycopg_pool
+        versions, so probe defensively."""
+        has_pool = getattr(self.store, "has_pool", None)
+        stats = getattr(self.store, "pool_stats", None)
+        pooled = bool(has_pool and has_pool())
+
+        def _stat(*keys: str):
+            def _read() -> float:
+                if not pooled or stats is None:
+                    return 0.0
+                current = stats() or {}
+                for key in keys:
+                    if key in current:
+                        return float(current[key])
+                return 0.0
+
+            return _read
+
+        metrics.register_gauge_source("pg_pool_size", _stat("pool_size"))
+        metrics.register_gauge_source("pg_pool_available", _stat("pool_available"))
+        metrics.register_gauge_source(
+            "pg_pool_waiting", _stat("requests_waiting", "requests_queued")
+        )
+
+    def readiness(self) -> tuple[bool, dict[str, Any]]:
+        """Dependency readiness for orchestration (distinct from liveness). Ready
+        means the store is reachable and the queue is observable.
+
+        The result is cached for a short TTL so an unauthenticated ``/ready``
+        flood cannot amplify into one fresh DB connection (and Redis round-trip)
+        per request."""
+        now = time.monotonic()
+        with self._readiness_lock:
+            cached = self._readiness_cache
+            if cached is not None and (now - cached[0]) < self._readiness_ttl:
+                return cached[1]
+        result = self._compute_readiness()
+        with self._readiness_lock:
+            self._readiness_cache = (time.monotonic(), result)
+        return result
+
+    def _compute_readiness(self) -> tuple[bool, dict[str, Any]]:
+        checks: dict[str, Any] = {}
+        ready = True
+        try:
+            self.store.ping()
+            checks["store"] = "ok"
+        except Exception as exc:
+            ready = False
+            checks["store"] = "error: %s" % exc
+        depth = self.queue.depth()
+        if depth >= 0:
+            checks["queue"] = "ok"
+        else:
+            # -1 => the queue backend (e.g. Redis) is unreachable.
+            checks["queue"] = "unreachable"
+            ready = False
+        return ready, {
+            "status": "ready" if ready else "not-ready",
+            "checks": checks,
+            "queue_depth": depth,
+            "queue_backend": self.queue.backend,
+        }
 
     def _build_llm_reviewer(self, prompt: str = "") -> OpenAICompatibleReviewer:
         if not self.llm_config:
@@ -126,6 +238,7 @@ class ReviewService:
             system_prompt=prompt,
             provider=str(self.llm_config["provider"]),
             extra_headers=dict(self.llm_config.get("headers") or {}),
+            breaker=self.llm_breaker,
         )
 
     def _candidate_reviewer(self, tenant_id: str):
@@ -696,7 +809,7 @@ class ReviewService:
         token = GitHubAppAuthenticator(
             self.settings.github_app_id, self.settings.github_private_key_path
         ).installation_token(installation_id)
-        return GitHubClient(token)
+        return GitHubClient(token, breaker=self.github_breaker)
 
     def create_fix(
         self,

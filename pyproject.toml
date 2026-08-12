@@ -30,6 +30,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+postgres-pool = [
+  "psycopg-pool>=3.2,<4",
+]
 dev = [
   "build>=1.2,<2",
   "mypy>=1.15,<3",

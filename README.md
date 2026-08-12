@@ -10,7 +10,7 @@
 [![CI](https://github.com/God1007/EvoAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/God1007/EvoAgent/actions/workflows/ci.yml)
 [![Security](https://github.com/God1007/EvoAgent/actions/workflows/security.yml/badge.svg)](https://github.com/God1007/EvoAgent/actions/workflows/security.yml)
 [![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Coverage](https://img.shields.io/badge/coverage-~83%25-brightgreen)](docs/evaluation.md)
+[![Coverage](https://img.shields.io/badge/coverage-~84%25-brightgreen)](docs/evaluation.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![PostgreSQL](https://img.shields.io/badge/Storage-SQLite%20%7C%20PostgreSQL-4169E1?logo=postgresql&logoColor=white)](#运行模式)
@@ -37,6 +37,9 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | --- | --- |
 | **多 Agent 协作** | Security、Reliability、LLM 和动态 Skill 并行产出证据，再由 Critic、Test、Synthesizer、Verifier 逐层过滤 |
 | **精确 Diff 定位** | 只接受 Unified Diff 新文件行号上的发现，降低错误定位和模型幻觉 |
+| **PR 会话连续性** | 同一 PR 多次 push 归入同一会话，跨轮次跟踪问题的新增/仍存在/已修复/移动，稳定 Marker 评论原地更新 |
+| **代码影响面图谱** | 基于 `ast` 的 Python 符号/调用/导入图，回答「改了这些文件，哪些符号在影响半径内」 |
+| **可执行证据阶梯** | Proof Runner 以「补丁前失败、补丁后通过」的沙箱复现将判断升级为 L1–L4 证据，基础设施失败判为不确定而非冒充证据 |
 | **双运行模式** | 本地使用 SQLite + 进程内队列；生产环境切换 PostgreSQL + Redis Streams |
 | **GitHub 自动化** | 支持 PR Webhook、幂等投递、Diff 拉取、评论 upsert 和独立修复 PR |
 | **保守型自动修复** | 仅处理可确定转换的规则，在新分支生成原子提交，并经过编译与可选测试门禁 |

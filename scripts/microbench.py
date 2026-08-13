@@ -24,12 +24,17 @@ from evoagent.models import Finding, Severity
 from evoagent.session import classify_findings, snapshot_findings
 
 # ns/op budgets: generous ceilings meant to catch order-of-magnitude regressions,
-# not micro-noise. Tune against `docs/performance-baseline.md`.
+# not micro-noise. These are the CI gate, so they must clear the SLOWEST runner
+# (shared 2-core GitHub runners are ~3x slower than a fast dev box) with headroom
+# for noise. Observed ns/op (fast dev box / GitHub CI): parse 111k/349k,
+# fingerprint 2.2k/6.4k, classify 157k/456k, codegraph 56k/161k. Budgets sit at
+# ~3x the CI figure - loose enough not to flake, tight enough to catch a >3x
+# regression. Tune against `docs/performance-baseline.md`.
 BUDGETS_NS = {
-    "parse_unified_diff": 200_000,
-    "finding_fingerprint": 20_000,
-    "scoped_fingerprint": 20_000,
-    "classify_findings": 400_000,
+    "parse_unified_diff": 1_000_000,
+    "finding_fingerprint": 50_000,
+    "scoped_fingerprint": 50_000,
+    "classify_findings": 1_500_000,
     "codegraph_impact_of": 2_000_000,
 }
 

@@ -1,4 +1,5 @@
 import http.client
+import os
 import tempfile
 import threading
 import unittest
@@ -29,7 +30,7 @@ class AdmissionControlTests(unittest.TestCase):
         base = dict(
             host="127.0.0.1",
             port=0,
-            db_path=tempfile.mktemp(suffix=".db"),
+            db_path=os.path.join(tempfile.mkdtemp(), "evoagent.db"),
             max_diff_bytes=10000,
             max_steps=8,
             timeout_seconds=10,

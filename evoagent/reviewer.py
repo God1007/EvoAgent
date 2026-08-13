@@ -117,6 +117,7 @@ class OpenAICompatibleReviewer(Reviewer):
         system_prompt: str = "",
         provider: str = "openai-compatible",
         extra_headers: dict[str, str] | None = None,
+        breaker=None,
     ):
         self.base_url = base_url
         self.api_key = api_key
@@ -126,6 +127,9 @@ class OpenAICompatibleReviewer(Reviewer):
         self.provider = provider
         self.name = "%s:%s" % (provider, model)
         self.extra_headers = extra_headers or {}
+        # Optional circuit breaker: trips after repeated LLM failures so a dead
+        # endpoint fails fast instead of tying up worker threads.
+        self._breaker = breaker
 
     def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
         schema = (
@@ -160,9 +164,15 @@ class OpenAICompatibleReviewer(Reviewer):
             headers=headers,
             method="POST",
         )
+
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                body = json.loads(response.read().decode("utf-8"))
+            # Only the network transport is guarded by the breaker: hard
+            # connectivity/timeout failures trip it (fail fast on a dead LLM),
+            # while an HTTP error response or a malformed-but-received body means
+            # the endpoint is alive and must not count as a breaker failure.
+            with self._open(request) as response:
+                raw = response.read()
+            body = json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read(1000).decode("utf-8", errors="replace")
             raise RuntimeError(
@@ -202,6 +212,21 @@ class OpenAICompatibleReviewer(Reviewer):
                 )
             )
         return findings
+
+    def _open(self, request: "urllib.request.Request"):
+        if self._breaker is None:
+            return urllib.request.urlopen(request, timeout=self.timeout)
+        self._breaker.allow()
+        try:
+            response = urllib.request.urlopen(request, timeout=self.timeout)
+        except urllib.error.HTTPError:
+            self._breaker.record_success()
+            raise
+        except Exception:
+            self._breaker.record_failure()
+            raise
+        self._breaker.record_success()
+        return response
 
 
 class CompositeReviewer(Reviewer):

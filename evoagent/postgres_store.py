@@ -7,6 +7,7 @@ dependency so local development can remain zero-config.
 
 import json
 import uuid
+from contextlib import AbstractContextManager
 from typing import Any
 
 from .models import ReviewReport, TaskState, TraceEvent
@@ -14,7 +15,13 @@ from .store import utc_now
 
 
 class PostgresTaskStore:
-    def __init__(self, url: str):
+    def __init__(
+        self,
+        url: str,
+        pool_min: int = 1,
+        pool_max: int = 10,
+        pool_timeout: float = 10.0,
+    ):
         try:
             import psycopg
             from psycopg.rows import dict_row
@@ -23,10 +30,79 @@ class PostgresTaskStore:
         self.psycopg = psycopg
         self.dict_row = dict_row
         self.url = url
-        self._init()
+        self.pool_timeout = float(pool_timeout)
+        # A real connection pool avoids a TCP connect + auth handshake on every
+        # single query (the previous per-call `psycopg.connect` was the dominant
+        # Postgres cost under load). Import-guarded so `psycopg_pool` stays an
+        # optional dependency and we fall back to per-call connections.
+        self._pool = None
+        if pool_max and pool_max > 0:
+            try:
+                from psycopg_pool import ConnectionPool
+            except ImportError:
+                print(
+                    "WARNING: psycopg_pool not installed; falling back to a new "
+                    "connection per query. Install the 'postgres-pool' extra "
+                    "(pip install psycopg-pool) for pooled connections."
+                )
+                ConnectionPool = None
+            if ConnectionPool is not None:
+                try:
+                    # open=False + explicit open() avoids the deprecated eager
+                    # constructor-open path in psycopg_pool >= 3.2.
+                    self._pool = ConnectionPool(
+                        conninfo=url,
+                        min_size=min(max(0, pool_min), pool_max),
+                        max_size=pool_max,
+                        timeout=self.pool_timeout,
+                        kwargs={"row_factory": dict_row},
+                        open=False,
+                    )
+                    self._pool.open()
+                except Exception as exc:
+                    print(
+                        "WARNING: could not create Postgres pool (%s); using per-call connections"
+                        % exc
+                    )
+                    self._pool = None
+        try:
+            self._init()
+        except Exception:
+            # Do not leak the pool's background threads/connections if schema
+            # initialization fails (e.g. Postgres briefly unavailable at boot).
+            if self._pool is not None:
+                self._pool.close()
+                self._pool = None
+            raise
 
-    def _connect(self):
+    def _connect(self) -> AbstractContextManager[Any]:
+        """Return a context manager yielding a connection. With a pool the
+        connection is checked out and returned on ``__exit__``; without one a
+        fresh connection is created and closed (psycopg3 semantics)."""
+        if self._pool is not None:
+            return self._pool.connection(timeout=self.pool_timeout)
         return self.psycopg.connect(self.url, row_factory=self.dict_row)
+
+    def has_pool(self) -> bool:
+        return self._pool is not None
+
+    def ping(self) -> None:
+        """Lightweight readiness probe: confirm the database is reachable."""
+        with self._connect() as conn:
+            conn.execute("SELECT 1")
+
+    def pool_stats(self) -> dict[str, int] | None:
+        """psycopg_pool stats for metrics, or ``None`` when unpooled."""
+        if self._pool is None:
+            return None
+        try:
+            return dict(self._pool.get_stats())
+        except Exception:  # pragma: no cover - defensive
+            return None
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.close()
 
     def _init(self) -> None:
         statements = [
@@ -1002,9 +1078,15 @@ class PostgresTaskStore:
         }
 
 
-def create_store(database_url: str, sqlite_path: str):
+def create_store(
+    database_url: str,
+    sqlite_path: str,
+    pool_min: int = 1,
+    pool_max: int = 10,
+    pool_timeout: float = 10.0,
+):
     if database_url.startswith(("postgres://", "postgresql://")):
-        return PostgresTaskStore(database_url)
+        return PostgresTaskStore(database_url, pool_min, pool_max, pool_timeout)
     from .store import TaskStore
 
     return TaskStore(sqlite_path)

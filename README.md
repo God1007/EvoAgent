@@ -494,6 +494,30 @@ curl -X POST 'http://127.0.0.1:8080/v1/skills/reload'
 
 ## 生产部署
 
+### 一键部署（推荐）
+
+```bash
+./scripts/deploy.sh
+# 或：make deploy
+```
+
+脚本会自动完成：检查 Docker 环境 → 从 `.env.example` 生成 `.env` → 生成缺失的密钥
+（`EVOAGENT_AUTH_SECRET`、Bootstrap 管理员密码、Webhook Secret）并启用登录 →
+`docker compose up --build -d` → 轮询 `/health`，最后打印访问地址与首次生成的管理员密码。
+
+脚本是幂等的，可重复执行；已存在的密钥不会被覆盖。常用子命令：
+
+```bash
+./scripts/deploy.sh status        # 查看容器状态与健康检查
+./scripts/deploy.sh logs          # 跟踪应用日志
+./scripts/deploy.sh down          # 停止（保留数据卷）
+./scripts/deploy.sh destroy       # 停止并删除数据卷（会清空数据）
+./scripts/deploy.sh --port 9090   # 指定宿主机端口
+./scripts/deploy.sh --no-auth     # 仅本地测试：关闭鉴权（切勿公网暴露）
+```
+
+如需手动分步操作，见下文。
+
 ### 1. 创建环境文件
 
 ```bash
@@ -737,7 +761,24 @@ make check
 
 GitHub 额外执行 Gitleaks、CodeQL、依赖审计和 Docker 构建冒烟测试（构建镜像、启动容器并校验 `/health` 与 `/v1/reviews`）。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)，边界适配器的集成测试范围与后续收敛计划记录在 [`docs/adr/0001-engineering-quality-gates.md`](docs/adr/0001-engineering-quality-gates.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
 
-更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)。
+更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)，性能 SLO、压测方法与可复现基线见 [`docs/performance.md`](docs/performance.md) 与 [`docs/performance-baseline.md`](docs/performance-baseline.md)。
+
+## 生产级性能与压测
+
+面向生产的水平/垂直扩展与过载保护均已内置，压测方法学（百分位而非均值、恒定到达率以规避 coordinated omission）详见 [`docs/performance.md`](docs/performance.md)：
+
+- **多核 HTTP 扩展**：`EVOAGENT_WEB_WORKERS` 通过 `SO_REUSEPORT` 派生多个 worker 进程，master 监督进程负责崩溃重启（带退避与风暴上限）与 `SIGTERM` 优雅摘流（`/ready` 转 503 → 等待在途请求 → 到期 `SIGKILL` 兜底）。
+- **过载保护（背压）**：按客户端的令牌桶限流 + 重端点的有界并发闸门，过载时返回 `429`/`503` + `Retry-After` 而非雪崩（`EVOAGENT_RATE_LIMIT_RPS`、`EVOAGENT_MAX_INFLIGHT_HEAVY`）。
+- **依赖韧性**：GitHub / LLM 出站调用包裹熔断器（closed/open/half-open + 退避抖动），仅对连接/超时类传输故障计数，上游宕机时快速失败而非占满线程。
+- **连接池**：Postgres 使用 `psycopg_pool` 连接池（`postgres-pool` 可选依赖，缺失时自动回退到每次新建连接），池指标经 `/metrics` 暴露。
+- **可观测性**：`/metrics` 新增延迟直方图（p50/p95/p99 可推导）、在途请求、被拒计数、队列深度、连接池与熔断器状态。
+- **压测工具**：纯 Python 恒定到达率压测器 [`scripts/loadgen.py`](scripts/loadgen.py)（离线/CI 可用，阈值超限即非零退出）、k6 脚本 [`perf/`](perf)、全栈 [`docker-compose.perf.yml`](docker-compose.perf.yml)，以及热点路径微基准 [`scripts/microbench.py`](scripts/microbench.py)。CI 由 [`.github/workflows/perf.yml`](.github/workflows/perf.yml) 作为性能回归门禁。
+
+```bash
+python -m evoagent &
+python scripts/loadgen.py --scenario steady --duration 30 --rate 300 --p99-ms 150 --max-error-rate 0.001
+python scripts/microbench.py --check
+```
 
 ## 测试与评测
 

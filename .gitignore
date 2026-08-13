@@ -15,4 +15,5 @@ dist/
 .DS_Store
 log/*.log
 output/
+perf/baseline-*/
 

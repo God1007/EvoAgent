@@ -89,6 +89,16 @@ class Settings:
     alert_smtp_host: str = ""
     alert_email_to: str = ""
     continuous_eval_seconds: int = 0
+    web_workers: int = 1
+    rate_limit_rps: int = 0
+    rate_limit_burst: int = 0
+    max_inflight_heavy: int = 0
+    breaker_failure_threshold: int = 5
+    breaker_reset_seconds: int = 30
+    outbound_retries: int = 2
+    pg_pool_min: int = 1
+    pg_pool_max: int = 10
+    pg_pool_timeout: int = 10
 
     def resolved_llm(self) -> dict[str, Any]:
         """Resolve a named provider to the existing OpenAI-compatible transport."""
@@ -246,4 +256,14 @@ class Settings:
             alert_smtp_host=os.getenv("EVOAGENT_ALERT_SMTP_HOST", ""),
             alert_email_to=os.getenv("EVOAGENT_ALERT_EMAIL_TO", ""),
             continuous_eval_seconds=_non_negative_int("EVOAGENT_CONTINUOUS_EVAL_SECONDS", 0),
+            web_workers=_int("EVOAGENT_WEB_WORKERS", 1),
+            rate_limit_rps=_non_negative_int("EVOAGENT_RATE_LIMIT_RPS", 0),
+            rate_limit_burst=_non_negative_int("EVOAGENT_RATE_LIMIT_BURST", 0),
+            max_inflight_heavy=_non_negative_int("EVOAGENT_MAX_INFLIGHT_HEAVY", 0),
+            breaker_failure_threshold=_int("EVOAGENT_BREAKER_FAILURE_THRESHOLD", 5),
+            breaker_reset_seconds=_int("EVOAGENT_BREAKER_RESET_SECONDS", 30),
+            outbound_retries=_non_negative_int("EVOAGENT_OUTBOUND_RETRIES", 2),
+            pg_pool_min=_non_negative_int("EVOAGENT_PG_POOL_MIN", 1),
+            pg_pool_max=_int("EVOAGENT_PG_POOL_MAX", 10),
+            pg_pool_timeout=_int("EVOAGENT_PG_POOL_TIMEOUT", 10),
         )

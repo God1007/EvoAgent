@@ -1,4 +1,4 @@
-.PHONY: install lock format lint type test audit build check
+.PHONY: install lock format lint type test audit build check deploy deploy-down deploy-logs
 
 install:
 	python -m pip install --require-hashes -r requirements-dev.lock
@@ -29,4 +29,13 @@ build:
 	python -m build
 
 check: lint type test audit build
+
+deploy:
+	./scripts/deploy.sh up
+
+deploy-down:
+	./scripts/deploy.sh down
+
+deploy-logs:
+	./scripts/deploy.sh logs
 

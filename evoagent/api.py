@@ -1,9 +1,14 @@
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import re
+import signal
+import socket
 import sys
+import threading
+import time
 import urllib.parse
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,9 +30,17 @@ RESUME = re.compile(r"^/v1/tasks/([0-9a-f-]+)/resume$")
 SESSION = re.compile(r"^/v1/sessions/([0-9a-f-]+)$")
 SESSION_INPUT = re.compile(r"^/v1/sessions/([0-9a-f-]+)/input$")
 ROLLBACK = re.compile(r"^/v1/skills/([A-Za-z0-9_-]+)/versions/(\d+)/activate$")
+# CPU/sandbox-heavy POST endpoints guarded by the bounded-concurrency gate.
+HEAVY_PATHS = frozenset({"/v1/reviews", "/v1/proofs", "/v1/codegraph/impact"})
+# Liveness/readiness/metrics probes are never rate-limited: monitoring and
+# orchestration must keep working precisely when the service is under overload.
+PROBE_PATHS = frozenset({"/health", "/ready", "/metrics"})
 SOURCE_WEB_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "web"))
 INSTALLED_WEB_ROOT = os.path.join(sys.prefix, "share", "evoagent", "web")
 WEB_ROOT = SOURCE_WEB_ROOT if os.path.isdir(SOURCE_WEB_ROOT) else INSTALLED_WEB_ROOT
+# Set on SIGTERM so /ready starts failing (load balancers drain us) while
+# in-flight requests finish before the process exits.
+DRAINING = threading.Event()
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -103,6 +116,25 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise ValueError("request body is empty or too large")
         return self.rfile.read(length)
 
+    def _drain_body(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            self.close_connection = True
+            return
+        cap = self.settings.max_diff_bytes + 256 * 1024
+        if length <= 0:
+            return
+        if length > cap:
+            # Too large to safely drain; abandon keep-alive on this connection.
+            self.close_connection = True
+            length = cap
+        while length > 0:
+            chunk = self.rfile.read(min(65536, length))
+            if not chunk:
+                break
+            length -= len(chunk)
+
     @staticmethod
     def _read_json(body: bytes) -> dict[str, Any]:
         try:
@@ -114,6 +146,61 @@ class ApiHandler(BaseHTTPRequestHandler):
         return value
 
     def do_GET(self) -> None:
+        self._dispatch("GET", self._do_GET)
+
+    def do_POST(self) -> None:
+        self._dispatch("POST", self._do_POST)
+
+    def _dispatch(self, method: str, handler) -> None:
+        """Single choke point for admission control and request-level
+        observability: per-client rate limiting, a bounded concurrency gate for
+        heavy endpoints, a latency histogram, and an in-flight gauge. Overload is
+        shed here (429/503 + Retry-After) rather than allowed to pile up."""
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path not in PROBE_PATHS:
+            client = self.client_address[0] if self.client_address else "unknown"
+            allowed, retry_after = self.service.rate_limiter.check(client)
+            if not allowed:
+                self._reject(429, retry_after, "rate limit exceeded")
+                return
+        # The concurrency gate protects synchronous CPU/sandbox work. Async
+        # review intake (?async=true) only enqueues a task and is cheap + already
+        # protected by the queue, so it is not gated.
+        gated = method == "POST" and path in HEAVY_PATHS
+        if gated and path == "/v1/reviews":
+            async_values = urllib.parse.parse_qs(parsed.query).get("async", ["false"])
+            if async_values and async_values[0].lower() in {"true", "1", "yes"}:
+                gated = False
+        gate = self.service.heavy_gate if gated else None
+        if gate is not None and not gate.try_acquire():
+            self._reject(503, 1.0, "server is at capacity, retry shortly")
+            return
+        metrics.add_gauge("http_in_flight", 1)
+        try:
+            with metrics.latency("http_request_%s" % method):
+                handler()
+        finally:
+            metrics.add_gauge("http_in_flight", -1)
+            if gate is not None:
+                gate.release()
+
+    def _reject(self, status: int, retry_after: float, message: str) -> None:
+        metrics.inc("http_rejected_total")
+        # Drain any request body so the JSON error + Retry-After are delivered
+        # cleanly instead of the peer seeing a connection reset (which would make
+        # the Retry-After signal unreliable for exactly the shed heavy requests).
+        self._drain_body()
+        body = json.dumps({"error": message}, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Retry-After", str(max(1, math.ceil(retry_after))))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _do_GET(self) -> None:
         parsed_url = urllib.parse.urlparse(self.path)
         path = parsed_url.path
         query = urllib.parse.parse_qs(parsed_url.query)
@@ -142,6 +229,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "llm_model": self.service.llm_config.get("model", ""),
                 },
             )
+            return
+        if path == "/ready":
+            if DRAINING.is_set():
+                self._send_json(503, {"status": "draining"})
+                return
+            ready, detail = self.service.readiness()
+            self._send_json(200 if ready else 503, detail)
             return
         principal = self._authenticate_or_send("read")
         if principal is None:
@@ -306,7 +400,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         self._send_json(404, {"error": "not found"})
 
-    def do_POST(self) -> None:
+    def _do_POST(self) -> None:
         parsed_url = urllib.parse.urlparse(self.path)
         path = parsed_url.path
         query = urllib.parse.parse_qs(parsed_url.query)
@@ -551,13 +645,219 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "operation failed", "detail": str(exc)})
 
 
-def run() -> None:
-    settings = Settings.from_env()
-    service = ReviewService(settings)
+class ReuseportThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that enables ``SO_REUSEPORT`` so several worker
+    processes can bind the same port and the kernel load-balances connections
+    across them. ``block_on_close`` (default) makes ``server_close()`` join
+    in-flight handler threads, giving a graceful drain."""
+
+    allow_reuse_address = True
+    daemon_threads = False
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError as exc:
+                # Without SO_REUSEPORT the 2nd+ worker will fail bind with
+                # EADDRINUSE; surface it instead of failing opaquely later.
+                print("WARNING: could not set SO_REUSEPORT: %s" % exc)
+        super().server_bind()
+
+
+def _make_server(settings: Settings, service: ReviewService) -> ReuseportThreadingHTTPServer:
     handler = type(
         "ConfiguredApiHandler", (ApiHandler,), {"service": service, "settings": settings}
     )
-    server = ThreadingHTTPServer((settings.host, settings.port), handler)
+    return ReuseportThreadingHTTPServer((settings.host, settings.port), handler)
+
+
+def _grace_seconds() -> float:
+    try:
+        return max(0.0, float(os.getenv("EVOAGENT_SHUTDOWN_GRACE_SECONDS", "0")))
+    except ValueError:
+        return 0.0
+
+
+def _install_drain_on_sigterm(server: ThreadingHTTPServer) -> None:
+    """On SIGTERM: flip readiness to draining (so the LB stops routing), wait a
+    short grace period, then stop accepting. Shutdown runs on its own thread
+    because ``shutdown()`` must not be called from the ``serve_forever`` thread."""
+
+    def _handler(_signum: int, _frame: Any) -> None:
+        DRAINING.set()
+
+        def _drain() -> None:
+            grace = _grace_seconds()
+            if grace:
+                time.sleep(grace)
+            server.shutdown()
+
+        threading.Thread(target=_drain, name="evoagent-drain", daemon=True).start()
+
+    try:
+        signal.signal(signal.SIGTERM, _handler)
+    except ValueError:  # pragma: no cover - not on main thread (e.g. under tests)
+        pass
+
+
+def _can_multiprocess(settings: Settings) -> bool:
+    return (
+        settings.web_workers > 1
+        and os.name == "posix"
+        and hasattr(os, "fork")
+        and hasattr(socket, "SO_REUSEPORT")
+    )
+
+
+def _run_worker(settings: Settings) -> None:
+    """Child worker: owns its own service (post-fork) and serves until drained.
+
+    Signal handlers were reset to SIG_DFL by the spawner before this runs, so a
+    SIGTERM during the (potentially slow) service construction simply terminates
+    the not-yet-serving child; once serving, the drain handler takes over."""
+    DRAINING.clear()
+    service = ReviewService(settings)
+    server = _make_server(settings, service)
+    _install_drain_on_sigterm(server)
+    # Same graceful-drain semantics for Ctrl-C in the worker.
+    try:
+        signal.signal(signal.SIGINT, signal.getsignal(signal.SIGTERM))
+    except (ValueError, OSError, TypeError):  # pragma: no cover
+        pass
+    try:
+        server.serve_forever()
+    finally:
+        service.close()
+        server.server_close()
+
+
+_TERM_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+# Restart storm guard: if more than this many workers die within the window,
+# the master gives up instead of fork-looping against a broken dependency.
+_MAX_RESTARTS = 10
+_RESTART_WINDOW = 60.0
+
+
+def _run_master(settings: Settings) -> None:
+    """Fork ``web_workers`` children (each binds the shared port via SO_REUSEPORT),
+    restart crashed workers with backoff, and on SIGTERM forward the signal, wait
+    a bounded grace period, then SIGKILL any stragglers."""
+    workers = settings.web_workers
+    print(
+        "EvoAgent: master pid %d supervising %d workers on http://%s:%d"
+        % (os.getpid(), workers, settings.host, settings.port)
+    )
+    children: set[int] = set()
+    stopping = threading.Event()
+    restart_times: list[float] = []
+
+    def _spawn() -> None:
+        # Block term signals across fork+bookkeeping so a signal can neither run
+        # the master handler mid-fork nor race the child into `children`.
+        blocked = _block_term_signals()
+        try:
+            pid = os.fork()
+        except OSError:
+            _restore_signals(blocked)
+            raise
+        if pid == 0:
+            # Child: default disposition during startup, restore mask, then run.
+            for sig in _TERM_SIGNALS:
+                try:
+                    signal.signal(sig, signal.SIG_DFL)
+                except (ValueError, OSError):
+                    pass
+            _restore_signals(blocked)
+            try:
+                _run_worker(settings)
+            finally:
+                os._exit(0)
+        children.add(pid)
+        _restore_signals(blocked)
+
+    def _handle_term(_signum: int, _frame: Any) -> None:
+        stopping.set()
+        for pid in list(children):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+    for sig in _TERM_SIGNALS:
+        signal.signal(sig, _handle_term)
+
+    for _ in range(workers):
+        _spawn()
+
+    while children and not stopping.is_set():
+        try:
+            pid, _status = os.waitpid(-1, 0)
+        except ChildProcessError:
+            break
+        except InterruptedError:  # pragma: no cover - EINTR retried by CPython
+            continue
+        children.discard(pid)
+        if stopping.is_set():
+            break
+        now = time.monotonic()
+        restart_times[:] = [t for t in restart_times if now - t < _RESTART_WINDOW]
+        if len(restart_times) >= _MAX_RESTARTS:
+            print("EvoAgent: too many worker restarts; shutting down")
+            stopping.set()
+            for other in list(children):
+                try:
+                    os.kill(other, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            break
+        restart_times.append(now)
+        time.sleep(min(0.1 * 2 ** min(len(restart_times), 6), 5.0))
+        print("EvoAgent: worker %d exited; restarting" % pid)
+        _spawn()
+
+    _reap_children(children, deadline_seconds=_grace_seconds() + 10.0)
+
+
+def _block_term_signals():
+    if hasattr(signal, "pthread_sigmask"):
+        return signal.pthread_sigmask(signal.SIG_BLOCK, set(_TERM_SIGNALS))
+    return None
+
+
+def _restore_signals(previous) -> None:
+    if previous is not None and hasattr(signal, "pthread_sigmask"):
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def _reap_children(children: set[int], deadline_seconds: float) -> None:
+    """Wait up to the deadline for children to exit after SIGTERM, then SIGKILL
+    and reap any that ignored it, so the master never hangs forever."""
+    deadline = time.monotonic() + max(1.0, deadline_seconds)
+    while children and time.monotonic() < deadline:
+        try:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            children.clear()
+            return
+        if pid == 0:
+            time.sleep(0.05)
+            continue
+        children.discard(pid)
+    for pid in list(children):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    for pid in list(children):
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        children.discard(pid)
+
+
+def _print_banner(settings: Settings, service: ReviewService) -> None:
     print("EvoAgent dashboard: http://%s:%d" % (settings.host, settings.port))
     print(
         "Persistence: %s | Queue: %s | Orchestrator: %s"
@@ -575,10 +875,23 @@ def run() -> None:
             "delivery; otherwise pending/in-flight/dead-letter tasks are lost on restart."
             % service.queue.backend
         )
+
+
+def run() -> None:
+    settings = Settings.from_env()
+    if _can_multiprocess(settings):
+        # Banner from a throwaway probe would create a stray service; children
+        # print their own readiness. The master just reports supervision.
+        _run_master(settings)
+        return
+    service = ReviewService(settings)
+    _print_banner(settings, service)
+    server = _make_server(settings, service)
+    _install_drain_on_sigterm(server)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        service.queue.close()
+        service.close()
         server.server_close()

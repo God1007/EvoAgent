@@ -23,6 +23,14 @@ class TaskStore:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def ping(self) -> None:
+        """Lightweight readiness probe: confirm the database is reachable."""
+        conn = self._connect()
+        try:
+            conn.execute("SELECT 1")
+        finally:
+            conn.close()
+
     def _init(self) -> None:
         with self._connect() as conn:
             conn.execute(

@@ -80,6 +80,7 @@ class GitHubClient:
         allowed_hosts: frozenset[str] | None = None,
         max_response_bytes: int = 25 * 1024 * 1024,
         max_archive_bytes: int = 1024 * 1024 * 1024,
+        breaker=None,
     ):
         self.token = token
         self.timeout = timeout
@@ -88,6 +89,9 @@ class GitHubClient:
         self.max_response_bytes = max_response_bytes
         self.max_archive_bytes = max_archive_bytes
         self._opener = urllib.request.build_opener(_RestrictedRedirectHandler(self.allowed_hosts))
+        # Optional circuit breaker: after this client's internal retries are
+        # exhausted repeatedly, the breaker trips and further calls fail fast.
+        self._breaker = breaker
 
     def _headers(self, accept: str = "application/vnd.github+json") -> dict[str, str]:
         headers = {
@@ -141,12 +145,12 @@ class GitHubClient:
                 headers=dict(self._headers(accept), **{"Content-Type": "application/json"}),
                 method=method,
             )
+            # Route the transport through the breaker so hard connectivity/timeout
+            # failures (the ones that pin a worker for the full timeout) trip it
+            # and fail fast. HTTP error *responses* mean the dependency is alive,
+            # so they are handled below and are NOT counted as breaker failures.
             try:
-                with self._opener.open(request, timeout=self.timeout) as response:
-                    body = _read_capped(response, limit)
-                    if raw:
-                        return body
-                    return json.loads(body.decode("utf-8")) if body else {}
+                response = self._open(request)
             except urllib.error.HTTPError as exc:
                 retryable = exc.code in {429, 500, 502, 503, 504}
                 if exc.code == 403 and exc.headers.get("X-RateLimit-Remaining") == "0":
@@ -165,10 +169,36 @@ class GitHubClient:
                 else:
                     delay = min(2 ** (attempt - 1) + random.random(), 10)
                 time.sleep(min(delay, 30))
+                continue
             except (urllib.error.URLError, TimeoutError) as exc:
                 if attempt >= self.max_attempts:
                     raise RuntimeError("GitHub API request failed: %s" % exc) from exc
                 time.sleep(min(2 ** (attempt - 1) + random.random(), 10))
+                continue
+            with response as resp:
+                body = _read_capped(resp, limit)
+            if raw:
+                return body
+            return json.loads(body.decode("utf-8")) if body else {}
+
+    def _open(self, request: "urllib.request.Request"):
+        """Open a request, routing transport (connect/timeout) failures through
+        the circuit breaker so a dead endpoint fails fast. An HTTPError *response*
+        means the dependency answered, so it counts as a breaker success and is
+        re-raised for the caller's retry/raise logic (no double request)."""
+        if self._breaker is None:
+            return self._opener.open(request, timeout=self.timeout)
+        self._breaker.allow()
+        try:
+            response = self._opener.open(request, timeout=self.timeout)
+        except urllib.error.HTTPError:
+            self._breaker.record_success()
+            raise
+        except Exception:
+            self._breaker.record_failure()
+            raise
+        self._breaker.record_success()
+        return response
 
     def get_pull_request(self, repository: str, number: int) -> dict:
         return self._json("GET", "https://api.github.com/repos/%s/pulls/%d" % (repository, number))

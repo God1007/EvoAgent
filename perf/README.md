@@ -5,6 +5,19 @@ Two interchangeable load tools plus a full-stack rig. Read
 [`../docs/performance-baseline.md`](../docs/performance-baseline.md) for captured
 numbers.
 
+## 0. One-command baseline capture
+
+[`../scripts/perf_baseline.sh`](../scripts/perf_baseline.sh) orchestrates the
+whole suite (read knee sweep, intake, spike, soak, overload/backpressure,
+multi-worker scaling, micro-benchmarks), boots/tears down servers per scenario,
+and writes per-run JSON + CSV to `perf/baseline-<timestamp>/`.
+
+```bash
+scripts/perf_baseline.sh all           # everything
+scripts/perf_baseline.sh overload      # just the 429/503 + Retry-After proofs
+scripts/perf_baseline.sh single --quick # fast self-test of the harness
+```
+
 ## 1. Pure-Python generator (no external tools)
 
 `scripts/loadgen.py` is an open-model, constant-arrival-rate generator (stdlib

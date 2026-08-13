@@ -494,6 +494,30 @@ curl -X POST 'http://127.0.0.1:8080/v1/skills/reload'
 
 ## 生产部署
 
+### 一键部署（推荐）
+
+```bash
+./scripts/deploy.sh
+# 或：make deploy
+```
+
+脚本会自动完成：检查 Docker 环境 → 从 `.env.example` 生成 `.env` → 生成缺失的密钥
+（`EVOAGENT_AUTH_SECRET`、Bootstrap 管理员密码、Webhook Secret）并启用登录 →
+`docker compose up --build -d` → 轮询 `/health`，最后打印访问地址与首次生成的管理员密码。
+
+脚本是幂等的，可重复执行；已存在的密钥不会被覆盖。常用子命令：
+
+```bash
+./scripts/deploy.sh status        # 查看容器状态与健康检查
+./scripts/deploy.sh logs          # 跟踪应用日志
+./scripts/deploy.sh down          # 停止（保留数据卷）
+./scripts/deploy.sh destroy       # 停止并删除数据卷（会清空数据）
+./scripts/deploy.sh --port 9090   # 指定宿主机端口
+./scripts/deploy.sh --no-auth     # 仅本地测试：关闭鉴权（切勿公网暴露）
+```
+
+如需手动分步操作，见下文。
+
 ### 1. 创建环境文件
 
 ```bash

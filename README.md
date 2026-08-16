@@ -732,6 +732,7 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 │   ├── api.py                    # HTTP API 与静态控制台
 │   ├── service.py                # 业务用例编排与 Capability 消费
 │   ├── plugins.py                # 插件依赖图、生命周期、Scope 与事件总线
+│   ├── ports.py                  # Store / Queue / CodeHost 领域端口
 │   ├── capabilities.py           # 稳定类型化 Capability 定义
 │   ├── bootstrap.py              # 默认 Provider Catalog 与应用组装
 │   ├── review_engine.py          # 可替换 Reviewer Graph 与 Harness 组装

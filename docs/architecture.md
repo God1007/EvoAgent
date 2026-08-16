@@ -11,6 +11,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Intake | `evoagent/api.py` | HTTP API, static web console, `/webhooks/github`, `/health`, `/metrics` |
 | Composition | `evoagent/plugins.py` | Trusted plugin manifests, capability registry, scopes, events, dependency graph, lifecycle rollback |
 | Composition | `evoagent/capabilities.py` | Stable typed capability definitions for providers and consumers |
+| Domain boundary | `evoagent/ports.py` | Focused Store, Queue, and CodeHost behavioral contracts |
 | Composition | `evoagent/bootstrap.py` | Replaceable built-in provider catalog and transactional application startup |
 | Orchestration | `evoagent/service.py` | Consumes composed capabilities, enqueues/processes reviews, GitHub integration |
 | Runtime | `evoagent/harness.py` | LangGraph state machine, budget, retry, checkpoint/resume |
@@ -77,6 +78,11 @@ repair rules, the verified fixer, authentication, release governance, alerting,
 evolution, and the queue factory. `ReviewService` consumes these contracts and
 does not instantiate their implementations directly.
 
+Capability keys select providers; domain Ports constrain provider behavior.
+Lower-level modules depend on focused Store facets rather than the complete
+database adapter. Shared backend behavior tests are documented in
+[`adapter-contracts.md`](adapter-contracts.md).
+
 Trusted plugins and Dynamic Skills are separate trust levels:
 
 - Trusted plugins run in-process, can own infrastructure resources, and require
@@ -123,8 +129,9 @@ The full analysis lives in [`threat-model.md`](threat-model.md). Key boundaries:
 - **New deterministic repair**: implement `FixRule` and provide the multi-valued
   `FIX_RULE` capability; `SafeFixer` retains verification and publication gates.
 - **New storage/queue/code-host/workflow backend**: implement a trusted provider
-  for the stable key in `evoagent.capabilities` and declare dependencies in its
-  manifest.
+  for the stable key in `evoagent.capabilities`, satisfy its Protocol in
+  `evoagent.ports`, pass the shared adapter contracts, and declare dependencies
+  in its manifest.
 - **New lifecycle observer**: subscribe to sanitized events such as
   `review.completed`; observer failures are isolated from the review path.
 

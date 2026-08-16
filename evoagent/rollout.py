@@ -2,6 +2,8 @@
 
 import hashlib
 
+from .ports import ReleaseStorePort
+
 
 def _percentage(config: dict[str, object], key: str) -> int:
     value = config.get(key, 0)
@@ -21,7 +23,7 @@ def _finding_keys(payload: dict[str, object] | None) -> set[str]:
 
 
 class ReleaseManager:
-    def __init__(self, store):
+    def __init__(self, store: ReleaseStorePort):
         self.store = store
 
     def configure(self, tenant_id: str, skill_name: str, config: dict[str, object]) -> dict:
@@ -32,7 +34,10 @@ class ReleaseManager:
         if config.get("candidate_version") is None:
             raise ValueError("candidate_version is required")
         self.store.save_deployment(tenant_id, skill_name, config)
-        return self.store.get_deployment(tenant_id, skill_name)
+        deployment = self.store.get_deployment(tenant_id, skill_name)
+        if deployment is None:
+            raise RuntimeError("deployment was not persisted")
+        return deployment
 
     def assignment(self, tenant_id: str, skill_name: str, key: str) -> dict[str, object]:
         deployment = self.store.get_deployment(tenant_id, skill_name)

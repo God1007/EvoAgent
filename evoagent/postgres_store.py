@@ -11,6 +11,7 @@ from contextlib import AbstractContextManager
 from typing import Any
 
 from .models import ReviewReport, TaskState, TraceEvent
+from .ports import ApplicationStorePort
 from .store import utc_now
 
 
@@ -170,6 +171,22 @@ class PostgresTaskStore:
                 min_samples INTEGER NOT NULL DEFAULT 20, status TEXT NOT NULL DEFAULT 'stable',
                 samples INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0,
                 updated_at TIMESTAMPTZ NOT NULL, PRIMARY KEY(tenant_id,skill_name))""",
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS "
+            "max_disagreement_rate DOUBLE PRECISION NOT NULL DEFAULT .2",
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS "
+            "auto_promote BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS "
+            "shadow_samples INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS "
+            "disagreements INTEGER NOT NULL DEFAULT 0",
+            """CREATE TABLE IF NOT EXISTS release_observations (
+                id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, skill_name TEXT NOT NULL,
+                task_id TEXT NOT NULL, lane TEXT NOT NULL, primary_json JSONB NOT NULL,
+                candidate_json JSONB, disagreement DOUBLE PRECISION NOT NULL,
+                candidate_failed BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL)""",
+            "CREATE INDEX IF NOT EXISTS idx_release_observations_deployment "
+            "ON release_observations(tenant_id, skill_name, id DESC)",
             """CREATE TABLE IF NOT EXISTS alerts (
                 id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, alert_key TEXT NOT NULL,
                 severity TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
@@ -967,6 +984,16 @@ class PostgresTaskStore:
                     utc_now(),
                 ),
             )
+            conn.execute(
+                "UPDATE deployments SET max_disagreement_rate=%s,auto_promote=%s,"
+                "shadow_samples=0,disagreements=0 WHERE tenant_id=%s AND skill_name=%s",
+                (
+                    float(config.get("max_disagreement_rate", 0.2)),
+                    bool(config.get("auto_promote", False)),
+                    tenant_id,
+                    skill_name,
+                ),
+            )
 
     def get_deployment(self, tenant_id: str, skill_name: str) -> dict[str, Any] | None:
         with self._connect() as conn:
@@ -1003,6 +1030,84 @@ class PostgresTaskStore:
                 )
                 value["status"] = "rolled_back"
         return value
+
+    def record_shadow_observation(
+        self,
+        tenant_id: str,
+        skill_name: str,
+        task_id: str,
+        lane: str,
+        primary: dict[str, Any],
+        candidate: dict[str, Any] | None,
+        disagreement: float,
+        candidate_failed: bool = False,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO release_observations(tenant_id,skill_name,task_id,lane,"
+                "primary_json,candidate_json,disagreement,candidate_failed,created_at) "
+                "VALUES (%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s)",
+                (
+                    tenant_id,
+                    skill_name,
+                    task_id,
+                    lane,
+                    json.dumps(primary, ensure_ascii=False),
+                    json.dumps(candidate, ensure_ascii=False) if candidate is not None else None,
+                    float(disagreement),
+                    candidate_failed,
+                    utc_now(),
+                ),
+            )
+            row = conn.execute(
+                "UPDATE deployments SET shadow_samples=shadow_samples+1,"
+                "disagreements=disagreements+%s,updated_at=%s "
+                "WHERE tenant_id=%s AND skill_name=%s RETURNING *",
+                (int(disagreement > 0), utc_now(), tenant_id, skill_name),
+            ).fetchone()
+            if not row:
+                return None
+            value = dict(row)
+            disagreement_rate = (
+                value["disagreements"] / value["shadow_samples"] if value["shadow_samples"] else 0.0
+            )
+            error_rate = value["errors"] / value["samples"] if value["samples"] else 0.0
+            if (
+                value["status"] == "running"
+                and value["auto_promote"]
+                and value["shadow_samples"] >= value["min_samples"]
+                and disagreement_rate <= value["max_disagreement_rate"]
+                and error_rate <= value["max_error_rate"]
+                and not candidate_failed
+            ):
+                conn.execute(
+                    "UPDATE deployments SET status='promoted',stable_version=candidate_version,"
+                    "canary_percent=0,shadow_percent=0,updated_at=%s "
+                    "WHERE tenant_id=%s AND skill_name=%s",
+                    (utc_now(), tenant_id, skill_name),
+                )
+                value["status"] = "promoted"
+        return value
+
+    def list_release_observations(
+        self,
+        tenant_id: str,
+        skill_name: str,
+        limit: int = 100,
+    ) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM release_observations WHERE tenant_id=%s AND skill_name=%s "
+                "ORDER BY id DESC LIMIT %s",
+                (tenant_id, skill_name, max(1, min(limit, 500))),
+            ).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            item["primary"] = item.pop("primary_json")
+            item["candidate"] = item.pop("candidate_json")
+            values.append(item)
+        return values
 
     def create_alert(
         self,
@@ -1084,7 +1189,7 @@ def create_store(
     pool_min: int = 1,
     pool_max: int = 10,
     pool_timeout: float = 10.0,
-):
+) -> ApplicationStorePort:
     if database_url.startswith(("postgres://", "postgresql://")):
         return PostgresTaskStore(database_url, pool_min, pool_max, pool_timeout)
     from .store import TaskStore

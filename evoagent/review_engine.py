@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from .agents import FilteredAgent, MultiAgentCoordinator
 from .circuit_breaker import CircuitBreaker
 from .config import Settings
 from .harness import ReviewHarness
 from .observability import Observability
+from .ports import ReviewWorkflowStorePort
 from .reviewer import LocalRuleReviewer, OpenAICompatibleReviewer, Reviewer
 from .skills import SkillRegistry
 
@@ -19,7 +18,7 @@ class ReviewEngine:
     def __init__(
         self,
         settings: Settings,
-        store: Any,
+        store: ReviewWorkflowStorePort,
         observability: Observability,
         llm_breaker: CircuitBreaker,
     ):

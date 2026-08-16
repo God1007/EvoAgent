@@ -12,8 +12,9 @@ from typing import Any, TypedDict, cast
 
 from .diff_parser import ParsedDiff, parse_unified_diff
 from .models import ChangedLine, Finding, ReviewReport, Severity, TaskState, TraceEvent
+from .ports import ReviewExecutionStorePort
 from .reviewer import Reviewer
-from .store import TaskStore, utc_now
+from .store import utc_now
 
 ALLOWED = {
     TaskState.PENDING: {TaskState.PLANNING, TaskState.FAILED, TaskState.CANCELLED},
@@ -46,7 +47,7 @@ class ReviewHarness:
 
     def __init__(
         self,
-        store: TaskStore,
+        store: ReviewExecutionStorePort,
         reviewer: Reviewer,
         max_steps: int = 8,
         timeout_seconds: int = 120,

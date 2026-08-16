@@ -4,6 +4,8 @@ import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
 
+from .ports import AlertStorePort
+
 trace_id_var: ContextVar[str] = ContextVar("trace_id", default="")
 logger = logging.getLogger("evoagent")
 
@@ -50,7 +52,7 @@ class Observability:
 
 
 class AlertManager:
-    def __init__(self, store, failure_rate: float = 0.2, min_samples: int = 10):
+    def __init__(self, store: AlertStorePort, failure_rate: float = 0.2, min_samples: int = 10):
         self.store = store
         self.failure_rate = failure_rate
         self.min_samples = min_samples

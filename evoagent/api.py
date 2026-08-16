@@ -566,7 +566,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     principal.tenant_id,
                     principal.username,
                     "proof.run",
-                    result.get("evidence_label", ""),
+                    str(result.get("evidence_label", "")),
                     {"level": result.get("evidence_level")},
                 )
                 self._send_json(201, result)

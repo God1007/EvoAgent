@@ -69,6 +69,9 @@ manifest = PluginManifest(
 | `queue.factory` | `evoagent.queue-factory` | Memory/Redis Streams 队列工厂 |
 
 第三方插件应引用这些 CapabilityKey，不应依赖 `ReviewService` 的内部构造顺序。
+Capability 负责“选择哪个 Provider”，`evoagent.ports` 中的 Protocol 负责
+“Provider 必须遵守什么行为合同”。Store、Queue、CodeHost 替换实现必须运行
+[`adapter-contracts.md`](adapter-contracts.md) 中的共享契约测试，不能只满足同名方法。
 
 ## 3. 添加可插拔 FixRule
 
@@ -210,3 +213,4 @@ global
 - 事件载荷不包含源码和密钥；
 - `/health` 中 `plugin_runtime=running` 且 Profile 正确；
 - 新 FixRule 同时包含肯定样本、拒绝修复样本和编译验证。
+- 新 Store、Queue 或 CodeHost Provider 已满足对应 Port，并通过共享行为契约。

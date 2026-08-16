@@ -13,6 +13,7 @@ from typing import Any, TypedDict, cast
 
 from .diff_parser import ParsedDiff
 from .models import Finding, Severity
+from .ports import AgentMessageStorePort
 from .reviewer import Reviewer
 
 
@@ -276,7 +277,7 @@ class MultiAgentCoordinator(Reviewer):
         self,
         agents: list[Reviewer],
         max_workers: int = 4,
-        store=None,
+        store: AgentMessageStorePort | None = None,
     ):
         self.agents = agents
         self.max_workers = max_workers

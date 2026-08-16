@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .diff_parser import parse_unified_diff
+from .ports import EvolutionStorePort
 from .reviewer import Reviewer
 from .store import utc_now
 
@@ -223,7 +224,7 @@ class EvolutionEngine:
 
     def __init__(
         self,
-        store,
+        store: EvolutionStorePort,
         reviewer_factory: Callable[[str], Reviewer] | None = None,
         min_cases: int = 3,
         max_cases: int = 5,

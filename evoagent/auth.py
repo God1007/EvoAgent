@@ -10,6 +10,8 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from .ports import AuthStorePort
+
 ROLE_PERMISSIONS = {
     "admin": {"read", "review", "fix", "manage", "audit"},
     "maintainer": {"read", "review", "fix"},
@@ -63,7 +65,7 @@ class Principal:
 class AuthManager:
     def __init__(
         self,
-        store,
+        store: AuthStorePort,
         secret: str,
         ttl_seconds: int = 3600,
         bootstrap_username: str = "",

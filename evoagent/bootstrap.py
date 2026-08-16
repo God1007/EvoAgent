@@ -46,6 +46,7 @@ from .plugins import (
     ProviderPlugin,
     discover_plugins,
 )
+from .ports import ApplicationStorePort, AuthStorePort
 from .postgres_store import create_store
 from .review_engine import ReviewEngine
 from .rollout import ReleaseManager
@@ -280,7 +281,7 @@ def _breaker(context: PluginContext, name: str) -> CircuitBreaker:
     )
 
 
-def _store(context: PluginContext) -> Any:
+def _store(context: PluginContext) -> ApplicationStorePort:
     settings = context.require(SETTINGS)
     return create_store(
         settings.database_url,
@@ -312,7 +313,7 @@ def _fixer(settings: Settings, rules: list[FixRule]) -> SafeFixer:
     )
 
 
-def _auth(settings: Settings, store: Any) -> AuthManager:
+def _auth(settings: Settings, store: AuthStorePort) -> AuthManager:
     return AuthManager(
         store,
         settings.auth_secret,

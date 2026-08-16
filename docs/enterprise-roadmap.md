@@ -22,12 +22,13 @@ It is an execution plan, not a marketing checklist.
 
 ## Phase 2 — Ports, persistence, and integration proof
 
-### 2.1 Explicit domain ports
+### 2.1 Explicit domain ports — baseline implemented
 
-Replace remaining structural/`Any` boundaries with focused Protocols:
+The first implementation replaces the Store/Queue/CodeHost `Any` and concrete
+adapter boundaries with focused Protocols:
 
 - `TaskExecutionStore`, `GovernanceStore`, `SessionStore`, `EvaluationStore`;
-- `TaskQueuePort`, `CodeHostPort`, `ModelGatewayPort`;
+- `TaskQueuePort`, `CodeHostPort` (the `ModelGatewayPort` remains in phase 4);
 - contract tests that every SQLite/PostgreSQL and Memory/Redis implementation must pass.
 
 Acceptance:
@@ -35,6 +36,13 @@ Acceptance:
 - application and domain modules depend on ports, not concrete adapters;
 - mypy checks both production adapter implementations against the same contracts;
 - a fake adapter can run service use-case tests without monkey-patching internals.
+
+Evidence: `evoagent/ports.py` is consumed by the harness, reviewer graph,
+authentication, evolution, rollout, alerting, fixer, service capability graph,
+and store factory. `tests/test_adapter_contracts.py` runs the same behavior
+contract against SQLite/PostgreSQL and Memory/Redis (production backends are
+enabled by explicit test URLs). This extraction also found and fixed missing
+PostgreSQL shadow-observation/automatic-promotion parity.
 
 ### 2.2 Versioned database migrations
 

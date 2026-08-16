@@ -28,6 +28,7 @@ from .github import GitHubAppAuthenticator, GitHubClient
 from .metrics import metrics
 from .models import TaskState, TraceEvent
 from .plugins import Plugin, PluginProfile, PluginRuntime
+from .ports import CodeHostPort
 from .proof import ProofRunner
 from .report import to_markdown
 from .review_engine import ReviewEngine
@@ -555,9 +556,8 @@ class ReviewService:
                 report = self._run_review(task_id, repository, pull_request, diff, tenant_id)
             self._run_shadow(task_id, tenant_id, diff, report)
             metrics.inc("reviews_total")
-            lane = (self.store.get(task_id, tenant_id).get("input") or {}).get(
-                "release_lane", "stable"
-            )
+            persisted = self.store.get(task_id, tenant_id) or {}
+            lane = (persisted.get("input") or {}).get("release_lane", "stable")
             self.releases.observe(tenant_id, "llm-review", False, lane)
             self._publish_event(
                 "review.completed",
@@ -825,7 +825,7 @@ class ReviewService:
         result["will_post_to_github"] = self.settings.auto_post_review
         return result
 
-    def github_client_for_installation(self, installation_id: int | None = None) -> GitHubClient:
+    def github_client_for_installation(self, installation_id: int | None = None) -> CodeHostPort:
         if installation_id is None:
             return self.github
         if not self.settings.github_app_id or not self.settings.github_private_key_path:

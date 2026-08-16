@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Any, TypedDict
 
 from .fix_rules import FixRule, default_fix_rules
-from .github import GitHubClient
+from .ports import CodeHostPort
 from .verifier import RepairVerifier
 
 
@@ -119,7 +119,7 @@ class SafeFixer:
 
     def create_fix_commits(
         self,
-        client: GitHubClient,
+        client: CodeHostPort,
         repository: str,
         pull_request: int,
         report: dict[str, Any],

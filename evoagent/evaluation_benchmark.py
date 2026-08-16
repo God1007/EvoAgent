@@ -130,7 +130,6 @@ def _risk_scenarios() -> list[dict]:
         r"yaml\.load",
         r"yaml\.safe_load",
         1,
-        False,
     )
     add(
         "SEC-PICKLE-LOAD",
@@ -211,7 +210,6 @@ def _risk_scenarios() -> list[dict]:
         r"secure\s*=\s*False",
         r"secure\s*=\s*True",
         1,
-        False,
     )
     add(
         "REL-FLOAT-MONEY",

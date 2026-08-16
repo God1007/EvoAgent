@@ -256,6 +256,11 @@ curl 'http://127.0.0.1:8080/v1/tasks/<task-id>/report'
 4. 如果配置了测试命令，则在隔离的仓库副本中运行测试；
 5. 所有门禁通过后，以一个原子提交创建 Draft Pull Request。
 
+除表中本地规则外，SafeFixer 还能消费多 Agent 或 LLM 产生的
+`SEC-YAML-LOAD` 与 `SEC-INSECURE-COOKIE` Finding：仅当 Python AST 精确匹配
+单参数 `yaml.load(...)` 或显式 `secure=False` 时，才分别替换为
+`yaml.safe_load(...)` 和 `secure=True`；自定义 Loader、额外参数等不确定形态会拒绝自动修复。
+
 ## 接入大模型
 
 EvoAgent 使用 OpenAI Chat Completions 兼容协议。无论使用哪个模型，输出都必须符合结构化 JSON Schema，并且发现位置必须属于 Diff 新增行。

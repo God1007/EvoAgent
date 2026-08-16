@@ -58,6 +58,38 @@ class AdvancedFeatureTests(unittest.TestCase):
         self.assertNotIn("print(result)", result["content"])
         self.assertEqual({"SEC-HARDCODED-SECRET", "REL-DEBUG-PRINT"}, set(result["rules"]))
 
+    def test_safe_fixer_hardens_cookie_and_yaml_load(self):
+        content = (
+            "import yaml\n"
+            "payload = yaml.load(value)\n"
+            'response.set_cookie("sid", value, secure=False)\n'
+        )
+        findings = [
+            {"path": "app.py", "line": 2, "rule_id": "SEC-YAML-LOAD"},
+            {"path": "app.py", "line": 3, "rule_id": "SEC-INSECURE-COOKIE"},
+        ]
+        result = SafeFixer().apply(content, findings, "app.py")
+        self.assertIn("yaml.safe_load(value)", result["content"])
+        self.assertIn("secure=True", result["content"])
+        self.assertNotIn("yaml.load(value)", result["content"])
+        self.assertNotIn("secure=False", result["content"])
+        self.assertEqual({"SEC-YAML-LOAD", "SEC-INSECURE-COOKIE"}, set(result["rules"]))
+        compile(result["content"], "app.py", "exec")
+
+    def test_safe_fixer_refuses_ambiguous_yaml_load(self):
+        content = "payload = yaml.load(value, Loader=custom_loader)\n"
+        findings = [{"path": "app.py", "line": 1, "rule_id": "SEC-YAML-LOAD"}]
+        result = SafeFixer().apply(content, findings, "app.py")
+        self.assertEqual(content, result["content"])
+        self.assertEqual([], result["rules"])
+
+    def test_safe_fixer_refuses_nonliteral_cookie_security_flag(self):
+        content = 'response.set_cookie("sid", value, secure=secure_by_policy)\n'
+        findings = [{"path": "app.py", "line": 1, "rule_id": "SEC-INSECURE-COOKIE"}]
+        result = SafeFixer().apply(content, findings, "app.py")
+        self.assertEqual(content, result["content"])
+        self.assertEqual([], result["rules"])
+
     def test_deepseek_and_free_openrouter_provider_presets(self):
         deepseek = settings(self.path)
         deepseek = deepseek.__class__(

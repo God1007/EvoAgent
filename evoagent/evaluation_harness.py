@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .diff_parser import parse_unified_diff
+from .fixer import SafeFixer
 from .models import Finding
 from .reviewer import Reviewer
 from .verifier import RepairVerifier
@@ -245,6 +246,20 @@ class FixtureRepairer:
                 "read_under_base(base, user_path)",
                 content,
             )
+        if rule in {"SEC-YAML-LOAD", "SEC-INSECURE-COOKIE"}:
+            result = SafeFixer().apply(
+                content,
+                [
+                    {
+                        "path": finding.path,
+                        "line": finding.line,
+                        "rule_id": rule,
+                    }
+                ],
+                finding.path,
+            )
+            if rule in result["rules"]:
+                return str(result["content"])
         return content
 
     @staticmethod
@@ -319,8 +334,15 @@ class EndToEndEvaluationHarness:
             "high_hits": 0,
             "clean_hit": False,
             "execution_success": False,
+            "repair_eligible": (
+                len(expected)
+                if self.repairer is not None
+                and bool((case.get("repair_validation") or {}).get("auto_fixable"))
+                else 0
+            ),
             "repair_attempted": 0,
             "repair_passed": 0,
+            "repair_abstained": 0,
             "e2e_success": False,
             "matches": [],
             "repair": [],
@@ -359,7 +381,8 @@ class EndToEndEvaluationHarness:
                         "location_distance": match.location_distance,
                     }
                 )
-                if self.repairer is not None:
+                repair_is_eligible = bool((case.get("repair_validation") or {}).get("auto_fixable"))
+                if self.repairer is not None and repair_is_eligible:
                     result["repair_attempted"] += 1
                     repair = self.repairer.repair(case, finding)
                     result["repair_passed"] += int(repair["passed"])
@@ -370,8 +393,11 @@ class EndToEndEvaluationHarness:
                             "checks": repair["checks"],
                         }
                     )
+                elif self.repairer is not None:
+                    result["repair_abstained"] += 1
             result["e2e_success"] = bool(
                 expected
+                and result["repair_eligible"] == len(expected)
                 and len(matched_expected) == len(expected)
                 and result["repair_attempted"] == len(expected)
                 and result["repair_passed"] == len(expected)
@@ -394,8 +420,10 @@ class EndToEndEvaluationHarness:
             "high_hits": 0,
             "clean_hits": 0,
             "execution_successes": 0,
+            "repair_eligible": 0,
             "repair_attempted": 0,
             "repair_passed": 0,
+            "repair_abstained": 0,
             "e2e_successes": 0,
         }
 
@@ -411,8 +439,10 @@ class EndToEndEvaluationHarness:
             "severity_hits",
             "high_total",
             "high_hits",
+            "repair_eligible",
             "repair_attempted",
             "repair_passed",
+            "repair_abstained",
         ):
             totals[field] += int(result[field])
         totals["clean_hits"] += int(result["clean_hit"])
@@ -436,7 +466,7 @@ class EndToEndEvaluationHarness:
             "high_risk_recall": ratio(totals["high_hits"], totals["high_total"]),
             "clean_accuracy": ratio(totals["clean_hits"], totals["clean_cases"]),
             "execution_success_rate": ratio(totals["execution_successes"], totals["cases"], 0.0),
-            "safe_fix_rate": ratio(totals["repair_passed"], totals["repair_attempted"], 0.0),
+            "safe_fix_rate": ratio(totals["repair_passed"], totals["repair_eligible"], 0.0),
             "e2e_security_fix_rate": ratio(totals["e2e_successes"], totals["risk_cases"], 0.0),
         }
 

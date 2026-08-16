@@ -98,6 +98,35 @@ class SafeFixer:
                         ):
                             keyword.value = ast.Constant(False)
                             changed.append("SEC-SUBPROCESS-SHELL")
+                if (
+                    (node.lineno, "SEC-YAML-LOAD") in targets
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "yaml"
+                    and node.func.attr == "load"
+                    and len(node.args) == 1
+                    and not node.keywords
+                ):
+                    # yaml.safe_load accepts a single stream argument. Refuse calls
+                    # with custom loaders or extra arguments instead of guessing at
+                    # their semantics.
+                    node.func.attr = "safe_load"
+                    changed.append("SEC-YAML-LOAD")
+                if (
+                    (node.lineno, "SEC-INSECURE-COOKIE") in targets
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "set_cookie"
+                ):
+                    secure_keywords = [
+                        keyword for keyword in node.keywords if keyword.arg == "secure"
+                    ]
+                    if (
+                        len(secure_keywords) == 1
+                        and isinstance(secure_keywords[0].value, ast.Constant)
+                        and secure_keywords[0].value.value is False
+                    ):
+                        secure_keywords[0].value = ast.Constant(True)
+                        changed.append("SEC-INSECURE-COOKIE")
                 return node
 
             def visit_Assign(inner, node):

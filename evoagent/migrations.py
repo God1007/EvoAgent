@@ -351,6 +351,39 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ON outbox_messages(status,available_at,lease_until)",
         ),
     ),
+    Migration(
+        5,
+        "versioned-repository-policies",
+        (
+            """CREATE TABLE IF NOT EXISTS repository_policies (
+                tenant_id TEXT NOT NULL, repository TEXT NOT NULL, version INTEGER NOT NULL,
+                enabled INTEGER NOT NULL, auto_fix INTEGER NOT NULL,
+                policy_json TEXT NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY(tenant_id,repository))""",
+            """CREATE TABLE IF NOT EXISTS repository_policy_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL,
+                repository TEXT NOT NULL, version INTEGER NOT NULL,
+                policy_json TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL,
+                UNIQUE(tenant_id,repository,version))""",
+            "CREATE INDEX IF NOT EXISTS idx_repository_policy_versions "
+            "ON repository_policy_versions(tenant_id,repository,version DESC)",
+        ),
+        (
+            """CREATE TABLE IF NOT EXISTS repository_policies (
+                tenant_id TEXT NOT NULL, repository TEXT NOT NULL, version INTEGER NOT NULL,
+                enabled BOOLEAN NOT NULL, auto_fix BOOLEAN NOT NULL,
+                policy_json JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(tenant_id,repository))""",
+            """CREATE TABLE IF NOT EXISTS repository_policy_versions (
+                id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL,
+                repository TEXT NOT NULL, version INTEGER NOT NULL,
+                policy_json JSONB NOT NULL, actor TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                UNIQUE(tenant_id,repository,version))""",
+            "CREATE INDEX IF NOT EXISTS idx_repository_policy_versions "
+            "ON repository_policy_versions(tenant_id,repository,version DESC)",
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1].version

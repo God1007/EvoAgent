@@ -954,6 +954,94 @@ class TaskStore:
                 (tenant_id, repository, int(auto_fix)),
             )
 
+    def save_repository_policy(
+        self,
+        tenant_id: str,
+        repository: str,
+        policy: dict[str, Any],
+        actor: str,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        serialized = json.dumps(policy, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT version FROM repository_policies WHERE tenant_id=? AND repository=?",
+                (tenant_id, repository),
+            ).fetchone()
+            version = int(row["version"]) + 1 if row else 1
+            conn.execute(
+                "INSERT INTO repository_policies(tenant_id,repository,version,enabled,auto_fix,"
+                "policy_json,updated_at) VALUES (?,?,?,?,?,?,?) "
+                "ON CONFLICT(tenant_id,repository) DO UPDATE SET version=excluded.version,"
+                "enabled=excluded.enabled,auto_fix=excluded.auto_fix,"
+                "policy_json=excluded.policy_json,updated_at=excluded.updated_at",
+                (
+                    tenant_id,
+                    repository,
+                    version,
+                    int(bool(policy["enabled"])),
+                    int(bool(policy["auto_fix"])),
+                    serialized,
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO repository_policy_versions(tenant_id,repository,version,"
+                "policy_json,actor,created_at) VALUES (?,?,?,?,?,?)",
+                (tenant_id, repository, version, serialized, actor, now),
+            )
+            conn.execute(
+                "INSERT INTO audit_log(tenant_id,actor,action,resource,detail_json,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (
+                    tenant_id,
+                    actor,
+                    "repository-policy.updated",
+                    repository,
+                    json.dumps({"version": version, "policy": policy}, ensure_ascii=False),
+                    now,
+                ),
+            )
+        return {
+            "tenant_id": tenant_id,
+            "repository": repository,
+            "version": version,
+            "policy": dict(policy),
+            "actor": actor,
+            "updated_at": now,
+        }
+
+    def get_repository_policy(self, tenant_id: str, repository: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT tenant_id,repository,version,policy_json,updated_at "
+                "FROM repository_policies WHERE tenant_id=? AND repository=?",
+                (tenant_id, repository),
+            ).fetchone()
+        if not row:
+            return None
+        value = dict(row)
+        value["policy"] = json.loads(value.pop("policy_json"))
+        return value
+
+    def list_repository_policy_versions(
+        self, tenant_id: str, repository: str, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tenant_id,repository,version,policy_json,actor,created_at "
+                "FROM repository_policy_versions WHERE tenant_id=? AND repository=? "
+                "ORDER BY version DESC LIMIT ?",
+                (tenant_id, repository, max(1, min(limit, 200))),
+            ).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            item["policy"] = json.loads(item.pop("policy_json"))
+            values.append(item)
+        return values
+
     def repository_allowed(
         self,
         tenant_id: str,
@@ -961,6 +1049,13 @@ class TaskStore:
         require_auto_fix: bool = False,
     ) -> bool:
         with self._connect() as conn:
+            policy = conn.execute(
+                "SELECT enabled,auto_fix FROM repository_policies "
+                "WHERE tenant_id=? AND repository=?",
+                (tenant_id, repository),
+            ).fetchone()
+            if policy:
+                return bool(policy["enabled"] and (not require_auto_fix or policy["auto_fix"]))
             total = conn.execute(
                 "SELECT COUNT(*) AS n FROM repository_grants WHERE tenant_id=?", (tenant_id,)
             ).fetchone()["n"]

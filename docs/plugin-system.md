@@ -55,6 +55,7 @@ manifest = PluginManifest(
 | --- | --- | --- |
 | `settings` | `evoagent.settings` | 不可变运行配置 |
 | `store` | `evoagent.store` | SQLite/PostgreSQL 持久化 |
+| `policy.repository` | `evoagent.policy.repository` | 租户/仓库版本化执行策略 |
 | `observability` | `evoagent.observability` | OpenTelemetry Provider |
 | `circuit-breaker.github` | `evoagent.breaker.github` | GitHub 熔断器 |
 | `circuit-breaker.llm` | `evoagent.breaker.llm` | LLM 熔断器 |

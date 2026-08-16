@@ -156,6 +156,26 @@ class AlertStorePort(Protocol):
     def create_alert(self, tenant_id: str, alert_key: str, severity: str, message: str) -> None: ...
 
 
+class RepositoryPolicyStorePort(Protocol):
+    def save_repository_policy(
+        self,
+        tenant_id: str,
+        repository: str,
+        policy: dict[str, Any],
+        actor: str,
+    ) -> dict[str, Any]: ...
+
+    def get_repository_policy(self, tenant_id: str, repository: str) -> dict[str, Any] | None: ...
+
+    def list_repository_policy_versions(
+        self, tenant_id: str, repository: str, limit: int = 50
+    ) -> list[dict[str, Any]]: ...
+
+    def repository_allowed(
+        self, tenant_id: str, repository: str, require_auto_fix: bool = False
+    ) -> bool: ...
+
+
 class OutboxStorePort(Protocol):
     def claim_outbox(
         self,
@@ -303,6 +323,7 @@ class ApplicationStorePort(
     EvolutionStorePort,
     ReleaseStorePort,
     AlertStorePort,
+    RepositoryPolicyStorePort,
     OutboxStorePort,
     ServiceStorePort,
     Protocol,

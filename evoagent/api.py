@@ -332,6 +332,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/v1/repository-policies":
+            if not principal.can("manage"):
+                self._send_json(403, {"error": "permission denied"})
+                return
+            repository = query.get("repository", [""])[0]
+            if not repository:
+                self._send_json(400, {"error": "repository query parameter is required"})
+                return
+            self._send_json(
+                200,
+                self.service.get_repository_policy(principal.tenant_id, repository),
+            )
+            return
         if path == "/v1/evaluation/cases":
             split = query.get("split", ["validation"])[0]
             if split == "holdout":
@@ -464,6 +477,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                     str(payload.get("repository", "")),
                     {"async": query.get("async", ["false"])[0]},
                 )
+                return
+            if path == "/v1/repository-policies":
+                principal = self._principal("manage")
+                payload = self._read_json(body)
+                repository = str(payload.get("repository", ""))
+                raw_policy = payload.get("policy")
+                if not isinstance(raw_policy, dict):
+                    raise ValueError("policy must be an object")
+                result = self.service.set_repository_policy(
+                    principal.tenant_id,
+                    repository,
+                    raw_policy,
+                    principal.username,
+                )
+                self._send_json(201, result)
                 return
             if path == "/webhooks/github":
                 if self.headers.get("X-GitHub-Event", "") != "pull_request":

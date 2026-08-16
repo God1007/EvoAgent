@@ -26,6 +26,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Evolution | `evoagent/evolution.py`, `rollout.py` | Prompt versioning, validation/holdout replay, canary/shadow, rollback |
 | Evolution | `evoagent/evaluation_harness.py`, `evaluation_benchmark.py` | Replay scoring, benchmark dataset |
 | Storage | `evoagent/store.py`, `postgres_store.py` | Task/finding/feedback/version/audit persistence |
+| Policy | `evoagent/policy.py` | Versioned tenant/repository execution and publication decisions |
 | Storage | `evoagent/migrations.py` | Locked, checksummed SQLite/PostgreSQL schema history and compatibility gate |
 | Cross-cutting | `evoagent/auth.py` | JWT, RBAC, tenant isolation |
 | Cross-cutting | `evoagent/observability.py`, `metrics.py` | Trace, Prometheus metrics, OpenTelemetry |
@@ -119,6 +120,11 @@ See [`plugin-system.md`](plugin-system.md) and
 - **Idempotency**: GitHub webhook delivery id, payload digest, and PR update
   time prevent invalid replay; comments use stable upsert markers and repair PRs
   use effect receipts plus deterministic branches.
+- **Repository governance** is resolved through a replaceable capability. The
+  accepted task stores a versioned policy snapshot while current disable/comment
+  kill switches are checked again at execution. See
+  [`repository-policies.md`](repository-policies.md) and
+  [`ADR 0005`](adr/0005-versioned-repository-policy.md).
 
 ## 5. Trust boundaries (summary)
 

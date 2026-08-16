@@ -18,6 +18,7 @@ from .capabilities import (
     OBSERVABILITY,
     QUEUE_FACTORY,
     RELEASES,
+    REPOSITORY_POLICY,
     REVIEW_ENGINE,
     STORE,
 )
@@ -29,6 +30,7 @@ from .metrics import metrics
 from .models import TaskState, TraceEvent
 from .outbox import OutboxDispatcher
 from .plugins import Plugin, PluginProfile, PluginRuntime
+from .policy import RepositoryPolicy
 from .ports import CodeHostPort
 from .proof import ProofRunner
 from .report import to_markdown
@@ -60,6 +62,7 @@ class ReviewService:
             self.github_breaker = self.plugin_runtime.require(GITHUB_BREAKER)
             self.llm_breaker = self.plugin_runtime.require(LLM_BREAKER)
             self.store = self.plugin_runtime.require(STORE)
+            self.policies = self.plugin_runtime.require(REPOSITORY_POLICY)
             self.observability = self.plugin_runtime.require(OBSERVABILITY)
             self.review_engine: ReviewEngine = self.plugin_runtime.require(REVIEW_ENGINE)
             self.llm_config = self.review_engine.llm_config
@@ -510,6 +513,18 @@ class ReviewService:
         if size > self.settings.max_diff_bytes:
             raise ValueError("diff exceeds maximum size of %d bytes" % self.settings.max_diff_bytes)
 
+    def _authorize_review(self, tenant_id: str, repository: str, diff: str) -> RepositoryPolicy:
+        self._validate_review(repository, diff)
+        policy = self.policies.resolve(tenant_id, repository)
+        self.policies.authorize_review(
+            policy,
+            len(diff.encode("utf-8")),
+            self.reviewer.name,
+            str(self.llm_config.get("provider", "local")),
+            str(self.llm_config.get("model", "")),
+        )
+        return policy
+
     def _create_task(
         self,
         repository: str,
@@ -518,6 +533,7 @@ class ReviewService:
         source: str,
         tenant_id: str = "default",
         outbox_payload: dict[str, Any] | None = None,
+        policy: RepositoryPolicy | None = None,
     ) -> str:
         task_id = str(uuid.uuid4())
         encoded = diff.encode("utf-8")
@@ -532,6 +548,9 @@ class ReviewService:
                 "diff_sha256": hashlib.sha256(encoded).hexdigest(),
                 "release_lane": assignment["lane"],
                 "shadow": assignment["shadow"],
+                "repository_policy": self.policies.snapshot(
+                    policy or self.policies.resolve(tenant_id, repository)
+                ),
             },
             tenant_id,
             diff,
@@ -547,6 +566,7 @@ class ReviewService:
         tenant_id: str,
         payload: dict[str, Any],
         outbox_payload: dict[str, Any],
+        policy: RepositoryPolicy | None = None,
     ) -> str:
         task_id = str(uuid.uuid4())
         assignment = self.releases.assignment(tenant_id, "llm-review", task_id)
@@ -559,6 +579,9 @@ class ReviewService:
                 "diff_pending": True,
                 "release_lane": assignment["lane"],
                 "shadow": assignment["shadow"],
+                "repository_policy": self.policies.snapshot(
+                    policy or self.policies.resolve(tenant_id, repository)
+                ),
                 **payload,
             },
             tenant_id,
@@ -575,9 +598,10 @@ class ReviewService:
         source: str = "api",
         tenant_id: str = "default",
     ) -> dict[str, Any]:
-        self._validate_review(repository, diff)
-        self._authorize_repository(tenant_id, repository)
-        task_id = self._create_task(repository, diff, pull_request, source, tenant_id)
+        policy = self._authorize_review(tenant_id, repository, diff)
+        task_id = self._create_task(
+            repository, diff, pull_request, source, tenant_id, policy=policy
+        )
         self._publish_event(
             "review.started",
             {
@@ -644,8 +668,7 @@ class ReviewService:
         installation_id: int | None = None,
         tenant_id: str = "default",
     ) -> dict[str, Any]:
-        self._validate_review(repository, diff)
-        self._authorize_repository(tenant_id, repository)
+        policy = self._authorize_review(tenant_id, repository, diff)
         task_id = self._create_task(
             repository,
             diff,
@@ -659,6 +682,7 @@ class ReviewService:
                 "installation_id": installation_id,
                 "tenant_id": tenant_id,
             },
+            policy,
         )
         self.outbox.notify()
         metrics.inc("reviews_enqueued_total")
@@ -670,7 +694,18 @@ class ReviewService:
         if not task:
             raise PermanentTaskError("task record no longer exists")
         tenant_id = payload.get("tenant_id") or task.get("tenant_id") or "default"
+        task_input = task.get("input") or {}
+        snapshot = task_input.get("repository_policy")
+        policy = (
+            self.policies.from_snapshot(snapshot)
+            if snapshot is not None
+            else self.policies.resolve(tenant_id, payload["repository"])
+        )
+        current_policy = self.policies.resolve(tenant_id, payload["repository"])
+        if not current_policy.enabled:
+            raise PermissionError("repository was disabled after this task was accepted")
         diff = self.store.get_task_payload(task_id)
+        fetched_diff = False
         if diff is None and payload.get("diff_url"):
             client = (
                 self.github_client_for_installation(payload.get("installation_id"))
@@ -681,7 +716,18 @@ class ReviewService:
             diff = client.fetch_diff(
                 payload["diff_url"], max_bytes=self.settings.max_diff_bytes + 4096
             )
-            self._validate_review(payload["repository"], diff)
+            fetched_diff = True
+        if diff is None:
+            raise PermanentTaskError("task payload no longer exists")
+        self._validate_review(payload["repository"], diff)
+        self.policies.authorize_review(
+            policy,
+            len(diff.encode("utf-8")),
+            self.reviewer.name,
+            str(self.llm_config.get("provider", "local")),
+            str(self.llm_config.get("model", "")),
+        )
+        if fetched_diff:
             encoded = diff.encode("utf-8")
             self.store.save_task_payload(task_id, diff)
             self.store.update_task_input(
@@ -692,8 +738,6 @@ class ReviewService:
                     "diff_sha256": hashlib.sha256(encoded).hexdigest(),
                 },
             )
-        if diff is None:
-            raise PermanentTaskError("task payload no longer exists")
         self._publish_event(
             "review.started",
             {
@@ -737,7 +781,12 @@ class ReviewService:
                 },
             )
             continuity = self._record_session_turn(payload, report)
-            if payload.get("github_issue_url") and self.settings.auto_post_review:
+            if (
+                payload.get("github_issue_url")
+                and self.settings.auto_post_review
+                and policy.post_review_comments
+                and current_policy.post_review_comments
+            ):
                 client = self.github_client_for_installation(payload.get("installation_id"))
                 body = to_markdown(report.to_dict())
                 if continuity:
@@ -851,7 +900,7 @@ class ReviewService:
         diff_url = pull.get("diff_url")
         if not repository or not isinstance(number, int) or not diff_url:
             raise ValueError("invalid GitHub pull_request payload")
-        self._authorize_repository(tenant_id, repository)
+        policy = self._authorize_repository(tenant_id, repository)
         head_sha = (pull.get("head") or {}).get("sha")
         session = self.store.start_session_turn(tenant_id, repository, number, head_sha, action)
         task_id = self._create_deferred_task(
@@ -877,6 +926,7 @@ class ReviewService:
                 "turn_id": session["turn_id"],
                 "head_sha": head_sha,
             },
+            policy,
         )
         self.outbox.notify()
         metrics.inc("reviews_enqueued_total")
@@ -888,7 +938,9 @@ class ReviewService:
             "turn": session["sequence"],
         }
         self.store.complete_webhook(delivery_id, task_id)
-        result["will_post_to_github"] = self.settings.auto_post_review
+        result["will_post_to_github"] = (
+            self.settings.auto_post_review and policy.post_review_comments
+        )
         return result
 
     def github_client_for_installation(self, installation_id: int | None = None) -> CodeHostPort:
@@ -913,8 +965,9 @@ class ReviewService:
         if task.get("pull_request") is None:
             raise ValueError("fix commits require a GitHub pull request task")
         actual_tenant = task.get("tenant_id") or tenant_id or "default"
-        if not self.store.repository_allowed(actual_tenant, task["repository"], True):
-            raise PermissionError("automatic repair is not enabled for this repository")
+        policy = self.policies.resolve(actual_tenant, task["repository"])
+        available_rule_ids = tuple(getattr(self.fixer, "rule_ids", ()))
+        allowed_rule_ids = self.policies.authorize_fix(policy, available_rule_ids)
         effect_key = "fix-pr:%s:%s" % (actual_tenant, task_id)
         owner = uuid.uuid4().hex
         receipt = self.store.claim_effect(
@@ -933,6 +986,7 @@ class ReviewService:
                 task["pull_request"],
                 task["report"],
                 operation_key=effect_key,
+                allowed_rule_ids=allowed_rule_ids,
             )
             if not self.store.complete_effect(effect_key, owner, result):
                 raise RuntimeError("repair publication lease was lost before completion")
@@ -991,6 +1045,37 @@ class ReviewService:
     def cancel_task(self, task_id: str, tenant_id: str | None = None) -> bool:
         return self.store.request_cancel(task_id, tenant_id)
 
-    def _authorize_repository(self, tenant_id: str, repository: str) -> None:
-        if not self.store.repository_allowed(tenant_id, repository):
+    def _authorize_repository(self, tenant_id: str, repository: str) -> RepositoryPolicy:
+        policy = self.policies.resolve(tenant_id, repository)
+        if not policy.enabled:
             raise PermissionError("repository is not authorized for this tenant")
+        return policy
+
+    def get_repository_policy(self, tenant_id: str, repository: str) -> dict[str, Any]:
+        policy = self.policies.resolve(tenant_id, repository)
+        return {
+            "tenant_id": tenant_id,
+            "repository": repository,
+            "version": policy.version,
+            "source": policy.source,
+            "policy": policy.to_dict(),
+            "history": self.store.list_repository_policy_versions(tenant_id, repository, 50),
+        }
+
+    def set_repository_policy(
+        self,
+        tenant_id: str,
+        repository: str,
+        policy: dict[str, Any],
+        actor: str,
+    ) -> dict[str, Any]:
+        parsed = RepositoryPolicy.from_dict(policy)
+        unknown_rules = set(parsed.allowed_fix_rules).difference(
+            tuple(getattr(self.fixer, "rule_ids", ()))
+        )
+        if unknown_rules:
+            raise ValueError(
+                "repository policy references unavailable fix rules: %s"
+                % ", ".join(sorted(unknown_rules))
+            )
+        return self.policies.save(tenant_id, repository, parsed.to_dict(), actor)

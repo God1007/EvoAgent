@@ -179,6 +179,25 @@ class CreateFixCommitsTests(unittest.TestCase):
         self.assertIsNone(result["branch"])
         self.assertIn("No finding was eligible", result["note"])
 
+    def test_policy_rule_allowlist_filters_other_deterministic_repairs(self):
+        fixer = SafeFixer(verifier=_FakeVerifier())
+        result = fixer.create_fix_commits(
+            _FakeClient(),
+            "o/r",
+            1,
+            _report(),
+            allowed_rule_ids=["REL-DEBUG-PRINT"],
+        )
+        self.assertIsNone(result["branch"])
+        self.assertEqual([], result["commits"])
+
+    def test_policy_rule_allowlist_rejects_unavailable_rule(self):
+        fixer = SafeFixer(verifier=_FakeVerifier())
+        with self.assertRaisesRegex(ValueError, "unknown automatic repair rules"):
+            fixer.create_fix_commits(
+                _FakeClient(), "o/r", 1, _report(), allowed_rule_ids=["UNKNOWN"]
+            )
+
     def test_verification_failure_blocks_repair(self):
         fixer = SafeFixer(verifier=_FakeVerifier(contents_pass=False))
         result = fixer.create_fix_commits(_FakeClient(), "o/r", 1, _report())

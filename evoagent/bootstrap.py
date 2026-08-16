@@ -18,6 +18,7 @@ from .capabilities import (
     OBSERVABILITY,
     QUEUE_FACTORY,
     RELEASES,
+    REPOSITORY_POLICY,
     REVIEW_ENGINE,
     SETTINGS,
     STORE,
@@ -46,6 +47,7 @@ from .plugins import (
     ProviderPlugin,
     discover_plugins,
 )
+from .policy import RepositoryPolicyResolver
 from .ports import ApplicationStorePort, AuthStorePort
 from .postgres_store import create_store
 from .review_engine import ReviewEngine
@@ -133,6 +135,13 @@ def default_plugins(settings: Settings) -> list[Plugin]:
             _store,
             "SQLite/PostgreSQL task and audit store",
             close=_close_resource,
+        ),
+        _provider(
+            "evoagent.policy.repository",
+            REPOSITORY_POLICY,
+            (STORE,),
+            lambda context: RepositoryPolicyResolver(context.require(STORE)),
+            "Versioned tenant and repository execution policy",
         ),
         _provider(
             "evoagent.observability",

@@ -125,6 +125,7 @@ class SafeFixer:
         pull_request: int,
         report: dict[str, Any],
         operation_key: str = "",
+        allowed_rule_ids: Iterable[str] | None = None,
     ) -> dict[str, Any]:
         pull = client.get_pull_request(repository, pull_request)
         source_ref = pull["head"]["ref"]
@@ -136,10 +137,15 @@ class SafeFixer:
             else datetime.now(UTC).strftime("%Y%m%d%H%M%S")
         )
         branch = "evoagent/fix-pr-%d-%s" % (pull_request, suffix)
+        allowed = set(self._rules) if allowed_rule_ids is None else set(allowed_rule_ids)
+        unknown = allowed.difference(self._rules)
+        if unknown:
+            raise ValueError("unknown automatic repair rules: %s" % ", ".join(sorted(unknown)))
         planned: list[tuple[str, dict[str, Any], FixResult]] = []
         by_path: dict[str, list[dict[str, Any]]] = {}
         for finding in report.get("findings", []):
-            by_path.setdefault(finding["path"], []).append(finding)
+            if finding.get("rule_id") in allowed:
+                by_path.setdefault(finding["path"], []).append(finding)
         for path, findings in by_path.items():
             current = client.get_file(source_repository, path, source_ref)
             result = self.apply(current["decoded_content"], findings, path)

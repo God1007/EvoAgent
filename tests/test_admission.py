@@ -101,6 +101,39 @@ class AdmissionControlTests(unittest.TestCase):
         self.assertEqual(200, ready_response.status)
         self.assertEqual(CURRENT_SCHEMA_VERSION, ready["checks"]["schema_version"])
 
+    def test_repository_policy_api_versions_and_reads_tenant_policy(self):
+        host, port = self._serve(self._settings())
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        self.addCleanup(conn.close)
+        body = json.dumps(
+            {
+                "repository": "org/repo",
+                "policy": {
+                    "auto_fix": True,
+                    "allowed_fix_rules": ["SEC-YAML-LOAD"],
+                    "max_diff_bytes": 4096,
+                },
+            }
+        )
+        conn.request(
+            "POST",
+            "/v1/repository-policies",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        created_response = conn.getresponse()
+        created = json.loads(created_response.read())
+        self.assertEqual(201, created_response.status)
+        self.assertEqual(1, created["version"])
+
+        conn.request("GET", "/v1/repository-policies?repository=org%2Frepo")
+        fetched_response = conn.getresponse()
+        fetched = json.loads(fetched_response.read())
+        self.assertEqual(200, fetched_response.status)
+        self.assertEqual("configured", fetched["source"])
+        self.assertEqual(4096, fetched["policy"]["max_diff_bytes"])
+        self.assertEqual([1], [item["version"] for item in fetched["history"]])
+
     def test_rejected_requests_are_counted_in_metrics(self):
         host, port = self._serve(self._settings(rate_limit_rps=1, rate_limit_burst=1))
         conn = http.client.HTTPConnection(host, port, timeout=5)

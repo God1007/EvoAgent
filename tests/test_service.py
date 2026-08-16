@@ -97,6 +97,49 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual("not-ready", detail["status"])
         self.assertEqual("worker stopped", detail["checks"]["queue"]["last_error"])
 
+    def test_review_persists_versioned_repository_policy_snapshot(self):
+        service = ReviewService(self.settings)
+        self.addCleanup(service.close)
+        first = service.set_repository_policy(
+            "default",
+            "org/repo",
+            {"max_diff_bytes": 10},
+            "alice",
+        )
+        self.assertEqual(1, first["version"])
+        diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
+        with self.assertRaisesRegex(ValueError, "repository policy limit"):
+            service.create_review("org/repo", diff, 1)
+
+        second = service.set_repository_policy(
+            "default",
+            "org/repo",
+            {
+                "max_diff_bytes": 1000,
+                "allowed_reviewers": [service.reviewer.name],
+                "allowed_llm_providers": ["local"],
+            },
+            "alice",
+        )
+        result = service.create_review("org/repo", diff, 1)
+        task = service.store.get(result["task_id"], "default")
+        snapshot = task["input"]["repository_policy"]
+        self.assertEqual(2, second["version"])
+        self.assertEqual(2, snapshot["version"])
+        self.assertEqual([service.reviewer.name], snapshot["policy"]["allowed_reviewers"])
+
+    def test_repository_policy_rejects_unknown_fix_rule_before_persisting(self):
+        service = ReviewService(self.settings)
+        self.addCleanup(service.close)
+        with self.assertRaisesRegex(ValueError, "unavailable fix rules"):
+            service.set_repository_policy(
+                "default",
+                "org/repo",
+                {"allowed_fix_rules": ["UNKNOWN-RULE"]},
+                "alice",
+            )
+        self.assertIsNone(service.store.get_repository_policy("default", "org/repo"))
+
     def tearDown(self):
         os.unlink(self.path)
 

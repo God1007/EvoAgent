@@ -10,12 +10,14 @@ from .fix_rules import FixRule
 from .fixer import SafeFixer
 from .observability import AlertManager, Observability
 from .plugins import CapabilityKey
+from .policy import RepositoryPolicyResolver
 from .ports import ApplicationStorePort, CodeHostPort, QueueFactoryPort
 from .review_engine import ReviewEngine
 from .rollout import ReleaseManager
 
 SETTINGS = CapabilityKey[Settings]("settings")
 STORE = CapabilityKey[ApplicationStorePort]("store")
+REPOSITORY_POLICY = CapabilityKey[RepositoryPolicyResolver]("policy.repository")
 OBSERVABILITY = CapabilityKey[Observability]("observability")
 GITHUB_BREAKER = CapabilityKey[CircuitBreaker]("circuit-breaker.github")
 LLM_BREAKER = CapabilityKey[CircuitBreaker]("circuit-breaker.llm")

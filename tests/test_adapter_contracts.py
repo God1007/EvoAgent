@@ -161,6 +161,43 @@ class _StoreBehaviorContract:
         cached = self.store.claim_effect(effect_key, "another-worker", 30)
         self.assertEqual({"published": True}, cached["result"])
 
+    def test_versioned_repository_policy_contract(self):
+        tenant_id = self.unique("policy-tenant")
+        repository = "acme/" + self.unique("policy-repository")
+        first_policy = {
+            "enabled": True,
+            "auto_fix": False,
+            "post_review_comments": True,
+            "allowed_reviewers": [],
+            "allowed_fix_rules": [],
+            "allowed_llm_providers": [],
+            "allowed_llm_models": [],
+            "max_diff_bytes": None,
+        }
+        first = self.store.save_repository_policy(
+            tenant_id, repository, first_policy, "contract-admin"
+        )
+        self.assertEqual(1, first["version"])
+        self.assertTrue(self.store.repository_allowed(tenant_id, repository))
+        self.assertFalse(self.store.repository_allowed(tenant_id, repository, True))
+
+        second_policy = {**first_policy, "enabled": False, "auto_fix": True}
+        second = self.store.save_repository_policy(
+            tenant_id, repository, second_policy, "contract-admin"
+        )
+        self.assertEqual(2, second["version"])
+        self.assertFalse(self.store.repository_allowed(tenant_id, repository))
+        current = self.store.get_repository_policy(tenant_id, repository)
+        self.assertEqual(second_policy, current["policy"])
+        history = self.store.list_repository_policy_versions(tenant_id, repository)
+        self.assertEqual([2, 1], [item["version"] for item in history])
+        self.assertTrue(
+            any(
+                item["action"] == "repository-policy.updated" and item["resource"] == repository
+                for item in self.store.list_audit(tenant_id, 20)
+            )
+        )
+
 
 class SQLiteStoreContractTests(_StoreBehaviorContract, unittest.TestCase):
     def setUp(self):

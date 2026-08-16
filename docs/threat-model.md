@@ -20,9 +20,10 @@ the mitigations that exist in the codebase today, plus known residual risks.
 1. **Internet → API/webhook** — anonymous or token-bearing callers.
 2. **PR content → reviewer/agents** — attacker-controlled text and code.
 3. **Service → GitHub / LLM** — outbound requests carrying secrets.
-4. **Service → dynamic skill** — third-party plugin code.
-5. **Service → repair verifier** — execution of untrusted PR code.
-6. **Tenant → tenant** — multi-tenant isolation.
+4. **Service → trusted plugin** — operator-installed in-process provider code.
+5. **Service → dynamic skill** — untrusted third-party reviewer code.
+6. **Service → repair verifier** — execution of untrusted PR code.
+7. **Tenant → tenant** — multi-tenant isolation.
 
 ## 3. Threats and mitigations
 
@@ -38,6 +39,7 @@ the mitigations that exist in the codebase today, plus known residual risks.
 | T8 | Replay / duplicate webhook | Delivery id, payload digest, PR update-time window checks | — |
 | T9 | Auth bypass / privilege escalation | JWT with fixed HS256, RBAC, tenant scoping, repository authorization checks | — |
 | T10 | Supply-chain (tampered deps) | Hash-locked `requirements*.lock`, `--require-hashes` installs, dependency-consistency guard test, Dependabot | Transitive lock refresh is manual after Dependabot PRs |
+| T11 | Unexpected in-process plugin activation | Entry-point discovery is disabled by default; enabling it requires an explicit plugin-id allowlist; manifest API/dependencies are validated and startup is transactional | A trusted plugin has process privileges; review and pin it like any production dependency |
 
 ## 4. Untrusted-execution policy
 
@@ -47,6 +49,8 @@ the mitigations that exist in the codebase today, plus known residual risks.
   `EVOAGENT_REPAIR_REQUIRE_CONTAINER=true`; without an image, `require_container`
   makes the verifier refuse host execution.
 - No GitHub token, LLM key, or host environment is injected into the verifier.
+- Plugin Profile and child Scope provide composition/lifecycle isolation only;
+  they are not security sandboxes.
 
 ## 5. Known residual risks (honest boundaries)
 

@@ -1,4 +1,5 @@
 import http.client
+import json
 import os
 import tempfile
 import threading
@@ -75,6 +76,23 @@ class AdmissionControlTests(unittest.TestCase):
             response = conn.getresponse()
             response.read()
             self.assertEqual(200, response.status)
+
+    def test_health_and_inventory_report_plugin_runtime(self):
+        host, port = self._serve(self._settings())
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        self.addCleanup(conn.close)
+
+        conn.request("GET", "/health")
+        health_response = conn.getresponse()
+        health = json.loads(health_response.read())
+        self.assertEqual("running", health["plugin_runtime"])
+        self.assertGreaterEqual(health["plugins"], 10)
+
+        conn.request("GET", "/v1/plugins")
+        inventory_response = conn.getresponse()
+        inventory = json.loads(inventory_response.read())
+        self.assertEqual(200, inventory_response.status)
+        self.assertIn("store", inventory["capabilities"])
 
     def test_rejected_requests_are_counted_in_metrics(self):
         host, port = self._serve(self._settings(rate_limit_rps=1, rate_limit_burst=1))

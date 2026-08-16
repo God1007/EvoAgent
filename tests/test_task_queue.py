@@ -95,6 +95,75 @@ class TaskQueueBackendTests(unittest.TestCase):
         finally:
             queue.close()
 
+    def test_depth_counts_scheduled_and_active_memory_deliveries(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def handler(_payload):
+            started.set()
+            release.wait(5)
+
+        queue = TaskQueue(handler, workers=1)
+        try:
+            queue.submit({"task_id": "active"})
+            self.assertTrue(started.wait(2))
+            self.assertEqual(1, queue.depth())
+            release.set()
+            self.assertTrue(queue.drain(2))
+            self.assertEqual(0, queue.depth())
+        finally:
+            release.set()
+            queue.close(2)
+
+    def test_close_waits_for_scheduled_work_before_returning(self):
+        started = threading.Event()
+        release = threading.Event()
+        seen = []
+
+        def handler(payload):
+            seen.append(payload["task_id"])
+            if payload["task_id"] == "first":
+                started.set()
+                release.wait(5)
+
+        queue = TaskQueue(handler, workers=1)
+        queue.submit({"task_id": "first"})
+        queue.submit({"task_id": "second"})
+        self.assertTrue(started.wait(2))
+        result = []
+        closer = threading.Thread(target=lambda: result.append(queue.close(2)))
+        closer.start()
+        time.sleep(0.05)
+        self.assertTrue(closer.is_alive())
+        release.set()
+        closer.join(3)
+
+        self.assertEqual([True], result)
+        self.assertEqual(["first", "second"], seen)
+
+    def test_close_reports_bounded_drain_timeout(self):
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def handler(_payload):
+            started.set()
+            release.wait(5)
+            finished.set()
+
+        queue = TaskQueue(handler, workers=1)
+        queue.submit({"task_id": "slow"})
+        self.assertTrue(started.wait(2))
+        self.assertFalse(queue.close(0.01))
+        release.set()
+        self.assertTrue(finished.wait(2))
+
+    def test_submit_after_close_fails_fast(self):
+        queue = TaskQueue(lambda _payload: None, workers=1)
+        self.assertTrue(queue.close())
+        with self.assertRaisesRegex(RuntimeError, "closed"):
+            queue.submit({"task_id": "late"})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -8,11 +8,11 @@ Reproducible snapshot of the end-to-end evaluation harness. Regenerate with
 
 | Field | Value |
 | --- | --- |
-| EvoAgent version | 0.3.0 |
+| EvoAgent version | 0.6.0 |
 | Python | 3.12 |
 | Dependencies | pinned via `requirements.lock` (hash-locked) |
 | Dataset | `evaluation_data/pr_diff_100.jsonl` |
-| Dataset SHA-256 | `88831bb19264f9fc15433de7801b623aad38b80076f5d5b085d0299fd40cc115` |
+| Dataset semantic SHA-256 | `844b6d45c3de39c6c1d8080067bb77900a7234a68891c264f5833b6abdf6e770` |
 | Corpus kind | `synthetic-controlled` (not real production PRs) |
 
 ## Dataset
@@ -24,19 +24,20 @@ Reproducible snapshot of the end-to-end evaluation harness. Regenerate with
 
 | Metric | Single-agent baseline | Multi-agent candidate | Δ |
 | --- | ---: | ---: | ---: |
-| Precision | 83.3% | 82.5% | -0.8 pp |
-| Recall | 62.5% | 82.5% | +20.0 pp |
-| F1 | 71.4% | 82.5% | +11.1 pp |
-| Severity accuracy | 100.0% | 100.0% | +0.0 pp |
-| High-risk recall | 84.2% | 94.7% | +10.5 pp |
+| Precision | 84.4% | 82.5% | -1.9 pp |
+| Recall | 67.5% | 82.5% | +15.0 pp |
+| F1 | 75.0% | 82.5% | +7.5 pp |
+| Severity accuracy | 96.3% | 97.0% | +0.7 pp |
+| High-risk recall | 89.5% | 94.7% | +5.3 pp |
 | Clean PR accuracy | 91.7% | 91.7% | +0.0 pp |
 | Execution success | 100.0% | 100.0% | +0.0 pp |
-| Safe-fix rate | — | 78.8% | — |
-| E2E security-fix rate | — | 65.0% | — |
+| Safe-fix rate | — | 100.0% | — |
+| E2E security-fix rate | — | 70.0% | — |
 
-Counts: baseline TP/FP/FN = 25/5/15; candidate TP/FP/FN = 33/7/7.
-Auto-repair: 26 of 33 matched risks passed all five repair gates; 26 of 40 total
-risk cases succeeded end-to-end.
+Counts: baseline TP/FP/FN = 27/5/13; candidate TP/FP/FN = 33/7/7.
+Auto-repair: all 28 deterministic-whitelist-eligible risks passed all five
+repair gates; 5 detected but ambiguous/non-whitelisted risks safely abstained;
+28 of 40 total risk cases succeeded end-to-end.
 
 ## Per-split results
 

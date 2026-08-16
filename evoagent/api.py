@@ -217,6 +217,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._serve_file("app.js")
             return
         if path == "/health":
+            plugin_status = self.service.plugin_status()
             self._send_json(
                 200,
                 {
@@ -227,6 +228,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "queue_durable": self.service.queue.durable,
                     "llm_provider": self.service.llm_config.get("provider", "local"),
                     "llm_model": self.service.llm_config.get("model", ""),
+                    "plugin_runtime": plugin_status["state"],
+                    "plugin_profile": plugin_status["profile"],
+                    "plugins": len(plugin_status["plugins"]),
                 },
             )
             return
@@ -242,6 +246,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         if path == "/metrics":
             self._send_text(200, metrics.prometheus(), "text/plain; version=0.0.4; charset=utf-8")
+            return
+        if path == "/v1/plugins":
+            self._send_json(200, self.service.plugin_status())
             return
         if path == "/api/dashboard":
             self._send_json(

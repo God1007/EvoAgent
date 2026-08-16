@@ -26,6 +26,10 @@ def _non_negative_int(name: str, default: int) -> int:
     return value
 
 
+def _csv(name: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in os.getenv(name, "").split(",") if item.strip())
+
+
 @dataclass(frozen=True)
 class Settings:
     host: str
@@ -67,6 +71,7 @@ class Settings:
     webhook_max_age_seconds: int = 600
     queue_max_attempts: int = 3
     queue_lease_seconds: int = 60
+    queue_shutdown_timeout_seconds: int = 30
     skill_timeout_seconds: int = 30
     skill_memory_mb: int = 256
     skill_sandbox: bool = True
@@ -99,6 +104,9 @@ class Settings:
     pg_pool_min: int = 1
     pg_pool_max: int = 10
     pg_pool_timeout: int = 10
+    plugin_profile_path: str = ""
+    plugin_discovery: bool = False
+    plugin_allowlist: tuple[str, ...] = ()
 
     def resolved_llm(self) -> dict[str, Any]:
         """Resolve a named provider to the existing OpenAI-compatible transport."""
@@ -189,6 +197,10 @@ class Settings:
             raise ValueError("bootstrap admin username and password must be configured together")
         if not 0.0 <= self.alert_failure_rate <= 1.0:
             raise ValueError("EVOAGENT_ALERT_FAILURE_RATE must be between 0 and 1")
+        if self.plugin_discovery and not self.plugin_allowlist:
+            raise ValueError(
+                "EVOAGENT_PLUGIN_ALLOWLIST is required when trusted plugin discovery is enabled"
+            )
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -234,6 +246,9 @@ class Settings:
             webhook_max_age_seconds=_int("EVOAGENT_WEBHOOK_MAX_AGE_SECONDS", 600),
             queue_max_attempts=_int("EVOAGENT_QUEUE_MAX_ATTEMPTS", 3),
             queue_lease_seconds=_int("EVOAGENT_QUEUE_LEASE_SECONDS", 60),
+            queue_shutdown_timeout_seconds=_non_negative_int(
+                "EVOAGENT_QUEUE_SHUTDOWN_TIMEOUT_SECONDS", 30
+            ),
             skill_timeout_seconds=_int("EVOAGENT_SKILL_TIMEOUT_SECONDS", 30),
             skill_memory_mb=_int("EVOAGENT_SKILL_MEMORY_MB", 256),
             skill_sandbox=_bool("EVOAGENT_SKILL_SANDBOX", True),
@@ -266,4 +281,7 @@ class Settings:
             pg_pool_min=_non_negative_int("EVOAGENT_PG_POOL_MIN", 1),
             pg_pool_max=_int("EVOAGENT_PG_POOL_MAX", 10),
             pg_pool_timeout=_int("EVOAGENT_PG_POOL_TIMEOUT", 10),
+            plugin_profile_path=os.getenv("EVOAGENT_PLUGIN_PROFILE", ""),
+            plugin_discovery=_bool("EVOAGENT_PLUGIN_DISCOVERY", False),
+            plugin_allowlist=_csv("EVOAGENT_PLUGIN_ALLOWLIST"),
         )

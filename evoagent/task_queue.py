@@ -12,16 +12,19 @@ Two backends with **different durability guarantees**:
 
 Both backends share the same retry-with-backoff and dead-letter API surface;
 only the Redis backend provides at-least-once durable delivery.
+
+Shutdown first rejects new submissions, then performs a bounded drain of active
+deliveries. Already-scheduled memory work is included in the drain count; Redis
+messages that are not completed remain durable for lease-based recovery.
 """
 
 import json
-import queue
 import socket
 import threading
 import time
 import uuid
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 
@@ -56,9 +59,12 @@ class TaskQueue:
             max_workers=workers, thread_name_prefix="evoagent-worker"
         )
         self._redis: Any = None
-        self._memory: queue.Queue[dict[str, Any]] = queue.Queue()
         self._memory_dlq: list[dict[str, Any]] = []
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._drain_condition = threading.Condition()
+        self._active_deliveries = 0
+        self._scheduled_memory = 0
         self._stop = threading.Event()
         self.consumer = "%s-%s" % (socket.gethostname(), uuid.uuid4().hex[:8])
         if redis_url:
@@ -86,44 +92,80 @@ class TaskQueue:
         return self._redis is not None
 
     def submit(self, payload: dict[str, Any], message_id: str = "") -> str:
-        message_identifier = message_id or str(payload.get("task_id") or uuid.uuid4())
-        envelope: dict[str, Any] = {
-            "message_id": message_identifier,
-            "attempt": 0,
-            "payload": payload,
-            "submitted_at": time.time(),
-        }
-        if self._redis:
-            self._redis.xadd(self.STREAM, {"envelope": json.dumps(envelope, ensure_ascii=False)})
-        else:
-            self._executor.submit(self._deliver, envelope)
-        return message_identifier
-
-    def _deliver(self, envelope: dict[str, Any]) -> bool:
-        envelope["attempt"] = int(envelope.get("attempt", 0)) + 1
-        try:
-            self.handler(envelope["payload"])
-            return True
-        except PermanentTaskError as exc:
-            self._dead_letter(envelope, str(exc))
-            return False
-        except Exception as exc:
-            if envelope["attempt"] >= self.max_attempts:
-                self._dead_letter(envelope, str(exc))
-            elif self._redis:
+        with self._lifecycle_lock:
+            if self._stop.is_set():
+                raise RuntimeError("task queue is closed")
+            message_identifier = message_id or str(payload.get("task_id") or uuid.uuid4())
+            envelope: dict[str, Any] = {
+                "message_id": message_identifier,
+                "attempt": 0,
+                "payload": payload,
+                "submitted_at": time.time(),
+            }
+            if self._redis:
                 self._redis.xadd(
                     self.STREAM, {"envelope": json.dumps(envelope, ensure_ascii=False)}
                 )
             else:
-                delay = min(self.backoff_base * 2 ** (envelope["attempt"] - 1), self.backoff_cap)
-                timer = threading.Timer(delay, self._submit_memory, args=(envelope,))
-                timer.daemon = True
-                timer.start()
-            return False
+                self._schedule_memory(envelope)
+        return message_identifier
 
-    def _submit_memory(self, envelope: dict[str, Any]) -> None:
-        if not self._stop.is_set():
-            self._executor.submit(self._deliver, envelope)
+    def _deliver(self, envelope: dict[str, Any]) -> bool:
+        with self._drain_condition:
+            self._active_deliveries += 1
+        try:
+            envelope["attempt"] = int(envelope.get("attempt", 0)) + 1
+            try:
+                self.handler(envelope["payload"])
+                return True
+            except PermanentTaskError as exc:
+                self._dead_letter(envelope, str(exc))
+                return False
+            except Exception as exc:
+                if envelope["attempt"] >= self.max_attempts:
+                    self._dead_letter(envelope, str(exc))
+                elif self._redis:
+                    self._redis.xadd(
+                        self.STREAM,
+                        {"envelope": json.dumps(envelope, ensure_ascii=False)},
+                    )
+                else:
+                    delay = min(
+                        self.backoff_base * 2 ** (envelope["attempt"] - 1),
+                        self.backoff_cap,
+                    )
+                    timer = threading.Timer(delay, self._schedule_memory, args=(envelope,))
+                    timer.daemon = True
+                    timer.start()
+                return False
+        finally:
+            with self._drain_condition:
+                self._active_deliveries -= 1
+                self._drain_condition.notify_all()
+
+    def _schedule_memory(self, envelope: dict[str, Any]) -> None:
+        with self._lifecycle_lock:
+            if self._stop.is_set():
+                return
+            with self._drain_condition:
+                self._scheduled_memory += 1
+            try:
+                future = self._executor.submit(self._deliver_memory, envelope)
+                future.add_done_callback(self._memory_done)
+            except RuntimeError:
+                with self._drain_condition:
+                    self._scheduled_memory -= 1
+                    self._drain_condition.notify_all()
+                if not self._stop.is_set():
+                    raise
+
+    def _deliver_memory(self, envelope: dict[str, Any]) -> None:
+        self._deliver(envelope)
+
+    def _memory_done(self, _future: Future[Any]) -> None:
+        with self._drain_condition:
+            self._scheduled_memory -= 1
+            self._drain_condition.notify_all()
 
     def _redis_worker(self) -> None:
         while not self._stop.is_set():
@@ -204,10 +246,30 @@ class TaskQueue:
         try:
             if self._redis:
                 return int(self._redis.xlen(self.STREAM))
-            return self._memory.qsize()
+            with self._drain_condition:
+                return self._scheduled_memory
         except Exception:  # pragma: no cover - defensive probe isolation
             return -1
 
-    def close(self) -> None:
-        self._stop.set()
-        self._executor.shutdown(wait=False)
+    def drain(self, timeout_seconds: float = 0.0) -> bool:
+        """Wait for active and already-scheduled in-memory deliveries.
+
+        Retry timers are not kept alive during shutdown. Redis messages remain
+        durable and can be reclaimed by another consumer after their lease.
+        """
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        with self._drain_condition:
+            while self._active_deliveries or self._scheduled_memory:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._drain_condition.wait(remaining)
+            return True
+
+    def close(self, drain_timeout_seconds: float = 0.0) -> bool:
+        """Stop intake, drain bounded in-flight work, and release workers."""
+        with self._lifecycle_lock:
+            self._stop.set()
+        drained = self.drain(drain_timeout_seconds)
+        self._executor.shutdown(wait=False, cancel_futures=not drained)
+        return drained

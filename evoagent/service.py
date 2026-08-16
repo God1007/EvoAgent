@@ -2,140 +2,84 @@ import hashlib
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
-from .agents import FilteredAgent, MultiAgentCoordinator
-from .auth import AuthManager
 from .backpressure import ConcurrencyLimiter, RateLimiter
-from .circuit_breaker import CircuitBreaker
+from .bootstrap import build_application_runtime
+from .capabilities import (
+    ALERTS,
+    AUTH,
+    EVOLUTION,
+    FIXER,
+    GITHUB_BREAKER,
+    GITHUB_CLIENT,
+    LLM_BREAKER,
+    OBSERVABILITY,
+    QUEUE_FACTORY,
+    RELEASES,
+    REVIEW_ENGINE,
+    STORE,
+)
 from .codegraph import build_graph
 from .config import Settings
 from .diff_parser import parse_unified_diff
-from .evolution import EvolutionEngine
-from .fixer import SafeFixer
 from .github import GitHubAppAuthenticator, GitHubClient
-from .harness import ReviewHarness
 from .metrics import metrics
 from .models import TaskState, TraceEvent
-from .observability import AlertManager, Observability
-from .postgres_store import create_store
+from .plugins import Plugin, PluginProfile, PluginRuntime
 from .proof import ProofRunner
 from .report import to_markdown
-from .reviewer import LocalRuleReviewer, OpenAICompatibleReviewer
-from .rollout import ReleaseManager
+from .review_engine import ReviewEngine
+from .reviewer import OpenAICompatibleReviewer
 from .session import classify_findings, continuity_summary, open_snapshot
-from .skills import SkillRegistry
 from .store import utc_now
-from .task_queue import PermanentTaskError, TaskQueue
+from .task_queue import PermanentTaskError
 from .verifier import RepairVerifier
 
 
 class ReviewService:
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        plugins: Sequence[Plugin] = (),
+        plugin_profile: PluginProfile | None = None,
+    ):
         self.settings = settings
         settings.validate_evolution()
-        # Outbound dependency breakers (created early so reviewers/clients built
-        # below can wrap their GitHub/LLM calls). They fail fast during outages.
-        self.github_breaker = CircuitBreaker(
-            "github",
-            settings.breaker_failure_threshold,
-            settings.breaker_reset_seconds,
+        self.plugin_runtime: PluginRuntime = build_application_runtime(
+            settings,
+            plugins,
+            plugin_profile,
         )
-        self.llm_breaker = CircuitBreaker(
-            "llm",
-            settings.breaker_failure_threshold,
-            settings.breaker_reset_seconds,
-        )
-        self.llm_config = settings.resolved_llm()
-        self.store = create_store(
-            settings.database_url,
-            settings.db_path,
-            settings.pg_pool_min,
-            settings.pg_pool_max,
-            settings.pg_pool_timeout,
-        )
-        self.observability = Observability(settings.otel_service_name, settings.otel_endpoint)
-        self.registry = SkillRegistry(
-            settings.skills_dir,
-            settings.skill_sandbox,
-            settings.skill_timeout_seconds,
-            settings.skill_memory_mb,
-            settings.skill_signing_key,
-            settings.skill_container_image,
-        )
-        local = LocalRuleReviewer()
-        self.registry.register(
-            "security-review",
-            FilteredAgent("security-agent", local, ("SEC-",)),
-            "1.0.0",
-            "Security, injection and secret detection",
-        )
-        self.registry.register(
-            "reliability-review",
-            FilteredAgent("reliability-agent", local, ("REL-",)),
-            "1.0.0",
-            "Reliability and observability review",
-        )
-        if self.llm_config:
-            active = self.store.get_active_skill_version("llm-review")
-            self.registry.register(
-                "llm-review",
-                self._build_llm_reviewer(active["prompt"] if active else ""),
-                "1.0.0",
-                "Context-aware AI code review via %s" % self.llm_config["provider"],
+        self._closed = False
+        try:
+            self.github_breaker = self.plugin_runtime.require(GITHUB_BREAKER)
+            self.llm_breaker = self.plugin_runtime.require(LLM_BREAKER)
+            self.store = self.plugin_runtime.require(STORE)
+            self.observability = self.plugin_runtime.require(OBSERVABILITY)
+            self.review_engine: ReviewEngine = self.plugin_runtime.require(REVIEW_ENGINE)
+            self.llm_config = self.review_engine.llm_config
+            self.registry = self.review_engine.registry
+            self.reviewer = self.review_engine.reviewer
+            self.harness = self.review_engine.harness
+            self.github = self.plugin_runtime.require(GITHUB_CLIENT)
+            self.fixer = self.plugin_runtime.require(FIXER)
+            self.auth = self.plugin_runtime.require(AUTH)
+            self.releases = self.plugin_runtime.require(RELEASES)
+            self.alerts = self.plugin_runtime.require(ALERTS)
+            self.evolution = self.plugin_runtime.require(EVOLUTION)
+            self.queue = self.plugin_runtime.require(QUEUE_FACTORY).create(
+                self._process_queued,
+                self._on_dead_letter,
             )
-        self.registry.reload()
-        coordinator = MultiAgentCoordinator(self.registry.reviewers(), store=self.store)
-        self.reviewer = coordinator
-        self.harness = ReviewHarness(
-            self.store,
-            self.reviewer,
-            settings.max_steps,
-            settings.timeout_seconds,
-            observability=self.observability,
-        )
-        self.github = GitHubClient(settings.github_token, breaker=self.github_breaker)
-        self.fixer = SafeFixer(
-            RepairVerifier(
-                settings.repair_test_command,
-                settings.repair_verify_timeout_seconds,
-                container_image=settings.repair_container_image,
-                memory_mb=settings.repair_memory_mb,
-                pids_limit=settings.repair_pids_limit,
-                cpus=settings.repair_cpus,
-                require_container=settings.repair_require_container,
-                max_output_bytes=settings.repair_max_output_bytes,
-            )
-        )
-        self.auth = AuthManager(
-            self.store,
-            settings.auth_secret,
-            settings.session_ttl_seconds,
-            settings.bootstrap_admin_username,
-            settings.bootstrap_admin_password,
-            settings.default_tenant_id,
-        )
-        self.releases = ReleaseManager(self.store)
-        self.alerts = AlertManager(
-            self.store, settings.alert_failure_rate, settings.alert_min_samples
-        )
-        self.evolution = EvolutionEngine(
-            self.store,
-            reviewer_factory=self._build_llm_reviewer if self.llm_config else None,
-            min_cases=settings.eval_min_cases,
-            max_cases=settings.eval_max_cases,
-            min_improvement=settings.eval_min_improvement,
-            min_holdout_cases=settings.eval_min_holdout_cases,
-            max_metric_regression=settings.eval_max_metric_regression,
-        )
-        self.queue = TaskQueue(
-            self._process_queued,
-            settings.async_workers,
-            settings.redis_url,
-            settings.queue_max_attempts,
-            settings.queue_lease_seconds,
-            self._on_dead_letter,
-        )
+        except Exception:
+            try:
+                self.plugin_runtime.stop()
+            except Exception:
+                metrics.inc("plugin_cleanup_failures_total")
+            raise
         metrics.register_gauge_source("queue_depth", self.queue.depth)
         # Admission control: per-client rate limit + a bounded gate for the
         # CPU/sandbox-heavy endpoints so overload sheds instead of collapsing.
@@ -147,17 +91,57 @@ class ReviewService:
         metrics.register_gauge_source("heavy_in_flight", self.heavy_gate.in_flight)
         metrics.register_gauge_source("breaker_github_state", self.github_breaker.state_code)
         metrics.register_gauge_source("breaker_llm_state", self.llm_breaker.state_code)
+        metrics.register_gauge_source(
+            "plugins_loaded",
+            lambda: float(len(self.plugin_runtime.describe()["plugins"])),
+        )
+        metrics.register_gauge_source(
+            "plugin_runtime_ready",
+            lambda: 1.0 if self.plugin_runtime.state.value == "running" else 0.0,
+        )
         self._readiness_lock = threading.Lock()
         self._readiness_cache: tuple[float, tuple[bool, dict[str, Any]]] | None = None
         self._readiness_ttl = 1.0
         self._register_pool_metrics()
+        self._publish_event(
+            "service.started",
+            {
+                "queue_backend": self.queue.backend,
+                "llm_provider": self.llm_config.get("provider", "local"),
+            },
+        )
 
     def close(self) -> None:
-        """Release owned resources (queue threads, DB pool) on shutdown."""
-        self.queue.close()
-        store_close = getattr(self.store, "close", None)
-        if callable(store_close):
-            store_close()
+        """Release owned resources in reverse dependency order."""
+        if self._closed:
+            return
+        self._closed = True
+        self._publish_event("service.stopping", {"queue_backend": self.queue.backend})
+        try:
+            drained = self.queue.close(self.settings.queue_shutdown_timeout_seconds)
+            if not drained:
+                metrics.inc("queue_drain_timeouts_total")
+                self._publish_event(
+                    "queue.drain-timeout",
+                    {
+                        "queue_backend": self.queue.backend,
+                        "timeout_seconds": self.settings.queue_shutdown_timeout_seconds,
+                    },
+                )
+        finally:
+            self.plugin_runtime.stop()
+
+    def _publish_event(self, name: str, payload: dict[str, Any]) -> None:
+        runtime = getattr(self, "plugin_runtime", None)
+        if runtime is None:
+            return
+        failures = runtime.publish(name, payload)
+        if failures:
+            metrics.inc("plugin_event_failures_total", len(failures))
+
+    def plugin_status(self) -> dict[str, Any]:
+        """Safe runtime inventory for health/debug endpoints."""
+        return self.plugin_runtime.describe()
 
     def _register_pool_metrics(self) -> None:
         """Expose Postgres pool utilization. Registered in both branches (with a
@@ -228,18 +212,7 @@ class ReviewService:
         }
 
     def _build_llm_reviewer(self, prompt: str = "") -> OpenAICompatibleReviewer:
-        if not self.llm_config:
-            raise RuntimeError("no LLM provider is configured")
-        return OpenAICompatibleReviewer(
-            str(self.llm_config["base_url"]),
-            str(self.llm_config["api_key"]),
-            str(self.llm_config["model"]),
-            self.settings.timeout_seconds,
-            system_prompt=prompt,
-            provider=str(self.llm_config["provider"]),
-            extra_headers=dict(self.llm_config.get("headers") or {}),
-            breaker=self.llm_breaker,
-        )
+        return self.review_engine.build_llm_reviewer(prompt)
 
     def _candidate_reviewer(self, tenant_id: str):
         if not self.llm_config:
@@ -273,22 +246,15 @@ class ReviewService:
         ):
             candidate = self._candidate_reviewer(tenant_id)
             if candidate:
-                canary_reviewer = MultiAgentCoordinator(
+                canary_reviewer = self.review_engine.build_coordinator(
                     [
                         item
                         for item in self.registry.reviewers()
                         if not isinstance(item, OpenAICompatibleReviewer)
                     ]
-                    + [candidate],
-                    store=self.store,
+                    + [candidate]
                 )
-                harness = ReviewHarness(
-                    self.store,
-                    canary_reviewer,
-                    self.settings.max_steps,
-                    self.settings.timeout_seconds,
-                    observability=self.observability,
-                )
+                harness = self.review_engine.build_harness(canary_reviewer)
                 return harness.run(task_id, repository, pull_request, diff)
         return self.harness.run(task_id, repository, pull_request, diff)
 
@@ -486,23 +452,11 @@ class ReviewService:
         return result
 
     def reload_skills(self) -> list:
-        if self.llm_config:
-            active = self.store.get_active_skill_version("llm-review")
-            self.registry.register(
-                "llm-review",
-                self._build_llm_reviewer(active["prompt"] if active else ""),
-                "1.0.0",
-                "Context-aware AI code review via %s" % self.llm_config["provider"],
-            )
-        skills = self.registry.reload()
-        self.reviewer = MultiAgentCoordinator(self.registry.reviewers(), store=self.store)
-        self.harness = ReviewHarness(
-            self.store,
-            self.reviewer,
-            self.settings.max_steps,
-            self.settings.timeout_seconds,
-            observability=self.observability,
-        )
+        skills = self.review_engine.reload()
+        self.registry = self.review_engine.registry
+        self.reviewer = self.review_engine.reviewer
+        self.harness = self.review_engine.harness
+        self._publish_event("skills.reloaded", {"count": len(skills)})
         return skills
 
     def _validate_review(self, repository: str, diff: str) -> None:
@@ -577,6 +531,16 @@ class ReviewService:
         self._validate_review(repository, diff)
         self._authorize_repository(tenant_id, repository)
         task_id = self._create_task(repository, diff, pull_request, source, tenant_id)
+        self._publish_event(
+            "review.started",
+            {
+                "task_id": task_id,
+                "tenant_id": tenant_id,
+                "repository": repository,
+                "source": source,
+                "mode": "synchronous",
+            },
+        )
         try:
             with (
                 self.observability.span(
@@ -595,12 +559,33 @@ class ReviewService:
                 "release_lane", "stable"
             )
             self.releases.observe(tenant_id, "llm-review", False, lane)
+            self._publish_event(
+                "review.completed",
+                {
+                    "task_id": task_id,
+                    "tenant_id": tenant_id,
+                    "repository": repository,
+                    "risk": report.risk,
+                    "findings": len(report.findings),
+                    "mode": "synchronous",
+                },
+            )
             return {"task_id": task_id, "state": "SUCCESS", "report": report.to_dict()}
-        except Exception:
+        except Exception as exc:
             task = self.store.get(task_id, tenant_id) or {}
             lane = (task.get("input") or {}).get("release_lane", "stable")
             self.releases.observe(tenant_id, "llm-review", True, lane)
             self.alerts.evaluate(tenant_id)
+            self._publish_event(
+                "review.failed",
+                {
+                    "task_id": task_id,
+                    "tenant_id": tenant_id,
+                    "repository": repository,
+                    "error_type": type(exc).__name__,
+                    "mode": "synchronous",
+                },
+            )
             raise
 
     def enqueue_review(
@@ -660,6 +645,16 @@ class ReviewService:
             )
         if diff is None:
             raise PermanentTaskError("task payload no longer exists")
+        self._publish_event(
+            "review.started",
+            {
+                "task_id": task_id,
+                "tenant_id": tenant_id,
+                "repository": payload["repository"],
+                "source": "queue",
+                "mode": "asynchronous",
+            },
+        )
         try:
             with (
                 self.observability.span(
@@ -681,6 +676,17 @@ class ReviewService:
             metrics.inc("reviews_total")
             lane = (task.get("input") or {}).get("release_lane", "stable")
             self.releases.observe(tenant_id, "llm-review", False, lane)
+            self._publish_event(
+                "review.completed",
+                {
+                    "task_id": task_id,
+                    "tenant_id": tenant_id,
+                    "repository": payload["repository"],
+                    "risk": report.risk,
+                    "findings": len(report.findings),
+                    "mode": "asynchronous",
+                },
+            )
             continuity = self._record_session_turn(payload, report)
             if payload.get("github_issue_url") and self.settings.auto_post_review:
                 client = self.github_client_for_installation(payload.get("installation_id"))
@@ -693,11 +699,21 @@ class ReviewService:
                     else "<!-- evoagent-review:%s -->" % task_id
                 )
                 client.upsert_comment(payload["github_issue_url"], body, marker)
-        except Exception:
+        except Exception as exc:
             metrics.inc("reviews_failed_total")
             lane = (task.get("input") or {}).get("release_lane", "stable")
             self.releases.observe(tenant_id, "llm-review", True, lane)
             self.alerts.evaluate(tenant_id)
+            self._publish_event(
+                "review.failed",
+                {
+                    "task_id": task_id,
+                    "tenant_id": tenant_id,
+                    "repository": payload["repository"],
+                    "error_type": type(exc).__name__,
+                    "mode": "asynchronous",
+                },
+            )
             raise
 
     def _on_dead_letter(self, payload: dict[str, Any], error: str) -> None:
@@ -727,6 +743,14 @@ class ReviewService:
             "Task %s entered the dead-letter queue: %s" % (task_id, error),
         )
         metrics.inc("dead_letters_total")
+        self._publish_event(
+            "task.dead-lettered",
+            {
+                "task_id": task_id,
+                "tenant_id": tenant_id,
+                "error": error[:500],
+            },
+        )
 
     def handle_github_pull_request(
         self,
@@ -832,6 +856,16 @@ class ReviewService:
             task["report"],
         )
         metrics.inc("fix_runs_total")
+        self._publish_event(
+            "fix.completed",
+            {
+                "task_id": task_id,
+                "tenant_id": actual_tenant,
+                "repository": task["repository"],
+                "published": bool(result.get("branch")),
+                "commits": len(result.get("commits", [])),
+            },
+        )
         return result
 
     def record_feedback(

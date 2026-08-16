@@ -17,7 +17,7 @@
 [![Redis](https://img.shields.io/badge/Queue-In--Process%20%7C%20Redis-DC382D?logo=redis&logoColor=white)](#运行模式)
 [![OpenAI Compatible](https://img.shields.io/badge/LLM-OpenAI%20Compatible-412991)](#接入大模型)
 
-[快速开始](#快速开始) · [工作原理](#工作原理) · [GitHub 接入](#接入-github) · [API](#api-概览) · [生产部署](#生产部署)
+[快速开始](#快速开始) · [工作原理](#工作原理) · [插件架构](docs/plugin-system.md) · [企业演进路线](docs/enterprise-roadmap.md) · [GitHub 接入](#接入-github) · [API](#api-概览) · [生产部署](#生产部署)
 
 </div>
 
@@ -45,6 +45,7 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **保守型自动修复** | 仅处理可确定转换的规则，在新分支生成原子提交，并经过编译与可选测试门禁 |
 | **受控能力演进** | 从误报、漏报和坏修复中生成候选 Prompt，通过 Validation/Holdout 回放门禁后才允许激活 |
 | **动态 Skills** | 基于 manifest 加载自定义审查器，支持哈希/签名校验、超时、内存限制和隔离进程 |
+| **可插拔微内核** | Store、Queue、Review Engine、代码托管、可观测性和 FixRule 通过稳定 Capability 组合，支持依赖校验、启动回滚、Profile 与作用域覆盖 |
 | **生产治理** | JWT、RBAC、多租户、仓库隔离、审计日志、灰度发布、影子流量、告警与死信队列 |
 | **可观测性** | 任务 Trace、Agent 消息、Prometheus 指标和 OpenTelemetry Trace |
 | **Web 控制台** | 提供运行总览、发起审查、任务中心、Skill 管理、演进实验室和 GitHub 配置页面 |
@@ -243,6 +244,8 @@ curl 'http://127.0.0.1:8080/v1/tasks/<task-id>/report'
 | `SEC-SUBPROCESS-SHELL` | High | `shell=True` 命令注入风险 | ✓ |
 | `SEC-HARDCODED-SECRET` | High | 硬编码 Password、Token、Secret、API Key | ✓ |
 | `SEC-SQL-CONCAT` | High | SQL 字符串拼接 | — |
+| `SEC-YAML-LOAD` | High | `yaml.load(...)` 不安全反序列化 | ✓ |
+| `SEC-INSECURE-COOKIE` | High | `set_cookie(..., secure=False)` | ✓ |
 | `REL-EMPTY-EXCEPT` | Medium | 宽泛捕获并吞掉异常 | — |
 | `REL-DEBUG-PRINT` | Low | 新增 `print()` / `console.log()` | ✓ |
 
@@ -256,10 +259,14 @@ curl 'http://127.0.0.1:8080/v1/tasks/<task-id>/report'
 4. 如果配置了测试命令，则在隔离的仓库副本中运行测试；
 5. 所有门禁通过后，以一个原子提交创建 Draft Pull Request。
 
-除表中本地规则外，SafeFixer 还能消费多 Agent 或 LLM 产生的
-`SEC-YAML-LOAD` 与 `SEC-INSECURE-COOKIE` Finding：仅当 Python AST 精确匹配
+对于 `SEC-YAML-LOAD` 与 `SEC-INSECURE-COOKIE` Finding，仅当 Python AST 精确匹配
 单参数 `yaml.load(...)` 或显式 `secure=False` 时，才分别替换为
 `yaml.safe_load(...)` 和 `secure=True`；自定义 Loader、额外参数等不确定形态会拒绝自动修复。
+
+以上五种确定性修复均实现为独立 `fix.rule` Provider，可以通过 TOML
+Profile 单独禁用，也可以由可信插件新增规则，而无需修改 `SafeFixer`。
+插件协议、生命周期、信任边界和开发示例见
+[`docs/plugin-system.md`](docs/plugin-system.md)。
 
 ## 接入大模型
 
@@ -680,6 +687,7 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 | --- | --- | --- |
 | `GET` | `/health` | 健康检查 |
 | `GET` | `/metrics` | Prometheus 文本指标 |
+| `GET` | `/v1/plugins` | 当前 Profile、插件激活顺序与 Capability Provider 清单 |
 | `GET` | `/api/dashboard` | Dashboard 聚合数据 |
 | `GET` | `/api/tasks` | 任务列表 |
 | `GET` | `/api/skills` | Skill 列表 |
@@ -702,6 +710,10 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 | `EVOAGENT_MAX_DIFF_BYTES` | `1048576` | 单次 Diff 最大字节数 |
 | `EVOAGENT_MAX_STEPS` | `8` | 单任务最大状态步数 |
 | `EVOAGENT_TIMEOUT_SECONDS` | `120` | 审查任务超时 |
+| `EVOAGENT_QUEUE_SHUTDOWN_TIMEOUT_SECONDS` | `30` | 关闭存储前等待队列在途任务完成的最长秒数 |
+| `EVOAGENT_PLUGIN_PROFILE` | 空 | Trusted Plugin TOML Profile 路径 |
+| `EVOAGENT_PLUGIN_DISCOVERY` | `false` | 是否发现已安装的可信插件 Entry Point |
+| `EVOAGENT_PLUGIN_ALLOWLIST` | 空 | 允许加载的可信 Plugin ID，逗号分隔 |
 | `EVOAGENT_LLM_PROVIDER` | `local` | `local`、`deepseek`、`openrouter-free` 或 `custom` |
 | `EVOAGENT_DATABASE_URL` | 空 | PostgreSQL URL；为空时使用 SQLite |
 | `EVOAGENT_REDIS_URL` | 空 | Redis URL；为空时使用进程内队列 |
@@ -718,12 +730,17 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 .
 ├── evoagent/
 │   ├── api.py                    # HTTP API 与静态控制台
-│   ├── service.py                # 业务入口与组件装配
+│   ├── service.py                # 业务用例编排与 Capability 消费
+│   ├── plugins.py                # 插件依赖图、生命周期、Scope 与事件总线
+│   ├── capabilities.py           # 稳定类型化 Capability 定义
+│   ├── bootstrap.py              # 默认 Provider Catalog 与应用组装
+│   ├── review_engine.py          # 可替换 Reviewer Graph 与 Harness 组装
 │   ├── harness.py                # LangGraph、状态机与 Checkpoint
 │   ├── agents.py                 # 多 Agent 协作协议
 │   ├── reviewer.py               # 本地规则与 OpenAI-compatible Reviewer
 │   ├── skills.py                 # 动态 Skill 注册、校验和隔离执行
-│   ├── fixer.py                  # 确定性自动修复
+│   ├── fix_rules.py              # 可插拔确定性修复规则
+│   ├── fixer.py                  # 修复验证与安全发布
 │   ├── verifier.py               # 编译与测试门禁
 │   ├── evolution.py              # Prompt 版本与回放门禁
 │   ├── evaluation_harness.py     # 端到端评测框架
@@ -735,6 +752,7 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 ├── tests/                        # 单元与集成测试
 ├── scripts/                      # 数据导入、评测和报告脚本
 ├── evaluation_data/              # 版本化评测数据
+├── examples/profiles/            # Trusted Plugin Profile 示例
 ├── docs/adr/                     # 架构决策记录
 ├── pyproject.toml                # 包元数据与质量工具统一配置
 ├── requirements.lock            # 运行依赖及跨平台哈希
@@ -764,7 +782,7 @@ make check
 
 当前整体行覆盖率约 83%，其中 `reviewer`、`fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
 
-GitHub 额外执行 Gitleaks、CodeQL、依赖审计和 Docker 构建冒烟测试（构建镜像、启动容器并校验 `/health` 与 `/v1/reviews`）。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)，边界适配器的集成测试范围与后续收敛计划记录在 [`docs/adr/0001-engineering-quality-gates.md`](docs/adr/0001-engineering-quality-gates.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
+GitHub 额外执行 Gitleaks、CodeQL、依赖审计和 Docker 构建冒烟测试（构建镜像、启动容器并校验 `/health` 与 `/v1/reviews`）。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；质量门禁与可信插件微内核分别记录在 [`ADR 0001`](docs/adr/0001-engineering-quality-gates.md) 和 [`ADR 0002`](docs/adr/0002-trusted-plugin-microkernel.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
 
 更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)，性能 SLO、压测方法与可复现基线见 [`docs/performance.md`](docs/performance.md) 与 [`docs/performance-baseline.md`](docs/performance-baseline.md)。
 

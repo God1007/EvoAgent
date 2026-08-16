@@ -69,7 +69,7 @@ class EndToEndEvaluationTests(unittest.TestCase):
             candidate_reviewer(), cases
         )
         self.assertEqual(
-            (25, 5, 15),
+            (27, 5, 13),
             (
                 baseline["metrics"]["tp"],
                 baseline["metrics"]["fp"],
@@ -84,7 +84,7 @@ class EndToEndEvaluationTests(unittest.TestCase):
                 candidate["metrics"]["fn"],
             ),
         )
-        self.assertEqual(0.7143, baseline["metrics"]["f1"])
+        self.assertEqual(0.75, baseline["metrics"]["f1"])
         self.assertEqual(0.825, candidate["metrics"]["f1"])
         self.assertEqual(0.9474, candidate["metrics"]["high_risk_recall"])
         self.assertEqual(0.9167, candidate["metrics"]["clean_accuracy"])

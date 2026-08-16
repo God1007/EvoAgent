@@ -1,8 +1,10 @@
 import ast
 import re
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any, TypedDict
 
+from .fix_rules import FixRule, default_fix_rules
 from .github import GitHubClient
 from .verifier import RepairVerifier
 
@@ -15,21 +17,29 @@ class FixResult(TypedDict):
 class SafeFixer:
     """Creates conservative fixes on a dedicated branch; never writes to the PR head."""
 
+    def __init__(
+        self,
+        verifier: RepairVerifier | None = None,
+        rules: Iterable[FixRule] | None = None,
+    ):
+        self.verifier = verifier or RepairVerifier()
+        selected = default_fix_rules() if rules is None else list(rules)
+        self._rules: dict[str, FixRule] = {}
+        for rule in selected:
+            if not isinstance(rule, FixRule):
+                raise TypeError("repair rule does not implement the FixRule protocol")
+            if rule.rule_id in self._rules:
+                raise ValueError("duplicate repair rule id: %s" % rule.rule_id)
+            self._rules[rule.rule_id] = rule
+
+    @property
+    def rule_ids(self) -> tuple[str, ...]:
+        return tuple(self._rules)
+
     def propose_line(self, line: str, finding: dict[str, Any]) -> str:
-        rule = finding.get("rule_id")
-        if rule == "REL-DEBUG-PRINT":
-            return ""
-        if rule == "SEC-SUBPROCESS-SHELL":
-            return re.sub(r"shell\s*=\s*True", "shell=False", line)
-        if rule == "SEC-HARDCODED-SECRET":
-            match = re.match(r"(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(['\"]).+?\3\s*$", line)
-            if match:
-                return '%s%s = os.environ["%s"]' % (
-                    match.group(1),
-                    match.group(2),
-                    match.group(2).upper(),
-                )
-        return line
+        rule_id = finding.get("rule_id")
+        rule = self._rules.get(rule_id) if isinstance(rule_id, str) else None
+        return rule.propose_line(line) if rule is not None else line
 
     def apply(self, content: str, findings: list[dict[str, Any]], path: str) -> FixResult:
         if path.endswith(".py") and hasattr(ast, "unparse"):
@@ -67,114 +77,45 @@ class SafeFixer:
         findings: list[dict[str, Any]],
         path: str,
     ) -> FixResult:
-        targets = {
-            (int(item.get("line", 0)), item.get("rule_id"))
-            for item in findings
-            if item.get("path") == path
-        }
-        changed: list[str] = []
-        needs_os = False
-
-        class Transformer(ast.NodeTransformer):
-            def visit_Expr(inner, node):
-                if (
-                    (node.lineno, "REL-DEBUG-PRINT") in targets
-                    and isinstance(node.value, ast.Call)
-                    and isinstance(node.value.func, ast.Name)
-                    and node.value.func.id == "print"
-                ):
-                    changed.append("REL-DEBUG-PRINT")
-                    return None
-                return inner.generic_visit(node)
-
-            def visit_Call(inner, node):
-                node = inner.generic_visit(node)
-                if (node.lineno, "SEC-SUBPROCESS-SHELL") in targets:
-                    for keyword in node.keywords:
-                        if (
-                            keyword.arg == "shell"
-                            and isinstance(keyword.value, ast.Constant)
-                            and keyword.value.value is True
-                        ):
-                            keyword.value = ast.Constant(False)
-                            changed.append("SEC-SUBPROCESS-SHELL")
-                if (
-                    (node.lineno, "SEC-YAML-LOAD") in targets
-                    and isinstance(node.func, ast.Attribute)
-                    and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id == "yaml"
-                    and node.func.attr == "load"
-                    and len(node.args) == 1
-                    and not node.keywords
-                ):
-                    # yaml.safe_load accepts a single stream argument. Refuse calls
-                    # with custom loaders or extra arguments instead of guessing at
-                    # their semantics.
-                    node.func.attr = "safe_load"
-                    changed.append("SEC-YAML-LOAD")
-                if (
-                    (node.lineno, "SEC-INSECURE-COOKIE") in targets
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "set_cookie"
-                ):
-                    secure_keywords = [
-                        keyword for keyword in node.keywords if keyword.arg == "secure"
-                    ]
-                    if (
-                        len(secure_keywords) == 1
-                        and isinstance(secure_keywords[0].value, ast.Constant)
-                        and secure_keywords[0].value.value is False
-                    ):
-                        secure_keywords[0].value = ast.Constant(True)
-                        changed.append("SEC-INSECURE-COOKIE")
-                return node
-
-            def visit_Assign(inner, node):
-                nonlocal needs_os
-                node = inner.generic_visit(node)
-                if (
-                    (node.lineno, "SEC-HARDCODED-SECRET") in targets
-                    and len(node.targets) == 1
-                    and isinstance(node.targets[0], ast.Name)
-                    and isinstance(node.value, ast.Constant)
-                    and isinstance(node.value.value, str)
-                ):
-                    name = node.targets[0].id
-                    node.value = ast.Subscript(
-                        value=ast.Attribute(
-                            value=ast.Name(id="os", ctx=ast.Load()),
-                            attr="environ",
-                            ctx=ast.Load(),
-                        ),
-                        slice=ast.Constant(name.upper()),
-                        ctx=ast.Load(),
-                    )
-                    needs_os = True
-                    changed.append("SEC-HARDCODED-SECRET")
-                return node
-
         try:
-            tree = Transformer().visit(ast.parse(content, filename=path))
+            tree = ast.parse(content, filename=path)
         except SyntaxError:
             return {"content": content, "rules": []}
+        targets: dict[str, set[int]] = {}
+        for item in findings:
+            rule_id = item.get("rule_id")
+            if item.get("path") == path and isinstance(rule_id, str):
+                targets.setdefault(rule_id, set()).add(int(item.get("line", 0)))
+        changed: list[str] = []
+        required_imports: set[str] = set()
+        for rule_id, rule in self._rules.items():
+            target_lines = frozenset(targets.get(rule_id, set()))
+            if not target_lines:
+                continue
+            mutation = rule.apply_python(tree, target_lines)
+            if mutation.changed:
+                changed.append(rule_id)
+                required_imports.update(mutation.required_imports)
         if not changed:
             return {"content": content, "rules": []}
-        if needs_os and not any(
-            isinstance(node, (ast.Import, ast.ImportFrom))
-            and (
-                (isinstance(node, ast.Import) and any(alias.name == "os" for alias in node.names))
-                or (isinstance(node, ast.ImportFrom) and node.module == "os")
-            )
-            for node in tree.body
-        ):
-            tree.body.insert(0, ast.Import(names=[ast.alias(name="os")]))
+        for module in sorted(required_imports, reverse=True):
+            if not self._has_import(tree, module):
+                tree.body.insert(0, ast.Import(names=[ast.alias(name=module)]))
         ast.fix_missing_locations(tree)
         value = ast.unparse(tree) + "\n"
         compile(value, path, "exec")
         return {"content": value, "rules": sorted(set(changed))}
 
-    def __init__(self, verifier: RepairVerifier | None = None):
-        self.verifier = verifier or RepairVerifier()
+    @staticmethod
+    def _has_import(tree: ast.Module, module: str) -> bool:
+        return any(
+            isinstance(node, (ast.Import, ast.ImportFrom))
+            and (
+                (isinstance(node, ast.Import) and any(alias.name == module for alias in node.names))
+                or (isinstance(node, ast.ImportFrom) and node.module == module)
+            )
+            for node in tree.body
+        )
 
     def create_fix_commits(
         self,

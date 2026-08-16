@@ -58,6 +58,9 @@ version = { attr = "evoagent.__version__" }
 [tool.setuptools.packages.find]
 include = ["evoagent*"]
 
+[tool.setuptools.package-data]
+evoagent = ["py.typed"]
+
 [tool.setuptools.data-files]
 "share/evoagent/web" = ["web/*.css", "web/*.html", "web/*.js"]
 "share/evoagent/skills/code-quality" = [

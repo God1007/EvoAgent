@@ -38,7 +38,8 @@ tables because its constructor accepts `ReviewExecutionStorePort`.
 1. runtime-checkable surface tests catch missing methods without contacting an
    external service;
 2. one behavior suite is inherited by each adapter backend, proving task,
-   checkpoint, session, identity, webhook, audit, and shadow-release semantics.
+   checkpoint, session, identity, webhook, audit, shadow-release, delivery,
+   health, shutdown, Outbox, and effect-receipt semantics.
 
 SQLite and the memory queue always run in the local test suite. Production
 backend contracts are enabled with:
@@ -47,11 +48,17 @@ backend contracts are enabled with:
 export EVOAGENT_TEST_POSTGRES_URL=postgresql://evoagent:evoagent@localhost:5432/evoagent
 export EVOAGENT_TEST_REDIS_URL=redis://localhost:6379/0
 pytest -q tests/test_adapter_contracts.py
+pytest -q tests/test_external_integrations.py
 ```
 
 The tests use unique logical identifiers and do not require a clean database,
 but the configured targets must be dedicated test infrastructure. The
 PostgreSQL adapter closes its connection pool after each contract test.
+
+The mandatory GitHub Actions matrix supplies both URLs on every pull request.
+It additionally proves real pool timeout/replacement, Redis connection recovery,
+consumer-process lease reclaim, durable DLQ replay, and acknowledged Stream
+cleanup. See `integration-testing.md` for the full boundary map.
 
 The initial contract extraction found a concrete parity defect: PostgreSQL did
 not implement the shadow-observation/automatic-promotion behavior already

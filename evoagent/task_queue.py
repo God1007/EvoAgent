@@ -61,6 +61,8 @@ class TaskQueue:
             max_workers=workers, thread_name_prefix="evoagent-worker"
         )
         self._redis: Any = None
+        self._redis_workers: list[Future[Any]] = []
+        self._last_worker_error = ""
         self._memory_dlq: list[dict[str, Any]] = []
         self._memory_published_ids: dict[str, float] = {}
         self._lock = threading.Lock()
@@ -75,7 +77,13 @@ class TaskQueue:
                 import redis
             except ImportError as exc:
                 raise RuntimeError("Redis mode requires: pip install redis") from exc
-            self._redis = redis.Redis.from_url(redis_url, decode_responses=True)
+            self._redis = redis.Redis.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                socket_timeout=max(2, min(lease_seconds, 5)),
+                health_check_interval=30,
+            )
             self._redis.ping()
             try:
                 self._redis.xgroup_create(self.STREAM, self.GROUP, id="0", mkstream=True)
@@ -83,7 +91,7 @@ class TaskQueue:
                 if "BUSYGROUP" not in str(exc):
                     raise
             for _ in range(workers):
-                self._executor.submit(self._redis_worker)
+                self._redis_workers.append(self._executor.submit(self._redis_worker))
 
     @property
     def backend(self) -> str:
@@ -213,51 +221,64 @@ class TaskQueue:
             self._drain_condition.notify_all()
 
     def _redis_worker(self) -> None:
+        retry_delay = 0.1
         while not self._stop.is_set():
-            self._reclaim_stale()
-            messages = self._redis.xreadgroup(
-                self.GROUP, self.consumer, {self.STREAM: ">"}, count=1, block=1000
-            )
-            for _stream, entries in messages:
-                for redis_id, fields in entries:
-                    try:
-                        envelope = json.loads(fields["envelope"])
-                    except Exception as exc:
-                        envelope = {
-                            "message_id": redis_id,
-                            "attempt": self.max_attempts,
-                            "payload": {},
-                            "submitted_at": time.time(),
-                        }
-                        self._dead_letter(envelope, "invalid queue envelope: %s" % exc)
-                        self._redis.xack(self.STREAM, self.GROUP, redis_id)
-                        continue
-                    try:
-                        self._deliver(envelope)
-                        # ACK only after work completed or was safely requeued/DLQed.
-                        self._redis.xack(self.STREAM, self.GROUP, redis_id)
-                    except Exception:
-                        # Infrastructure failure: leave pending for lease recovery.
-                        continue
+            try:
+                self._reclaim_stale()
+                messages = self._redis.xreadgroup(
+                    self.GROUP, self.consumer, {self.STREAM: ">"}, count=1, block=1000
+                )
+                for _stream, entries in messages:
+                    for redis_id, fields in entries:
+                        self._consume_redis_entry(redis_id, fields)
+                self._last_worker_error = ""
+                retry_delay = 0.1
+            except Exception as exc:
+                # A Redis restart or transient network failure must not silently
+                # retire the worker Future forever. Leave unacknowledged entries
+                # pending and reconnect with bounded exponential backoff.
+                self._last_worker_error = str(exc)[:500]
+                self._stop.wait(retry_delay)
+                retry_delay = min(retry_delay * 2, 5.0)
+
+    def _consume_redis_entry(self, redis_id: str, fields: dict[str, Any]) -> None:
+        try:
+            envelope = json.loads(fields["envelope"])
+        except Exception as exc:
+            envelope = {
+                "message_id": redis_id,
+                "attempt": self.max_attempts,
+                "payload": {},
+                "submitted_at": time.time(),
+            }
+            self._dead_letter(envelope, "invalid queue envelope: %s" % exc)
+            self._ack_redis_entry(redis_id)
+            return
+        self._deliver(envelope)
+        # ACK only after work completed or was safely requeued/DLQed. XDEL is
+        # safe because EvoAgent owns the only consumer group for this stream;
+        # retaining acknowledged rows forever would make queue depth and Redis
+        # memory usage grow without bound.
+        self._ack_redis_entry(redis_id)
+
+    def _ack_redis_entry(self, redis_id: str) -> None:
+        with self._redis.pipeline(transaction=True) as pipeline:
+            pipeline.xack(self.STREAM, self.GROUP, redis_id)
+            pipeline.xdel(self.STREAM, redis_id)
+            pipeline.execute()
 
     def _reclaim_stale(self) -> None:
-        try:
-            result = self._redis.xautoclaim(
-                self.STREAM,
-                self.GROUP,
-                self.consumer,
-                min_idle_time=self.lease_seconds * 1000,
-                start_id="0-0",
-                count=10,
-            )
-            entries = result[1] if len(result) > 1 else []
-            for redis_id, fields in entries:
-                envelope = json.loads(fields["envelope"])
-                self._deliver(envelope)
-                self._redis.xack(self.STREAM, self.GROUP, redis_id)
-        except Exception:
-            # Redis versions without XAUTOCLAIM still process new entries.
-            return
+        result = self._redis.xautoclaim(
+            self.STREAM,
+            self.GROUP,
+            self.consumer,
+            min_idle_time=self.lease_seconds * 1000,
+            start_id="0-0",
+            count=10,
+        )
+        entries = result[1] if len(result) > 1 else []
+        for redis_id, fields in entries:
+            self._consume_redis_entry(redis_id, fields)
 
     def _dead_letter(self, envelope: dict[str, Any], error: str) -> None:
         item = {**envelope, "error": error[:2000], "failed_at": time.time()}
@@ -297,8 +318,8 @@ class TaskQueue:
 
     def depth(self) -> int:
         """Best-effort backlog size for observability. For Redis this is the
-        stream length (approximate: includes un-trimmed acked entries); for the
-        in-memory backend it is the executor queue size. Returns -1 if unknown."""
+        unacknowledged stream length (acknowledged rows are deleted); for the
+        in-memory backend it is scheduled executor work. Returns -1 if unknown."""
         try:
             if self._redis:
                 return int(self._redis.xlen(self.STREAM))
@@ -306,6 +327,32 @@ class TaskQueue:
                 return self._scheduled_memory
         except Exception:  # pragma: no cover - defensive probe isolation
             return -1
+
+    def health(self) -> dict[str, Any]:
+        """Return a dependency and worker-liveness snapshot for readiness."""
+        if not self._redis:
+            return {
+                "healthy": not self._stop.is_set(),
+                "backend": self.backend,
+                "workers_running": 0,
+                "workers_expected": 0,
+                "last_error": "",
+            }
+        running = sum(not worker.done() for worker in self._redis_workers)
+        dependency_ok = False
+        error = self._last_worker_error
+        try:
+            dependency_ok = bool(self._redis.ping())
+        except Exception as exc:
+            error = str(exc)[:500]
+        expected = len(self._redis_workers)
+        return {
+            "healthy": dependency_ok and running == expected and not self._stop.is_set(),
+            "backend": self.backend,
+            "workers_running": running,
+            "workers_expected": expected,
+            "last_error": error,
+        }
 
     def drain(self, timeout_seconds: float = 0.0) -> bool:
         """Wait for active and already-scheduled in-memory deliveries.
@@ -328,4 +375,8 @@ class TaskQueue:
             self._stop.set()
         drained = self.drain(drain_timeout_seconds)
         self._executor.shutdown(wait=False, cancel_futures=not drained)
+        if self._redis is not None and drained:
+            # Closing the pool interrupts a worker blocked in XREADGROUP; its
+            # reconnect loop observes `_stop` and exits without a leaked socket.
+            self._redis.close()
         return drained

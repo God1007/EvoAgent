@@ -77,6 +77,26 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(1, fixer.calls)
 
+    def test_readiness_exposes_queue_worker_health_and_fails_closed(self):
+        service = ReviewService(self.settings)
+        self.addCleanup(service.close)
+        ready, detail = service.readiness()
+        self.assertTrue(ready)
+        self.assertTrue(detail["checks"]["queue"]["healthy"])
+
+        service.queue.health = lambda: {  # type: ignore[method-assign]
+            "healthy": False,
+            "backend": service.queue.backend,
+            "workers_running": 0,
+            "workers_expected": 1,
+            "last_error": "worker stopped",
+        }
+        service._readiness_cache = None
+        ready, detail = service.readiness()
+        self.assertFalse(ready)
+        self.assertEqual("not-ready", detail["status"])
+        self.assertEqual("worker stopped", detail["checks"]["queue"]["last_error"])
+
     def tearDown(self):
         os.unlink(self.path)
 

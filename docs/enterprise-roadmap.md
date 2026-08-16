@@ -13,7 +13,7 @@ It is an execution plan, not a marketing checklist.
 | Review extensibility | Implemented | Reviewer interface, sandboxed Dynamic Skills, replaceable `review.engine` |
 | Repair extensibility | Implemented | Independent `fix.rule` providers; verifier and publication gates remain centralized |
 | Local durability | Development only | SQLite + memory queue is explicitly non-durable |
-| Production persistence | Implemented, integration evidence incomplete | PostgreSQL + Redis Streams, ACK/lease/DLQ; needs mandatory CI matrix and migration tooling |
+| Production persistence | Implemented baseline | PostgreSQL + Redis Streams, migration CLI, Outbox, ACK/lease/DLQ, and mandatory real-service CI; backup/restore drill remains pending |
 | Graceful lifecycle | Implemented | Readiness drain plus bounded queue drain before Store/plugin shutdown |
 | Multi-tenancy/governance | Implemented baseline | JWT, RBAC, tenant/repository authorization, audit, canary/shadow/rollback |
 | Strong untrusted execution | Partial | Container isolation exists; host fallback is not a strong boundary; microVM/remote runner pending |
@@ -82,10 +82,10 @@ publishes by stable task-id key; Memory and Redis adapters deduplicate publicati
 exhaustion becomes observable/replayable `dead`; readiness and metrics expose
 the path. Effect receipts, comment markers, and deterministic repair branches
 make GitHub publication retry-safe. In-process fault injection covers transaction
-rollback and the publish-before-mark crash. Actual process-kill PostgreSQL/Redis
-recovery remains deliberately open for the mandatory adapter CI matrix.
+rollback and the publish-before-mark crash. The mandatory adapter CI matrix now
+adds real PostgreSQL/Redis and a consumer-process death before ACK.
 
-### 2.4 Mandatory adapter integration matrix
+### 2.4 Mandatory adapter integration matrix — implemented baseline
 
 Add CI jobs for PostgreSQL, Redis Streams, GitHub HTTP fixtures, and containerized
 Verifier execution. Remove those modules from coverage exclusions only after the
@@ -97,6 +97,17 @@ Acceptance:
 - PostgreSQL pool exhaustion and reconnect behavior are tested;
 - wheel-installed resources, health/readiness, and shutdown drain run in the
   built container image.
+
+Implemented evidence: `.github/workflows/ci.yml` provisions PostgreSQL 16 and
+Redis 7 for every pull request; runs the shared adapter suite plus pool
+exhaustion/replacement, Redis reconnect, cross-process reclaim, dedupe, and DLQ
+tests; drives the GitHub client over a real local HTTP fixture; executes the
+Verifier against Docker; smoke-tests the installed wheel's web/Skill resources;
+and runs an async review through the built image, Postgres outbox, Redis Stream,
+and worker before a bounded SIGTERM shutdown. PostgreSQL remains excluded from
+the single-process unit coverage denominator until its entire broad Store
+surface (not only critical contracts) has boundary coverage; the external job
+is nevertheless a required pass/fail merge gate.
 
 ## Phase 3 — Application decomposition and policy scopes
 

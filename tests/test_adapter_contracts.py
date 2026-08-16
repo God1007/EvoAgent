@@ -207,6 +207,9 @@ class _QueueBehaviorContract:
             self.assertIsInstance(queue, TaskQueuePort)
             self.assertEqual(self.expected_backend, queue.backend)
             self.assertEqual(self.expected_durable, queue.durable)
+            health = queue.health()
+            self.assertTrue(health["healthy"], health)
+            self.assertEqual(self.expected_backend, health["backend"])
             self.assertEqual(
                 message_id,
                 queue.submit({"message_id": message_id}, message_id=message_id),

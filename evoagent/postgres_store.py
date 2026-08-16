@@ -1,8 +1,9 @@
 """PostgreSQL persistence backend.
 
 The implementation mirrors TaskStore's public API and is selected when
-EVOAGENT_DATABASE_URL starts with postgres. psycopg is an optional production
-dependency so local development can remain zero-config.
+EVOAGENT_DATABASE_URL starts with postgres. The driver and bounded connection
+pool are runtime dependencies; local development remains zero-config because
+SQLite is selected when no database URL is supplied.
 """
 
 import json
@@ -35,8 +36,8 @@ class PostgresTaskStore:
         self.pool_timeout = float(pool_timeout)
         # A real connection pool avoids a TCP connect + auth handshake on every
         # single query (the previous per-call `psycopg.connect` was the dominant
-        # Postgres cost under load). Import-guarded so `psycopg_pool` stays an
-        # optional dependency and we fall back to per-call connections.
+        # Postgres cost under load). Keep the import guard so a deliberately
+        # stripped/embedder installation fails visibly but can still connect.
         self._pool = None
         if pool_max and pool_max > 0:
             try:
@@ -44,11 +45,10 @@ class PostgresTaskStore:
             except ImportError:
                 print(
                     "WARNING: psycopg_pool not installed; falling back to a new "
-                    "connection per query. Install the 'postgres-pool' extra "
-                    "(pip install psycopg-pool) for pooled connections."
+                    "connection per query. Reinstall EvoAgent with its declared "
+                    "runtime dependencies to enable bounded pooling."
                 )
-                ConnectionPool = None
-            if ConnectionPool is not None:
+            else:
                 try:
                     # open=False + explicit open() avoids the deprecated eager
                     # constructor-open path in psycopg_pool >= 3.2.

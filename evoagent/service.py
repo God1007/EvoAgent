@@ -228,12 +228,10 @@ class ReviewService:
         except Exception as exc:
             ready = False
             checks["store"] = "error: %s" % exc
+        queue_health = self.queue.health()
         depth = self.queue.depth()
-        if depth >= 0:
-            checks["queue"] = "ok"
-        else:
-            # -1 => the queue backend (e.g. Redis) is unreachable.
-            checks["queue"] = "unreachable"
+        checks["queue"] = queue_health
+        if not queue_health["healthy"] or depth < 0:
             ready = False
         try:
             outbox = self.outbox.stats()

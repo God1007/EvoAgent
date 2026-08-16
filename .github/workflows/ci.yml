@@ -41,6 +41,33 @@ jobs:
         run: python -m pytest --cov=evoagent --cov-report=term-missing --cov-report=xml
       - name: Build distributions
         run: python -m build
+      - name: Smoke-test the installed wheel and packaged resources
+        run: |
+          wheel_env="${RUNNER_TEMP}/evoagent-wheel"
+          python -m venv --system-site-packages "$wheel_env"
+          "$wheel_env/bin/python" -m pip install --no-deps dist/*.whl
+          cd "$RUNNER_TEMP"
+          EVOAGENT_HOST=127.0.0.1 EVOAGENT_PORT=18081 \
+            EVOAGENT_DB_PATH="${RUNNER_TEMP}/wheel-smoke.db" \
+            "$wheel_env/bin/evoagent" > wheel-smoke.log 2>&1 &
+          wheel_pid=$!
+          trap 'kill "$wheel_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:18081/health >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              cat wheel-smoke.log
+              exit 1
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:18081/ | grep -q '<!doctype html>'
+          test -f "$wheel_env/share/evoagent/skills/code-quality/SKILL.md"
+          "$wheel_env/bin/evoagent-migrate" | grep -q '"schema_version": 4'
+          kill -TERM "$wheel_pid"
+          wait "$wheel_pid"
+          trap - EXIT
 
   compatibility:
     name: Python ${{ matrix.python-version }}
@@ -106,4 +133,114 @@ jobs:
       - name: Tear down
         if: always()
         run: docker rm -f evoagent-ci || true
+
+  external-integration:
+    name: PostgreSQL + Redis + container contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      EVOAGENT_TEST_POSTGRES_URL: postgresql://evoagent:evoagent-ci@127.0.0.1:5432/evoagent
+      EVOAGENT_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: evoagent
+          POSTGRES_USER: evoagent
+          POSTGRES_PASSWORD: evoagent-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U evoagent -d evoagent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.lock
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements-dev.lock
+          python -m pip install --no-deps -e .
+      - name: Run the real migration entry point
+        env:
+          EVOAGENT_DATABASE_URL: ${{ env.EVOAGENT_TEST_POSTGRES_URL }}
+        run: |
+          python -m evoagent.migrate | tee migration.json
+          python -c "import json; d=json.load(open('migration.json')); assert d == {'backend':'postgresql','schema_version':4,'status':'migrated'}"
+      - name: Run adapter contracts and restart fault tests
+        run: |
+          python -m pytest -q \
+            tests/test_adapter_contracts.py \
+            tests/test_external_integrations.py \
+            tests/test_github_http_fixture.py
+      - name: Build the production image
+        run: docker build -t evoagent:ci .
+      - name: Run the real container verifier boundary tests
+        env:
+          EVOAGENT_TEST_CONTAINER_IMAGE: evoagent:ci
+        run: python -m pytest -q tests/test_container_integration.py
+      - name: Start the built image with PostgreSQL and Redis
+        run: |
+          docker run -d --name evoagent-full-stack --network host \
+            -e EVOAGENT_HOST=127.0.0.1 \
+            -e EVOAGENT_PORT=18080 \
+            -e EVOAGENT_AUTH_REQUIRED=false \
+            -e EVOAGENT_DATABASE_URL="${EVOAGENT_TEST_POSTGRES_URL}" \
+            -e EVOAGENT_REDIS_URL="${EVOAGENT_TEST_REDIS_URL}" \
+            -e EVOAGENT_SKILLS_DIR=/app/skills \
+            evoagent:ci
+      - name: Prove readiness and end-to-end outbox delivery
+        run: |
+          for attempt in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:18080/ready > ready.json 2>/dev/null; then
+              break
+            fi
+            if [ "$attempt" = 45 ]; then
+              docker logs evoagent-full-stack
+              exit 1
+            fi
+            sleep 1
+          done
+          python -c "import json; d=json.load(open('ready.json')); assert d['status']=='ready'; assert d['queue_backend']=='redis-streams'; assert d['checks']['schema_version']==4; assert d['checks']['queue']['healthy']"
+          curl -fsS -X POST 'http://127.0.0.1:18080/v1/reviews?async=true' \
+            -H 'Content-Type: application/json' \
+            -d '{"repository":"ci/full-stack","pull_request":17,"diff":"diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n+value = 1\n+print(value)"}' \
+            > accepted.json
+          task_id=$(python -c "import json; print(json.load(open('accepted.json'))['task_id'])")
+          for attempt in $(seq 1 45); do
+            curl -fsS "http://127.0.0.1:18080/v1/tasks/${task_id}" > task.json
+            state=$(python -c "import json; print(json.load(open('task.json'))['state'])")
+            if [ "$state" = SUCCESS ]; then
+              exit 0
+            fi
+            if [ "$state" = FAILED ] || [ "$attempt" = 45 ]; then
+              cat task.json
+              docker logs evoagent-full-stack
+              exit 1
+            fi
+            sleep 1
+          done
+      - name: Verify graceful container shutdown
+        run: |
+          docker stop --time 20 evoagent-full-stack
+          test "$(docker inspect -f '{{.State.ExitCode}}' evoagent-full-stack)" = 0
+      - name: Tear down
+        if: always()
+        run: docker rm -f evoagent-full-stack 2>/dev/null || true
 

@@ -120,9 +120,8 @@ python scripts/microbench.py --json micro.json
 - **Resilience**: outbound GitHub and LLM calls are wrapped in a circuit breaker
   with exponential backoff + jitter, so an upstream outage fails fast instead of
   exhausting workers.
-- **Storage**: Postgres uses a real connection pool (`psycopg_pool`, install the
-  `postgres-pool` extra; without it the store transparently falls back to a
-  connection per query). Size the pool with `EVOAGENT_PG_POOL_MAX`. Note the
+- **Storage**: Postgres uses a real connection pool (`psycopg_pool` is a core
+  runtime dependency). Size the pool with `EVOAGENT_PG_POOL_MAX`. Note the
   total backend budget is roughly `web_workers * pg_pool_max` (each worker
   process owns its own pool), so keep it under the server's `max_connections`.
   SQLite is single-writer and intended for single-node/dev.

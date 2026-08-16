@@ -801,7 +801,7 @@ make check
 
 当前整体行覆盖率约 86%，其中 `reviewer`、`fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
 
-GitHub 额外执行 Gitleaks、CodeQL、依赖审计和 Docker 构建冒烟测试（构建镜像、启动容器并校验 `/health` 与 `/v1/reviews`）。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；质量门禁、可信插件微内核、数据库迁移与事务 Outbox 分别记录在 [`ADR 0001`](docs/adr/0001-engineering-quality-gates.md)、[`ADR 0002`](docs/adr/0002-trusted-plugin-microkernel.md)、[`ADR 0003`](docs/adr/0003-versioned-forward-only-migrations.md) 和 [`ADR 0004`](docs/adr/0004-transactional-outbox.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
+GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16 与 Redis 7，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离，以及生产镜像的 `/ready` → Outbox → Redis → Worker 全链路。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；质量门禁、可信插件微内核、数据库迁移与事务 Outbox 分别记录在 [`ADR 0001`](docs/adr/0001-engineering-quality-gates.md)、[`ADR 0002`](docs/adr/0002-trusted-plugin-microkernel.md)、[`ADR 0003`](docs/adr/0003-versioned-forward-only-migrations.md) 和 [`ADR 0004`](docs/adr/0004-transactional-outbox.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
 
 更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)，性能 SLO、压测方法与可复现基线见 [`docs/performance.md`](docs/performance.md) 与 [`docs/performance-baseline.md`](docs/performance-baseline.md)。
 
@@ -812,7 +812,7 @@ GitHub 额外执行 Gitleaks、CodeQL、依赖审计和 Docker 构建冒烟测�
 - **多核 HTTP 扩展**：`EVOAGENT_WEB_WORKERS` 通过 `SO_REUSEPORT` 派生多个 worker 进程，master 监督进程负责崩溃重启（带退避与风暴上限）与 `SIGTERM` 优雅摘流（`/ready` 转 503 → 等待在途请求 → 到期 `SIGKILL` 兜底）。
 - **过载保护（背压）**：按客户端的令牌桶限流 + 重端点的有界并发闸门，过载时返回 `429`/`503` + `Retry-After` 而非雪崩（`EVOAGENT_RATE_LIMIT_RPS`、`EVOAGENT_MAX_INFLIGHT_HEAVY`）。
 - **依赖韧性**：GitHub / LLM 出站调用包裹熔断器（closed/open/half-open + 退避抖动），仅对连接/超时类传输故障计数，上游宕机时快速失败而非占满线程。
-- **连接池**：Postgres 使用 `psycopg_pool` 连接池（`postgres-pool` 可选依赖，缺失时自动回退到每次新建连接），池指标经 `/metrics` 暴露。
+- **连接池**：Postgres 使用核心依赖 `psycopg_pool` 的有界连接池；池大小、可用连接和等待请求经 `/metrics` 暴露，真实耗尽/恢复行为由 CI 门禁验证。
 - **可观测性**：`/metrics` 新增延迟直方图（p50/p95/p99 可推导）、在途请求、被拒计数、队列深度、连接池与熔断器状态。
 - **压测工具**：纯 Python 恒定到达率压测器 [`scripts/loadgen.py`](scripts/loadgen.py)（离线/CI 可用，阈值超限即非零退出）、k6 脚本 [`perf/`](perf)、全栈 [`docker-compose.perf.yml`](docker-compose.perf.yml)，以及热点路径微基准 [`scripts/microbench.py`](scripts/microbench.py)。CI 由 [`.github/workflows/perf.yml`](.github/workflows/perf.yml) 作为性能回归门禁。
 

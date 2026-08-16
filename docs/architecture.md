@@ -108,6 +108,9 @@ See [`plugin-system.md`](plugin-system.md) and
   consumer leases, dead-letter queue, and replay. The in-process
   `memory-ephemeral` backend is **not** durable (`/health` reports
   `queue_durable: false`) and is for single-process development only.
+  Redis workers reconnect after transient transport failures; acknowledged
+  entries are atomically ACKed and deleted so memory and operational depth do
+  not grow forever. `/ready` checks both Redis reachability and worker liveness.
 - **Durable acceptance** uses a transactional outbox. A committed task and its
   queue intent cannot diverge; dispatch leases and message-key dedupe recover
   the publish/ack crash window. See

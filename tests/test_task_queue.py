@@ -20,8 +20,14 @@ class TaskQueueBackendTests(unittest.TestCase):
         try:
             self.assertEqual("memory-ephemeral", queue.backend)
             self.assertFalse(queue.durable)
+            self.assertTrue(queue.health()["healthy"])
         finally:
             queue.close()
+
+    def test_closed_memory_queue_reports_unhealthy(self):
+        queue = TaskQueue(lambda _payload: None, workers=1)
+        queue.close()
+        self.assertFalse(queue.health()["healthy"])
 
     def test_successful_delivery_invokes_handler(self):
         seen = []

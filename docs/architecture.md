@@ -16,6 +16,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Orchestration | `evoagent/service.py` | Consumes composed capabilities, enqueues/processes reviews, GitHub integration |
 | Runtime | `evoagent/harness.py` | LangGraph state machine, budget, retry, checkpoint/resume |
 | Runtime | `evoagent/task_queue.py` | In-process queue or Redis Streams (ACK, lease, DLQ, replay) |
+| Runtime | `evoagent/outbox.py` | Store-to-queue transactional publication, leases, retry and recovery |
 | Review | `evoagent/review_engine.py`, `agents.py` | Replaceable review engine and default multi-agent collaboration protocol |
 | Review | `evoagent/reviewer.py` | Local deterministic rules + OpenAI-compatible reviewer + composite |
 | Review | `evoagent/skills.py` | Dynamic skill registry, manifest/hash/signature checks, sandboxed execution |
@@ -41,7 +42,8 @@ process startup
   → resolve ReviewService capabilities
 
 change (webhook | REST | console)
-  → ReviewService.enqueue_review            # persist task, enqueue
+  → ReviewService.enqueue_review            # atomically persist task + outbox
+  → OutboxDispatcher                        # lease + idempotent publication
   → TaskQueue                               # in-process or Redis Streams
   → ReviewHarness.run                       # LangGraph nodes, checkpoint each step
       parse → plan → specialists (security, reliability, llm, skills)
@@ -106,9 +108,14 @@ See [`plugin-system.md`](plugin-system.md) and
   consumer leases, dead-letter queue, and replay. The in-process
   `memory-ephemeral` backend is **not** durable (`/health` reports
   `queue_durable: false`) and is for single-process development only.
+- **Durable acceptance** uses a transactional outbox. A committed task and its
+  queue intent cannot diverge; dispatch leases and message-key dedupe recover
+  the publish/ack crash window. See
+  [`transactional-outbox.md`](transactional-outbox.md) and
+  [`ADR 0004`](adr/0004-transactional-outbox.md).
 - **Idempotency**: GitHub webhook delivery id, payload digest, and PR update
-  time are checked to prevent duplicate consumption and replay outside the
-  allowed window.
+  time prevent invalid replay; comments use stable upsert markers and repair PRs
+  use effect receipts plus deterministic branches.
 
 ## 5. Trust boundaries (summary)
 

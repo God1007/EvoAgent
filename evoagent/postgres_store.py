@@ -13,7 +13,7 @@ from typing import Any
 from .migrations import migrate_postgres
 from .models import ReviewReport, TaskState, TraceEvent
 from .ports import ApplicationStorePort
-from .store import utc_now
+from .store import utc_after, utc_now
 
 
 class PostgresTaskStore:
@@ -138,6 +138,210 @@ class PostgresTaskStore:
                     tenant_id,
                 ),
             )
+
+    def create_review_task(
+        self,
+        task_id: str,
+        repository: str,
+        pull_request: int | None,
+        payload: dict[str, Any],
+        tenant_id: str,
+        diff: str | None = None,
+        outbox_payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist task, optional diff, and queue intent in one transaction."""
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO tasks(id,state,repository,pull_request,input_json,report_json,error,"
+                "created_at,updated_at,tenant_id,cancel_requested) "
+                "VALUES (%s,%s,%s,%s,%s::jsonb,NULL,NULL,%s,%s,%s,FALSE)",
+                (
+                    task_id,
+                    TaskState.PENDING.value,
+                    repository,
+                    pull_request,
+                    json.dumps(payload, ensure_ascii=False),
+                    now,
+                    now,
+                    tenant_id,
+                ),
+            )
+            if diff is not None:
+                conn.execute(
+                    "INSERT INTO task_payloads(task_id,diff,created_at) VALUES (%s,%s,%s)",
+                    (task_id, diff, now),
+                )
+            if outbox_payload is not None:
+                conn.execute(
+                    "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,"
+                    "attempts,available_at,created_at,updated_at) "
+                    "VALUES (%s,%s,%s,%s::jsonb,'pending',0,%s,%s,%s)",
+                    (
+                        "review:" + task_id,
+                        "review",
+                        task_id,
+                        json.dumps(outbox_payload, ensure_ascii=False),
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+
+    def claim_outbox(
+        self,
+        owner: str,
+        limit: int,
+        lease_seconds: float,
+        max_attempts: int,
+    ) -> list[dict[str, Any]]:
+        now = utc_now()
+        lease_until = utc_after(lease_seconds)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM outbox_messages WHERE attempts < %s AND "
+                "((status='pending' AND available_at<=%s) OR "
+                "(status='publishing' AND lease_until<%s)) "
+                "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT %s",
+                (max_attempts, now, now, max(1, min(limit, 500))),
+            ).fetchall()
+            claimed = []
+            for row in rows:
+                conn.execute(
+                    "UPDATE outbox_messages SET status='publishing',attempts=attempts+1,"
+                    "lease_owner=%s,lease_until=%s,updated_at=%s WHERE id=%s",
+                    (owner, lease_until, now, row["id"]),
+                )
+                item = dict(row)
+                item["attempts"] = int(item["attempts"]) + 1
+                raw_payload = item.pop("payload_json")
+                item["payload"] = (
+                    json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+                )
+                claimed.append(item)
+        return claimed
+
+    def mark_outbox_published(self, message_id: str, owner: str) -> bool:
+        now = utc_now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE outbox_messages SET status='published',published_at=%s,updated_at=%s,"
+                "lease_owner=NULL,lease_until=NULL,last_error=NULL "
+                "WHERE id=%s AND status='publishing' AND lease_owner=%s",
+                (now, now, message_id, owner),
+            )
+        return cursor.rowcount > 0
+
+    def release_outbox(
+        self,
+        message_id: str,
+        owner: str,
+        error: str,
+        retry_delay_seconds: float,
+        max_attempts: int,
+    ) -> bool:
+        now = utc_now()
+        available_at = utc_after(retry_delay_seconds)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE outbox_messages SET "
+                "status=CASE WHEN attempts>=%s THEN 'dead' ELSE 'pending' END,"
+                "available_at=%s,lease_owner=NULL,lease_until=NULL,last_error=%s,updated_at=%s "
+                "WHERE id=%s AND status='publishing' AND lease_owner=%s",
+                (max_attempts, available_at, error[:2000], now, message_id, owner),
+            )
+        return cursor.rowcount > 0
+
+    def outbox_stats(self) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total,"
+                "COUNT(*) FILTER(WHERE status='pending') AS pending,"
+                "COUNT(*) FILTER(WHERE status='publishing') AS publishing,"
+                "COUNT(*) FILTER(WHERE status='dead') AS dead FROM outbox_messages"
+            ).fetchone()
+        return {key: int(row[key] or 0) for key in ("total", "pending", "publishing", "dead")}
+
+    def list_outbox(self, status: str = "dead", limit: int = 100) -> list:
+        if status not in {"pending", "publishing", "published", "dead"}:
+            raise ValueError("unsupported outbox status")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM outbox_messages WHERE status=%s ORDER BY created_at DESC LIMIT %s",
+                (status, max(1, min(limit, 500))),
+            ).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            raw_payload = item.pop("payload_json")
+            item["payload"] = (
+                json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+            )
+            values.append(item)
+        return values
+
+    def requeue_outbox(self, message_id: str) -> bool:
+        now = utc_now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE outbox_messages SET status='pending',attempts=0,available_at=%s,"
+                "lease_owner=NULL,lease_until=NULL,last_error=NULL,updated_at=%s "
+                "WHERE id=%s AND status='dead'",
+                (now, now, message_id),
+            )
+        return cursor.rowcount > 0
+
+    def claim_effect(self, effect_key: str, owner: str, lease_seconds: float) -> dict[str, Any]:
+        now = utc_now()
+        lease_until = utc_after(lease_seconds)
+        with self._connect() as conn:
+            inserted = conn.execute(
+                "INSERT INTO effect_receipts(effect_key,status,owner,lease_until,attempts,"
+                "created_at,updated_at) VALUES (%s,'in-progress',%s,%s,1,%s,%s) "
+                "ON CONFLICT(effect_key) DO NOTHING RETURNING effect_key",
+                (effect_key, owner, lease_until, now, now),
+            ).fetchone()
+            if inserted:
+                return {"status": "acquired"}
+            row = conn.execute(
+                "SELECT * FROM effect_receipts WHERE effect_key=%s FOR UPDATE", (effect_key,)
+            ).fetchone()
+            if row["status"] == "completed":
+                raw_result = row["result_json"]
+                return {
+                    "status": "completed",
+                    "result": json.loads(raw_result) if isinstance(raw_result, str) else raw_result,
+                }
+            acquired = conn.execute(
+                "UPDATE effect_receipts SET owner=%s,lease_until=%s,attempts=attempts+1,"
+                "last_error=NULL,updated_at=%s WHERE effect_key=%s AND lease_until<%s "
+                "RETURNING effect_key",
+                (owner, lease_until, now, effect_key, now),
+            ).fetchone()
+            if acquired:
+                return {"status": "acquired"}
+        return {"status": "busy"}
+
+    def complete_effect(self, effect_key: str, owner: str, result: dict[str, Any]) -> bool:
+        now = utc_now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE effect_receipts SET status='completed',result_json=%s::jsonb,owner=NULL,"
+                "lease_until=NULL,last_error=NULL,updated_at=%s,completed_at=%s "
+                "WHERE effect_key=%s AND status='in-progress' AND owner=%s",
+                (json.dumps(result, ensure_ascii=False), now, now, effect_key, owner),
+            )
+        return cursor.rowcount > 0
+
+    def release_effect(self, effect_key: str, owner: str, error: str) -> bool:
+        now = utc_now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE effect_receipts SET lease_until=%s,last_error=%s,updated_at=%s "
+                "WHERE effect_key=%s AND status='in-progress' AND owner=%s",
+                (now, error[:2000], now, effect_key, owner),
+            )
+        return cursor.rowcount > 0
 
     def transition(self, task_id: str, event: TraceEvent) -> None:
         with self._connect() as conn:

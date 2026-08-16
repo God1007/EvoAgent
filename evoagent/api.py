@@ -318,6 +318,20 @@ class ApiHandler(BaseHTTPRequestHandler):
                 {"messages": self.service.queue.dead_letters(int(query.get("limit", [100])[0]))},
             )
             return
+        if path == "/api/outbox":
+            if not principal.can("manage"):
+                self._send_json(403, {"error": "permission denied"})
+                return
+            outbox_status = query.get("status", ["dead"])[0]
+            self._send_json(
+                200,
+                {
+                    "messages": self.service.store.list_outbox(
+                        outbox_status, int(query.get("limit", [100])[0])
+                    )
+                },
+            )
+            return
         if path == "/v1/evaluation/cases":
             split = query.get("split", ["validation"])[0]
             if split == "holdout":
@@ -598,6 +612,20 @@ class ApiHandler(BaseHTTPRequestHandler):
                 principal = self._principal("manage")
                 payload = self._read_json(body)
                 ok = self.service.queue.replay_dead_letter(str(payload.get("message_id", "")))
+                self._send_json(202 if ok else 404, {"replayed": ok})
+                return
+            if path == "/v1/outbox/replay":
+                principal = self._principal("manage")
+                payload = self._read_json(body)
+                message_id = str(payload.get("message_id", ""))
+                ok = self.service.replay_outbox(message_id)
+                self.service.store.audit(
+                    principal.tenant_id,
+                    principal.username,
+                    "outbox.replay",
+                    message_id,
+                    {"replayed": ok},
+                )
                 self._send_json(202 if ok else 404, {"replayed": ok})
                 return
             if path == "/v1/evaluation/cases":

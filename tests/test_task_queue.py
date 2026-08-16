@@ -164,6 +164,18 @@ class TaskQueueBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "closed"):
             queue.submit({"task_id": "late"})
 
+    def test_duplicate_message_id_is_published_once(self):
+        seen = []
+        queue = TaskQueue(lambda payload: seen.append(payload["value"]), workers=1)
+        try:
+            self.assertEqual("same", queue.submit({"value": 1}, message_id="same"))
+            self.assertEqual("same", queue.submit({"value": 2}, message_id="same"))
+            self.assertTrue(_wait(lambda: seen == [1]))
+            time.sleep(0.05)
+            self.assertEqual([1], seen)
+        finally:
+            queue.close()
+
 
 if __name__ == "__main__":
     unittest.main()

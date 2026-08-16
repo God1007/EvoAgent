@@ -355,7 +355,7 @@ class AdvancedFeatureTests(unittest.TestCase):
             if task["state"] in {"SUCCESS", "FAILED"}:
                 break
             time.sleep(0.02)
-        service.queue.close()
+        service.close()
         self.assertEqual("SUCCESS", task["state"])
         self.assertEqual(
             {"SEC-EVAL", "QUALITY-UNFINISHED"},

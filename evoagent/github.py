@@ -216,6 +216,27 @@ class GitHubClient:
     def get_repository(self, repository: str) -> dict:
         return self._json("GET", "https://api.github.com/repos/%s" % repository)
 
+    def get_branch(self, repository: str, branch: str) -> dict | None:
+        try:
+            return self._json(
+                "GET",
+                "https://api.github.com/repos/%s/git/ref/heads/%s"
+                % (repository, urllib.parse.quote(branch, safe="")),
+            )
+        except RuntimeError as exc:
+            if "HTTP 404" in str(exc):
+                return None
+            raise
+
+    def find_pull_request_by_head(self, repository: str, branch: str) -> dict | None:
+        owner = repository.split("/", 1)[0]
+        values = self._json(
+            "GET",
+            "https://api.github.com/repos/%s/pulls?state=all&head=%s"
+            % (repository, urllib.parse.quote("%s:%s" % (owner, branch), safe="")),
+        )
+        return values[0] if values else None
+
     def ensure_repository_access(self, repository: str) -> None:
         result = self.get_repository(repository)
         if str(result.get("full_name", "")).lower() != repository.lower():

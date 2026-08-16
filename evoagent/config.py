@@ -26,6 +26,13 @@ def _non_negative_int(name: str, default: int) -> int:
     return value
 
 
+def _positive_float(name: str, default: float) -> float:
+    value = float(os.getenv(name, str(default)))
+    if value <= 0:
+        raise ValueError("%s must be positive" % name)
+    return value
+
+
 def _csv(name: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in os.getenv(name, "").split(",") if item.strip())
 
@@ -107,6 +114,11 @@ class Settings:
     plugin_profile_path: str = ""
     plugin_discovery: bool = False
     plugin_allowlist: tuple[str, ...] = ()
+    outbox_poll_seconds: float = 0.25
+    outbox_batch_size: int = 50
+    outbox_lease_seconds: int = 30
+    outbox_max_attempts: int = 20
+    effect_lease_seconds: int = 300
 
     def resolved_llm(self) -> dict[str, Any]:
         """Resolve a named provider to the existing OpenAI-compatible transport."""
@@ -284,4 +296,9 @@ class Settings:
             plugin_profile_path=os.getenv("EVOAGENT_PLUGIN_PROFILE", ""),
             plugin_discovery=_bool("EVOAGENT_PLUGIN_DISCOVERY", False),
             plugin_allowlist=_csv("EVOAGENT_PLUGIN_ALLOWLIST"),
+            outbox_poll_seconds=_positive_float("EVOAGENT_OUTBOX_POLL_SECONDS", 0.25),
+            outbox_batch_size=_int("EVOAGENT_OUTBOX_BATCH_SIZE", 50),
+            outbox_lease_seconds=_int("EVOAGENT_OUTBOX_LEASE_SECONDS", 30),
+            outbox_max_attempts=_int("EVOAGENT_OUTBOX_MAX_ATTEMPTS", 20),
+            effect_lease_seconds=_int("EVOAGENT_EFFECT_LEASE_SECONDS", 300),
         )

@@ -24,7 +24,7 @@ class AdmissionControlTests(unittest.TestCase):
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        self.addCleanup(service.queue.close)
+        self.addCleanup(service.close)
         self.addCleanup(server.shutdown)
         return server.server_address
 

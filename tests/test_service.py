@@ -4,8 +4,9 @@ import unittest
 from dataclasses import dataclass
 
 from evoagent.config import Settings
-from evoagent.models import Finding, Severity
+from evoagent.models import Finding, ReviewReport, Severity, TaskState, TraceEvent
 from evoagent.service import ReviewService
+from evoagent.store import utc_now
 
 
 @dataclass
@@ -47,6 +48,34 @@ class ServiceTests(unittest.TestCase):
             github_token="",
             auto_post_review=False,
         )
+
+    def test_fix_publication_result_is_cached_by_durable_effect_key(self):
+        service = ReviewService(self.settings)
+        self.addCleanup(service.close)
+        task_id = "fix-task"
+        service.store.create(task_id, "org/repo", 7, {}, "default")
+        service.store.succeed(
+            task_id,
+            ReviewReport("org/repo", 7, "one issue", "high", [_finding()]),
+            TraceEvent(1, TaskState.SUCCESS, "done", utc_now()),
+        )
+
+        class CountingFixer:
+            calls = 0
+
+            def create_fix_commits(self, *_args, **_kwargs):
+                self.calls += 1
+                return {"branch": "evoagent/fix", "commits": [{"sha": "abc"}]}
+
+        fixer = CountingFixer()
+        service.fixer = fixer
+        service.github_client_for_installation = lambda _installation=None: service.github
+
+        first = service.create_fix(task_id)
+        second = service.create_fix(task_id)
+
+        self.assertEqual(first, second)
+        self.assertEqual(1, fixer.calls)
 
     def tearDown(self):
         os.unlink(self.path)

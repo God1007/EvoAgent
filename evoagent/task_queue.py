@@ -35,6 +35,8 @@ class PermanentTaskError(RuntimeError):
 class TaskQueue:
     STREAM = "evoagent:review:stream"
     DLQ = "evoagent:review:dlq"
+    DEDUP = "evoagent:review:dedup:"
+    DEDUP_TTL_SECONDS = 7 * 24 * 60 * 60
     GROUP = "evoagent-workers"
 
     def __init__(
@@ -60,6 +62,7 @@ class TaskQueue:
         )
         self._redis: Any = None
         self._memory_dlq: list[dict[str, Any]] = []
+        self._memory_published_ids: dict[str, float] = {}
         self._lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
         self._drain_condition = threading.Condition()
@@ -102,13 +105,55 @@ class TaskQueue:
                 "payload": payload,
                 "submitted_at": time.time(),
             }
-            if self._redis:
-                self._redis.xadd(
-                    self.STREAM, {"envelope": json.dumps(envelope, ensure_ascii=False)}
+            self._publish_envelope(envelope, deduplicate=True)
+        return message_identifier
+
+    def _publish_envelope(self, envelope: dict[str, Any], deduplicate: bool) -> None:
+        serialized = json.dumps(envelope, ensure_ascii=False)
+        message_id = str(envelope["message_id"])
+        if self._redis:
+            if deduplicate:
+                # HGET + XADD + HSET must be one Redis operation. A process
+                # crash cannot leave a dedupe marker without the stream entry,
+                # and an outbox retry after publish returns without duplicating.
+                self._redis.eval(
+                    "local key=KEYS[1]..ARGV[1]; "
+                    "local existing=redis.call('GET',key); "
+                    "if existing then return existing end; "
+                    "local id=redis.call('XADD',KEYS[2],'*','envelope',ARGV[2]); "
+                    "redis.call('SET',key,id,'EX',ARGV[3]); return id",
+                    2,
+                    self.DEDUP,
+                    self.STREAM,
+                    message_id,
+                    serialized,
+                    self.DEDUP_TTL_SECONDS,
                 )
             else:
-                self._schedule_memory(envelope)
-        return message_identifier
+                self._redis.xadd(self.STREAM, {"envelope": serialized})
+            return
+        if deduplicate:
+            now = time.monotonic()
+            published_at = self._memory_published_ids.get(message_id)
+            if published_at is not None and now - published_at < self.DEDUP_TTL_SECONDS:
+                return
+            if len(self._memory_published_ids) >= 100_000:
+                cutoff = now - self.DEDUP_TTL_SECONDS
+                self._memory_published_ids = {
+                    key: timestamp
+                    for key, timestamp in self._memory_published_ids.items()
+                    if timestamp >= cutoff
+                }
+                while len(self._memory_published_ids) >= 100_000:
+                    self._memory_published_ids.pop(next(iter(self._memory_published_ids)))
+        if deduplicate:
+            self._memory_published_ids[message_id] = time.monotonic()
+        try:
+            self._schedule_memory(envelope)
+        except Exception:
+            if deduplicate:
+                self._memory_published_ids.pop(message_id, None)
+            raise
 
     def _deliver(self, envelope: dict[str, Any]) -> bool:
         with self._drain_condition:
@@ -235,7 +280,18 @@ class TaskQueue:
         for item in self.dead_letters(500):
             if item.get("message_id") == message_id:
                 payload = item.get("payload") or {}
-                self.submit(payload, message_id=message_id)
+                with self._lifecycle_lock:
+                    if self._stop.is_set():
+                        raise RuntimeError("task queue is closed")
+                    self._publish_envelope(
+                        {
+                            "message_id": message_id,
+                            "attempt": 0,
+                            "payload": payload,
+                            "submitted_at": time.time(),
+                        },
+                        deduplicate=False,
+                    )
                 return True
         return False
 

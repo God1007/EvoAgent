@@ -156,12 +156,50 @@ class AlertStorePort(Protocol):
     def create_alert(self, tenant_id: str, alert_key: str, severity: str, message: str) -> None: ...
 
 
+class OutboxStorePort(Protocol):
+    def claim_outbox(
+        self,
+        owner: str,
+        limit: int,
+        lease_seconds: float,
+        max_attempts: int,
+    ) -> list[dict[str, Any]]: ...
+
+    def mark_outbox_published(self, message_id: str, owner: str) -> bool: ...
+
+    def release_outbox(
+        self,
+        message_id: str,
+        owner: str,
+        error: str,
+        retry_delay_seconds: float,
+        max_attempts: int,
+    ) -> bool: ...
+
+    def outbox_stats(self) -> dict[str, Any]: ...
+
+    def list_outbox(self, status: str = "dead", limit: int = 100) -> list: ...
+
+    def requeue_outbox(self, message_id: str) -> bool: ...
+
+
 class ServiceStorePort(Protocol):
     def ping(self) -> None: ...
 
     def schema_version(self) -> int: ...
 
     def get(self, task_id: str, tenant_id: str | None = None) -> dict[str, Any] | None: ...
+
+    def create_review_task(
+        self,
+        task_id: str,
+        repository: str,
+        pull_request: int | None,
+        payload: dict[str, Any],
+        tenant_id: str,
+        diff: str | None = None,
+        outbox_payload: dict[str, Any] | None = None,
+    ) -> None: ...
 
     def list_tasks(self, limit: int = 50, tenant_id: str | None = None) -> list: ...
 
@@ -251,6 +289,12 @@ class ServiceStorePort(Protocol):
         tenant_id: str | None = None,
     ) -> list: ...
 
+    def claim_effect(self, effect_key: str, owner: str, lease_seconds: float) -> dict[str, Any]: ...
+
+    def complete_effect(self, effect_key: str, owner: str, result: dict[str, Any]) -> bool: ...
+
+    def release_effect(self, effect_key: str, owner: str, error: str) -> bool: ...
+
 
 @runtime_checkable
 class ApplicationStorePort(
@@ -259,6 +303,7 @@ class ApplicationStorePort(
     EvolutionStorePort,
     ReleaseStorePort,
     AlertStorePort,
+    OutboxStorePort,
     ServiceStorePort,
     Protocol,
 ):
@@ -307,6 +352,10 @@ class CodeHostPort(Protocol):
     def get_pull_request(self, repository: str, number: int) -> dict: ...
 
     def get_file(self, repository: str, path: str, ref: str) -> dict: ...
+
+    def get_branch(self, repository: str, branch: str) -> dict | None: ...
+
+    def find_pull_request_by_head(self, repository: str, branch: str) -> dict | None: ...
 
     def create_atomic_commit(
         self,

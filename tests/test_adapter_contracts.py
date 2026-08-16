@@ -136,6 +136,31 @@ class _StoreBehaviorContract:
         self.assertEqual("promoted", result["status"])
         self.assertEqual("promoted", self.store.get_deployment("tenant-a", skill_name)["status"])
 
+    def test_transactional_outbox_and_effect_receipt_contract(self):
+        task_id = self.unique("outbox-task")
+        self.store.create_review_task(
+            task_id,
+            "acme/widgets",
+            19,
+            {"source": "contract"},
+            "tenant-a",
+            "--- a/a.py\n+++ b/a.py\n",
+            {"task_id": task_id, "repository": "acme/widgets"},
+        )
+        messages = self.store.claim_outbox("contract-worker", 10, 30, 5)
+        self.assertEqual([task_id], [item["message_key"] for item in messages])
+        self.assertTrue(self.store.mark_outbox_published(messages[0]["id"], "contract-worker"))
+
+        effect_key = self.unique("effect")
+        self.assertEqual(
+            "acquired", self.store.claim_effect(effect_key, "contract-worker", 30)["status"]
+        )
+        self.assertTrue(
+            self.store.complete_effect(effect_key, "contract-worker", {"published": True})
+        )
+        cached = self.store.claim_effect(effect_key, "another-worker", 30)
+        self.assertEqual({"published": True}, cached["result"])
+
 
 class SQLiteStoreContractTests(_StoreBehaviorContract, unittest.TestCase):
     def setUp(self):

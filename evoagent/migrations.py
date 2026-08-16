@@ -316,6 +316,41 @@ MIGRATIONS: tuple[Migration, ...] = (
             SQLiteColumn("deployments", "disagreements", "INTEGER NOT NULL DEFAULT 0"),
         ),
     ),
+    Migration(
+        4,
+        "transactional-outbox-and-effects",
+        (
+            """CREATE TABLE IF NOT EXISTS outbox_messages (
+                id TEXT PRIMARY KEY, topic TEXT NOT NULL, message_key TEXT NOT NULL UNIQUE,
+                payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0, available_at TEXT NOT NULL,
+                lease_owner TEXT, lease_until TEXT, last_error TEXT,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, published_at TEXT)""",
+            """CREATE TABLE IF NOT EXISTS effect_receipts (
+                effect_key TEXT PRIMARY KEY, status TEXT NOT NULL,
+                owner TEXT, lease_until TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+                result_json TEXT, last_error TEXT, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, completed_at TEXT)""",
+            "CREATE INDEX IF NOT EXISTS idx_outbox_dispatch "
+            "ON outbox_messages(status,available_at,lease_until)",
+        ),
+        (
+            """CREATE TABLE IF NOT EXISTS outbox_messages (
+                id TEXT PRIMARY KEY, topic TEXT NOT NULL, message_key TEXT NOT NULL UNIQUE,
+                payload_json JSONB NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0, available_at TIMESTAMPTZ NOT NULL,
+                lease_owner TEXT, lease_until TIMESTAMPTZ, last_error TEXT,
+                created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
+                published_at TIMESTAMPTZ)""",
+            """CREATE TABLE IF NOT EXISTS effect_receipts (
+                effect_key TEXT PRIMARY KEY, status TEXT NOT NULL,
+                owner TEXT, lease_until TIMESTAMPTZ, attempts INTEGER NOT NULL DEFAULT 0,
+                result_json JSONB, last_error TEXT, created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ)""",
+            "CREATE INDEX IF NOT EXISTS idx_outbox_dispatch "
+            "ON outbox_messages(status,available_at,lease_until)",
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1].version

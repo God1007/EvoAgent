@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.6.0)
+## Current maturity (v0.7.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -65,7 +65,7 @@ transaction rollback. `evoagent-migrate` supports a separate deployment job and
 remains part of the integration/operations phase because it requires dedicated
 external infrastructure.
 
-### 2.3 Transactional task/outbox semantics
+### 2.3 Transactional task/outbox semantics — implemented baseline
 
 Close the failure window between writing a task record and publishing a queue
 message. Introduce an outbox with idempotent dispatcher and consumer keys.
@@ -75,6 +75,15 @@ Acceptance:
 - process death after task commit but before queue publish cannot orphan work;
 - duplicate delivery cannot publish duplicate comments or fix PRs;
 - chaos tests kill workers at each persistence/ACK boundary and prove recovery.
+
+Implemented evidence: task + Diff + outbox commit atomically; a leased dispatcher
+publishes by stable task-id key; Memory and Redis adapters deduplicate publication
+(Redis uses atomic Lua); expired publisher leases are reclaimable; attempt
+exhaustion becomes observable/replayable `dead`; readiness and metrics expose
+the path. Effect receipts, comment markers, and deterministic repair branches
+make GitHub publication retry-safe. In-process fault injection covers transaction
+rollback and the publish-before-mark crash. Actual process-kill PostgreSQL/Redis
+recovery remains deliberately open for the mandatory adapter CI matrix.
 
 ### 2.4 Mandatory adapter integration matrix
 

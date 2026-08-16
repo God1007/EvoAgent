@@ -22,6 +22,7 @@ to inherit an EvoAgent implementation class.
 | `EvolutionStorePort` | evaluation and skill version governance | SQLite/PostgreSQL store facet |
 | `ReleaseStorePort` | canary, shadow, promotion, rollback | SQLite/PostgreSQL store facet |
 | `AlertStorePort` | operational alert evaluation | SQLite/PostgreSQL store facet |
+| `OutboxStorePort` | durable queue publication and recovery | SQLite/PostgreSQL store facet |
 | `TaskQueuePort` / `QueueFactoryPort` | asynchronous review delivery | memory executor, Redis Streams |
 | `CodeHostPort` | diff intake, comment delivery, repair PR | GitHub |
 

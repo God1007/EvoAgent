@@ -46,7 +46,7 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **受控能力演进** | 从误报、漏报和坏修复中生成候选 Prompt，通过 Validation/Holdout 回放门禁后才允许激活 |
 | **动态 Skills** | 基于 manifest 加载自定义审查器，支持哈希/签名校验、超时、内存限制和隔离进程 |
 | **可插拔微内核** | Store、Queue、Review Engine、代码托管、可观测性和 FixRule 通过稳定 Capability 组合，支持依赖校验、启动回滚、Profile 与作用域覆盖 |
-| **生产治理** | JWT、RBAC、多租户、仓库隔离、审计日志、灰度发布、影子流量、告警与死信队列 |
+| **生产治理** | JWT、RBAC、多租户、仓库隔离、事务 Outbox、审计日志、灰度发布、影子流量、告警与死信队列 |
 | **可观测性** | 任务 Trace、Agent 消息、Prometheus 指标和 OpenTelemetry Trace |
 | **Web 控制台** | 提供运行总览、发起审查、任务中心、Skill 管理、演进实验室和 GitHub 配置页面 |
 
@@ -67,13 +67,15 @@ flowchart TB
     subgraph RUNTIME["02 · DURABLE RUNTIME"]
         direction LR
         SERVICE(["ReviewService"])
+        OUTBOX["Transactional Outbox<br/>Lease · Retry · Dedupe"]
         QUEUE["Task Queue<br/>Memory · Redis Streams"]
         HARNESS(["Review Harness<br/>Budget · Retry · Checkpoint"])
         PARSER["Unified Diff Parser"]
         STORE[("Task Store<br/>SQLite · PostgreSQL")]
 
-        SERVICE --> QUEUE --> HARNESS --> PARSER
+        SERVICE --> OUTBOX --> QUEUE --> HARNESS --> PARSER
         SERVICE -. "persist" .-> STORE
+        OUTBOX -. "claim" .-> STORE
         HARNESS -. "trace" .-> STORE
     end
 
@@ -706,6 +708,8 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 | `GET` | `/api/alerts` | 持久化告警 |
 | `GET` | `/api/queue/dead-letters` | 死信任务列表 |
 | `POST` | `/v1/queue/dead-letters/replay` | 重放指定死信任务 |
+| `GET` | `/api/outbox` | 按状态查询事务 Outbox 消息 |
+| `POST` | `/v1/outbox/replay` | 审计并重放指定 Outbox 死消息 |
 
 `POST /v1/reviews` 的 Diff 默认最大为 1 MiB；单任务默认最多 8 步、120 秒。可通过 `.env.example` 中的环境变量调整。
 
@@ -721,6 +725,8 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 | `EVOAGENT_MAX_STEPS` | `8` | 单任务最大状态步数 |
 | `EVOAGENT_TIMEOUT_SECONDS` | `120` | 审查任务超时 |
 | `EVOAGENT_QUEUE_SHUTDOWN_TIMEOUT_SECONDS` | `30` | 关闭存储前等待队列在途任务完成的最长秒数 |
+| `EVOAGENT_OUTBOX_MAX_ATTEMPTS` | `20` | Outbox 发布进入 dead 前的最大尝试次数 |
+| `EVOAGENT_OUTBOX_LEASE_SECONDS` | `30` | Outbox Dispatcher 的消息所有权租约秒数 |
 | `EVOAGENT_PLUGIN_PROFILE` | 空 | Trusted Plugin TOML Profile 路径 |
 | `EVOAGENT_PLUGIN_DISCOVERY` | `false` | 是否发现已安装的可信插件 Entry Point |
 | `EVOAGENT_PLUGIN_ALLOWLIST` | 空 | 允许加载的可信 Plugin ID，逗号分隔 |
@@ -744,6 +750,7 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 │   ├── plugins.py                # 插件依赖图、生命周期、Scope 与事件总线
 │   ├── ports.py                  # Store / Queue / CodeHost 领域端口
 │   ├── migrations.py             # 带校验和与兼容门禁的数据库迁移历史
+│   ├── outbox.py                 # 事务发布、租约重试与故障恢复
 │   ├── capabilities.py           # 稳定类型化 Capability 定义
 │   ├── bootstrap.py              # 默认 Provider Catalog 与应用组装
 │   ├── review_engine.py          # 可替换 Reviewer Graph 与 Harness 组装
@@ -792,9 +799,9 @@ make check
 - 锁定依赖漏洞审计；
 - sdist / wheel 构建验证。
 
-当前整体行覆盖率约 83%，其中 `reviewer`、`fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
+当前整体行覆盖率约 86%，其中 `reviewer`、`fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
 
-GitHub 额外执行 Gitleaks、CodeQL、依赖审计和 Docker 构建冒烟测试（构建镜像、启动容器并校验 `/health` 与 `/v1/reviews`）。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；质量门禁、可信插件微内核与数据库迁移策略分别记录在 [`ADR 0001`](docs/adr/0001-engineering-quality-gates.md)、[`ADR 0002`](docs/adr/0002-trusted-plugin-microkernel.md) 和 [`ADR 0003`](docs/adr/0003-versioned-forward-only-migrations.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
+GitHub 额外执行 Gitleaks、CodeQL、依赖审计和 Docker 构建冒烟测试（构建镜像、启动容器并校验 `/health` 与 `/v1/reviews`）。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；质量门禁、可信插件微内核、数据库迁移与事务 Outbox 分别记录在 [`ADR 0001`](docs/adr/0001-engineering-quality-gates.md)、[`ADR 0002`](docs/adr/0002-trusted-plugin-microkernel.md)、[`ADR 0003`](docs/adr/0003-versioned-forward-only-migrations.md) 和 [`ADR 0004`](docs/adr/0004-transactional-outbox.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
 
 更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)，性能 SLO、压测方法与可复现基线见 [`docs/performance.md`](docs/performance.md) 与 [`docs/performance-baseline.md`](docs/performance-baseline.md)。
 

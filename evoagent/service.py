@@ -27,6 +27,7 @@ from .diff_parser import parse_unified_diff
 from .github import GitHubAppAuthenticator, GitHubClient
 from .metrics import metrics
 from .models import TaskState, TraceEvent
+from .outbox import OutboxDispatcher
 from .plugins import Plugin, PluginProfile, PluginRuntime
 from .ports import CodeHostPort
 from .proof import ProofRunner
@@ -75,13 +76,33 @@ class ReviewService:
                 self._process_queued,
                 self._on_dead_letter,
             )
+            self.outbox = OutboxDispatcher(
+                self.store,
+                self.queue,
+                settings.outbox_poll_seconds,
+                settings.outbox_batch_size,
+                settings.outbox_lease_seconds,
+                settings.outbox_max_attempts,
+            )
         except Exception:
+            outbox = getattr(self, "outbox", None)
+            if outbox is not None:
+                outbox.close()
+            queue = getattr(self, "queue", None)
+            if queue is not None:
+                queue.close()
             try:
                 self.plugin_runtime.stop()
             except Exception:
                 metrics.inc("plugin_cleanup_failures_total")
             raise
         metrics.register_gauge_source("queue_depth", self.queue.depth)
+        metrics.register_gauge_source(
+            "outbox_pending", lambda: float(self.store.outbox_stats()["pending"])
+        )
+        metrics.register_gauge_source(
+            "outbox_dead", lambda: float(self.store.outbox_stats()["dead"])
+        )
         # Admission control: per-client rate limit + a bounded gate for the
         # CPU/sandbox-heavy endpoints so overload sheds instead of collapsing.
         self.rate_limiter = RateLimiter(
@@ -119,6 +140,8 @@ class ReviewService:
         self._closed = True
         self._publish_event("service.stopping", {"queue_backend": self.queue.backend})
         try:
+            if not self.outbox.close(self.settings.queue_shutdown_timeout_seconds):
+                metrics.inc("outbox_shutdown_timeouts_total")
             drained = self.queue.close(self.settings.queue_shutdown_timeout_seconds)
             if not drained:
                 metrics.inc("queue_drain_timeouts_total")
@@ -143,6 +166,12 @@ class ReviewService:
     def plugin_status(self) -> dict[str, Any]:
         """Safe runtime inventory for health/debug endpoints."""
         return self.plugin_runtime.describe()
+
+    def replay_outbox(self, message_id: str) -> bool:
+        replayed = self.store.requeue_outbox(message_id)
+        if replayed:
+            self.outbox.notify()
+        return replayed
 
     def _register_pool_metrics(self) -> None:
         """Expose Postgres pool utilization. Registered in both branches (with a
@@ -205,6 +234,19 @@ class ReviewService:
         else:
             # -1 => the queue backend (e.g. Redis) is unreachable.
             checks["queue"] = "unreachable"
+            ready = False
+        try:
+            outbox = self.outbox.stats()
+            checks["outbox"] = {
+                "dispatcher_running": outbox["dispatcher_running"],
+                "pending": outbox["pending"],
+                "publishing": outbox["publishing"],
+                "dead": outbox["dead"],
+            }
+            if not outbox["dispatcher_running"] or outbox["dead"]:
+                ready = False
+        except Exception as exc:
+            checks["outbox"] = "error: %s" % exc
             ready = False
         return ready, {
             "status": "ready" if ready else "not-ready",
@@ -477,11 +519,12 @@ class ReviewService:
         pull_request: int | None,
         source: str,
         tenant_id: str = "default",
+        outbox_payload: dict[str, Any] | None = None,
     ) -> str:
         task_id = str(uuid.uuid4())
         encoded = diff.encode("utf-8")
         assignment = self.releases.assignment(tenant_id, "llm-review", task_id)
-        self.store.create(
+        self.store.create_review_task(
             task_id,
             repository,
             pull_request,
@@ -493,8 +536,9 @@ class ReviewService:
                 "shadow": assignment["shadow"],
             },
             tenant_id,
+            diff,
+            {"task_id": task_id, **outbox_payload} if outbox_payload is not None else None,
         )
-        self.store.save_task_payload(task_id, diff)
         return task_id
 
     def _create_deferred_task(
@@ -504,10 +548,11 @@ class ReviewService:
         source: str,
         tenant_id: str,
         payload: dict[str, Any],
+        outbox_payload: dict[str, Any],
     ) -> str:
         task_id = str(uuid.uuid4())
         assignment = self.releases.assignment(tenant_id, "llm-review", task_id)
-        self.store.create(
+        self.store.create_review_task(
             task_id,
             repository,
             pull_request,
@@ -519,6 +564,8 @@ class ReviewService:
                 **payload,
             },
             tenant_id,
+            None,
+            {"task_id": task_id, **outbox_payload},
         )
         return task_id
 
@@ -601,18 +648,21 @@ class ReviewService:
     ) -> dict[str, Any]:
         self._validate_review(repository, diff)
         self._authorize_repository(tenant_id, repository)
-        task_id = self._create_task(repository, diff, pull_request, source, tenant_id)
-        self.queue.submit(
+        task_id = self._create_task(
+            repository,
+            diff,
+            pull_request,
+            source,
+            tenant_id,
             {
-                "task_id": task_id,
                 "repository": repository,
                 "pull_request": pull_request,
                 "github_issue_url": github_issue_url,
                 "installation_id": installation_id,
                 "tenant_id": tenant_id,
             },
-            message_id=task_id,
         )
+        self.outbox.notify()
         metrics.inc("reviews_enqueued_total")
         return {"task_id": task_id, "state": "PENDING", "queue": self.queue.backend}
 
@@ -699,7 +749,27 @@ class ReviewService:
                     if payload.get("session_id")
                     else "<!-- evoagent-review:%s -->" % task_id
                 )
-                client.upsert_comment(payload["github_issue_url"], body, marker)
+                effect_key = (
+                    "github-comment:"
+                    + hashlib.sha256(
+                        (payload["github_issue_url"] + "\n" + marker).encode("utf-8")
+                    ).hexdigest()
+                )
+                owner = uuid.uuid4().hex
+                receipt = self.store.claim_effect(
+                    effect_key,
+                    owner,
+                    max(1.0, min(15.0, self.settings.queue_lease_seconds / 2)),
+                )
+                if receipt["status"] == "acquired":
+                    try:
+                        client.upsert_comment(payload["github_issue_url"], body, marker)
+                        self.store.complete_effect(effect_key, owner, {"marker": marker})
+                    except Exception as exc:
+                        self.store.release_effect(effect_key, owner, str(exc))
+                        raise
+                elif receipt["status"] == "busy":
+                    metrics.inc("effect_receipt_busy_total")
         except Exception as exc:
             metrics.inc("reviews_failed_total")
             lane = (task.get("input") or {}).get("release_lane", "stable")
@@ -798,10 +868,7 @@ class ReviewService:
                 "head_sha": head_sha,
                 "trigger": action,
             },
-        )
-        self.queue.submit(
             {
-                "task_id": task_id,
                 "repository": repository,
                 "pull_request": number,
                 "github_issue_url": pull.get("issue_url", ""),
@@ -812,8 +879,8 @@ class ReviewService:
                 "turn_id": session["turn_id"],
                 "head_sha": head_sha,
             },
-            message_id=task_id,
         )
+        self.outbox.notify()
         metrics.inc("reviews_enqueued_total")
         result: dict[str, object] = {
             "task_id": task_id,
@@ -850,12 +917,30 @@ class ReviewService:
         actual_tenant = task.get("tenant_id") or tenant_id or "default"
         if not self.store.repository_allowed(actual_tenant, task["repository"], True):
             raise PermissionError("automatic repair is not enabled for this repository")
-        result = self.fixer.create_fix_commits(
-            self.github_client_for_installation(installation_id),
-            task["repository"],
-            task["pull_request"],
-            task["report"],
+        effect_key = "fix-pr:%s:%s" % (actual_tenant, task_id)
+        owner = uuid.uuid4().hex
+        receipt = self.store.claim_effect(
+            effect_key,
+            owner,
+            self.settings.effect_lease_seconds,
         )
+        if receipt["status"] == "completed":
+            return dict(receipt.get("result") or {})
+        if receipt["status"] == "busy":
+            raise RuntimeError("a repair publication for this task is already in progress")
+        try:
+            result = self.fixer.create_fix_commits(
+                self.github_client_for_installation(installation_id),
+                task["repository"],
+                task["pull_request"],
+                task["report"],
+                operation_key=effect_key,
+            )
+            if not self.store.complete_effect(effect_key, owner, result):
+                raise RuntimeError("repair publication lease was lost before completion")
+        except Exception as exc:
+            self.store.release_effect(effect_key, owner, str(exc))
+            raise
         metrics.inc("fix_runs_total")
         self._publish_event(
             "fix.completed",

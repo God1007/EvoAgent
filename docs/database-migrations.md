@@ -41,7 +41,7 @@ python -m evoagent.migrate
 Successful output is machine-readable and contains no database credentials:
 
 ```json
-{"backend": "postgresql", "schema_version": 3, "status": "migrated"}
+{"backend": "postgresql", "schema_version": 4, "status": "migrated"}
 ```
 
 Schema compatibility errors exit with status `2`. Normal application startup

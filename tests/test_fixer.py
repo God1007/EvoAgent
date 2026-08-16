@@ -131,6 +131,10 @@ class _FakeClient:
     def __init__(self):
         self.created_commit = None
         self.created_pr = None
+        self.commit_calls = 0
+        self.pr_calls = 0
+        self.existing_branch = None
+        self.existing_pr = None
 
     def get_pull_request(self, repo, number):
         return {
@@ -145,12 +149,22 @@ class _FakeClient:
         return b"zip-bytes"
 
     def create_atomic_commit(self, repo, branch, parent, files, message):
+        self.commit_calls += 1
         self.created_commit = {"branch": branch, "files": files}
+        self.existing_branch = {"object": {"sha": "newsha"}}
         return {"sha": "newsha"}
 
     def create_draft_pull_request(self, repo, title, head, base, body):
+        self.pr_calls += 1
         self.created_pr = {"title": title, "head": head}
-        return {"number": 7, "html_url": "https://github.com/o/r/pull/7"}
+        self.existing_pr = {"number": 7, "html_url": "https://github.com/o/r/pull/7"}
+        return self.existing_pr
+
+    def get_branch(self, repo, branch):
+        return self.existing_branch
+
+    def find_pull_request_by_head(self, repo, branch):
+        return self.existing_pr
 
 
 def _report():
@@ -193,6 +207,21 @@ class CreateFixCommitsTests(unittest.TestCase):
         committed = client.created_commit["files"]["a.py"]
         self.assertIn("os.environ", committed)
         self.assertNotIn('"abcdef"', committed)
+
+    def test_operation_key_reuses_branch_and_draft_pull_request(self):
+        client = _FakeClient()
+        fixer = SafeFixer(verifier=_FakeVerifier())
+        first = fixer.create_fix_commits(
+            client, "o/r", 1, _report(), operation_key="fix-pr:tenant:task"
+        )
+        second = fixer.create_fix_commits(
+            client, "o/r", 1, _report(), operation_key="fix-pr:tenant:task"
+        )
+
+        self.assertEqual(first["branch"], second["branch"])
+        self.assertEqual(1, client.commit_calls)
+        self.assertEqual(1, client.pr_calls)
+        self.assertIn("reused", second["note"])
 
 
 if __name__ == "__main__":

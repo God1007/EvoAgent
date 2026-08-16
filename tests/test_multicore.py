@@ -46,7 +46,7 @@ class ReadinessTests(unittest.TestCase):
         DRAINING.clear()
         self.addCleanup(DRAINING.clear)
         self.service = ReviewService(_settings())
-        self.addCleanup(self.service.queue.close)
+        self.addCleanup(self.service.close)
         self.server = _make_server(_settings(), self.service)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
@@ -87,12 +87,12 @@ class ReuseportTests(unittest.TestCase):
         DRAINING.clear()
         self.addCleanup(DRAINING.clear)
         service_a = ReviewService(_settings())
-        self.addCleanup(service_a.queue.close)
+        self.addCleanup(service_a.close)
         server_a = _make_server(_settings(), service_a)
         host, port = server_a.server_address
 
         service_b = ReviewService(_settings())
-        self.addCleanup(service_b.queue.close)
+        self.addCleanup(service_b.close)
         server_b = _make_server(_settings(port=port), service_b)
         self.assertEqual(port, server_b.server_address[1])
 

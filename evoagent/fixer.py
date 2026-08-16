@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import re
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -123,13 +124,18 @@ class SafeFixer:
         repository: str,
         pull_request: int,
         report: dict[str, Any],
+        operation_key: str = "",
     ) -> dict[str, Any]:
         pull = client.get_pull_request(repository, pull_request)
         source_ref = pull["head"]["ref"]
         source_sha = pull["head"]["sha"]
         source_repository = pull["head"].get("repo", {}).get("full_name") or repository
-        stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
-        branch = "evoagent/fix-pr-%d-%s" % (pull_request, stamp)
+        suffix = (
+            hashlib.sha256(operation_key.encode("utf-8")).hexdigest()[:16]
+            if operation_key
+            else datetime.now(UTC).strftime("%Y%m%d%H%M%S")
+        )
+        branch = "evoagent/fix-pr-%d-%s" % (pull_request, suffix)
         planned: list[tuple[str, dict[str, Any], FixResult]] = []
         by_path: dict[str, list[dict[str, Any]]] = {}
         for finding in report.get("findings", []):
@@ -162,14 +168,21 @@ class SafeFixer:
                 "verification": verification,
                 "note": "Repair was blocked because compilation or tests failed.",
             }
-        commit = client.create_atomic_commit(
-            repository,
-            branch,
-            source_sha,
-            files,
-            "fix: apply verified EvoAgent repairs for PR #%d" % pull_request,
+        existing_draft = (
+            client.find_pull_request_by_head(repository, branch) if operation_key else None
         )
-        draft = client.create_draft_pull_request(
+        existing_branch = client.get_branch(repository, branch) if operation_key else None
+        if existing_branch:
+            commit = {"sha": (existing_branch.get("object") or {}).get("sha")}
+        else:
+            commit = client.create_atomic_commit(
+                repository,
+                branch,
+                source_sha,
+                files,
+                "fix: apply verified EvoAgent repairs for PR #%d" % pull_request,
+            )
+        draft = existing_draft or client.create_draft_pull_request(
             repository,
             "fix: verified EvoAgent repairs for #%d" % pull_request,
             branch,
@@ -191,5 +204,9 @@ class SafeFixer:
             "commits": commits,
             "draft_pull_request": {"number": draft.get("number"), "url": draft.get("html_url")},
             "verification": verification,
-            "note": "Verified repairs were published as one atomic commit in a draft pull request.",
+            "note": (
+                "The previously published verified repair was reused."
+                if existing_draft
+                else "Verified repairs were published as one atomic commit in a draft pull request."
+            ),
         }

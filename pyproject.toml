@@ -47,6 +47,7 @@ dev = [
 
 [project.scripts]
 evoagent = "evoagent.api:run"
+evoagent-migrate = "evoagent.migrate:run"
 
 [project.urls]
 Homepage = "https://github.com/God1007/EvoAgent"

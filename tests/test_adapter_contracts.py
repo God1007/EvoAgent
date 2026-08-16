@@ -7,6 +7,7 @@ import unittest
 import uuid
 
 from evoagent.github import GitHubClient
+from evoagent.migrations import CURRENT_SCHEMA_VERSION
 from evoagent.models import TaskState, TraceEvent
 from evoagent.ports import ApplicationStorePort, CodeHostPort, TaskQueuePort
 from evoagent.postgres_store import PostgresTaskStore
@@ -45,6 +46,7 @@ class _StoreBehaviorContract:
     def test_task_checkpoint_payload_and_cancellation_contract(self):
         task_id = self.unique("task")
         self.store.ping()
+        self.assertEqual(CURRENT_SCHEMA_VERSION, self.store.schema_version())
         self.store.create(task_id, "acme/widgets", 17, {"source": "contract"}, "tenant-a")
         self.store.transition(
             task_id,

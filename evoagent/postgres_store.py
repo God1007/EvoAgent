@@ -10,6 +10,7 @@ import uuid
 from contextlib import AbstractContextManager
 from typing import Any
 
+from .migrations import migrate_postgres
 from .models import ReviewReport, TaskState, TraceEvent
 from .ports import ApplicationStorePort
 from .store import utc_now
@@ -106,114 +107,11 @@ class PostgresTaskStore:
             self._pool.close()
 
     def _init(self) -> None:
-        statements = [
-            """CREATE TABLE IF NOT EXISTS tasks (
-                id TEXT PRIMARY KEY, state TEXT NOT NULL, repository TEXT NOT NULL,
-                pull_request INTEGER, input_json JSONB NOT NULL, report_json JSONB,
-                error TEXT, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS trace_events (
-                id BIGSERIAL PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), step INTEGER NOT NULL,
-                state TEXT NOT NULL, message TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS failure_cases (
-                id BIGSERIAL PRIMARY KEY, task_id TEXT NOT NULL, category TEXT NOT NULL,
-                payload_json JSONB NOT NULL, resolved BOOLEAN NOT NULL DEFAULT FALSE,
-                created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS skill_versions (
-                id BIGSERIAL PRIMARY KEY, skill_name TEXT NOT NULL, version INTEGER NOT NULL,
-                prompt TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, active BOOLEAN NOT NULL DEFAULT FALSE,
-                parent_version INTEGER, created_at TIMESTAMPTZ NOT NULL, UNIQUE(skill_name, version))""",
-            """CREATE TABLE IF NOT EXISTS installations (
-                installation_id BIGINT PRIMARY KEY, account_login TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS evaluation_cases (
-                id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, split TEXT NOT NULL,
-                diff TEXT NOT NULL, expected_json JSONB NOT NULL, source TEXT NOT NULL,
-                active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS evolution_runs (
-                id TEXT PRIMARY KEY, skill_name TEXT NOT NULL, candidate_version INTEGER NOT NULL,
-                baseline_version INTEGER, decision TEXT NOT NULL, candidate_score DOUBLE PRECISION NOT NULL,
-                baseline_score DOUBLE PRECISION NOT NULL, metrics_json JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL)""",
-            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'",
-            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT FALSE",
-            "ALTER TABLE installations ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'",
-            """CREATE TABLE IF NOT EXISTS checkpoints (
-                task_id TEXT NOT NULL REFERENCES tasks(id), node TEXT NOT NULL, status TEXT NOT NULL,
-                attempt INTEGER NOT NULL DEFAULT 1, state_json JSONB NOT NULL, error TEXT,
-                updated_at TIMESTAMPTZ NOT NULL, PRIMARY KEY(task_id,node))""",
-            """CREATE TABLE IF NOT EXISTS task_payloads (
-                task_id TEXT PRIMARY KEY REFERENCES tasks(id), diff TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS agent_messages (
-                id BIGSERIAL PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
-                sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL,
-                correlation_id TEXT NOT NULL, content_json JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS webhook_deliveries (
-                delivery_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, event_type TEXT NOT NULL,
-                payload_sha256 TEXT NOT NULL, task_id TEXT, received_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS users (
-                id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
-                active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS memberships (
-                user_id TEXT NOT NULL REFERENCES users(id), tenant_id TEXT NOT NULL, role TEXT NOT NULL,
-                PRIMARY KEY(user_id,tenant_id))""",
-            """CREATE TABLE IF NOT EXISTS repository_grants (
-                tenant_id TEXT NOT NULL, repository TEXT NOT NULL, auto_fix BOOLEAN NOT NULL DEFAULT FALSE,
-                PRIMARY KEY(tenant_id,repository))""",
-            """CREATE TABLE IF NOT EXISTS audit_log (
-                id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, actor TEXT NOT NULL,
-                action TEXT NOT NULL, resource TEXT NOT NULL, detail_json JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS deployments (
-                tenant_id TEXT NOT NULL, skill_name TEXT NOT NULL, stable_version INTEGER,
-                candidate_version INTEGER, canary_percent INTEGER NOT NULL DEFAULT 0,
-                shadow_percent INTEGER NOT NULL DEFAULT 0, max_error_rate DOUBLE PRECISION NOT NULL DEFAULT .1,
-                min_samples INTEGER NOT NULL DEFAULT 20, status TEXT NOT NULL DEFAULT 'stable',
-                samples INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0,
-                updated_at TIMESTAMPTZ NOT NULL, PRIMARY KEY(tenant_id,skill_name))""",
-            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS "
-            "max_disagreement_rate DOUBLE PRECISION NOT NULL DEFAULT .2",
-            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS "
-            "auto_promote BOOLEAN NOT NULL DEFAULT FALSE",
-            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS "
-            "shadow_samples INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS "
-            "disagreements INTEGER NOT NULL DEFAULT 0",
-            """CREATE TABLE IF NOT EXISTS release_observations (
-                id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, skill_name TEXT NOT NULL,
-                task_id TEXT NOT NULL, lane TEXT NOT NULL, primary_json JSONB NOT NULL,
-                candidate_json JSONB, disagreement DOUBLE PRECISION NOT NULL,
-                candidate_failed BOOLEAN NOT NULL DEFAULT FALSE,
-                created_at TIMESTAMPTZ NOT NULL)""",
-            "CREATE INDEX IF NOT EXISTS idx_release_observations_deployment "
-            "ON release_observations(tenant_id, skill_name, id DESC)",
-            """CREATE TABLE IF NOT EXISTS alerts (
-                id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, alert_key TEXT NOT NULL,
-                severity TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
-                created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
-                UNIQUE(tenant_id,alert_key,status))""",
-            """CREATE TABLE IF NOT EXISTS review_sessions (
-                id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, repository TEXT NOT NULL,
-                pull_request INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'open',
-                latest_head_sha TEXT, pending_input TEXT, created_at TIMESTAMPTZ NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL, UNIQUE(tenant_id,repository,pull_request))""",
-            """CREATE TABLE IF NOT EXISTS session_turns (
-                id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES review_sessions(id),
-                task_id TEXT, head_sha TEXT, trigger TEXT NOT NULL, sequence INTEGER NOT NULL,
-                summary_json JSONB, created_at TIMESTAMPTZ NOT NULL,
-                UNIQUE(session_id, sequence))""",
-            """CREATE TABLE IF NOT EXISTS session_findings (
-                id BIGSERIAL PRIMARY KEY, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
-                fingerprint TEXT NOT NULL, status TEXT NOT NULL, snapshot_json JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL)""",
-            "CREATE INDEX IF NOT EXISTS idx_session_turns_session "
-            "ON session_turns(session_id, sequence)",
-            "CREATE INDEX IF NOT EXISTS idx_session_findings_turn ON session_findings(turn_id)",
-        ]
         with self._connect() as conn:
-            with conn.cursor() as cur:
-                for statement in statements:
-                    cur.execute(statement)
+            self._schema_version = migrate_postgres(conn)
+
+    def schema_version(self) -> int:
+        return self._schema_version
 
     def create(
         self,

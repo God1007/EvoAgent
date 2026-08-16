@@ -25,6 +25,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Evolution | `evoagent/evolution.py`, `rollout.py` | Prompt versioning, validation/holdout replay, canary/shadow, rollback |
 | Evolution | `evoagent/evaluation_harness.py`, `evaluation_benchmark.py` | Replay scoring, benchmark dataset |
 | Storage | `evoagent/store.py`, `postgres_store.py` | Task/finding/feedback/version/audit persistence |
+| Storage | `evoagent/migrations.py` | Locked, checksummed SQLite/PostgreSQL schema history and compatibility gate |
 | Cross-cutting | `evoagent/auth.py` | JWT, RBAC, tenant isolation |
 | Cross-cutting | `evoagent/observability.py`, `metrics.py` | Trace, Prometheus metrics, OpenTelemetry |
 | Model | `evoagent/models.py` | `Finding`, `Severity`, `ReviewReport`, stable fingerprints |
@@ -97,6 +98,10 @@ See [`plugin-system.md`](plugin-system.md) and
 
 - **Task store** (`store.py` / `postgres_store.py`) is the source of truth for
   task state, findings, feedback, skill versions, audit log, and alerts.
+- **Schema history** is forward-only and checksummed. Startup serializes pending
+  migrations and refuses a database created by a newer application. See
+  [`database-migrations.md`](database-migrations.md) and
+  [`ADR 0003`](adr/0003-versioned-forward-only-migrations.md).
 - **Queue durability** depends on the backend. `redis-streams` provides ACK,
   consumer leases, dead-letter queue, and replay. The in-process
   `memory-ephemeral` backend is **not** durable (`/health` reports

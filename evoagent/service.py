@@ -195,6 +195,7 @@ class ReviewService:
         try:
             self.store.ping()
             checks["store"] = "ok"
+            checks["schema_version"] = self.store.schema_version()
         except Exception as exc:
             ready = False
             checks["store"] = "error: %s" % exc

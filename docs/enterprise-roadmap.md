@@ -44,7 +44,7 @@ contract against SQLite/PostgreSQL and Memory/Redis (production backends are
 enabled by explicit test URLs). This extraction also found and fixed missing
 PostgreSQL shadow-observation/automatic-promotion parity.
 
-### 2.2 Versioned database migrations
+### 2.2 Versioned database migrations — implemented, restore drill pending
 
 Replace constructor-time ad-hoc schema mutation with an explicit migration
 history and startup compatibility check.
@@ -55,6 +55,15 @@ Acceptance:
 - startup refuses a newer unsupported schema instead of guessing;
 - migration rollback/restore procedure is documented;
 - PostgreSQL backup and restore is exercised in CI or a scheduled environment.
+
+Implemented evidence: one immutable SQLite/PostgreSQL catalog records version,
+name, checksum, and timestamp; SQLite and PostgreSQL acquire migration locks;
+startup rejects newer, discontinuous, or modified histories; an unversioned
+legacy database is adopted without row loss; an injected DDL failure proves
+transaction rollback. `evoagent-migrate` supports a separate deployment job and
+`/ready` exposes the schema version. The actual PostgreSQL backup/restore drill
+remains part of the integration/operations phase because it requires dedicated
+external infrastructure.
 
 ### 2.3 Transactional task/outbox semantics
 

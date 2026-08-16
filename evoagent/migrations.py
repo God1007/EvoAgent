@@ -1,0 +1,448 @@
+"""Versioned, checksummed schema migrations for SQLite and PostgreSQL.
+
+Migration definitions are immutable once released.  Both adapters share the
+same logical version history while retaining dialect-specific SQL.  Existing
+pre-migration databases are adopted by replaying idempotent migrations and
+recording their history; newer or tampered histories fail closed at startup.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+
+
+class SchemaMigrationError(RuntimeError):
+    """Base class for startup failures caused by database schema state."""
+
+
+class SchemaTooNewError(SchemaMigrationError):
+    """The database was migrated by a newer application release."""
+
+
+class SchemaHistoryError(SchemaMigrationError):
+    """The recorded migration history is incomplete or has been modified."""
+
+
+class MigrationApplyError(SchemaMigrationError):
+    """A pending migration could not be applied transactionally."""
+
+
+@dataclass(frozen=True)
+class SQLiteColumn:
+    table: str
+    name: str
+    declaration: str
+
+
+@dataclass(frozen=True)
+class Migration:
+    version: int
+    name: str
+    sqlite_statements: tuple[str, ...]
+    postgres_statements: tuple[str, ...]
+    sqlite_columns: tuple[SQLiteColumn, ...] = ()
+
+    @property
+    def checksum(self) -> str:
+        payload = {
+            "version": self.version,
+            "name": self.name,
+            "sqlite": self.sqlite_statements,
+            "postgres": self.postgres_statements,
+            "sqlite_columns": [
+                (column.table, column.name, column.declaration) for column in self.sqlite_columns
+            ],
+        }
+        canonical = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+MIGRATIONS: tuple[Migration, ...] = (
+    Migration(
+        1,
+        "task-runtime",
+        (
+            """CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY, state TEXT NOT NULL, repository TEXT NOT NULL,
+                pull_request INTEGER, input_json TEXT NOT NULL, report_json TEXT,
+                error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                cancel_requested INTEGER NOT NULL DEFAULT 0)""",
+            """CREATE TABLE IF NOT EXISTS trace_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+                step INTEGER NOT NULL, state TEXT NOT NULL, message TEXT NOT NULL,
+                created_at TEXT NOT NULL, FOREIGN KEY(task_id) REFERENCES tasks(id))""",
+            """CREATE TABLE IF NOT EXISTS failure_cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+                category TEXT NOT NULL, payload_json TEXT NOT NULL,
+                resolved INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS installations (
+                installation_id INTEGER PRIMARY KEY, account_login TEXT NOT NULL,
+                created_at TEXT NOT NULL, tenant_id TEXT NOT NULL DEFAULT 'default')""",
+            """CREATE TABLE IF NOT EXISTS checkpoints (
+                task_id TEXT NOT NULL, node TEXT NOT NULL, status TEXT NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 1, state_json TEXT NOT NULL, error TEXT,
+                updated_at TEXT NOT NULL, PRIMARY KEY(task_id,node),
+                FOREIGN KEY(task_id) REFERENCES tasks(id))""",
+            """CREATE TABLE IF NOT EXISTS task_payloads (
+                task_id TEXT PRIMARY KEY, diff TEXT NOT NULL, created_at TEXT NOT NULL,
+                FOREIGN KEY(task_id) REFERENCES tasks(id))""",
+            """CREATE TABLE IF NOT EXISTS agent_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
+                sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL,
+                correlation_id TEXT NOT NULL, content_json TEXT NOT NULL,
+                created_at TEXT NOT NULL, FOREIGN KEY(task_id) REFERENCES tasks(id))""",
+            """CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                delivery_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, event_type TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL, task_id TEXT, received_at TEXT NOT NULL)""",
+        ),
+        (
+            """CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY, state TEXT NOT NULL, repository TEXT NOT NULL,
+                pull_request INTEGER, input_json JSONB NOT NULL, report_json JSONB,
+                error TEXT, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default',
+                cancel_requested BOOLEAN NOT NULL DEFAULT FALSE)""",
+            """CREATE TABLE IF NOT EXISTS trace_events (
+                id BIGSERIAL PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+                step INTEGER NOT NULL, state TEXT NOT NULL, message TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS failure_cases (
+                id BIGSERIAL PRIMARY KEY, task_id TEXT NOT NULL, category TEXT NOT NULL,
+                payload_json JSONB NOT NULL, resolved BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS installations (
+                installation_id BIGINT PRIMARY KEY, account_login TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                tenant_id TEXT NOT NULL DEFAULT 'default')""",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS "
+            "cancel_requested BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE installations ADD COLUMN IF NOT EXISTS "
+            "tenant_id TEXT NOT NULL DEFAULT 'default'",
+            """CREATE TABLE IF NOT EXISTS checkpoints (
+                task_id TEXT NOT NULL REFERENCES tasks(id), node TEXT NOT NULL,
+                status TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 1,
+                state_json JSONB NOT NULL, error TEXT, updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(task_id,node))""",
+            """CREATE TABLE IF NOT EXISTS task_payloads (
+                task_id TEXT PRIMARY KEY REFERENCES tasks(id), diff TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS agent_messages (
+                id BIGSERIAL PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
+                sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL,
+                correlation_id TEXT NOT NULL, content_json JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                delivery_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, event_type TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL, task_id TEXT, received_at TIMESTAMPTZ NOT NULL)""",
+        ),
+        (
+            SQLiteColumn("tasks", "tenant_id", "TEXT NOT NULL DEFAULT 'default'"),
+            SQLiteColumn("tasks", "cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
+            SQLiteColumn("installations", "tenant_id", "TEXT NOT NULL DEFAULT 'default'"),
+        ),
+    ),
+    Migration(
+        2,
+        "governance-and-evolution",
+        (
+            """CREATE TABLE IF NOT EXISTS skill_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, skill_name TEXT NOT NULL,
+                version INTEGER NOT NULL, prompt TEXT NOT NULL, score REAL NOT NULL,
+                active INTEGER NOT NULL DEFAULT 0, parent_version INTEGER,
+                created_at TEXT NOT NULL, UNIQUE(skill_name,version))""",
+            """CREATE TABLE IF NOT EXISTS evaluation_cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+                split TEXT NOT NULL, diff TEXT NOT NULL, expected_json TEXT NOT NULL,
+                source TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS evolution_runs (
+                id TEXT PRIMARY KEY, skill_name TEXT NOT NULL, candidate_version INTEGER NOT NULL,
+                baseline_version INTEGER, decision TEXT NOT NULL, candidate_score REAL NOT NULL,
+                baseline_score REAL NOT NULL, metrics_json TEXT NOT NULL,
+                created_at TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS memberships (
+                user_id TEXT NOT NULL, tenant_id TEXT NOT NULL, role TEXT NOT NULL,
+                PRIMARY KEY(user_id,tenant_id), FOREIGN KEY(user_id) REFERENCES users(id))""",
+            """CREATE TABLE IF NOT EXISTS repository_grants (
+                tenant_id TEXT NOT NULL, repository TEXT NOT NULL,
+                auto_fix INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(tenant_id,repository))""",
+            """CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL,
+                actor TEXT NOT NULL, action TEXT NOT NULL, resource TEXT NOT NULL,
+                detail_json TEXT NOT NULL, created_at TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS deployments (
+                tenant_id TEXT NOT NULL, skill_name TEXT NOT NULL, stable_version INTEGER,
+                candidate_version INTEGER, canary_percent INTEGER NOT NULL DEFAULT 0,
+                shadow_percent INTEGER NOT NULL DEFAULT 0,
+                max_error_rate REAL NOT NULL DEFAULT 0.1, min_samples INTEGER NOT NULL DEFAULT 20,
+                status TEXT NOT NULL DEFAULT 'stable', samples INTEGER NOT NULL DEFAULT 0,
+                errors INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+                PRIMARY KEY(tenant_id,skill_name))""",
+            """CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL,
+                alert_key TEXT NOT NULL, severity TEXT NOT NULL, message TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, UNIQUE(tenant_id,alert_key,status))""",
+        ),
+        (
+            """CREATE TABLE IF NOT EXISTS skill_versions (
+                id BIGSERIAL PRIMARY KEY, skill_name TEXT NOT NULL, version INTEGER NOT NULL,
+                prompt TEXT NOT NULL, score DOUBLE PRECISION NOT NULL,
+                active BOOLEAN NOT NULL DEFAULT FALSE, parent_version INTEGER,
+                created_at TIMESTAMPTZ NOT NULL, UNIQUE(skill_name,version))""",
+            """CREATE TABLE IF NOT EXISTS evaluation_cases (
+                id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, split TEXT NOT NULL,
+                diff TEXT NOT NULL, expected_json JSONB NOT NULL, source TEXT NOT NULL,
+                active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS evolution_runs (
+                id TEXT PRIMARY KEY, skill_name TEXT NOT NULL, candidate_version INTEGER NOT NULL,
+                baseline_version INTEGER, decision TEXT NOT NULL,
+                candidate_score DOUBLE PRECISION NOT NULL,
+                baseline_score DOUBLE PRECISION NOT NULL, metrics_json JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL, active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS memberships (
+                user_id TEXT NOT NULL REFERENCES users(id), tenant_id TEXT NOT NULL,
+                role TEXT NOT NULL, PRIMARY KEY(user_id,tenant_id))""",
+            """CREATE TABLE IF NOT EXISTS repository_grants (
+                tenant_id TEXT NOT NULL, repository TEXT NOT NULL,
+                auto_fix BOOLEAN NOT NULL DEFAULT FALSE, PRIMARY KEY(tenant_id,repository))""",
+            """CREATE TABLE IF NOT EXISTS audit_log (
+                id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, actor TEXT NOT NULL,
+                action TEXT NOT NULL, resource TEXT NOT NULL, detail_json JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS deployments (
+                tenant_id TEXT NOT NULL, skill_name TEXT NOT NULL, stable_version INTEGER,
+                candidate_version INTEGER, canary_percent INTEGER NOT NULL DEFAULT 0,
+                shadow_percent INTEGER NOT NULL DEFAULT 0,
+                max_error_rate DOUBLE PRECISION NOT NULL DEFAULT .1,
+                min_samples INTEGER NOT NULL DEFAULT 20,
+                status TEXT NOT NULL DEFAULT 'stable', samples INTEGER NOT NULL DEFAULT 0,
+                errors INTEGER NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(tenant_id,skill_name))""",
+            """CREATE TABLE IF NOT EXISTS alerts (
+                id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, alert_key TEXT NOT NULL,
+                severity TEXT NOT NULL, message TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open', created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL, UNIQUE(tenant_id,alert_key,status))""",
+        ),
+    ),
+    Migration(
+        3,
+        "sessions-and-shadow-release",
+        (
+            """CREATE TABLE IF NOT EXISTS release_observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL,
+                skill_name TEXT NOT NULL, task_id TEXT NOT NULL, lane TEXT NOT NULL,
+                primary_json TEXT NOT NULL, candidate_json TEXT,
+                disagreement REAL NOT NULL, candidate_failed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS review_sessions (
+                id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, repository TEXT NOT NULL,
+                pull_request INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'open',
+                latest_head_sha TEXT, pending_input TEXT, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, UNIQUE(tenant_id,repository,pull_request))""",
+            """CREATE TABLE IF NOT EXISTS session_turns (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL, task_id TEXT, head_sha TEXT,
+                trigger TEXT NOT NULL, sequence INTEGER NOT NULL, summary_json TEXT,
+                created_at TEXT NOT NULL, UNIQUE(session_id,sequence),
+                FOREIGN KEY(session_id) REFERENCES review_sessions(id))""",
+            """CREATE TABLE IF NOT EXISTS session_findings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL, fingerprint TEXT NOT NULL, status TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                FOREIGN KEY(turn_id) REFERENCES session_turns(id))""",
+            "CREATE INDEX IF NOT EXISTS idx_release_observations_deployment "
+            "ON release_observations(tenant_id,skill_name,id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_session_turns_session "
+            "ON session_turns(session_id,sequence)",
+            "CREATE INDEX IF NOT EXISTS idx_session_findings_turn ON session_findings(turn_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_tenant_created ON tasks(tenant_id,created_at)",
+        ),
+        (
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS "
+            "max_disagreement_rate DOUBLE PRECISION NOT NULL DEFAULT .2",
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS "
+            "auto_promote BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS "
+            "shadow_samples INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE deployments ADD COLUMN IF NOT EXISTS "
+            "disagreements INTEGER NOT NULL DEFAULT 0",
+            """CREATE TABLE IF NOT EXISTS release_observations (
+                id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, skill_name TEXT NOT NULL,
+                task_id TEXT NOT NULL, lane TEXT NOT NULL, primary_json JSONB NOT NULL,
+                candidate_json JSONB, disagreement DOUBLE PRECISION NOT NULL,
+                candidate_failed BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS review_sessions (
+                id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, repository TEXT NOT NULL,
+                pull_request INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'open',
+                latest_head_sha TEXT, pending_input TEXT, created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL, UNIQUE(tenant_id,repository,pull_request))""",
+            """CREATE TABLE IF NOT EXISTS session_turns (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES review_sessions(id),
+                task_id TEXT, head_sha TEXT, trigger TEXT NOT NULL, sequence INTEGER NOT NULL,
+                summary_json JSONB, created_at TIMESTAMPTZ NOT NULL,
+                UNIQUE(session_id,sequence))""",
+            """CREATE TABLE IF NOT EXISTS session_findings (
+                id BIGSERIAL PRIMARY KEY, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL, status TEXT NOT NULL, snapshot_json JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL)""",
+            "CREATE INDEX IF NOT EXISTS idx_release_observations_deployment "
+            "ON release_observations(tenant_id,skill_name,id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_session_turns_session "
+            "ON session_turns(session_id,sequence)",
+            "CREATE INDEX IF NOT EXISTS idx_session_findings_turn ON session_findings(turn_id)",
+            "CREATE INDEX IF NOT EXISTS idx_tasks_tenant_created ON tasks(tenant_id,created_at)",
+        ),
+        (
+            SQLiteColumn("deployments", "max_disagreement_rate", "REAL NOT NULL DEFAULT 0.2"),
+            SQLiteColumn("deployments", "auto_promote", "INTEGER NOT NULL DEFAULT 0"),
+            SQLiteColumn("deployments", "shadow_samples", "INTEGER NOT NULL DEFAULT 0"),
+            SQLiteColumn("deployments", "disagreements", "INTEGER NOT NULL DEFAULT 0"),
+        ),
+    ),
+)
+
+CURRENT_SCHEMA_VERSION = MIGRATIONS[-1].version
+MIN_SUPPORTED_SCHEMA_VERSION = 0
+_MIGRATION_BY_VERSION = {migration.version: migration for migration in MIGRATIONS}
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def _validate_target(target_version: int) -> None:
+    if not MIN_SUPPORTED_SCHEMA_VERSION <= target_version <= CURRENT_SCHEMA_VERSION:
+        raise ValueError(
+            "target schema version must be between %d and %d"
+            % (MIN_SUPPORTED_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION)
+        )
+
+
+def _validate_history(rows: list[Any], target_version: int) -> set[int]:
+    if not rows:
+        return set()
+    versions = [int(row["version"]) for row in rows]
+    newest = max(versions)
+    if newest > CURRENT_SCHEMA_VERSION:
+        raise SchemaTooNewError(
+            "database schema version %d is newer than supported version %d; "
+            "deploy a compatible EvoAgent release instead of starting this binary"
+            % (newest, CURRENT_SCHEMA_VERSION)
+        )
+    expected = list(range(1, newest + 1))
+    if versions != expected:
+        raise SchemaHistoryError(
+            "database migration history is not contiguous: expected %s, found %s"
+            % (expected, versions)
+        )
+    for row in rows:
+        migration = _MIGRATION_BY_VERSION.get(int(row["version"]))
+        if migration is None:
+            raise SchemaHistoryError("unknown schema migration version %s" % row["version"])
+        if row["name"] != migration.name or row["checksum"] != migration.checksum:
+            raise SchemaHistoryError(
+                "schema migration %d (%s) does not match the immutable application history"
+                % (migration.version, migration.name)
+            )
+    if newest > target_version:
+        raise SchemaTooNewError(
+            "database schema version %d is newer than requested target %d"
+            % (newest, target_version)
+        )
+    return set(versions)
+
+
+def _ensure_sqlite_column(conn: sqlite3.Connection, column: SQLiteColumn) -> None:
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(%s)" % column.table).fetchall()
+    }
+    if column.name not in columns:
+        conn.execute(
+            "ALTER TABLE %s ADD COLUMN %s %s" % (column.table, column.name, column.declaration)
+        )
+
+
+def migrate_sqlite(conn: sqlite3.Connection, target_version: int = CURRENT_SCHEMA_VERSION) -> int:
+    """Apply all pending SQLite migrations under one immediate transaction."""
+    _validate_target(target_version)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
+                applied_at TEXT NOT NULL)"""
+        )
+        rows = conn.execute(
+            "SELECT version,name,checksum,applied_at FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        applied = _validate_history(list(rows), target_version)
+        for migration in MIGRATIONS:
+            if migration.version > target_version or migration.version in applied:
+                continue
+            for statement in migration.sqlite_statements:
+                conn.execute(statement)
+            for column in migration.sqlite_columns:
+                _ensure_sqlite_column(conn, column)
+            conn.execute(
+                "INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES (?,?,?,?)",
+                (migration.version, migration.name, migration.checksum, _now()),
+            )
+        conn.commit()
+    except SchemaMigrationError:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise MigrationApplyError("SQLite schema migration failed: %s" % exc) from exc
+    return target_version
+
+
+def migrate_postgres(conn: Any, target_version: int = CURRENT_SCHEMA_VERSION) -> int:
+    """Apply pending PostgreSQL migrations in the caller-owned transaction."""
+    _validate_target(target_version)
+    try:
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            ("evoagent:schema-migrations",),
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
+                applied_at TIMESTAMPTZ NOT NULL)"""
+        )
+        rows = conn.execute(
+            "SELECT version,name,checksum,applied_at FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        applied = _validate_history(list(rows), target_version)
+        for migration in MIGRATIONS:
+            if migration.version > target_version or migration.version in applied:
+                continue
+            for statement in migration.postgres_statements:
+                conn.execute(statement)
+            conn.execute(
+                "INSERT INTO schema_migrations(version,name,checksum,applied_at) "
+                "VALUES (%s,%s,%s,%s)",
+                (migration.version, migration.name, migration.checksum, _now()),
+            )
+    except SchemaMigrationError:
+        raise
+    except Exception as exc:
+        raise MigrationApplyError("PostgreSQL schema migration failed: %s" % exc) from exc
+    return target_version

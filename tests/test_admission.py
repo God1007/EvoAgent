@@ -8,6 +8,7 @@ from http.server import ThreadingHTTPServer
 
 from evoagent.api import ApiHandler
 from evoagent.config import Settings
+from evoagent.migrations import CURRENT_SCHEMA_VERSION
 from evoagent.service import ReviewService
 
 
@@ -93,6 +94,12 @@ class AdmissionControlTests(unittest.TestCase):
         inventory = json.loads(inventory_response.read())
         self.assertEqual(200, inventory_response.status)
         self.assertIn("store", inventory["capabilities"])
+
+        conn.request("GET", "/ready")
+        ready_response = conn.getresponse()
+        ready = json.loads(ready_response.read())
+        self.assertEqual(200, ready_response.status)
+        self.assertEqual(CURRENT_SCHEMA_VERSION, ready["checks"]["schema_version"])
 
     def test_rejected_requests_are_counted_in_metrics(self):
         host, port = self._serve(self._settings(rate_limit_rps=1, rate_limit_burst=1))

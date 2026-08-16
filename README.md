@@ -557,6 +557,16 @@ docker compose up --build -d
 docker compose ps
 ```
 
+升级生产环境时，先按变更流程备份数据库，再用相同镜像运行独立迁移任务：
+
+```bash
+docker compose run --rm evoagent python -m evoagent.migrate
+```
+
+迁移历史带版本、名称和 SHA-256 校验和；服务会拒绝连接由更高版本程序创建的
+数据库。并发实例启动由数据库迁移锁串行化。备份、恢复与 expand/migrate/contract
+流程见 [`docs/database-migrations.md`](docs/database-migrations.md)。
+
 Compose 会启动：
 
 - EvoAgent：`0.0.0.0:8080`
@@ -733,6 +743,7 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 │   ├── service.py                # 业务用例编排与 Capability 消费
 │   ├── plugins.py                # 插件依赖图、生命周期、Scope 与事件总线
 │   ├── ports.py                  # Store / Queue / CodeHost 领域端口
+│   ├── migrations.py             # 带校验和与兼容门禁的数据库迁移历史
 │   ├── capabilities.py           # 稳定类型化 Capability 定义
 │   ├── bootstrap.py              # 默认 Provider Catalog 与应用组装
 │   ├── review_engine.py          # 可替换 Reviewer Graph 与 Harness 组装
@@ -783,7 +794,7 @@ make check
 
 当前整体行覆盖率约 83%，其中 `reviewer`、`fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
 
-GitHub 额外执行 Gitleaks、CodeQL、依赖审计和 Docker 构建冒烟测试（构建镜像、启动容器并校验 `/health` 与 `/v1/reviews`）。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；质量门禁与可信插件微内核分别记录在 [`ADR 0001`](docs/adr/0001-engineering-quality-gates.md) 和 [`ADR 0002`](docs/adr/0002-trusted-plugin-microkernel.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
+GitHub 额外执行 Gitleaks、CodeQL、依赖审计和 Docker 构建冒烟测试（构建镜像、启动容器并校验 `/health` 与 `/v1/reviews`）。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；质量门禁、可信插件微内核与数据库迁移策略分别记录在 [`ADR 0001`](docs/adr/0001-engineering-quality-gates.md)、[`ADR 0002`](docs/adr/0002-trusted-plugin-microkernel.md) 和 [`ADR 0003`](docs/adr/0003-versioned-forward-only-migrations.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
 
 更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)，性能 SLO、压测方法与可复现基线见 [`docs/performance.md`](docs/performance.md) 与 [`docs/performance-baseline.md`](docs/performance-baseline.md)。
 

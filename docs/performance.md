@@ -135,7 +135,6 @@ python scripts/microbench.py --json micro.json
 - PgBouncer, read replicas, and partitioning + TTL for `trace_events` and
   `session_findings` (both grow unbounded today).
 - microVM isolation (Firecracker/gVisor) for `/v1/proofs`.
-- Versioned schema migrations (Alembic) instead of `CREATE TABLE IF NOT EXISTS`.
 - Trusted-proxy `X-Forwarded-For` parsing for the rate limiter (today it keys on
   the socket peer, so behind a proxy all clients share one bucket) and a
   dedicated concurrency guard for `/webhooks/github` `synchronize` fan-out.

@@ -41,6 +41,7 @@ from .metrics import metrics
 from .outbox import OutboxDispatcher
 from .plugins import Plugin, PluginProfile, PluginRuntime
 from .ports import CodeHostPort
+from .retention import RetentionManager, RetentionOptions
 from .review_engine import ReviewEngine
 from .reviewer import GatewayReviewer
 
@@ -160,7 +161,18 @@ class ReviewService:
                 settings.outbox_lease_seconds,
                 settings.outbox_max_attempts,
             )
+            self.retention = RetentionManager(
+                self.store,
+                RetentionOptions(
+                    retention_days=settings.history_retention_days,
+                    interval_seconds=settings.history_maintenance_seconds,
+                    batch_size=settings.history_prune_batch_size,
+                ),
+            )
         except Exception:
+            retention = getattr(self, "retention", None)
+            if retention is not None:
+                retention.close()
             outbox = getattr(self, "outbox", None)
             if outbox is not None:
                 outbox.close()
@@ -207,6 +219,17 @@ class ReviewService:
             "plugin_runtime_ready",
             lambda: 1.0 if self.plugin_runtime.state.value == "running" else 0.0,
         )
+        metrics.register_gauge_source(
+            "retention_enabled", lambda: 1.0 if self.retention.enabled else 0.0
+        )
+        metrics.register_gauge_source(
+            "retention_last_success_timestamp_seconds",
+            self.retention.last_success_timestamp,
+        )
+        metrics.register_gauge_source(
+            "retention_maintenance_interval_seconds",
+            lambda: float(self.settings.history_maintenance_seconds),
+        )
         self._readiness_lock = threading.Lock()
         self._readiness_cache: tuple[float, tuple[bool, dict[str, Any]]] | None = None
         self._readiness_ttl = 1.0
@@ -226,6 +249,8 @@ class ReviewService:
         self._closed = True
         self._publish_event("service.stopping", {"queue_backend": self.queue.backend})
         try:
+            if not self.retention.close(self.settings.queue_shutdown_timeout_seconds):
+                metrics.inc("retention_shutdown_timeouts_total")
             if not self.outbox.close(self.settings.queue_shutdown_timeout_seconds):
                 metrics.inc("outbox_shutdown_timeouts_total")
             drained = self.queue.close(self.settings.queue_shutdown_timeout_seconds)
@@ -252,6 +277,9 @@ class ReviewService:
     def plugin_status(self) -> dict[str, Any]:
         """Safe runtime inventory for health/debug endpoints."""
         return self.plugin_runtime.describe()
+
+    def retention_status(self) -> dict[str, Any]:
+        return self.retention.status()
 
     def replay_outbox(self, message_id: str) -> bool:
         replayed = self.store.requeue_outbox(message_id)

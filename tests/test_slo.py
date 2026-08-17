@@ -103,6 +103,7 @@ sample_query = "two"
         self.assertIn("EvoAgentModelCapacitySaturated", rules)
         self.assertIn("EvoAgentRepairVerificationBlockedHigh", rules)
         self.assertIn("EvoAgentNegativeFeedbackHigh", rules)
+        self.assertIn("EvoAgentRetentionMaintenanceStalled", rules)
         self.assertIn("or vector(0)", rules)
         for anchor in (
             "availability-fast-burn",
@@ -116,14 +117,16 @@ sample_query = "two"
             "repair-outcomes",
             "quality-feedback",
             "plugin-runtime",
+            "history-retention",
         ):
             self.assertIn("#" + anchor, rules)
             self.assertIn("## " + anchor.replace("-", " "), runbook)
         self.assertEqual("evoagent-enterprise", dashboard["uid"])
-        self.assertGreaterEqual(len(dashboard["panels"]), 12)
+        self.assertGreaterEqual(len(dashboard["panels"]), 13)
         dashboard_text = json.dumps(dashboard)
         self.assertIn("evoagent:ratio:model_capacity_rejected_15m", dashboard_text)
         self.assertIn("evoagent:ratio:negative_feedback_24h", dashboard_text)
+        self.assertIn("evoagent_retention_trace_events_pruned_total", dashboard_text)
 
 
 class PrometheusClientTests(unittest.TestCase):

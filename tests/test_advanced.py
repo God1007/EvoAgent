@@ -162,6 +162,22 @@ class AdvancedFeatureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "between 1 and 720"):
             configured.validate_evolution()
 
+    def test_operational_history_retention_configuration_is_bounded(self):
+        configured = settings(self.path)
+        invalid = (
+            {"history_retention_days": 36_501},
+            {"history_maintenance_seconds": 0},
+            {"history_retention_days": 30, "history_maintenance_seconds": 59},
+            {"history_prune_batch_size": 0},
+            {"history_prune_batch_size": 10_001},
+        )
+        for changes in invalid:
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(ValueError, "EVOAGENT_HISTORY"),
+            ):
+                configured.__class__(**{**configured.__dict__, **changes}).validate_evolution()
+
     def test_feedback_candidate_is_deferred_without_a_model(self):
         store = TaskStore(self.path)
         store.create("task", "org/repo", 1, {"source": "test"})

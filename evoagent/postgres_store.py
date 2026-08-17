@@ -128,6 +128,110 @@ class PostgresTaskStore:
     def schema_version(self) -> int:
         return self._schema_version
 
+    def prune_operational_history(
+        self,
+        trace_before: str,
+        session_before: str,
+        batch_size: int,
+        pruned_at: str,
+    ) -> dict[str, int]:
+        """Prune inactive history in bounded, replica-safe transactions."""
+        bounded = max(1, min(int(batch_size), 10_000))
+        terminal_states = (
+            TaskState.SUCCESS.value,
+            TaskState.FAILED.value,
+            TaskState.CANCELLED.value,
+        )
+        with self._connect() as conn:
+            trace_rows = conn.execute(
+                "SELECT events.id,events.task_id FROM trace_events AS events "
+                "JOIN tasks AS task ON task.id=events.task_id "
+                "WHERE events.created_at<%s AND task.state=ANY(%s) "
+                "AND events.id<>(SELECT MAX(latest.id) FROM trace_events AS latest "
+                "WHERE latest.task_id=events.task_id) "
+                "ORDER BY events.created_at,events.id LIMIT %s "
+                "FOR UPDATE OF events SKIP LOCKED",
+                (trace_before, list(terminal_states), bounded),
+            ).fetchall()
+            trace_ids = [int(row["id"]) for row in trace_rows]
+            task_ids = sorted({str(row["task_id"]) for row in trace_rows})
+            if trace_ids:
+                conn.execute("DELETE FROM trace_events WHERE id=ANY(%s)", (trace_ids,))
+                conn.execute(
+                    "UPDATE tasks SET trace_pruned_at=COALESCE(trace_pruned_at,%s) "
+                    "WHERE id=ANY(%s)",
+                    (pruned_at, task_ids),
+                )
+
+            candidates = conn.execute(
+                "SELECT turn.id,turn.session_id FROM session_turns AS turn "
+                "WHERE turn.summary_json IS NOT NULL AND turn.findings_pruned_at IS NULL "
+                "AND EXISTS (SELECT 1 FROM session_findings AS finding "
+                "WHERE finding.turn_id=turn.id AND finding.created_at<%s) "
+                "AND NOT EXISTS (SELECT 1 FROM session_findings AS finding "
+                "WHERE finding.turn_id=turn.id AND finding.created_at>=%s) "
+                "AND EXISTS (SELECT 1 FROM session_turns AS later "
+                "WHERE later.session_id=turn.session_id AND later.summary_json IS NOT NULL "
+                "AND later.sequence>turn.sequence) "
+                "AND NOT EXISTS (SELECT 1 FROM session_turns AS pending "
+                "WHERE pending.session_id=turn.session_id AND pending.summary_json IS NULL "
+                "AND pending.sequence>turn.sequence AND NOT EXISTS ("
+                "SELECT 1 FROM session_turns AS middle "
+                "WHERE middle.session_id=turn.session_id AND middle.summary_json IS NOT NULL "
+                "AND middle.sequence>turn.sequence AND middle.sequence<pending.sequence)) "
+                "ORDER BY turn.created_at,turn.id LIMIT %s",
+                (session_before, session_before, bounded),
+            ).fetchall()
+            candidate_ids = [str(row["id"]) for row in candidates]
+            for session_id in sorted({str(row["session_id"]) for row in candidates}):
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    ("session-state:%s" % session_id,),
+                )
+
+            turn_ids: list[str] = []
+            if candidate_ids:
+                # Re-evaluate after acquiring every session lock: a new pending
+                # turn may have appeared between candidate discovery and lock.
+                eligible = conn.execute(
+                    "SELECT turn.id FROM session_turns AS turn "
+                    "WHERE turn.id=ANY(%s) AND turn.summary_json IS NOT NULL "
+                    "AND turn.findings_pruned_at IS NULL "
+                    "AND EXISTS (SELECT 1 FROM session_findings AS finding "
+                    "WHERE finding.turn_id=turn.id AND finding.created_at<%s) "
+                    "AND NOT EXISTS (SELECT 1 FROM session_findings AS finding "
+                    "WHERE finding.turn_id=turn.id AND finding.created_at>=%s) "
+                    "AND EXISTS (SELECT 1 FROM session_turns AS later "
+                    "WHERE later.session_id=turn.session_id AND later.summary_json IS NOT NULL "
+                    "AND later.sequence>turn.sequence) "
+                    "AND NOT EXISTS (SELECT 1 FROM session_turns AS pending "
+                    "WHERE pending.session_id=turn.session_id AND pending.summary_json IS NULL "
+                    "AND pending.sequence>turn.sequence AND NOT EXISTS ("
+                    "SELECT 1 FROM session_turns AS middle "
+                    "WHERE middle.session_id=turn.session_id AND middle.summary_json IS NOT NULL "
+                    "AND middle.sequence>turn.sequence AND middle.sequence<pending.sequence))",
+                    (candidate_ids, session_before, session_before),
+                ).fetchall()
+                turn_ids = [str(row["id"]) for row in eligible]
+            findings_pruned = 0
+            if turn_ids:
+                findings_pruned = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS count FROM session_findings WHERE turn_id=ANY(%s)",
+                        (turn_ids,),
+                    ).fetchone()["count"]
+                )
+                conn.execute(
+                    "UPDATE session_turns SET findings_pruned_at=%s WHERE id=ANY(%s)",
+                    (pruned_at, turn_ids),
+                )
+                conn.execute("DELETE FROM session_findings WHERE turn_id=ANY(%s)", (turn_ids,))
+        return {
+            "trace_events": len(trace_ids),
+            "session_turns": len(turn_ids),
+            "session_findings": findings_pruned,
+        }
+
     def create(
         self,
         task_id: str,
@@ -1062,6 +1166,8 @@ class PostgresTaskStore:
             value["collaboration"].append(item)
         for key in ("created_at", "updated_at"):
             value[key] = value[key].isoformat()
+        if value.get("trace_pruned_at") is not None:
+            value["trace_pruned_at"] = value["trace_pruned_at"].isoformat()
         for item in value["trace"]:
             item["created_at"] = item["created_at"].isoformat()
         return value
@@ -1138,6 +1244,10 @@ class PostgresTaskStore:
             (tenant_id, repository, pull_request),
         ).fetchone()
         session_id = row["id"]
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            ("session-state:%s" % session_id,),
+        )
         previous_head = None if is_new else row["latest_head_sha"]
         sequence = (
             int(
@@ -1197,6 +1307,10 @@ class PostgresTaskStore:
     ) -> None:
         now = utc_now()
         with self._connect() as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                ("session-state:%s" % session_id,),
+            )
             conn.execute("DELETE FROM session_findings WHERE turn_id=%s", (turn_id,))
             for snap in open_snapshots:
                 conn.execute(
@@ -1213,7 +1327,7 @@ class PostgresTaskStore:
                 )
             conn.execute(
                 "UPDATE session_turns SET task_id=COALESCE(%s, task_id), summary_json=%s::jsonb, "
-                "head_sha=COALESCE(%s, head_sha) WHERE id=%s",
+                "head_sha=COALESCE(%s, head_sha),findings_pruned_at=NULL WHERE id=%s",
                 (task_id, json.dumps(summary, ensure_ascii=False), head_sha, turn_id),
             )
             conn.execute(
@@ -1252,7 +1366,8 @@ class PostgresTaskStore:
             if not srow:
                 return None
             turns = conn.execute(
-                "SELECT id,task_id,head_sha,trigger,sequence,summary_json,created_at "
+                "SELECT id,task_id,head_sha,trigger,sequence,summary_json,created_at,"
+                "findings_pruned_at "
                 "FROM session_turns WHERE session_id=%s ORDER BY sequence DESC LIMIT %s",
                 (session_id, turn_limit),
             ).fetchall()
@@ -1265,6 +1380,9 @@ class PostgresTaskStore:
                 item = dict(turn)
                 item["summary"] = item.pop("summary_json")
                 item["created_at"] = item["created_at"].isoformat()
+                if item["findings_pruned_at"] is not None:
+                    item["findings_pruned_at"] = item["findings_pruned_at"].isoformat()
+                item["findings_retained"] = item["findings_pruned_at"] is None
                 findings = conn.execute(
                     "SELECT snapshot_json FROM session_findings WHERE turn_id=%s ORDER BY id",
                     (item["id"],),

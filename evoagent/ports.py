@@ -499,6 +499,14 @@ class ServiceStorePort(Protocol):
 
     def schema_version(self) -> int: ...
 
+    def prune_operational_history(
+        self,
+        trace_before: str,
+        session_before: str,
+        batch_size: int,
+        pruned_at: str,
+    ) -> dict[str, int]: ...
+
     def get(self, task_id: str, tenant_id: str | None = None) -> dict[str, Any] | None: ...
 
     def create_review_task(

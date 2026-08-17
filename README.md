@@ -53,6 +53,7 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **可观测性** | 任务 Trace、Agent 消息、固定基数的模型成本/容量/修复/反馈 Prometheus 指标和 OpenTelemetry Trace |
 | **SLO 与告警** | 版本化 30 天 SLO、错误预算、快/慢燃烧率告警、模型容量与预算、修复验证和反馈趋势告警、Grafana Dashboard 与处置 Runbook |
 | **灾备证据** | SQLite/PostgreSQL 执行隔离恢复与 RPO/RTO 校验，并可从 PostgreSQL/Outbox 向全新 Redis 离线重建未完成任务 |
+| **数据生命周期** | 默认关闭、显式启用的状态感知历史保留；分批清理终态 Trace 与过期会话快照，同时保留最新事件和跨轮次连续性锚点 |
 | **质量证据治理** | 双人盲标与独立裁决、标注包/数据集哈希、许可与来源审计、仓库隔离、语言/CWE/Rule 切片及置信度校准 |
 | **Web 控制台** | 提供运行总览、发起审查、任务中心、Skill 管理、演进实验室和 GitHub 配置页面 |
 
@@ -834,6 +835,9 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `EVOAGENT_LLM_CAPACITY_WINDOW_RETENTION_HOURS` | `48` | 路由分钟容量计数保留小时数 |
 | `EVOAGENT_DATABASE_URL` | 空 | PostgreSQL URL；为空时使用 SQLite |
 | `EVOAGENT_REDIS_URL` | 空 | Redis URL；为空时使用进程内队列 |
+| `EVOAGENT_HISTORY_RETENTION_DAYS` | `0` | 终态 Trace 与可淘汰会话快照的保留天数；0 表示关闭 |
+| `EVOAGENT_HISTORY_MAINTENANCE_SECONDS` | `3600` | 历史保留维护周期；启用时至少 60 秒 |
+| `EVOAGENT_HISTORY_PRUNE_BATCH_SIZE` | `1000` | 每批最多处理的 Trace 行与会话轮次，最大 10000 |
 | `EVOAGENT_ASYNC_WORKERS` | `2` | 异步 Worker 数量 |
 | `EVOAGENT_AUTH_REQUIRED` | `false` | 是否启用登录和 API 鉴权 |
 | `EVOAGENT_AUTO_POST_REVIEW` | `false` | 是否自动向 GitHub PR 回写报告 |
@@ -939,6 +943,7 @@ GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强
 - **过载保护（背压）**：按客户端的令牌桶限流 + 重端点的有界并发闸门，过载时返回 `429`/`503` + `Retry-After` 而非雪崩。默认只信 socket peer；配置 `EVOAGENT_TRUSTED_PROXY_CIDRS` 后才从右向左验证 `X-Forwarded-For` 代理链，避免伪造地址绕过限流。
 - **依赖韧性**：GitHub / LLM 出站调用包裹熔断器（closed/open/half-open + 退避抖动），仅对连接/超时类传输故障计数，上游宕机时快速失败而非占满线程。
 - **连接池**：Postgres 使用核心依赖 `psycopg_pool` 的有界连接池；池大小、可用连接和等待请求经 `/metrics` 暴露，真实耗尽/恢复行为由 CI 门禁验证。
+- **历史保留**：可选的状态感知维护器分批清理过期运行历史，不删除活跃任务、每个任务的最后事件、会话最新完成快照或乱序完成仍需读取的连续性锚点。
 - **可观测性**：`/metrics` 新增延迟直方图（p50/p95/p99 可推导）、在途请求、被拒计数、队列深度、连接池与熔断器状态。
 - **压测工具**：纯 Python 恒定到达率压测器 [`scripts/loadgen.py`](scripts/loadgen.py)（离线/CI 可用，阈值超限即非零退出）、k6 脚本 [`perf/`](perf)、全栈 [`docker-compose.perf.yml`](docker-compose.perf.yml)，以及热点路径微基准 [`scripts/microbench.py`](scripts/microbench.py)。CI 由 [`.github/workflows/perf.yml`](.github/workflows/perf.yml) 作为性能回归门禁。
 

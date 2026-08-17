@@ -590,6 +590,26 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ON model_route_capacity_windows(route_id,window_start)",
         ),
     ),
+    Migration(
+        13,
+        "operational-history-retention",
+        (
+            "CREATE INDEX IF NOT EXISTS idx_trace_events_retention ON trace_events(created_at,id)",
+            "CREATE INDEX IF NOT EXISTS idx_session_findings_retention "
+            "ON session_findings(created_at,id)",
+        ),
+        (
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS trace_pruned_at TIMESTAMPTZ",
+            "ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS findings_pruned_at TIMESTAMPTZ",
+            "CREATE INDEX IF NOT EXISTS idx_trace_events_retention ON trace_events(created_at,id)",
+            "CREATE INDEX IF NOT EXISTS idx_session_findings_retention "
+            "ON session_findings(created_at,id)",
+        ),
+        (
+            SQLiteColumn("tasks", "trace_pruned_at", "TEXT"),
+            SQLiteColumn("session_turns", "findings_pruned_at", "TEXT"),
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1].version

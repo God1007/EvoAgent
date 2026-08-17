@@ -135,6 +135,9 @@ class Settings:
     rate_limit_burst: int = 0
     trusted_proxy_cidrs: tuple[str, ...] = ()
     max_inflight_heavy: int = 0
+    history_retention_days: int = 0
+    history_maintenance_seconds: int = 3600
+    history_prune_batch_size: int = 1000
     breaker_failure_threshold: int = 5
     breaker_reset_seconds: int = 30
     outbound_retries: int = 2
@@ -261,6 +264,18 @@ class Settings:
             normalized_proxy_cidrs.append(str(network))
         if len(normalized_proxy_cidrs) != len(set(normalized_proxy_cidrs)):
             raise ValueError("EVOAGENT_TRUSTED_PROXY_CIDRS contains duplicate networks")
+        if self.history_retention_days > 36_500:
+            raise ValueError("EVOAGENT_HISTORY_RETENTION_DAYS must be at most 36500")
+        if self.history_maintenance_seconds <= 0:
+            raise ValueError("EVOAGENT_HISTORY_MAINTENANCE_SECONDS must be positive")
+        if self.history_retention_days and self.history_maintenance_seconds < 60:
+            raise ValueError(
+                "EVOAGENT_HISTORY_MAINTENANCE_SECONDS must be at least 60 when retention is enabled"
+            )
+        if self.history_prune_batch_size <= 0:
+            raise ValueError("EVOAGENT_HISTORY_PRUNE_BATCH_SIZE must be positive")
+        if self.history_prune_batch_size > 10_000:
+            raise ValueError("EVOAGENT_HISTORY_PRUNE_BATCH_SIZE must be at most 10000")
         if (
             (self.llm_daily_cost_micros > 0 or self.llm_shadow_daily_cost_micros > 0)
             and self.llm_input_cost_micros_per_million == 0
@@ -422,6 +437,9 @@ class Settings:
             rate_limit_burst=_non_negative_int("EVOAGENT_RATE_LIMIT_BURST", 0),
             trusted_proxy_cidrs=_csv("EVOAGENT_TRUSTED_PROXY_CIDRS"),
             max_inflight_heavy=_non_negative_int("EVOAGENT_MAX_INFLIGHT_HEAVY", 0),
+            history_retention_days=_non_negative_int("EVOAGENT_HISTORY_RETENTION_DAYS", 0),
+            history_maintenance_seconds=_int("EVOAGENT_HISTORY_MAINTENANCE_SECONDS", 3600),
+            history_prune_batch_size=_int("EVOAGENT_HISTORY_PRUNE_BATCH_SIZE", 1000),
             breaker_failure_threshold=_int("EVOAGENT_BREAKER_FAILURE_THRESHOLD", 5),
             breaker_reset_seconds=_int("EVOAGENT_BREAKER_RESET_SECONDS", 30),
             outbound_retries=_non_negative_int("EVOAGENT_OUTBOUND_RETRIES", 2),

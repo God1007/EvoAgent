@@ -134,3 +134,12 @@ groups:
         annotations:
           summary: EvoAgent plugin graph is not running
           runbook: docs/operations.md#plugin-runtime
+
+      - alert: EvoAgentRetentionMaintenanceStalled
+        expr: evoagent_retention_enabled > 0 and (time() - evoagent_retention_last_success_timestamp_seconds) > clamp_min(2 * evoagent_retention_maintenance_interval_seconds, 600)
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Operational-history retention has not completed on schedule
+          runbook: docs/operations.md#history-retention

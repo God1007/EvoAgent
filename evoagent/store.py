@@ -44,6 +44,92 @@ class TaskStore:
     def schema_version(self) -> int:
         return self._schema_version
 
+    def prune_operational_history(
+        self,
+        trace_before: str,
+        session_before: str,
+        batch_size: int,
+        pruned_at: str,
+    ) -> dict[str, int]:
+        """Prune inactive history without removing recovery/continuity anchors."""
+        bounded = max(1, min(int(batch_size), 10_000))
+        terminal_states = (
+            TaskState.SUCCESS.value,
+            TaskState.FAILED.value,
+            TaskState.CANCELLED.value,
+        )
+        with self._lock, self._connect() as conn:
+            # Serialize the read/mark/delete plan with all SQLite writers,
+            # including session turn creation in another process.
+            conn.execute("BEGIN IMMEDIATE")
+            trace_rows = conn.execute(
+                "SELECT events.id,events.task_id FROM trace_events AS events "
+                "JOIN tasks AS task ON task.id=events.task_id "
+                "WHERE events.created_at<? AND task.state IN (?,?,?) "
+                "AND events.id<>(SELECT MAX(latest.id) FROM trace_events AS latest "
+                "WHERE latest.task_id=events.task_id) "
+                "ORDER BY events.created_at,events.id LIMIT ?",
+                (trace_before, *terminal_states, bounded),
+            ).fetchall()
+            trace_ids = [int(row["id"]) for row in trace_rows]
+            task_ids = sorted({str(row["task_id"]) for row in trace_rows})
+            if trace_ids:
+                placeholders = ",".join("?" for _ in trace_ids)
+                conn.execute(
+                    "DELETE FROM trace_events WHERE id IN (%s)" % placeholders,
+                    trace_ids,
+                )
+                task_placeholders = ",".join("?" for _ in task_ids)
+                conn.execute(
+                    "UPDATE tasks SET trace_pruned_at=COALESCE(trace_pruned_at,?) "
+                    "WHERE id IN (%s)" % task_placeholders,
+                    (pruned_at, *task_ids),
+                )
+
+            turn_rows = conn.execute(
+                "SELECT turn.id,turn.session_id FROM session_turns AS turn "
+                "WHERE turn.summary_json IS NOT NULL AND turn.findings_pruned_at IS NULL "
+                "AND EXISTS (SELECT 1 FROM session_findings AS finding "
+                "WHERE finding.turn_id=turn.id AND finding.created_at<?) "
+                "AND NOT EXISTS (SELECT 1 FROM session_findings AS finding "
+                "WHERE finding.turn_id=turn.id AND finding.created_at>=?) "
+                "AND EXISTS (SELECT 1 FROM session_turns AS later "
+                "WHERE later.session_id=turn.session_id AND later.summary_json IS NOT NULL "
+                "AND later.sequence>turn.sequence) "
+                "AND NOT EXISTS (SELECT 1 FROM session_turns AS pending "
+                "WHERE pending.session_id=turn.session_id AND pending.summary_json IS NULL "
+                "AND pending.sequence>turn.sequence AND NOT EXISTS ("
+                "SELECT 1 FROM session_turns AS middle "
+                "WHERE middle.session_id=turn.session_id AND middle.summary_json IS NOT NULL "
+                "AND middle.sequence>turn.sequence AND middle.sequence<pending.sequence)) "
+                "ORDER BY turn.created_at,turn.id LIMIT ?",
+                (session_before, session_before, bounded),
+            ).fetchall()
+            turn_ids = [str(row["id"]) for row in turn_rows]
+            findings_pruned = 0
+            if turn_ids:
+                placeholders = ",".join("?" for _ in turn_ids)
+                findings_pruned = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS count FROM session_findings "
+                        "WHERE turn_id IN (%s)" % placeholders,
+                        turn_ids,
+                    ).fetchone()["count"]
+                )
+                conn.execute(
+                    "UPDATE session_turns SET findings_pruned_at=? WHERE id IN (%s)" % placeholders,
+                    (pruned_at, *turn_ids),
+                )
+                conn.execute(
+                    "DELETE FROM session_findings WHERE turn_id IN (%s)" % placeholders,
+                    turn_ids,
+                )
+        return {
+            "trace_events": len(trace_ids),
+            "session_turns": len(turn_ids),
+            "session_findings": findings_pruned,
+        }
+
     def create(
         self,
         task_id: str,
@@ -1109,7 +1195,7 @@ class TaskStore:
                 )
             conn.execute(
                 "UPDATE session_turns SET task_id=COALESCE(?, task_id), summary_json=?, "
-                "head_sha=COALESCE(?, head_sha) WHERE id=?",
+                "head_sha=COALESCE(?, head_sha),findings_pruned_at=NULL WHERE id=?",
                 (task_id, json.dumps(summary, ensure_ascii=False), head_sha, turn_id),
             )
             conn.execute(
@@ -1151,7 +1237,8 @@ class TaskStore:
                 return None
             # Most recent turns only, returned in chronological order.
             turns = conn.execute(
-                "SELECT id,task_id,head_sha,trigger,sequence,summary_json,created_at "
+                "SELECT id,task_id,head_sha,trigger,sequence,summary_json,created_at,"
+                "findings_pruned_at "
                 "FROM session_turns WHERE session_id=? ORDER BY sequence DESC LIMIT ?",
                 (session_id, turn_limit),
             ).fetchall()
@@ -1162,6 +1249,7 @@ class TaskStore:
                 item = dict(turn)
                 summary = item.pop("summary_json")
                 item["summary"] = json.loads(summary) if summary else None
+                item["findings_retained"] = item["findings_pruned_at"] is None
                 findings = conn.execute(
                     "SELECT snapshot_json FROM session_findings WHERE turn_id=? ORDER BY id",
                     (item["id"],),

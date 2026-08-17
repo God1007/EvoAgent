@@ -88,6 +88,107 @@ class _StoreBehaviorContract:
         self.assertIsNotNone(timeline)
         self.assertEqual(2, len(timeline["turns"]))
 
+    def test_operational_retention_preserves_live_and_continuity_anchors(self):
+        old = "2000-01-01T00:00:00+00:00"
+        cutoff = "2999-01-01T00:00:00+00:00"
+        pruned_at = "2030-01-01T00:00:00+00:00"
+
+        terminal_task = self.unique("retention-terminal")
+        self.store.create(terminal_task, "acme/history", 1, {}, "tenant-a")
+        self.store.transition(
+            terminal_task,
+            TraceEvent(1, TaskState.PLANNING, "planning", old),
+        )
+        self.store.cancel(
+            terminal_task,
+            TraceEvent(2, TaskState.CANCELLED, "cancelled", old),
+        )
+        active_task = self.unique("retention-active")
+        self.store.create(active_task, "acme/history", 2, {}, "tenant-a")
+        self.store.transition(
+            active_task,
+            TraceEvent(1, TaskState.PLANNING, "planning", old),
+        )
+
+        repository = "acme/" + self.unique("retention-session")
+        first = self.store.start_session_turn("tenant-a", repository, 7, "head-1", "opened")
+        first_snapshot = {"fingerprint": "first", "status": "new", "path": "one.py"}
+        self.store.complete_session_turn(
+            first["session_id"],
+            first["turn_id"],
+            None,
+            [first_snapshot],
+            {"new": 1},
+            "head-1",
+        )
+        second = self.store.start_session_turn("tenant-a", repository, 7, "head-2", "synchronize")
+        third = self.store.start_session_turn("tenant-a", repository, 7, "head-3", "synchronize")
+        third_snapshot = {"fingerprint": "third", "status": "new", "path": "three.py"}
+        self.store.complete_session_turn(
+            third["session_id"],
+            third["turn_id"],
+            None,
+            [third_snapshot],
+            {"new": 1},
+            "head-3",
+        )
+
+        protected = self.store.prune_operational_history(cutoff, cutoff, 100, pruned_at)
+
+        self.assertEqual(1, protected["trace_events"])
+        self.assertEqual(0, protected["session_turns"])
+        terminal = self.store.get(terminal_task, "tenant-a")
+        self.assertEqual([TaskState.CANCELLED.value], [item["state"] for item in terminal["trace"]])
+        self.assertEqual(pruned_at, terminal["trace_pruned_at"])
+        self.assertEqual(1, len(self.store.get(active_task, "tenant-a")["trace"]))
+        self.assertEqual(
+            [first_snapshot],
+            self.store.previous_open_snapshot(first["session_id"], second["turn_id"]),
+        )
+
+        second_snapshot = {"fingerprint": "second", "status": "new", "path": "two.py"}
+        self.store.complete_session_turn(
+            second["session_id"],
+            second["turn_id"],
+            None,
+            [second_snapshot],
+            {"new": 1},
+            "head-2",
+        )
+        pruned = self.store.prune_operational_history(cutoff, cutoff, 100, pruned_at)
+
+        self.assertEqual(2, pruned["session_turns"])
+        self.assertEqual(2, pruned["session_findings"])
+        timeline = self.store.get_session_timeline(first["session_id"], "tenant-a")
+        turns = {item["id"]: item for item in timeline["turns"]}
+        self.assertFalse(turns[first["turn_id"]]["findings_retained"])
+        self.assertFalse(turns[second["turn_id"]]["findings_retained"])
+        self.assertEqual([], turns[first["turn_id"]]["findings"])
+        self.assertEqual(pruned_at, turns[first["turn_id"]]["findings_pruned_at"])
+        self.assertTrue(turns[third["turn_id"]]["findings_retained"])
+        self.assertEqual([third_snapshot], turns[third["turn_id"]]["findings"])
+
+        fourth = self.store.start_session_turn("tenant-a", repository, 7, "head-4", "synchronize")
+        self.assertEqual([third_snapshot], fourth["previous_findings"])
+        self.assertEqual(
+            {"trace_events": 0, "session_turns": 0, "session_findings": 0},
+            self.store.prune_operational_history(cutoff, cutoff, 100, pruned_at),
+        )
+        rewritten = {"fingerprint": "first-rewritten", "status": "new", "path": "one.py"}
+        self.store.complete_session_turn(
+            first["session_id"],
+            first["turn_id"],
+            None,
+            [rewritten],
+            {"new": 1},
+            "head-1",
+        )
+        timeline = self.store.get_session_timeline(first["session_id"], "tenant-a")
+        first_turn = next(item for item in timeline["turns"] if item["id"] == first["turn_id"])
+        self.assertTrue(first_turn["findings_retained"])
+        self.assertIsNone(first_turn["findings_pruned_at"])
+        self.assertEqual([rewritten], first_turn["findings"])
+
     def test_identity_webhook_and_audit_contract(self):
         username = self.unique("user")
         user_id = self.unique("id")

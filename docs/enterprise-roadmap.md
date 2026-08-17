@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.26.0)
+## Current maturity (v0.27.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -24,6 +24,7 @@ It is an execution plan, not a marketing checklist.
 | Operational failure security | Implemented baseline | Allowlisted message-free failure summaries, stable code-location references, persistence-adapter enforcement, legacy-data migration, and exception-message-free OpenTelemetry/plugin/proof paths |
 | Quality evidence | Governance baseline implemented | Reproducible synthetic regression plus blind dual-annotation/adjudication compiler, rights/content/split/evidence audit, per-language/CWE/rule slices, and confidence calibration; production gate remains blocked until a real approved corpus is supplied |
 | HA/DR operational proof | Implemented recovery baseline | SQLite/PostgreSQL isolated restore validates schema/content/application/RPO/RTO; an offline audited epoch reconstructs incomplete PostgreSQL/Outbox intent only into empty Redis and is proven against real CI services; managed PITR and regional routing exercise remain pending |
+| Operational data lifecycle | Implemented baseline | Opt-in bounded retention removes eligible terminal Trace history and superseded session snapshots while preserving recovery/continuity anchors and durable deletion markers; native partitioning, managed lifecycle, and long-soak evidence remain pending |
 
 ## Phase 2 — Ports, persistence, and integration proof
 
@@ -335,6 +336,17 @@ attacker cannot prepend a new rate-limit identity. Malformed chains fall back to
 the socket peer, raw forwarding values never enter logs or metric labels, and
 fixed counters distinguish accepted, ignored, and invalid forwarding metadata.
 See [`ADR 0024`](adr/0024-trusted-proxy-client-identity.md).
+
+The v0.27 increment closes the unbounded application-history baseline without
+turning retention into an unsafe table TTL. A Store-level transaction prunes
+only old terminal-task Trace events and superseded completed session findings,
+preserving the latest event, latest completed turn, and any snapshot required
+by an out-of-order pending turn. Durable markers distinguish intentional
+deletion from empty data. The disabled-by-default coordinator bounds every
+batch and run, participates in shutdown, publishes fixed-cardinality metrics,
+and is covered by health, dashboard, alert, runbook, and the shared
+SQLite/PostgreSQL adapter contract. See
+[`ADR 0025`](adr/0025-state-aware-operational-retention.md).
 
 Implemented database recovery baseline: `evoagent-dr` performs SQLite online
 backup/restore or a PostgreSQL exported-snapshot `pg_dump` followed by

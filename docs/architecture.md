@@ -35,6 +35,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Cross-cutting | `evoagent/observability.py`, `metrics.py` | Trace, fixed-cardinality Prometheus quality/economics metrics, OpenTelemetry |
 | Operations | `evoagent/slo.py`, `ops/` | Versioned SLO evaluation, Prometheus alerts, and Grafana dashboard |
 | Operations | `evoagent/dr.py`, `recovery.py` | Isolated database restore evidence and offline PostgreSQL-to-Redis task reconstruction |
+| Operations | `evoagent/retention.py` | Bounded, state-aware operational-history retention and lifecycle telemetry |
 | Model | `evoagent/models.py` | `Finding`, `Severity`, `ReviewReport`, stable fingerprints |
 | Adapters | `evoagent/github.py`, `diff_parser.py` | Hardened GitHub client, unified-diff parsing |
 
@@ -153,6 +154,13 @@ See [`plugin-system.md`](plugin-system.md) and
   task, and outbox in one Store transaction. Concurrent duplicate deliveries
   return the same task, while injected failures leave no partial records. See
   [`ADR 0006`](adr/0006-use-case-boundaries-and-atomic-webhook-intake.md).
+- **Operational-history retention** is opt-in and delegates deletion safety to
+  the Store transaction. It prunes only old terminal-task Trace events and old
+  completed session snapshots while retaining every task's latest event, the
+  latest completed turn, and any predecessor still needed by an out-of-order
+  pending turn. Durable markers distinguish deliberately pruned history from an
+  originally empty result. See
+  [`ADR 0025`](adr/0025-state-aware-operational-retention.md).
 - **Idempotent external effects**: comments use stable upsert markers and repair
   PRs use effect receipts plus deterministic branches.
 - **Repository governance** is resolved through a replaceable capability. The

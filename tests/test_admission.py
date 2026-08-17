@@ -234,6 +234,7 @@ class AdmissionControlTests(unittest.TestCase):
         health = json.loads(health_response.read())
         self.assertEqual("running", health["plugin_runtime"])
         self.assertGreaterEqual(health["plugins"], 10)
+        self.assertFalse(health["retention"]["enabled"])
 
         conn.request("GET", "/v1/plugins")
         inventory_response = conn.getresponse()

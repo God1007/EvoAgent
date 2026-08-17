@@ -408,6 +408,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "plugin_runtime": plugin_status["state"],
                     "plugin_profile": plugin_status["profile"],
                     "plugins": len(plugin_status["plugins"]),
+                    "retention": self.service.retention_status(),
                 },
             )
             return

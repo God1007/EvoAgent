@@ -140,6 +140,19 @@
       ],
       "title": "Negative feedback ratio",
       "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 44},
+      "id": 13,
+      "targets": [
+        {"expr": "sum(rate(evoagent_retention_trace_events_pruned_total[30m]))", "legendFormat": "trace events", "refId": "A"},
+        {"expr": "sum(rate(evoagent_retention_session_findings_pruned_total[30m]))", "legendFormat": "session findings", "refId": "B"},
+        {"expr": "sum(rate(evoagent_retention_failures_total[30m]))", "legendFormat": "failures", "refId": "C"}
+      ],
+      "title": "Operational history retention",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

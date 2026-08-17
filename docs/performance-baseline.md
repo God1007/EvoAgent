@@ -106,12 +106,12 @@ and rejection gauges read from `/metrics` afterward.
 | Dead letters | 0 |
 
 Latency is flat and low across the window with no errors, and the queue fully
-drains. RSS grew ~14 MB over 3 minutes; this is consistent with the **known
-unbounded growth of `trace_events` / `session_findings` / in-memory metric
-histograms** (see `docs/performance.md` §7) rather than a request-path leak, but
-it should be watched over multi-hour runs and is the motivation for the planned
-TTL/partitioning work. A true multi-hour soak on the durable (Postgres + Redis)
-backend is still outstanding.
+drains. RSS grew ~14 MB over 3 minutes. This capture predates the opt-in
+state-aware retention of `trace_events` / superseded `session_findings` and ran
+with retention disabled, so it cannot attribute the increase to a specific
+surface. In-memory metric histograms and retained operational rows should be
+measured separately in a multi-hour run. Native TTL/partitioning and a true
+durable Postgres + Redis soak remain outstanding.
 
 ## 5. Overload / backpressure
 
@@ -221,8 +221,8 @@ budgets. All within budget.
 - **Intake**: 200 req/s clean; bounded by the synchronous SQLite enqueue write.
 - **Spike**: 1500 req/s instantaneous burst absorbed with no errors (transient
   ~0.5 s tail during the jump).
-- **Soak**: flat latency, queue drains, but ~14 MB / 3 min RSS growth to watch
-  (unbounded trace/metric tables).
+- **Soak**: flat latency and a drained queue, but ~14 MB / 3 min RSS growth to
+  remeasure with v0.27 retention enabled and per-surface database/RSS evidence.
 - **Overload**: rate-limit (`429`) and heavy-gate (`503`) both shed cleanly with
   `Retry-After` and self-recover.
 - **Micro**: all hot paths within regression budgets.

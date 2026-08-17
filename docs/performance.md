@@ -145,8 +145,10 @@ python scripts/microbench.py --json micro.json
 ## 7. Known follow-ups (not yet implemented)
 
 - Full ASGI/FastAPI rewrite (kept stdlib + multi-process by design for now).
-- PgBouncer, read replicas, and partitioning + TTL for `trace_events` and
-  `session_findings` (both grow unbounded today).
+- PgBouncer, read replicas, and native partitioning/managed TTL. The application
+  now offers opt-in, invariant-aware bounded retention for `trace_events` and
+  superseded `session_findings`, but a multi-hour PostgreSQL soak and physical
+  table-reclamation policy remain deployment work.
 - microVM isolation (Firecracker/Kata) as an alternative `proof.executor`
   provider for hostile public multi-tenancy.
 - A dedicated concurrency guard for `/webhooks/github` `synchronize` fan-out.

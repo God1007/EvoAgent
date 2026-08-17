@@ -52,6 +52,12 @@ class SQLiteMigrationTests(unittest.TestCase):
             model_usage_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(model_usage)").fetchall()
             }
+            task_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
+            }
+            session_turn_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(session_turns)").fetchall()
+            }
             shadow_table = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='model_route_shadows'"
             ).fetchone()
@@ -73,10 +79,14 @@ class SQLiteMigrationTests(unittest.TestCase):
         self.assertIn("idx_model_route_shadows_report", indexes)
         self.assertIn("idx_model_route_capacity_leases", indexes)
         self.assertIn("idx_model_route_capacity_windows", indexes)
+        self.assertIn("idx_trace_events_retention", indexes)
+        self.assertIn("idx_session_findings_retention", indexes)
         self.assertEqual(
             {"lane", "topology_sha256"}, {"lane", "topology_sha256"} & model_usage_columns
         )
         self.assertIsNotNone(shadow_table)
+        self.assertIn("trace_pruned_at", task_columns)
+        self.assertIn("findings_pruned_at", session_turn_columns)
         self.assertEqual(
             {"model_route_capacity_leases", "model_route_capacity_windows"}, capacity_tables
         )

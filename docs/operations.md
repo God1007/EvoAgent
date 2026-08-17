@@ -213,6 +213,43 @@ Inspect startup dependency/cycle errors, the active Profile, and the trusted
 plugin allowlist. Roll back the plugin package or Profile as one deployment;
 live global hot-swap is intentionally unsupported.
 
+## History retention
+
+Operational-history deletion is disabled by default. Set
+`EVOAGENT_HISTORY_RETENTION_DAYS` above zero only after the retention period,
+backup/restore evidence, legal holds, and incident-forensics requirements have
+been approved. Schema migration 13 is additive and deletes nothing. During a
+rolling PostgreSQL deployment, apply the migration first, complete the rollout
+so every writer is v0.27 or newer, and only then enable retention: all writers
+must participate in the new per-session coordination lock before pruning can be
+considered safe.
+
+Each maintenance run is bounded by
+`EVOAGENT_HISTORY_PRUNE_BATCH_SIZE` and ten batches. The batch size limits Trace
+rows and session turns per transaction; one session turn can contain multiple
+findings, so choose a conservative value from measured production snapshots.
+The Store transaction enforces these invariants:
+
+- active-task Trace is never removed, and a terminal task always retains its
+  latest event;
+- the latest completed turn in a PR session remains a future-turn anchor;
+- a completed snapshot remains while an out-of-order pending turn could still
+  require it as the immediately preceding completed state;
+- task `trace_pruned_at` and timeline `findings_retained=false` markers make
+  deliberate pruning distinguishable from an originally empty result.
+
+Check `/health.retention`,
+`retention_trace_events_pruned_total`,
+`retention_session_findings_pruned_total`, and `retention_failures_total` after
+enablement. `EvoAgentRetentionMaintenanceStalled` fires when no successful run
+has completed within twice the configured interval (with a ten-minute floor).
+Compare `last_error_type` with Store health and migration compatibility; it is
+intentionally message-free. If the alert persists, disable the setting through
+the reviewed deployment configuration, preserve database/metric evidence, and
+fix the adapter or capacity problem before re-enabling it. Do not delete rows or
+edit prune markers with ad-hoc SQL. Retention is not a backup, VACUUM strategy,
+native PostgreSQL partition policy, or legal-hold system.
+
 ## Proof Runner
 
 Use `proof_inconclusive_total / proof_runs_total` and runner capacity logs to

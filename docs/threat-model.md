@@ -48,6 +48,7 @@ the mitigations that exist in the codebase today, plus known residual risks.
 | T16 | Secret/source leakage through persisted failures, readiness, plugins, or automatic tracing | Operational failures use an allowlisted `operation [type; ref]` grammar whose reference hashes only exception type and traceback code locations; application adapters sanitize Queue/DLQ, Outbox/effect, task graph, Agent, proof, plugin and readiness paths; SQLite/PostgreSQL enforce failure fields again; OpenTelemetry automatic exception recording is disabled; migration 10 replaces legacy messages | Model-ledger diagnostics and sandbox command output are separate controlled surfaces; code-location references are diagnostic fingerprints, not globally unique incident IDs |
 | T17 | Cross-tenant activity disclosure or monitoring collapse through metric labels | Quality/economics telemetry uses fixed names for bounded lane/reason/outcome/category states and never labels tenant, repository, route, model, rule, request, or failure values; attribution remains behind tenant-authorized stores | Aggregate platform trends are intentionally visible to metric operators; per-tenant diagnosis requires authorized ledger/failure access |
 | T18 | Forged forwarded address bypasses per-client admission or poisons access logs | `X-Forwarded-For` is ignored unless the kernel peer matches one of at most 64 canonical trusted CIDRs; the bounded literal-IP chain is evaluated right-to-left and stops at the first untrusted hop; malformed chains fall back to the socket peer and raw headers are never logged or used as metric labels | Correctness still depends on network policy ensuring only the configured proxies can use their source addresses and on operators keeping proxy CIDRs current |
+| T19 | Operational history exhausts storage, or a retention job destroys live continuity/audit state | Retention is disabled by default, bounded per transaction/run, restricted to terminal Trace history and superseded completed session snapshots, and preserves latest events plus pending-turn continuity anchors; durable prune markers, health, fixed metrics, and a stalled-maintenance alert expose its effects | Deletion is irreversible in the live database; backups, legal retention policy, PostgreSQL table growth/partitioning, and enabling only after a complete compatible rollout remain operator responsibilities |
 
 ## 4. Untrusted-execution policy
 
@@ -80,6 +81,8 @@ the mitigations that exist in the codebase today, plus known residual risks.
   regulated workloads.
 - Model fallback is bounded and policy-filtered, but is not an availability
   guarantee without independently provisioned provider/region capacity.
+- Application retention reduces eligible operational rows but is not a backup,
+  legal hold, native table partitioning, or provider-managed lifecycle system.
 
 ## 6. Reporting
 

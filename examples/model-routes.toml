@@ -1,0 +1,28 @@
+version = 1
+
+# Secrets are resolved from the named environment variables at startup.
+[[routes]]
+id = "eu-primary"
+priority = 10
+provider = "provider-a"
+model = "model-a"
+base_url = "https://eu-a.example/v1"
+api_key_env = "PROVIDER_A_API_KEY"
+region = "eu-west"
+tenant_ids = ["acme"]
+repository_patterns = ["acme/payments-*"]
+input_cost_micros_per_million = 250000
+output_cost_micros_per_million = 1000000
+
+[[routes]]
+id = "eu-fallback"
+priority = 20
+provider = "provider-b"
+model = "model-b"
+base_url = "https://eu-b.example/v1"
+api_key_env = "PROVIDER_B_API_KEY"
+region = "eu-west"
+tenant_ids = ["acme"]
+repository_patterns = ["acme/payments-*"]
+input_cost_micros_per_million = 300000
+output_cost_micros_per_million = 1200000

@@ -1,0 +1,234 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "gridPos": {"h": 8, "w": 6, "x": 0, "y": 0},
+      "id": 1,
+      "targets": [
+        {"expr": "evoagent:sli:http_availability_5m", "refId": "A"}
+      ],
+      "title": "HTTP availability (5m)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "gridPos": {"h": 8, "w": 6, "x": 6, "y": 0},
+      "id": 2,
+      "targets": [
+        {"expr": "evoagent:sli:intake_p99_seconds_10m", "refId": "A"}
+      ],
+      "title": "Async intake p99 (10m)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "gridPos": {"h": 8, "w": 6, "x": 12, "y": 0},
+      "id": 3,
+      "targets": [
+        {"expr": "evoagent:sli:review_success_30m", "refId": "A"}
+      ],
+      "title": "Review success (30m)",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 8, "w": 6, "x": 18, "y": 0},
+      "id": 4,
+      "targets": [
+        {"expr": "sum(evoagent_dead_letter_depth) + sum(evoagent_outbox_dead)", "refId": "A"}
+      ],
+      "title": "Operator-action backlog",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 8},
+      "id": 5,
+      "targets": [
+        {"expr": "max(evoagent_queue_oldest_age_seconds)", "legendFormat": "queue", "refId": "A"},
+        {"expr": "max(evoagent_outbox_oldest_age_seconds)", "legendFormat": "outbox", "refId": "B"}
+      ],
+      "title": "Oldest durable work",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 8},
+      "id": 6,
+      "targets": [
+        {"expr": "sum(rate(evoagent_reviews_total[5m]))", "legendFormat": "success", "refId": "A"},
+        {"expr": "sum(rate(evoagent_reviews_failed_total[5m]))", "legendFormat": "failed", "refId": "B"}
+      ],
+      "title": "Review terminal rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 17},
+      "id": 7,
+      "targets": [
+        {"expr": "sum(rate(evoagent_model_requests_total[5m]))", "legendFormat": "model calls", "refId": "A"},
+        {"expr": "sum(rate(evoagent_model_requests_failed_total[5m]))", "legendFormat": "model failures", "refId": "B"},
+        {"expr": "sum(rate(evoagent_model_fallback_attempts_total[5m]))", "legendFormat": "fallback", "refId": "C"}
+      ],
+      "title": "Model gateway traffic",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 17},
+      "id": 8,
+      "targets": [
+        {"expr": "sum(rate(evoagent_proof_inconclusive_total[30m])) / clamp_min(sum(rate(evoagent_proof_runs_total[30m])), 0.000001)", "refId": "A"}
+      ],
+      "title": "Proof infrastructure uncertainty",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 26},
+      "id": 9,
+      "targets": [
+        {"expr": "evoagent:cost:model_micros_per_terminal_review_30m", "refId": "A"}
+      ],
+      "title": "Model cost micros per terminal review",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 26},
+      "id": 10,
+      "targets": [
+        {"expr": "evoagent:ratio:model_capacity_rejected_15m", "refId": "A"}
+      ],
+      "title": "Model capacity rejection ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 35},
+      "id": 11,
+      "targets": [
+        {"expr": "sum(rate(evoagent_fix_published_total[30m]))", "legendFormat": "published", "refId": "A"},
+        {"expr": "sum(rate(evoagent_fix_abstained_total[30m]))", "legendFormat": "abstained", "refId": "B"},
+        {"expr": "sum(rate(evoagent_fix_verification_blocked_total[30m]))", "legendFormat": "verification blocked", "refId": "C"},
+        {"expr": "sum(rate(evoagent_fix_failed_total[30m]))", "legendFormat": "failed", "refId": "D"}
+      ],
+      "title": "Repair outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 35},
+      "id": 12,
+      "targets": [
+        {"expr": "evoagent:ratio:negative_feedback_24h", "refId": "A"}
+      ],
+      "title": "Negative feedback ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 44},
+      "id": 13,
+      "targets": [
+        {"expr": "sum(rate(evoagent_retention_trace_events_pruned_total[30m]))", "legendFormat": "trace events", "refId": "A"},
+        {"expr": "sum(rate(evoagent_retention_session_findings_pruned_total[30m]))", "legendFormat": "session findings", "refId": "B"},
+        {"expr": "sum(rate(evoagent_retention_failures_total[30m]))", "legendFormat": "failures", "refId": "C"}
+      ],
+      "title": "Operational history retention",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 53},
+      "id": 14,
+      "targets": [
+        {"expr": "evoagent:ratio:tenant_review_capacity_rejected_15m", "refId": "A"}
+      ],
+      "title": "Tenant review capacity rejection ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 53},
+      "id": 15,
+      "targets": [
+        {"expr": "max(evoagent_review_admission_slots_active)", "refId": "A"}
+      ],
+      "title": "Global active review admissions",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 62},
+      "id": 16,
+      "targets": [
+        {"expr": "evoagent:ratio:queue_fair_deferrals_15m", "refId": "A"}
+      ],
+      "title": "Tenant-fair scheduler deferral ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 62},
+      "id": 17,
+      "targets": [
+        {"expr": "max(evoagent_queue_fair_waiting_tenants)", "legendFormat": "waiting tenants", "refId": "A"},
+        {"expr": "sum(increase(evoagent_queue_lease_heartbeat_failures_total[10m]))", "legendFormat": "lease heartbeat failures", "refId": "B"}
+      ],
+      "title": "Tenant-fair scheduler waiting tenants",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 71},
+      "id": 18,
+      "targets": [
+        {"expr": "max(evoagent_queue_keyspace_version)", "legendFormat": "keyspace version", "refId": "A"},
+        {"expr": "max(evoagent_queue_redis_cluster_enabled)", "legendFormat": "cluster enabled", "refId": "B"}
+      ],
+      "title": "Redis queue topology",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["evoagent", "slo"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "label": "Prometheus",
+        "name": "DS_PROMETHEUS",
+        "query": "prometheus",
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timezone": "browser",
+  "title": "EvoAgent Enterprise Overview",
+  "uid": "evoagent-enterprise",
+  "version": 1
+}

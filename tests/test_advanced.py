@@ -58,6 +58,38 @@ class AdvancedFeatureTests(unittest.TestCase):
         self.assertNotIn("print(result)", result["content"])
         self.assertEqual({"SEC-HARDCODED-SECRET", "REL-DEBUG-PRINT"}, set(result["rules"]))
 
+    def test_safe_fixer_hardens_cookie_and_yaml_load(self):
+        content = (
+            "import yaml\n"
+            "payload = yaml.load(value)\n"
+            'response.set_cookie("sid", value, secure=False)\n'
+        )
+        findings = [
+            {"path": "app.py", "line": 2, "rule_id": "SEC-YAML-LOAD"},
+            {"path": "app.py", "line": 3, "rule_id": "SEC-INSECURE-COOKIE"},
+        ]
+        result = SafeFixer().apply(content, findings, "app.py")
+        self.assertIn("yaml.safe_load(value)", result["content"])
+        self.assertIn("secure=True", result["content"])
+        self.assertNotIn("yaml.load(value)", result["content"])
+        self.assertNotIn("secure=False", result["content"])
+        self.assertEqual({"SEC-YAML-LOAD", "SEC-INSECURE-COOKIE"}, set(result["rules"]))
+        compile(result["content"], "app.py", "exec")
+
+    def test_safe_fixer_refuses_ambiguous_yaml_load(self):
+        content = "payload = yaml.load(value, Loader=custom_loader)\n"
+        findings = [{"path": "app.py", "line": 1, "rule_id": "SEC-YAML-LOAD"}]
+        result = SafeFixer().apply(content, findings, "app.py")
+        self.assertEqual(content, result["content"])
+        self.assertEqual([], result["rules"])
+
+    def test_safe_fixer_refuses_nonliteral_cookie_security_flag(self):
+        content = 'response.set_cookie("sid", value, secure=secure_by_policy)\n'
+        findings = [{"path": "app.py", "line": 1, "rule_id": "SEC-INSECURE-COOKIE"}]
+        result = SafeFixer().apply(content, findings, "app.py")
+        self.assertEqual(content, result["content"])
+        self.assertEqual([], result["rules"])
+
     def test_deepseek_and_free_openrouter_provider_presets(self):
         deepseek = settings(self.path)
         deepseek = deepseek.__class__(
@@ -75,6 +107,134 @@ class AdvancedFeatureTests(unittest.TestCase):
             }
         )
         self.assertTrue(str(free.resolved_llm()["model"]).endswith(":free"))
+
+    def test_cost_budget_requires_pricing_to_avoid_false_enforcement(self):
+        configured = settings(self.path)
+        configured = configured.__class__(**{**configured.__dict__, "llm_daily_cost_micros": 1000})
+        with self.assertRaisesRegex(ValueError, "pricing is required"):
+            configured.validate_evolution()
+
+    def test_model_reservation_ttl_must_exceed_provider_timeout(self):
+        configured = settings(self.path)
+        configured = configured.__class__(
+            **{
+                **configured.__dict__,
+                "timeout_seconds": 120,
+                "llm_reservation_ttl_seconds": 120,
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "must exceed"):
+            configured.validate_evolution()
+
+    def test_model_capacity_lease_must_exceed_provider_timeout(self):
+        configured = settings(self.path)
+        configured = configured.__class__(
+            **{
+                **configured.__dict__,
+                "timeout_seconds": 120,
+                "llm_capacity_lease_seconds": 120,
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "CAPACITY_LEASE_SECONDS must exceed"):
+            configured.validate_evolution()
+
+    def test_trusted_proxy_networks_must_be_bounded_canonical_cidrs(self):
+        configured = settings(self.path)
+        for cidrs in (
+            ("0.0.0.0/0",),
+            ("10.0.0.1/8",),
+            ("127.0.0.1",),
+            ("not-a-network",),
+        ):
+            with (
+                self.subTest(cidrs=cidrs),
+                self.assertRaisesRegex(ValueError, "EVOAGENT_TRUSTED_PROXY_CIDRS"),
+            ):
+                configured.__class__(
+                    **{**configured.__dict__, "trusted_proxy_cidrs": cidrs}
+                ).validate_evolution()
+
+    def test_model_capacity_window_retention_is_bounded(self):
+        configured = settings(self.path)
+        configured = configured.__class__(
+            **{**configured.__dict__, "llm_capacity_window_retention_hours": 721}
+        )
+        with self.assertRaisesRegex(ValueError, "between 1 and 720"):
+            configured.validate_evolution()
+
+    def test_operational_history_retention_configuration_is_bounded(self):
+        configured = settings(self.path)
+        invalid = (
+            {"history_retention_days": 36_501},
+            {"history_maintenance_seconds": 0},
+            {"history_retention_days": 30, "history_maintenance_seconds": 59},
+            {"history_prune_batch_size": 0},
+            {"history_prune_batch_size": 10_001},
+        )
+        for changes in invalid:
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(ValueError, "EVOAGENT_HISTORY"),
+            ):
+                configured.__class__(**{**configured.__dict__, **changes}).validate_evolution()
+
+    def test_tenant_review_capacity_configuration_is_bounded(self):
+        configured = settings(self.path)
+        invalid = (
+            {"tenant_max_active_reviews": -1},
+            {"tenant_max_active_reviews": 1_000_001},
+            {"tenant_capacity_retry_seconds": 0},
+            {"tenant_capacity_retry_seconds": 3601},
+        )
+        for changes in invalid:
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(ValueError, "EVOAGENT_TENANT"),
+            ):
+                configured.__class__(**{**configured.__dict__, **changes}).validate_evolution()
+
+    def test_tenant_fair_queue_requires_durable_redis(self):
+        configured = settings(self.path)
+        with self.assertRaisesRegex(ValueError, "QUEUE_FAIR_SCHEDULING requires"):
+            configured.__class__(
+                **{**configured.__dict__, "queue_fair_scheduling": True}
+            ).validate_evolution()
+
+        configured.__class__(
+            **{
+                **configured.__dict__,
+                "redis_url": "redis://127.0.0.1:6379/0",
+                "queue_fair_scheduling": True,
+            }
+        ).validate_evolution()
+
+    def test_cluster_queue_requires_a_canonical_namespace_and_database_zero(self):
+        configured = settings(self.path)
+        invalid = (
+            {"queue_namespace": "prod"},
+            {"redis_url": "redis://127.0.0.1:6379/0", "queue_redis_cluster": True},
+            {
+                "redis_url": "redis://127.0.0.1:6379/0",
+                "queue_namespace": "bad/name",
+            },
+            {
+                "redis_url": "redis://127.0.0.1:6379/2",
+                "queue_namespace": "prod",
+                "queue_redis_cluster": True,
+            },
+        )
+        for changes in invalid:
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "QUEUE|CLUSTER"):
+                configured.__class__(**{**configured.__dict__, **changes}).validate_evolution()
+
+        configured.__class__(
+            **{
+                **configured.__dict__,
+                "redis_url": "redis://127.0.0.1:6379/0",
+                "queue_namespace": "prod-eu1",
+                "queue_redis_cluster": True,
+            }
+        ).validate_evolution()
 
     def test_feedback_candidate_is_deferred_without_a_model(self):
         store = TaskStore(self.path)
@@ -323,7 +483,7 @@ class AdvancedFeatureTests(unittest.TestCase):
             if task["state"] in {"SUCCESS", "FAILED"}:
                 break
             time.sleep(0.02)
-        service.queue.close()
+        service.close()
         self.assertEqual("SUCCESS", task["state"])
         self.assertEqual(
             {"SEC-EVAL", "QUALITY-UNFINISHED"},

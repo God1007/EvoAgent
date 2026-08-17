@@ -1,8 +1,9 @@
 """PostgreSQL persistence backend.
 
 The implementation mirrors TaskStore's public API and is selected when
-EVOAGENT_DATABASE_URL starts with postgres. psycopg is an optional production
-dependency so local development can remain zero-config.
+EVOAGENT_DATABASE_URL starts with postgres. The driver and bounded connection
+pool are runtime dependencies; local development remains zero-config because
+SQLite is selected when no database URL is supplied.
 """
 
 import json
@@ -10,8 +11,11 @@ import uuid
 from contextlib import AbstractContextManager
 from typing import Any
 
+from .errors import TenantReviewCapacityError, preserve_safe_summary, safe_exception_summary
+from .migrations import migrate_postgres, validate_current_schema_history
 from .models import ReviewReport, TaskState, TraceEvent
-from .store import utc_now
+from .ports import ApplicationStorePort
+from .store import utc_after, utc_now
 
 
 class PostgresTaskStore:
@@ -21,6 +25,7 @@ class PostgresTaskStore:
         pool_min: int = 1,
         pool_max: int = 10,
         pool_timeout: float = 10.0,
+        auto_migrate: bool = True,
     ):
         try:
             import psycopg
@@ -31,10 +36,11 @@ class PostgresTaskStore:
         self.dict_row = dict_row
         self.url = url
         self.pool_timeout = float(pool_timeout)
+        self.auto_migrate = bool(auto_migrate)
         # A real connection pool avoids a TCP connect + auth handshake on every
         # single query (the previous per-call `psycopg.connect` was the dominant
-        # Postgres cost under load). Import-guarded so `psycopg_pool` stays an
-        # optional dependency and we fall back to per-call connections.
+        # Postgres cost under load). Keep the import guard so a deliberately
+        # stripped/embedder installation fails visibly but can still connect.
         self._pool = None
         if pool_max and pool_max > 0:
             try:
@@ -42,11 +48,10 @@ class PostgresTaskStore:
             except ImportError:
                 print(
                     "WARNING: psycopg_pool not installed; falling back to a new "
-                    "connection per query. Install the 'postgres-pool' extra "
-                    "(pip install psycopg-pool) for pooled connections."
+                    "connection per query. Reinstall EvoAgent with its declared "
+                    "runtime dependencies to enable bounded pooling."
                 )
-                ConnectionPool = None
-            if ConnectionPool is not None:
+            else:
                 try:
                     # open=False + explicit open() avoids the deprecated eager
                     # constructor-open path in psycopg_pool >= 3.2.
@@ -62,7 +67,7 @@ class PostgresTaskStore:
                 except Exception as exc:
                     print(
                         "WARNING: could not create Postgres pool (%s); using per-call connections"
-                        % exc
+                        % safe_exception_summary(exc, "store readiness failed")
                     )
                     self._pool = None
         try:
@@ -91,6 +96,12 @@ class PostgresTaskStore:
         with self._connect() as conn:
             conn.execute("SELECT 1")
 
+    def connected_database_name(self) -> str:
+        """Return the server-reported database, not merely the DSN value."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT current_database() AS database_name").fetchone()
+        return str(row["database_name"])
+
     def pool_stats(self) -> dict[str, int] | None:
         """psycopg_pool stats for metrics, or ``None`` when unpooled."""
         if self._pool is None:
@@ -105,98 +116,121 @@ class PostgresTaskStore:
             self._pool.close()
 
     def _init(self) -> None:
-        statements = [
-            """CREATE TABLE IF NOT EXISTS tasks (
-                id TEXT PRIMARY KEY, state TEXT NOT NULL, repository TEXT NOT NULL,
-                pull_request INTEGER, input_json JSONB NOT NULL, report_json JSONB,
-                error TEXT, created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS trace_events (
-                id BIGSERIAL PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), step INTEGER NOT NULL,
-                state TEXT NOT NULL, message TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS failure_cases (
-                id BIGSERIAL PRIMARY KEY, task_id TEXT NOT NULL, category TEXT NOT NULL,
-                payload_json JSONB NOT NULL, resolved BOOLEAN NOT NULL DEFAULT FALSE,
-                created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS skill_versions (
-                id BIGSERIAL PRIMARY KEY, skill_name TEXT NOT NULL, version INTEGER NOT NULL,
-                prompt TEXT NOT NULL, score DOUBLE PRECISION NOT NULL, active BOOLEAN NOT NULL DEFAULT FALSE,
-                parent_version INTEGER, created_at TIMESTAMPTZ NOT NULL, UNIQUE(skill_name, version))""",
-            """CREATE TABLE IF NOT EXISTS installations (
-                installation_id BIGINT PRIMARY KEY, account_login TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS evaluation_cases (
-                id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE, split TEXT NOT NULL,
-                diff TEXT NOT NULL, expected_json JSONB NOT NULL, source TEXT NOT NULL,
-                active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS evolution_runs (
-                id TEXT PRIMARY KEY, skill_name TEXT NOT NULL, candidate_version INTEGER NOT NULL,
-                baseline_version INTEGER, decision TEXT NOT NULL, candidate_score DOUBLE PRECISION NOT NULL,
-                baseline_score DOUBLE PRECISION NOT NULL, metrics_json JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL)""",
-            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'",
-            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN NOT NULL DEFAULT FALSE",
-            "ALTER TABLE installations ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default'",
-            """CREATE TABLE IF NOT EXISTS checkpoints (
-                task_id TEXT NOT NULL REFERENCES tasks(id), node TEXT NOT NULL, status TEXT NOT NULL,
-                attempt INTEGER NOT NULL DEFAULT 1, state_json JSONB NOT NULL, error TEXT,
-                updated_at TIMESTAMPTZ NOT NULL, PRIMARY KEY(task_id,node))""",
-            """CREATE TABLE IF NOT EXISTS task_payloads (
-                task_id TEXT PRIMARY KEY REFERENCES tasks(id), diff TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS agent_messages (
-                id BIGSERIAL PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id),
-                sender TEXT NOT NULL, recipient TEXT NOT NULL, kind TEXT NOT NULL,
-                correlation_id TEXT NOT NULL, content_json JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS webhook_deliveries (
-                delivery_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, event_type TEXT NOT NULL,
-                payload_sha256 TEXT NOT NULL, task_id TEXT, received_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS users (
-                id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
-                active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS memberships (
-                user_id TEXT NOT NULL REFERENCES users(id), tenant_id TEXT NOT NULL, role TEXT NOT NULL,
-                PRIMARY KEY(user_id,tenant_id))""",
-            """CREATE TABLE IF NOT EXISTS repository_grants (
-                tenant_id TEXT NOT NULL, repository TEXT NOT NULL, auto_fix BOOLEAN NOT NULL DEFAULT FALSE,
-                PRIMARY KEY(tenant_id,repository))""",
-            """CREATE TABLE IF NOT EXISTS audit_log (
-                id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, actor TEXT NOT NULL,
-                action TEXT NOT NULL, resource TEXT NOT NULL, detail_json JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL)""",
-            """CREATE TABLE IF NOT EXISTS deployments (
-                tenant_id TEXT NOT NULL, skill_name TEXT NOT NULL, stable_version INTEGER,
-                candidate_version INTEGER, canary_percent INTEGER NOT NULL DEFAULT 0,
-                shadow_percent INTEGER NOT NULL DEFAULT 0, max_error_rate DOUBLE PRECISION NOT NULL DEFAULT .1,
-                min_samples INTEGER NOT NULL DEFAULT 20, status TEXT NOT NULL DEFAULT 'stable',
-                samples INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0,
-                updated_at TIMESTAMPTZ NOT NULL, PRIMARY KEY(tenant_id,skill_name))""",
-            """CREATE TABLE IF NOT EXISTS alerts (
-                id BIGSERIAL PRIMARY KEY, tenant_id TEXT NOT NULL, alert_key TEXT NOT NULL,
-                severity TEXT NOT NULL, message TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
-                created_at TIMESTAMPTZ NOT NULL, updated_at TIMESTAMPTZ NOT NULL,
-                UNIQUE(tenant_id,alert_key,status))""",
-            """CREATE TABLE IF NOT EXISTS review_sessions (
-                id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, repository TEXT NOT NULL,
-                pull_request INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'open',
-                latest_head_sha TEXT, pending_input TEXT, created_at TIMESTAMPTZ NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL, UNIQUE(tenant_id,repository,pull_request))""",
-            """CREATE TABLE IF NOT EXISTS session_turns (
-                id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES review_sessions(id),
-                task_id TEXT, head_sha TEXT, trigger TEXT NOT NULL, sequence INTEGER NOT NULL,
-                summary_json JSONB, created_at TIMESTAMPTZ NOT NULL,
-                UNIQUE(session_id, sequence))""",
-            """CREATE TABLE IF NOT EXISTS session_findings (
-                id BIGSERIAL PRIMARY KEY, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
-                fingerprint TEXT NOT NULL, status TEXT NOT NULL, snapshot_json JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL)""",
-            "CREATE INDEX IF NOT EXISTS idx_session_turns_session "
-            "ON session_turns(session_id, sequence)",
-            "CREATE INDEX IF NOT EXISTS idx_session_findings_turn ON session_findings(turn_id)",
-        ]
         with self._connect() as conn:
-            with conn.cursor() as cur:
-                for statement in statements:
-                    cur.execute(statement)
+            if self.auto_migrate:
+                self._schema_version = migrate_postgres(conn)
+            else:
+                rows = conn.execute(
+                    "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
+                ).fetchall()
+                self._schema_version = validate_current_schema_history(list(rows))
+
+    def schema_version(self) -> int:
+        return self._schema_version
+
+    def prune_operational_history(
+        self,
+        trace_before: str,
+        session_before: str,
+        batch_size: int,
+        pruned_at: str,
+    ) -> dict[str, int]:
+        """Prune inactive history in bounded, replica-safe transactions."""
+        bounded = max(1, min(int(batch_size), 10_000))
+        terminal_states = (
+            TaskState.SUCCESS.value,
+            TaskState.FAILED.value,
+            TaskState.CANCELLED.value,
+        )
+        with self._connect() as conn:
+            trace_rows = conn.execute(
+                "SELECT events.id,events.task_id FROM trace_events AS events "
+                "JOIN tasks AS task ON task.id=events.task_id "
+                "WHERE events.created_at<%s AND task.state=ANY(%s) "
+                "AND events.id<>(SELECT MAX(latest.id) FROM trace_events AS latest "
+                "WHERE latest.task_id=events.task_id) "
+                "ORDER BY events.created_at,events.id LIMIT %s "
+                "FOR UPDATE OF events SKIP LOCKED",
+                (trace_before, list(terminal_states), bounded),
+            ).fetchall()
+            trace_ids = [int(row["id"]) for row in trace_rows]
+            task_ids = sorted({str(row["task_id"]) for row in trace_rows})
+            if trace_ids:
+                conn.execute("DELETE FROM trace_events WHERE id=ANY(%s)", (trace_ids,))
+                conn.execute(
+                    "UPDATE tasks SET trace_pruned_at=COALESCE(trace_pruned_at,%s) "
+                    "WHERE id=ANY(%s)",
+                    (pruned_at, task_ids),
+                )
+
+            candidates = conn.execute(
+                "SELECT turn.id,turn.session_id FROM session_turns AS turn "
+                "WHERE turn.summary_json IS NOT NULL AND turn.findings_pruned_at IS NULL "
+                "AND EXISTS (SELECT 1 FROM session_findings AS finding "
+                "WHERE finding.turn_id=turn.id AND finding.created_at<%s) "
+                "AND NOT EXISTS (SELECT 1 FROM session_findings AS finding "
+                "WHERE finding.turn_id=turn.id AND finding.created_at>=%s) "
+                "AND EXISTS (SELECT 1 FROM session_turns AS later "
+                "WHERE later.session_id=turn.session_id AND later.summary_json IS NOT NULL "
+                "AND later.sequence>turn.sequence) "
+                "AND NOT EXISTS (SELECT 1 FROM session_turns AS pending "
+                "WHERE pending.session_id=turn.session_id AND pending.summary_json IS NULL "
+                "AND pending.sequence>turn.sequence AND NOT EXISTS ("
+                "SELECT 1 FROM session_turns AS middle "
+                "WHERE middle.session_id=turn.session_id AND middle.summary_json IS NOT NULL "
+                "AND middle.sequence>turn.sequence AND middle.sequence<pending.sequence)) "
+                "ORDER BY turn.created_at,turn.id LIMIT %s",
+                (session_before, session_before, bounded),
+            ).fetchall()
+            candidate_ids = [str(row["id"]) for row in candidates]
+            for session_id in sorted({str(row["session_id"]) for row in candidates}):
+                conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    ("session-state:%s" % session_id,),
+                )
+
+            turn_ids: list[str] = []
+            if candidate_ids:
+                # Re-evaluate after acquiring every session lock: a new pending
+                # turn may have appeared between candidate discovery and lock.
+                eligible = conn.execute(
+                    "SELECT turn.id FROM session_turns AS turn "
+                    "WHERE turn.id=ANY(%s) AND turn.summary_json IS NOT NULL "
+                    "AND turn.findings_pruned_at IS NULL "
+                    "AND EXISTS (SELECT 1 FROM session_findings AS finding "
+                    "WHERE finding.turn_id=turn.id AND finding.created_at<%s) "
+                    "AND NOT EXISTS (SELECT 1 FROM session_findings AS finding "
+                    "WHERE finding.turn_id=turn.id AND finding.created_at>=%s) "
+                    "AND EXISTS (SELECT 1 FROM session_turns AS later "
+                    "WHERE later.session_id=turn.session_id AND later.summary_json IS NOT NULL "
+                    "AND later.sequence>turn.sequence) "
+                    "AND NOT EXISTS (SELECT 1 FROM session_turns AS pending "
+                    "WHERE pending.session_id=turn.session_id AND pending.summary_json IS NULL "
+                    "AND pending.sequence>turn.sequence AND NOT EXISTS ("
+                    "SELECT 1 FROM session_turns AS middle "
+                    "WHERE middle.session_id=turn.session_id AND middle.summary_json IS NOT NULL "
+                    "AND middle.sequence>turn.sequence AND middle.sequence<pending.sequence))",
+                    (candidate_ids, session_before, session_before),
+                ).fetchall()
+                turn_ids = [str(row["id"]) for row in eligible]
+            findings_pruned = 0
+            if turn_ids:
+                findings_pruned = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS count FROM session_findings WHERE turn_id=ANY(%s)",
+                        (turn_ids,),
+                    ).fetchone()["count"]
+                )
+                conn.execute(
+                    "UPDATE session_turns SET findings_pruned_at=%s WHERE id=ANY(%s)",
+                    (pruned_at, turn_ids),
+                )
+                conn.execute("DELETE FROM session_findings WHERE turn_id=ANY(%s)", (turn_ids,))
+        return {
+            "trace_events": len(trace_ids),
+            "session_turns": len(turn_ids),
+            "session_findings": findings_pruned,
+        }
 
     def create(
         self,
@@ -224,6 +258,1033 @@ class PostgresTaskStore:
                 ),
             )
 
+    def create_review_task(
+        self,
+        task_id: str,
+        repository: str,
+        pull_request: int | None,
+        payload: dict[str, Any],
+        tenant_id: str,
+        diff: str | None = None,
+        outbox_payload: dict[str, Any] | None = None,
+        max_active_reviews: int = 0,
+    ) -> None:
+        """Persist task, optional diff, and queue intent in one transaction."""
+        now = utc_now()
+        limit = max(0, int(max_active_reviews))
+        rejected = False
+        with self._connect() as conn:
+            self._lock_tenant_admission(conn, tenant_id)
+            active = self._active_admission_count(conn, tenant_id)
+            if limit and active >= limit:
+                self._record_admission_rejection(
+                    conn,
+                    tenant_id,
+                    repository,
+                    active,
+                    limit,
+                    str(payload.get("source", "review")),
+                    now,
+                )
+                rejected = True
+            else:
+                conn.execute(
+                    "INSERT INTO tasks(id,state,repository,pull_request,input_json,report_json,"
+                    "error,created_at,updated_at,tenant_id,cancel_requested) "
+                    "VALUES (%s,%s,%s,%s,%s::jsonb,NULL,NULL,%s,%s,%s,FALSE)",
+                    (
+                        task_id,
+                        TaskState.PENDING.value,
+                        repository,
+                        pull_request,
+                        json.dumps(payload, ensure_ascii=False),
+                        now,
+                        now,
+                        tenant_id,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO task_admissions(task_id,tenant_id,active,release_on_failure,"
+                    "generation,acquired_at) VALUES (%s,%s,TRUE,%s,1,%s)",
+                    (task_id, tenant_id, outbox_payload is None, now),
+                )
+                if diff is not None:
+                    conn.execute(
+                        "INSERT INTO task_payloads(task_id,diff,created_at) VALUES (%s,%s,%s)",
+                        (task_id, diff, now),
+                    )
+                if outbox_payload is not None:
+                    conn.execute(
+                        "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,"
+                        "attempts,available_at,created_at,updated_at) "
+                        "VALUES (%s,%s,%s,%s::jsonb,'pending',0,%s,%s,%s)",
+                        (
+                            "review:" + task_id,
+                            "review",
+                            task_id,
+                            json.dumps(
+                                {**outbox_payload, "admission_generation": 1},
+                                ensure_ascii=False,
+                            ),
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+        if rejected:
+            raise TenantReviewCapacityError()
+
+    @staticmethod
+    def _lock_tenant_admission(conn, tenant_id: str) -> None:
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            ("tenant-review-admission:%s" % tenant_id,),
+        )
+
+    @staticmethod
+    def _active_admission_count(conn, tenant_id: str | None = None) -> int:
+        if tenant_id is None:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM task_admissions WHERE active=TRUE"
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM task_admissions WHERE tenant_id=%s AND active=TRUE",
+                (tenant_id,),
+            ).fetchone()
+        return int(row["count"])
+
+    @staticmethod
+    def _record_admission_rejection(
+        conn,
+        tenant_id: str,
+        resource: str,
+        active: int,
+        limit: int,
+        source: str,
+        now: str,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO audit_log(tenant_id,actor,action,resource,detail_json,created_at) "
+            "VALUES (%s,'system','review.capacity-rejected',%s,%s::jsonb,%s)",
+            (
+                tenant_id,
+                resource[:250],
+                json.dumps(
+                    {"active": active, "limit": limit, "source": source[:64]},
+                    ensure_ascii=False,
+                ),
+                now,
+            ),
+        )
+
+    def tenant_review_admission_stats(self, tenant_id: str | None = None) -> dict[str, Any]:
+        with self._connect() as conn:
+            if tenant_id is None:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS active,MIN(acquired_at) AS oldest_acquired_at "
+                    "FROM task_admissions WHERE active=TRUE"
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS active,MIN(acquired_at) AS oldest_acquired_at "
+                    "FROM task_admissions WHERE tenant_id=%s AND active=TRUE",
+                    (tenant_id,),
+                ).fetchone()
+        oldest = row["oldest_acquired_at"]
+        return {
+            "active": int(row["active"]),
+            "oldest_acquired_at": oldest.isoformat() if oldest is not None else None,
+        }
+
+    def release_review_admission(
+        self, task_id: str, reason: str, generation: int | None = None
+    ) -> bool:
+        if reason not in {"success", "cancelled", "failed", "dead-letter"}:
+            raise ValueError("unsupported review admission release reason")
+        with self._connect() as conn:
+            query = (
+                "UPDATE task_admissions SET active=FALSE,released_at=%s,release_reason=%s "
+                "WHERE task_id=%s AND active=TRUE"
+            )
+            params: list[Any] = [utc_now(), reason, task_id]
+            if generation is not None:
+                query += " AND generation=%s"
+                params.append(int(generation))
+            cursor = conn.execute(query, params)
+        return cursor.rowcount > 0
+
+    def resume_review_task(
+        self,
+        task_id: str,
+        tenant_id: str,
+        max_active_reviews: int,
+        outbox_id: str,
+        message_key: str,
+        outbox_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        limit = max(0, int(max_active_reviews))
+        rejected = False
+        result: dict[str, Any]
+        with self._connect() as conn:
+            self._lock_tenant_admission(conn, tenant_id)
+            row = conn.execute(
+                "SELECT task.state,task.repository,admission.active,admission.generation "
+                "FROM tasks AS task "
+                "LEFT JOIN task_admissions AS admission ON admission.task_id=task.id "
+                "WHERE task.id=%s AND task.tenant_id=%s FOR UPDATE OF task",
+                (task_id, tenant_id),
+            ).fetchone()
+            if row is None:
+                result = {"status": "missing"}
+            elif row["state"] in {TaskState.SUCCESS.value, TaskState.CANCELLED.value}:
+                result = {"status": str(row["state"]).lower()}
+            elif bool(row["active"]):
+                result = {"status": "active"}
+            else:
+                active = self._active_admission_count(conn, tenant_id)
+                if limit and active >= limit:
+                    self._record_admission_rejection(
+                        conn,
+                        tenant_id,
+                        str(row["repository"]),
+                        active,
+                        limit,
+                        "resume",
+                        now,
+                    )
+                    rejected = True
+                    result = {"status": "rejected"}
+                else:
+                    generation = int(row["generation"] or 0) + 1
+                    conn.execute(
+                        "INSERT INTO task_admissions(task_id,tenant_id,active,"
+                        "release_on_failure,generation,acquired_at,released_at,release_reason) "
+                        "VALUES (%s,%s,TRUE,FALSE,%s,%s,NULL,NULL) "
+                        "ON CONFLICT(task_id) DO UPDATE SET "
+                        "tenant_id=EXCLUDED.tenant_id,active=TRUE,release_on_failure=FALSE,"
+                        "generation=EXCLUDED.generation,acquired_at=EXCLUDED.acquired_at,"
+                        "released_at=NULL,release_reason=NULL",
+                        (task_id, tenant_id, generation, now),
+                    )
+                    conn.execute(
+                        "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,"
+                        "attempts,available_at,created_at,updated_at) "
+                        "VALUES (%s,'review',%s,%s::jsonb,'pending',0,%s,%s,%s)",
+                        (
+                            outbox_id,
+                            message_key,
+                            json.dumps(
+                                {**outbox_payload, "admission_generation": generation},
+                                ensure_ascii=False,
+                            ),
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                    result = {"status": "resumed", "generation": generation}
+        if rejected:
+            raise TenantReviewCapacityError()
+        return result
+
+    def claim_outbox(
+        self,
+        owner: str,
+        limit: int,
+        lease_seconds: float,
+        max_attempts: int,
+    ) -> list[dict[str, Any]]:
+        now = utc_now()
+        lease_until = utc_after(lease_seconds)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM outbox_messages WHERE attempts < %s AND "
+                "((status='pending' AND available_at<=%s) OR "
+                "(status='publishing' AND lease_until<%s)) "
+                "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT %s",
+                (max_attempts, now, now, max(1, min(limit, 500))),
+            ).fetchall()
+            claimed = []
+            for row in rows:
+                conn.execute(
+                    "UPDATE outbox_messages SET status='publishing',attempts=attempts+1,"
+                    "lease_owner=%s,lease_until=%s,updated_at=%s WHERE id=%s",
+                    (owner, lease_until, now, row["id"]),
+                )
+                item = dict(row)
+                item["attempts"] = int(item["attempts"]) + 1
+                raw_payload = item.pop("payload_json")
+                item["payload"] = (
+                    json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+                )
+                claimed.append(item)
+        return claimed
+
+    def mark_outbox_published(self, message_id: str, owner: str) -> bool:
+        now = utc_now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE outbox_messages SET status='published',published_at=%s,updated_at=%s,"
+                "lease_owner=NULL,lease_until=NULL,last_error=NULL "
+                "WHERE id=%s AND status='publishing' AND lease_owner=%s",
+                (now, now, message_id, owner),
+            )
+        return cursor.rowcount > 0
+
+    def release_outbox(
+        self,
+        message_id: str,
+        owner: str,
+        error: str,
+        retry_delay_seconds: float,
+        max_attempts: int,
+    ) -> bool:
+        now = utc_now()
+        available_at = utc_after(retry_delay_seconds)
+        error = preserve_safe_summary(error, "outbox dispatch failed")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE outbox_messages SET "
+                "status=CASE WHEN attempts>=%s THEN 'dead' ELSE 'pending' END,"
+                "available_at=%s,lease_owner=NULL,lease_until=NULL,last_error=%s,updated_at=%s "
+                "WHERE id=%s AND status='publishing' AND lease_owner=%s",
+                (max_attempts, available_at, error[:2000], now, message_id, owner),
+            )
+        return cursor.rowcount > 0
+
+    def outbox_stats(self) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS total,"
+                "COUNT(*) FILTER(WHERE status='pending') AS pending,"
+                "COUNT(*) FILTER(WHERE status='publishing') AS publishing,"
+                "COUNT(*) FILTER(WHERE status='dead') AS dead,"
+                "EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - "
+                "MIN(created_at) FILTER(WHERE status IN ('pending','publishing')))) "
+                "AS oldest_age_seconds FROM outbox_messages"
+            ).fetchone()
+        result: dict[str, Any] = {
+            key: int(row[key] or 0) for key in ("total", "pending", "publishing", "dead")
+        }
+        result["oldest_age_seconds"] = float(row["oldest_age_seconds"] or 0.0)
+        return result
+
+    def list_outbox(self, status: str = "dead", limit: int = 100) -> list:
+        if status not in {"pending", "publishing", "published", "dead"}:
+            raise ValueError("unsupported outbox status")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM outbox_messages WHERE status=%s ORDER BY created_at DESC LIMIT %s",
+                (status, max(1, min(limit, 500))),
+            ).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            raw_payload = item.pop("payload_json")
+            item["payload"] = (
+                json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+            )
+            values.append(item)
+        return values
+
+    def requeue_outbox(self, message_id: str) -> bool:
+        now = utc_now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE outbox_messages SET status='pending',attempts=0,available_at=%s,"
+                "lease_owner=NULL,lease_until=NULL,last_error=NULL,updated_at=%s "
+                "WHERE id=%s AND status='dead'",
+                (now, now, message_id),
+            )
+        return cursor.rowcount > 0
+
+    def queue_recovery_candidates(self, limit: int) -> list[dict[str, Any]]:
+        """Describe incomplete or delivery-managed task intents without mutation."""
+        bounded = max(1, min(int(limit), 100_001))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT t.id,t.repository,t.pull_request,t.tenant_id,o.status AS outbox_status,"
+                "o.payload_json,(p.task_id IS NOT NULL) AS has_payload,"
+                "a.generation AS admission_generation "
+                "FROM tasks t LEFT JOIN outbox_messages o ON o.id='review:'||t.id "
+                "LEFT JOIN task_payloads p ON p.task_id=t.id "
+                "LEFT JOIN task_admissions a ON a.task_id=t.id "
+                "WHERE t.cancel_requested=FALSE AND (t.state NOT IN (%s,%s,%s) "
+                "OR (t.state=%s AND a.active=TRUE)) "
+                "ORDER BY t.created_at,t.id LIMIT %s",
+                (
+                    TaskState.SUCCESS.value,
+                    TaskState.FAILED.value,
+                    TaskState.CANCELLED.value,
+                    TaskState.FAILED.value,
+                    bounded,
+                ),
+            ).fetchall()
+        candidates = []
+        for row in rows:
+            raw_payload = row["payload_json"]
+            payload = (
+                json.loads(raw_payload)
+                if isinstance(raw_payload, str)
+                else raw_payload
+                if raw_payload is not None
+                else {
+                    "task_id": row["id"],
+                    "repository": row["repository"],
+                    "pull_request": row["pull_request"],
+                    "tenant_id": row["tenant_id"],
+                }
+                if row["has_payload"]
+                else None
+            )
+            if isinstance(payload, dict):
+                payload = {
+                    **payload,
+                    "task_id": row["id"],
+                    "repository": row["repository"],
+                    "pull_request": row["pull_request"],
+                    "tenant_id": row["tenant_id"],
+                }
+                if row["admission_generation"] is not None:
+                    payload["admission_generation"] = int(row["admission_generation"])
+            recoverable = isinstance(payload, dict)
+            candidates.append(
+                {
+                    "task_id": row["id"],
+                    "tenant_id": row["tenant_id"],
+                    "outbox_status": row["outbox_status"] or "missing",
+                    "payload": payload,
+                    "recoverable": recoverable,
+                    "reason": "" if recoverable else "valid recovery payload is missing",
+                }
+            )
+        return candidates
+
+    def get_queue_recovery(self, recovery_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT detail_json,created_at FROM audit_log "
+                "WHERE tenant_id='system' AND action='recovery.queue.stage' AND resource=%s "
+                "ORDER BY id DESC LIMIT 1",
+                (recovery_id,),
+            ).fetchone()
+        if not row:
+            return None
+        detail = row["detail_json"]
+        return {
+            **(json.loads(detail) if isinstance(detail, str) else detail),
+            "created_at": row["created_at"],
+        }
+
+    def stage_queue_recovery(
+        self,
+        recovery_id: str,
+        plan_sha256: str,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))", ("queue-recovery:" + recovery_id,)
+            )
+            existing = conn.execute(
+                "SELECT detail_json FROM audit_log WHERE tenant_id='system' "
+                "AND action='recovery.queue.stage' AND resource=%s ORDER BY id DESC LIMIT 1",
+                (recovery_id,),
+            ).fetchone()
+            if existing:
+                raw_detail = existing["detail_json"]
+                detail = json.loads(raw_detail) if isinstance(raw_detail, str) else raw_detail
+                if detail.get("plan_sha256") != plan_sha256:
+                    raise ValueError("recovery id was already used for a different plan")
+                return {**detail, "already_applied": True}
+            staged = 0
+            skipped_terminal = 0
+            skipped_unrecoverable = 0
+            preserved_outbox_history = 0
+            tenants = set()
+            for candidate in candidates:
+                task = conn.execute(
+                    "SELECT state,cancel_requested,tenant_id,EXISTS(SELECT 1 FROM "
+                    "task_admissions a WHERE a.task_id=tasks.id AND a.active=TRUE) "
+                    "AS admission_active FROM tasks WHERE id=%s FOR UPDATE",
+                    (candidate["task_id"],),
+                ).fetchone()
+                if (
+                    not task
+                    or task["state"] in {TaskState.SUCCESS.value, TaskState.CANCELLED.value}
+                    or (
+                        task["state"] == TaskState.FAILED.value
+                        and not bool(task["admission_active"])
+                    )
+                    or bool(task["cancel_requested"])
+                ):
+                    skipped_terminal += 1
+                    continue
+                payload = candidate.get("payload")
+                if not isinstance(payload, dict):
+                    skipped_unrecoverable += 1
+                    continue
+                message_id = "review:" + candidate["task_id"]
+                serialized = json.dumps(payload, ensure_ascii=False)
+                outbox = conn.execute(
+                    "SELECT status FROM outbox_messages WHERE id=%s FOR UPDATE", (message_id,)
+                ).fetchone()
+                if outbox and outbox["status"] in {"published", "dead"}:
+                    recovery_message_id = "recovery:%s:%s" % (
+                        recovery_id,
+                        candidate["task_id"],
+                    )
+                    conn.execute(
+                        "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,"
+                        "attempts,available_at,created_at,updated_at) "
+                        "VALUES (%s,'review',%s,%s::jsonb,'pending',0,%s,%s,%s)",
+                        (
+                            recovery_message_id,
+                            "%s:%s" % (recovery_id, candidate["task_id"]),
+                            serialized,
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                    preserved_outbox_history += 1
+                elif outbox:
+                    conn.execute(
+                        "UPDATE outbox_messages SET payload_json=%s::jsonb,status='pending',"
+                        "attempts=0,available_at=%s,lease_owner=NULL,lease_until=NULL,"
+                        "last_error=NULL,updated_at=%s WHERE id=%s",
+                        (serialized, now, now, message_id),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,"
+                        "attempts,available_at,created_at,updated_at) "
+                        "VALUES (%s,'review',%s,%s::jsonb,'pending',0,%s,%s,%s)",
+                        (message_id, candidate["task_id"], serialized, now, now, now),
+                    )
+                staged += 1
+                tenants.add(str(task["tenant_id"]))
+            detail = {
+                "recovery_id": recovery_id,
+                "plan_sha256": plan_sha256,
+                "candidate_count": len(candidates),
+                "staged": staged,
+                "skipped_terminal": skipped_terminal,
+                "skipped_unrecoverable": skipped_unrecoverable,
+                "preserved_outbox_history": preserved_outbox_history,
+                "tenant_count": len(tenants),
+            }
+            conn.execute(
+                "INSERT INTO audit_log(tenant_id,actor,action,resource,detail_json,created_at) "
+                "VALUES ('system','evoagent-recover','recovery.queue.stage',%s,%s::jsonb,%s)",
+                (recovery_id, json.dumps(detail, ensure_ascii=False), now),
+            )
+        return {**detail, "already_applied": False}
+
+    def acquire_model_route_capacity(
+        self,
+        record: dict[str, Any],
+        max_inflight: int = 0,
+        requests_per_minute: int = 0,
+    ) -> dict[str, Any]:
+        """Atomically claim one shared route slot and fixed-window request unit."""
+        if max_inflight < 0 or requests_per_minute < 0:
+            raise ValueError("model route capacity limits must be non-negative")
+        topology = record["topology_sha256"]
+        route_id = record["route_id"]
+        now = record["now"]
+        window_start = record["window_start"]
+        with self._connect() as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                ("model-capacity:%s" % route_id,),
+            )
+            conn.execute(
+                "DELETE FROM model_route_capacity_leases WHERE route_id=%s AND expires_at<=%s",
+                (route_id, now),
+            )
+            conn.execute(
+                "DELETE FROM model_route_capacity_windows WHERE route_id=%s AND window_start<%s",
+                (route_id, record["retention_cutoff"]),
+            )
+            active = conn.execute(
+                "SELECT COUNT(*) AS count,MIN(expires_at) AS retry_at "
+                "FROM model_route_capacity_leases WHERE route_id=%s AND expires_at>%s",
+                (route_id, now),
+            ).fetchone()
+            if max_inflight and int(active["count"]) >= max_inflight:
+                conn.execute(
+                    "INSERT INTO model_route_capacity_windows(topology_sha256,route_id,"
+                    "window_start,concurrency_rejections,updated_at) VALUES (%s,%s,%s,1,%s) "
+                    "ON CONFLICT(topology_sha256,route_id,window_start) DO UPDATE SET "
+                    "concurrency_rejections=model_route_capacity_windows."
+                    "concurrency_rejections+1,updated_at=EXCLUDED.updated_at",
+                    (topology, route_id, window_start, now),
+                )
+                retry_at = active["retry_at"]
+                return {
+                    "admitted": False,
+                    "reason": "concurrency",
+                    "retry_at": retry_at.isoformat() if retry_at else None,
+                }
+            window = conn.execute(
+                "SELECT COALESCE(SUM(admitted),0) AS admitted "
+                "FROM model_route_capacity_windows WHERE route_id=%s AND window_start=%s",
+                (route_id, window_start),
+            ).fetchone()
+            if requests_per_minute and int(window["admitted"]) >= requests_per_minute:
+                conn.execute(
+                    "INSERT INTO model_route_capacity_windows(topology_sha256,route_id,"
+                    "window_start,rate_rejections,updated_at) VALUES (%s,%s,%s,1,%s) "
+                    "ON CONFLICT(topology_sha256,route_id,window_start) DO UPDATE SET "
+                    "rate_rejections=model_route_capacity_windows.rate_rejections+1,"
+                    "updated_at=EXCLUDED.updated_at",
+                    (topology, route_id, window_start, now),
+                )
+                return {
+                    "admitted": False,
+                    "reason": "rate",
+                    "retry_at": record["window_end"],
+                }
+            conn.execute(
+                "INSERT INTO model_route_capacity_windows(topology_sha256,route_id,window_start,"
+                "admitted,updated_at) VALUES (%s,%s,%s,1,%s) "
+                "ON CONFLICT(topology_sha256,route_id,window_start) DO UPDATE SET "
+                "admitted=model_route_capacity_windows.admitted+1,updated_at=EXCLUDED.updated_at",
+                (topology, route_id, window_start, now),
+            )
+            lease_id = ""
+            if max_inflight:
+                lease_id = record["lease_id"]
+                conn.execute(
+                    "INSERT INTO model_route_capacity_leases(lease_id,topology_sha256,route_id,"
+                    "root_request_id,expires_at,created_at) VALUES (%s,%s,%s,%s,%s,%s)",
+                    (
+                        lease_id,
+                        topology,
+                        route_id,
+                        record["root_request_id"],
+                        record["expires_at"],
+                        now,
+                    ),
+                )
+        return {"admitted": True, "reason": "", "retry_at": None, "lease_id": lease_id}
+
+    def release_model_route_capacity(self, lease_id: str) -> bool:
+        if not lease_id:
+            return False
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM model_route_capacity_leases WHERE lease_id=%s", (lease_id,)
+            )
+        return cursor.rowcount > 0
+
+    def model_route_capacity_stats(
+        self,
+        route_id: str,
+        now: str,
+        window_start: str,
+    ) -> dict[str, Any]:
+        with self._connect() as conn:
+            active = conn.execute(
+                "SELECT COUNT(*) AS active_inflight,MIN(expires_at) AS earliest_expiry "
+                "FROM model_route_capacity_leases WHERE route_id=%s AND expires_at>%s",
+                (route_id, now),
+            ).fetchone()
+            window = conn.execute(
+                "SELECT COALESCE(SUM(admitted),0) AS admitted,"
+                "COALESCE(SUM(concurrency_rejections),0) AS concurrency_rejections,"
+                "COALESCE(SUM(rate_rejections),0) AS rate_rejections "
+                "FROM model_route_capacity_windows WHERE route_id=%s AND window_start=%s",
+                (route_id, window_start),
+            ).fetchone()
+        earliest = active["earliest_expiry"]
+        return {
+            "active_inflight": int(active["active_inflight"]),
+            "earliest_expiry": earliest.isoformat() if earliest else None,
+            "admitted_this_minute": int(window["admitted"]),
+            "concurrency_rejections_this_minute": int(window["concurrency_rejections"]),
+            "rate_rejections_this_minute": int(window["rate_rejections"]),
+        }
+
+    def reserve_model_usage(
+        self,
+        record: dict[str, Any],
+        period_start: str,
+        token_budget: int = 0,
+        cost_budget_micros: int = 0,
+        lane_token_budget: int = 0,
+        lane_cost_budget_micros: int = 0,
+    ) -> bool:
+        """Atomically enforce one repository's period budget and reserve capacity."""
+        if record.get("lane", "active") not in {"active", "shadow"}:
+            raise ValueError("model usage lane must be active or shadow")
+        with self._connect() as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (
+                    "model-budget:%s:%s:%s"
+                    % (record["tenant_id"], record["repository"], period_start[:10]),
+                ),
+            )
+            used = conn.execute(
+                "SELECT COALESCE(SUM(CASE WHEN status IN ('reserved','uncertain') "
+                "THEN reserved_tokens "
+                "ELSE input_tokens+output_tokens END),0) AS tokens,"
+                "COALESCE(SUM(CASE WHEN status IN ('reserved','uncertain') "
+                "THEN reserved_cost_micros "
+                "ELSE cost_micros END),0) AS cost FROM model_usage "
+                "WHERE tenant_id=%s AND repository=%s AND created_at>=%s "
+                "AND status IN ('reserved','uncertain','success','failed')",
+                (record["tenant_id"], record["repository"], period_start),
+            ).fetchone()
+            if (
+                token_budget > 0
+                and int(used["tokens"]) + int(record["reserved_tokens"]) > token_budget
+            ):
+                return False
+            if (
+                cost_budget_micros > 0
+                and int(used["cost"]) + int(record["reserved_cost_micros"]) > cost_budget_micros
+            ):
+                return False
+            lane = record.get("lane", "active")
+            if lane_token_budget > 0 or lane_cost_budget_micros > 0:
+                lane_used = conn.execute(
+                    "SELECT COALESCE(SUM(CASE WHEN status IN ('reserved','uncertain') "
+                    "THEN reserved_tokens ELSE input_tokens+output_tokens END),0) AS tokens,"
+                    "COALESCE(SUM(CASE WHEN status IN ('reserved','uncertain') "
+                    "THEN reserved_cost_micros ELSE cost_micros END),0) AS cost "
+                    "FROM model_usage WHERE tenant_id=%s AND repository=%s AND created_at>=%s "
+                    "AND lane=%s AND status IN ('reserved','uncertain','success','failed')",
+                    (record["tenant_id"], record["repository"], period_start, lane),
+                ).fetchone()
+                if (
+                    lane_token_budget > 0
+                    and int(lane_used["tokens"]) + int(record["reserved_tokens"])
+                    > lane_token_budget
+                ):
+                    return False
+                if (
+                    lane_cost_budget_micros > 0
+                    and int(lane_used["cost"]) + int(record["reserved_cost_micros"])
+                    > lane_cost_budget_micros
+                ):
+                    return False
+            conn.execute(
+                "INSERT INTO model_usage(request_id,root_request_id,route_id,attempt,tenant_id,"
+                "repository,task_id,purpose,provider,model,status,reserved_tokens,"
+                "reserved_cost_micros,redactions,request_sha256,lane,topology_sha256,created_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'reserved',%s,%s,%s,%s,%s,%s,%s)",
+                (
+                    record["request_id"],
+                    record.get("root_request_id") or record["request_id"],
+                    record.get("route_id") or "%s-%s" % (record["provider"], record["model"]),
+                    record.get("attempt", 1),
+                    record["tenant_id"],
+                    record["repository"],
+                    record.get("task_id"),
+                    record["purpose"],
+                    record["provider"],
+                    record["model"],
+                    record["reserved_tokens"],
+                    record.get("reserved_cost_micros", 0),
+                    record.get("redactions", 0),
+                    record["request_sha256"],
+                    record.get("lane", "active"),
+                    record.get("topology_sha256") or None,
+                    record.get("created_at") or utc_now(),
+                ),
+            )
+        return True
+
+    def complete_model_usage(
+        self,
+        request_id: str,
+        status: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_micros: int,
+        error: str = "",
+    ) -> bool:
+        if status not in {"success", "failed"}:
+            raise ValueError("model usage status must be success or failed")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE model_usage SET status=%s,input_tokens=%s,output_tokens=%s,"
+                "cost_micros=%s,error=%s,completed_at=%s "
+                "WHERE request_id=%s AND status IN ('reserved','uncertain')",
+                (
+                    status,
+                    max(0, input_tokens),
+                    max(0, output_tokens),
+                    max(0, cost_micros),
+                    error[:2000] or None,
+                    utc_now(),
+                    request_id,
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def expire_model_usage_reservations(self, cutoff: str, limit: int = 1000) -> int:
+        """Quarantine expired in-flight calls without releasing unknown provider cost."""
+        bounded_limit = max(1, min(limit, 10_000))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "WITH candidates AS ("
+                "SELECT request_id FROM model_usage "
+                "WHERE status='reserved' AND created_at<%s "
+                "ORDER BY created_at,request_id LIMIT %s FOR UPDATE SKIP LOCKED"
+                ") UPDATE model_usage AS usage SET status='uncertain',"
+                "error='reservation expired before durable completion; reconciliation required' "
+                "FROM candidates WHERE usage.request_id=candidates.request_id "
+                "AND usage.status='reserved' RETURNING usage.request_id",
+                (cutoff, bounded_limit),
+            ).fetchall()
+        return len(rows)
+
+    def reconcile_model_usage(
+        self,
+        tenant_id: str,
+        actor: str,
+        request_id: str,
+        status: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_micros: int,
+        error: str = "",
+    ) -> bool:
+        """Apply operator-verified provider usage to one uncertain reservation."""
+        if status not in {"success", "failed"}:
+            raise ValueError("model usage status must be success or failed")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE model_usage SET status=%s,input_tokens=%s,output_tokens=%s,"
+                "cost_micros=%s,error=%s,completed_at=%s "
+                "WHERE tenant_id=%s AND request_id=%s AND status='uncertain'",
+                (
+                    status,
+                    max(0, input_tokens),
+                    max(0, output_tokens),
+                    max(0, cost_micros),
+                    error[:2000] or None,
+                    utc_now(),
+                    tenant_id,
+                    request_id,
+                ),
+            )
+            if cursor.rowcount:
+                detail = {
+                    "status": status,
+                    "input_tokens": max(0, input_tokens),
+                    "output_tokens": max(0, output_tokens),
+                    "cost_micros": max(0, cost_micros),
+                }
+                conn.execute(
+                    "INSERT INTO audit_log(tenant_id,actor,action,resource,detail_json,created_at) "
+                    "VALUES (%s,%s,%s,%s,%s::jsonb,%s)",
+                    (
+                        tenant_id,
+                        actor,
+                        "model-usage.reconciled",
+                        request_id,
+                        json.dumps(detail, ensure_ascii=False),
+                        utc_now(),
+                    ),
+                )
+        return cursor.rowcount > 0
+
+    def list_model_usage(
+        self, tenant_id: str, repository: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM model_usage WHERE tenant_id=%s"
+        params: list[Any] = [tenant_id]
+        if repository is not None:
+            query += " AND repository=%s"
+            params.append(repository)
+        query += " ORDER BY created_at DESC LIMIT %s"
+        params.append(max(1, min(limit, 1000)))
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            for key in ("created_at", "completed_at"):
+                if item.get(key) is not None:
+                    item[key] = item[key].isoformat()
+            values.append(item)
+        return values
+
+    def start_model_route_shadow(self, record: dict[str, Any]) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "INSERT INTO model_route_shadows(observation_id,topology_sha256,root_request_id,"
+                "tenant_id,repository,task_id,purpose,active_route_id,candidate_route_id,status,"
+                "active_output_sha256,input_sha256,created_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'scheduled',%s,%s,%s) "
+                "ON CONFLICT(observation_id) DO NOTHING RETURNING observation_id",
+                (
+                    record["observation_id"],
+                    record["topology_sha256"],
+                    record["root_request_id"],
+                    record["tenant_id"],
+                    record["repository"],
+                    record.get("task_id"),
+                    record["purpose"],
+                    record["active_route_id"],
+                    record["candidate_route_id"],
+                    record["active_output_sha256"],
+                    record["input_sha256"],
+                    record.get("created_at") or utc_now(),
+                ),
+            ).fetchone()
+        return row is not None
+
+    def complete_model_route_shadow(
+        self,
+        observation_id: str,
+        status: str,
+        agreement: bool | None,
+        candidate_output_sha256: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_micros: int,
+        duration_ms: int,
+        error_type: str = "",
+        error_ref: str = "",
+    ) -> bool:
+        if status not in {
+            "success",
+            "failed",
+            "budget-rejected",
+            "capacity-rejected",
+            "shed",
+            "cancelled",
+        }:
+            raise ValueError("invalid model route shadow status")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE model_route_shadows SET status=%s,agreement=%s,"
+                "candidate_output_sha256=%s,input_tokens=%s,output_tokens=%s,cost_micros=%s,"
+                "duration_ms=%s,error_type=%s,error_ref=%s,completed_at=%s "
+                "WHERE observation_id=%s AND status='scheduled'",
+                (
+                    status,
+                    agreement,
+                    candidate_output_sha256 or None,
+                    max(0, input_tokens),
+                    max(0, output_tokens),
+                    max(0, cost_micros),
+                    max(0, duration_ms),
+                    error_type[:160] or None,
+                    error_ref[:16] or None,
+                    utc_now(),
+                    observation_id,
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def expire_model_route_shadows(self, cutoff: str, limit: int = 1000) -> int:
+        """Make crash-orphaned scheduled observations a terminal gate failure."""
+        bounded_limit = max(1, min(limit, 10_000))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "WITH candidates AS (SELECT observation_id FROM model_route_shadows "
+                "WHERE status='scheduled' AND created_at<%s "
+                "ORDER BY created_at,observation_id LIMIT %s FOR UPDATE SKIP LOCKED) "
+                "UPDATE model_route_shadows AS shadow SET status='uncertain',"
+                "error_type='evoagent.shadow.ObservationExpired',"
+                "error_ref='0000000000000000',completed_at=%s FROM candidates "
+                "WHERE shadow.observation_id=candidates.observation_id "
+                "AND shadow.status='scheduled' RETURNING shadow.observation_id",
+                (cutoff, bounded_limit, utc_now()),
+            ).fetchall()
+        return len(rows)
+
+    def model_route_shadow_stats(
+        self,
+        tenant_id: str,
+        candidate_route_id: str,
+        topology_sha256: str,
+        repository: str | None = None,
+    ) -> dict[str, int]:
+        query = (
+            "SELECT COUNT(*) AS attempts,"
+            "COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0) AS samples,"
+            "COALESCE(SUM(CASE WHEN status NOT IN ('scheduled','success') THEN 1 ELSE 0 END),0) "
+            "AS errors,"
+            "COALESCE(SUM(CASE WHEN status='scheduled' THEN 1 ELSE 0 END),0) AS pending,"
+            "COALESCE(SUM(CASE WHEN status='success' AND agreement=FALSE THEN 1 ELSE 0 END),0) "
+            "AS disagreements,COALESCE(SUM(input_tokens),0) AS input_tokens,"
+            "COALESCE(SUM(output_tokens),0) AS output_tokens,"
+            "COALESCE(SUM(cost_micros),0) AS cost_micros "
+            "FROM model_route_shadows WHERE tenant_id=%s AND candidate_route_id=%s "
+            "AND topology_sha256=%s"
+        )
+        params: list[Any] = [tenant_id, candidate_route_id, topology_sha256]
+        if repository is not None:
+            query += " AND repository=%s"
+            params.append(repository)
+        with self._connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        return {key: int(row[key]) for key in row.keys()}
+
+    def claim_effect(self, effect_key: str, owner: str, lease_seconds: float) -> dict[str, Any]:
+        now = utc_now()
+        lease_until = utc_after(lease_seconds)
+        with self._connect() as conn:
+            inserted = conn.execute(
+                "INSERT INTO effect_receipts(effect_key,status,owner,lease_until,attempts,"
+                "created_at,updated_at) VALUES (%s,'in-progress',%s,%s,1,%s,%s) "
+                "ON CONFLICT(effect_key) DO NOTHING RETURNING effect_key",
+                (effect_key, owner, lease_until, now, now),
+            ).fetchone()
+            if inserted:
+                return {"status": "acquired"}
+            row = conn.execute(
+                "SELECT * FROM effect_receipts WHERE effect_key=%s FOR UPDATE", (effect_key,)
+            ).fetchone()
+            if row["status"] == "completed":
+                raw_result = row["result_json"]
+                return {
+                    "status": "completed",
+                    "result": json.loads(raw_result) if isinstance(raw_result, str) else raw_result,
+                }
+            acquired = conn.execute(
+                "UPDATE effect_receipts SET owner=%s,lease_until=%s,attempts=attempts+1,"
+                "last_error=NULL,updated_at=%s WHERE effect_key=%s AND lease_until<%s "
+                "RETURNING effect_key",
+                (owner, lease_until, now, effect_key, now),
+            ).fetchone()
+            if acquired:
+                return {"status": "acquired"}
+        return {"status": "busy"}
+
+    def complete_effect(self, effect_key: str, owner: str, result: dict[str, Any]) -> bool:
+        now = utc_now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE effect_receipts SET status='completed',result_json=%s::jsonb,owner=NULL,"
+                "lease_until=NULL,last_error=NULL,updated_at=%s,completed_at=%s "
+                "WHERE effect_key=%s AND status='in-progress' AND owner=%s",
+                (json.dumps(result, ensure_ascii=False), now, now, effect_key, owner),
+            )
+        return cursor.rowcount > 0
+
+    def release_effect(self, effect_key: str, owner: str, error: str) -> bool:
+        now = utc_now()
+        error = preserve_safe_summary(error, "external effect failed")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE effect_receipts SET lease_until=%s,last_error=%s,updated_at=%s "
+                "WHERE effect_key=%s AND status='in-progress' AND owner=%s",
+                (now, error[:2000], now, effect_key, owner),
+            )
+        return cursor.rowcount > 0
+
     def transition(self, task_id: str, event: TraceEvent) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -250,8 +1311,14 @@ class PostgresTaskStore:
                 "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (%s,%s,%s,%s,%s)",
                 (task_id, event.step, event.state.value, event.message, event.created_at),
             )
+            conn.execute(
+                "UPDATE task_admissions SET active=FALSE,released_at=%s,"
+                "release_reason='success' WHERE task_id=%s AND active=TRUE",
+                (event.created_at, task_id),
+            )
 
     def fail(self, task_id: str, error: str, event: TraceEvent) -> None:
+        error = preserve_safe_summary(error, "review execution failed")
         with self._connect() as conn:
             conn.execute(
                 "UPDATE tasks SET state=%s,error=%s,updated_at=%s WHERE id=%s",
@@ -259,7 +1326,13 @@ class PostgresTaskStore:
             )
             conn.execute(
                 "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (%s,%s,%s,%s,%s)",
-                (task_id, event.step, event.state.value, event.message, event.created_at),
+                (task_id, event.step, event.state.value, error, event.created_at),
+            )
+            conn.execute(
+                "UPDATE task_admissions SET active=FALSE,released_at=%s,"
+                "release_reason='failed' WHERE task_id=%s AND active=TRUE "
+                "AND release_on_failure=TRUE",
+                (event.created_at, task_id),
             )
 
     def get(self, task_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
@@ -293,11 +1366,16 @@ class PostgresTaskStore:
             value["collaboration"].append(item)
         for key in ("created_at", "updated_at"):
             value[key] = value[key].isoformat()
+        if value.get("trace_pruned_at") is not None:
+            value["trace_pruned_at"] = value["trace_pruned_at"].isoformat()
         for item in value["trace"]:
             item["created_at"] = item["created_at"].isoformat()
         return value
 
     def record_agent_message(self, task_id: str, message: dict[str, Any]) -> None:
+        content = dict(message.get("content", {}))
+        if message.get("kind") == "agent_failure":
+            content = {"error": preserve_safe_summary(content.get("error"), "review agent failed")}
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO agent_messages(task_id,sender,recipient,kind,correlation_id,"
@@ -308,7 +1386,7 @@ class PostgresTaskStore:
                     message["recipient"],
                     message["kind"],
                     message.get("correlation_id", ""),
-                    json.dumps(message.get("content", {}), ensure_ascii=False),
+                    json.dumps(content, ensure_ascii=False),
                     utc_now(),
                 ),
             )
@@ -322,46 +1400,71 @@ class PostgresTaskStore:
         trigger: str,
         task_id: str | None = None,
     ) -> dict[str, Any]:
-        now = utc_now()
         with self._connect() as conn:
-            # Serialize get-or-create + sequence allocation per PR so concurrent
-            # opened/synchronize deliveries cannot duplicate a session or collide
-            # on a turn sequence (READ COMMITTED would otherwise allow both).
-            conn.execute(
-                "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                ("session:%s:%s:%s" % (tenant_id, repository, pull_request),),
+            return self._start_session_turn_in_transaction(
+                conn,
+                tenant_id,
+                repository,
+                pull_request,
+                head_sha,
+                trigger,
+                task_id,
+                utc_now(),
             )
-            new_id = str(uuid.uuid4())
-            inserted = conn.execute(
-                "INSERT INTO review_sessions(id,tenant_id,repository,pull_request,status,"
-                "latest_head_sha,created_at,updated_at) VALUES (%s,%s,%s,%s,'open',%s,%s,%s) "
-                "ON CONFLICT(tenant_id,repository,pull_request) DO NOTHING RETURNING id",
-                (new_id, tenant_id, repository, pull_request, head_sha, now, now),
-            ).fetchone()
-            is_new = inserted is not None
-            row = conn.execute(
-                "SELECT id, latest_head_sha FROM review_sessions "
-                "WHERE tenant_id=%s AND repository=%s AND pull_request=%s",
-                (tenant_id, repository, pull_request),
-            ).fetchone()
-            session_id = row["id"]
-            previous_head = None if is_new else row["latest_head_sha"]
-            sequence = (
-                int(
-                    conn.execute(
-                        "SELECT COALESCE(MAX(sequence),0) AS m FROM session_turns WHERE session_id=%s",
-                        (session_id,),
-                    ).fetchone()["m"]
-                )
-                + 1
+
+    def _start_session_turn_in_transaction(
+        self,
+        conn,
+        tenant_id: str,
+        repository: str,
+        pull_request: int,
+        head_sha: str | None,
+        trigger: str,
+        task_id: str | None,
+        now: str,
+    ) -> dict[str, Any]:
+        # Serialize get-or-create + sequence allocation per PR so concurrent
+        # opened/synchronize deliveries cannot duplicate a session or collide
+        # on a turn sequence (READ COMMITTED would otherwise allow both).
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            ("session:%s:%s:%s" % (tenant_id, repository, pull_request),),
+        )
+        new_id = str(uuid.uuid4())
+        inserted = conn.execute(
+            "INSERT INTO review_sessions(id,tenant_id,repository,pull_request,status,"
+            "latest_head_sha,created_at,updated_at) VALUES (%s,%s,%s,%s,'open',%s,%s,%s) "
+            "ON CONFLICT(tenant_id,repository,pull_request) DO NOTHING RETURNING id",
+            (new_id, tenant_id, repository, pull_request, head_sha, now, now),
+        ).fetchone()
+        is_new = inserted is not None
+        row = conn.execute(
+            "SELECT id, latest_head_sha FROM review_sessions "
+            "WHERE tenant_id=%s AND repository=%s AND pull_request=%s",
+            (tenant_id, repository, pull_request),
+        ).fetchone()
+        session_id = row["id"]
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            ("session-state:%s" % session_id,),
+        )
+        previous_head = None if is_new else row["latest_head_sha"]
+        sequence = (
+            int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(sequence),0) AS m FROM session_turns WHERE session_id=%s",
+                    (session_id,),
+                ).fetchone()["m"]
             )
-            turn_id = str(uuid.uuid4())
-            conn.execute(
-                "INSERT INTO session_turns(id,session_id,task_id,head_sha,trigger,sequence,created_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
-                (turn_id, session_id, task_id, head_sha, trigger, sequence, now),
-            )
-            previous = self._previous_open_snapshot(conn, session_id, turn_id)
+            + 1
+        )
+        turn_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO session_turns(id,session_id,task_id,head_sha,trigger,sequence,created_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            (turn_id, session_id, task_id, head_sha, trigger, sequence, now),
+        )
+        previous = self._previous_open_snapshot(conn, session_id, turn_id)
         return {
             "session_id": session_id,
             "turn_id": turn_id,
@@ -404,6 +1507,10 @@ class PostgresTaskStore:
     ) -> None:
         now = utc_now()
         with self._connect() as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                ("session-state:%s" % session_id,),
+            )
             conn.execute("DELETE FROM session_findings WHERE turn_id=%s", (turn_id,))
             for snap in open_snapshots:
                 conn.execute(
@@ -420,7 +1527,7 @@ class PostgresTaskStore:
                 )
             conn.execute(
                 "UPDATE session_turns SET task_id=COALESCE(%s, task_id), summary_json=%s::jsonb, "
-                "head_sha=COALESCE(%s, head_sha) WHERE id=%s",
+                "head_sha=COALESCE(%s, head_sha),findings_pruned_at=NULL WHERE id=%s",
                 (task_id, json.dumps(summary, ensure_ascii=False), head_sha, turn_id),
             )
             conn.execute(
@@ -459,7 +1566,8 @@ class PostgresTaskStore:
             if not srow:
                 return None
             turns = conn.execute(
-                "SELECT id,task_id,head_sha,trigger,sequence,summary_json,created_at "
+                "SELECT id,task_id,head_sha,trigger,sequence,summary_json,created_at,"
+                "findings_pruned_at "
                 "FROM session_turns WHERE session_id=%s ORDER BY sequence DESC LIMIT %s",
                 (session_id, turn_limit),
             ).fetchall()
@@ -472,6 +1580,9 @@ class PostgresTaskStore:
                 item = dict(turn)
                 item["summary"] = item.pop("summary_json")
                 item["created_at"] = item["created_at"].isoformat()
+                if item["findings_pruned_at"] is not None:
+                    item["findings_pruned_at"] = item["findings_pruned_at"].isoformat()
+                item["findings_retained"] = item["findings_pruned_at"] is None
                 findings = conn.execute(
                     "SELECT snapshot_json FROM session_findings WHERE turn_id=%s ORDER BY id",
                     (item["id"],),
@@ -513,6 +1624,11 @@ class PostgresTaskStore:
         return values
 
     def record_failure_case(self, task_id: str, category: str, payload: dict[str, Any]) -> None:
+        payload = dict(payload)
+        if category == "execution_error":
+            payload = {
+                "error": preserve_safe_summary(payload.get("error"), "review execution failed")
+            }
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO failure_cases(task_id,category,payload_json,created_at) VALUES (%s,%s,%s::jsonb,%s)",
@@ -748,6 +1864,8 @@ class PostgresTaskStore:
         attempt: int = 1,
         error: str = "",
     ) -> None:
+        if error:
+            error = preserve_safe_summary(error, "review node failed")
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO checkpoints(task_id,node,status,attempt,state_json,error,updated_at) "
@@ -808,6 +1926,11 @@ class PostgresTaskStore:
                 "VALUES (%s,%s,%s,%s,%s)",
                 (task_id, event.step, event.state.value, event.message, event.created_at),
             )
+            conn.execute(
+                "UPDATE task_admissions SET active=FALSE,released_at=%s,"
+                "release_reason='cancelled' WHERE task_id=%s AND active=TRUE",
+                (event.created_at, task_id),
+            )
 
     def claim_webhook(
         self,
@@ -834,6 +1957,122 @@ class PostgresTaskStore:
             if existing and existing["payload_sha256"] != payload_sha256:
                 raise ValueError("delivery id was already used with a different payload")
             return False
+
+    def accept_pull_request_webhook(
+        self,
+        delivery_id: str,
+        tenant_id: str,
+        payload_sha256: str,
+        repository: str,
+        pull_request: int,
+        head_sha: str | None,
+        trigger: str,
+        task_id: str,
+        task_payload: dict[str, Any],
+        outbox_payload: dict[str, Any],
+        max_active_reviews: int = 0,
+    ) -> dict[str, Any]:
+        """Atomically bind one delivery to its session, task, and queue intent."""
+        if not delivery_id:
+            raise ValueError("X-GitHub-Delivery is required")
+        now = utc_now()
+        with self._connect() as conn:
+            inserted = conn.execute(
+                "INSERT INTO webhook_deliveries"
+                "(delivery_id,tenant_id,event_type,payload_sha256,received_at) "
+                "VALUES (%s,%s,'pull_request',%s,%s) "
+                "ON CONFLICT(delivery_id) DO NOTHING RETURNING delivery_id",
+                (delivery_id, tenant_id, payload_sha256, now),
+            ).fetchone()
+            if not inserted:
+                existing = conn.execute(
+                    "SELECT payload_sha256,task_id FROM webhook_deliveries "
+                    "WHERE delivery_id=%s FOR UPDATE",
+                    (delivery_id,),
+                ).fetchone()
+                if not existing:
+                    raise RuntimeError("webhook delivery conflict could not be resolved")
+                if existing and existing["payload_sha256"] != payload_sha256:
+                    raise ValueError("delivery id was already used with a different payload")
+                if existing and existing["task_id"]:
+                    return {"accepted": False, "task_id": existing["task_id"]}
+            self._lock_tenant_admission(conn, tenant_id)
+            limit = max(0, int(max_active_reviews))
+            active = self._active_admission_count(conn, tenant_id)
+            if limit and active >= limit:
+                self._record_admission_rejection(
+                    conn,
+                    tenant_id,
+                    repository,
+                    active,
+                    limit,
+                    "github-webhook",
+                    now,
+                )
+                conn.commit()
+                raise TenantReviewCapacityError()
+            session = self._start_session_turn_in_transaction(
+                conn,
+                tenant_id,
+                repository,
+                pull_request,
+                head_sha,
+                trigger,
+                task_id,
+                now,
+            )
+            session_payload = {
+                "session_id": session["session_id"],
+                "turn_id": session["turn_id"],
+                "head_sha": head_sha,
+            }
+            conn.execute(
+                "INSERT INTO tasks(id,state,repository,pull_request,input_json,report_json,error,"
+                "created_at,updated_at,tenant_id,cancel_requested) "
+                "VALUES (%s,%s,%s,%s,%s::jsonb,NULL,NULL,%s,%s,%s,FALSE)",
+                (
+                    task_id,
+                    TaskState.PENDING.value,
+                    repository,
+                    pull_request,
+                    json.dumps({**task_payload, **session_payload}, ensure_ascii=False),
+                    now,
+                    now,
+                    tenant_id,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO task_admissions(task_id,tenant_id,active,release_on_failure,"
+                "generation,acquired_at) VALUES (%s,%s,TRUE,FALSE,1,%s)",
+                (task_id, tenant_id, now),
+            )
+            conn.execute(
+                "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,"
+                "attempts,available_at,created_at,updated_at) "
+                "VALUES (%s,%s,%s,%s::jsonb,'pending',0,%s,%s,%s)",
+                (
+                    "review:" + task_id,
+                    "review",
+                    task_id,
+                    json.dumps(
+                        {
+                            "task_id": task_id,
+                            **outbox_payload,
+                            **session_payload,
+                            "admission_generation": 1,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                "UPDATE webhook_deliveries SET task_id=%s WHERE delivery_id=%s",
+                (task_id, delivery_id),
+            )
+        return {"accepted": True, "task_id": task_id, **session}
 
     def complete_webhook(self, delivery_id: str, task_id: str | None) -> None:
         with self._connect() as conn:
@@ -893,6 +2132,100 @@ class PostgresTaskStore:
                 (tenant_id, repository, auto_fix),
             )
 
+    def save_repository_policy(
+        self,
+        tenant_id: str,
+        repository: str,
+        policy: dict[str, Any],
+        actor: str,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        serialized = json.dumps(policy, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        with self._connect() as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                ("repository-policy:%s:%s" % (tenant_id, repository),),
+            )
+            row = conn.execute(
+                "SELECT version FROM repository_policies "
+                "WHERE tenant_id=%s AND repository=%s FOR UPDATE",
+                (tenant_id, repository),
+            ).fetchone()
+            version = int(row["version"]) + 1 if row else 1
+            conn.execute(
+                "INSERT INTO repository_policies(tenant_id,repository,version,enabled,auto_fix,"
+                "policy_json,updated_at) VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s) "
+                "ON CONFLICT(tenant_id,repository) DO UPDATE SET version=EXCLUDED.version,"
+                "enabled=EXCLUDED.enabled,auto_fix=EXCLUDED.auto_fix,"
+                "policy_json=EXCLUDED.policy_json,updated_at=EXCLUDED.updated_at",
+                (
+                    tenant_id,
+                    repository,
+                    version,
+                    bool(policy["enabled"]),
+                    bool(policy["auto_fix"]),
+                    serialized,
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO repository_policy_versions(tenant_id,repository,version,"
+                "policy_json,actor,created_at) VALUES (%s,%s,%s,%s::jsonb,%s,%s)",
+                (tenant_id, repository, version, serialized, actor, now),
+            )
+            conn.execute(
+                "INSERT INTO audit_log(tenant_id,actor,action,resource,detail_json,created_at) "
+                "VALUES (%s,%s,%s,%s,%s::jsonb,%s)",
+                (
+                    tenant_id,
+                    actor,
+                    "repository-policy.updated",
+                    repository,
+                    json.dumps({"version": version, "policy": policy}, ensure_ascii=False),
+                    now,
+                ),
+            )
+        return {
+            "tenant_id": tenant_id,
+            "repository": repository,
+            "version": version,
+            "policy": dict(policy),
+            "actor": actor,
+            "updated_at": now,
+        }
+
+    def get_repository_policy(self, tenant_id: str, repository: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT tenant_id,repository,version,policy_json,updated_at "
+                "FROM repository_policies WHERE tenant_id=%s AND repository=%s",
+                (tenant_id, repository),
+            ).fetchone()
+        if not row:
+            return None
+        value = dict(row)
+        raw_policy = value.pop("policy_json")
+        value["policy"] = json.loads(raw_policy) if isinstance(raw_policy, str) else raw_policy
+        return value
+
+    def list_repository_policy_versions(
+        self, tenant_id: str, repository: str, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT tenant_id,repository,version,policy_json,actor,created_at "
+                "FROM repository_policy_versions WHERE tenant_id=%s AND repository=%s "
+                "ORDER BY version DESC LIMIT %s",
+                (tenant_id, repository, max(1, min(limit, 200))),
+            ).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            raw_policy = item.pop("policy_json")
+            item["policy"] = json.loads(raw_policy) if isinstance(raw_policy, str) else raw_policy
+            values.append(item)
+        return values
+
     def repository_allowed(
         self,
         tenant_id: str,
@@ -900,6 +2233,13 @@ class PostgresTaskStore:
         require_auto_fix: bool = False,
     ) -> bool:
         with self._connect() as conn:
+            policy = conn.execute(
+                "SELECT enabled,auto_fix FROM repository_policies "
+                "WHERE tenant_id=%s AND repository=%s",
+                (tenant_id, repository),
+            ).fetchone()
+            if policy:
+                return bool(policy["enabled"] and (not require_auto_fix or policy["auto_fix"]))
             total = conn.execute(
                 "SELECT COUNT(*) AS n FROM repository_grants WHERE tenant_id=%s", (tenant_id,)
             ).fetchone()["n"]
@@ -917,6 +2257,10 @@ class PostgresTaskStore:
         resource: str,
         detail: dict[str, Any] | None = None,
     ) -> None:
+        if action == "shadow.failed":
+            detail = {
+                "error": preserve_safe_summary((detail or {}).get("error"), "shadow review failed")
+            }
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO audit_log(tenant_id,actor,action,resource,detail_json,created_at) "
@@ -967,6 +2311,16 @@ class PostgresTaskStore:
                     utc_now(),
                 ),
             )
+            conn.execute(
+                "UPDATE deployments SET max_disagreement_rate=%s,auto_promote=%s,"
+                "shadow_samples=0,disagreements=0 WHERE tenant_id=%s AND skill_name=%s",
+                (
+                    float(config.get("max_disagreement_rate", 0.2)),
+                    bool(config.get("auto_promote", False)),
+                    tenant_id,
+                    skill_name,
+                ),
+            )
 
     def get_deployment(self, tenant_id: str, skill_name: str) -> dict[str, Any] | None:
         with self._connect() as conn:
@@ -1004,6 +2358,84 @@ class PostgresTaskStore:
                 value["status"] = "rolled_back"
         return value
 
+    def record_shadow_observation(
+        self,
+        tenant_id: str,
+        skill_name: str,
+        task_id: str,
+        lane: str,
+        primary: dict[str, Any],
+        candidate: dict[str, Any] | None,
+        disagreement: float,
+        candidate_failed: bool = False,
+    ) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO release_observations(tenant_id,skill_name,task_id,lane,"
+                "primary_json,candidate_json,disagreement,candidate_failed,created_at) "
+                "VALUES (%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s,%s,%s)",
+                (
+                    tenant_id,
+                    skill_name,
+                    task_id,
+                    lane,
+                    json.dumps(primary, ensure_ascii=False),
+                    json.dumps(candidate, ensure_ascii=False) if candidate is not None else None,
+                    float(disagreement),
+                    candidate_failed,
+                    utc_now(),
+                ),
+            )
+            row = conn.execute(
+                "UPDATE deployments SET shadow_samples=shadow_samples+1,"
+                "disagreements=disagreements+%s,updated_at=%s "
+                "WHERE tenant_id=%s AND skill_name=%s RETURNING *",
+                (int(disagreement > 0), utc_now(), tenant_id, skill_name),
+            ).fetchone()
+            if not row:
+                return None
+            value = dict(row)
+            disagreement_rate = (
+                value["disagreements"] / value["shadow_samples"] if value["shadow_samples"] else 0.0
+            )
+            error_rate = value["errors"] / value["samples"] if value["samples"] else 0.0
+            if (
+                value["status"] == "running"
+                and value["auto_promote"]
+                and value["shadow_samples"] >= value["min_samples"]
+                and disagreement_rate <= value["max_disagreement_rate"]
+                and error_rate <= value["max_error_rate"]
+                and not candidate_failed
+            ):
+                conn.execute(
+                    "UPDATE deployments SET status='promoted',stable_version=candidate_version,"
+                    "canary_percent=0,shadow_percent=0,updated_at=%s "
+                    "WHERE tenant_id=%s AND skill_name=%s",
+                    (utc_now(), tenant_id, skill_name),
+                )
+                value["status"] = "promoted"
+        return value
+
+    def list_release_observations(
+        self,
+        tenant_id: str,
+        skill_name: str,
+        limit: int = 100,
+    ) -> list:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM release_observations WHERE tenant_id=%s AND skill_name=%s "
+                "ORDER BY id DESC LIMIT %s",
+                (tenant_id, skill_name, max(1, min(limit, 500))),
+            ).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            item["primary"] = item.pop("primary_json")
+            item["candidate"] = item.pop("candidate_json")
+            values.append(item)
+        return values
+
     def create_alert(
         self,
         tenant_id: str,
@@ -1011,6 +2443,8 @@ class PostgresTaskStore:
         severity: str,
         message: str,
     ) -> None:
+        if alert_key.startswith("dlq:"):
+            message = preserve_safe_summary(message, "task delivery failed")
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO alerts(tenant_id,alert_key,severity,message,status,created_at,updated_at) "
@@ -1084,7 +2518,7 @@ def create_store(
     pool_min: int = 1,
     pool_max: int = 10,
     pool_timeout: float = 10.0,
-):
+) -> ApplicationStorePort:
     if database_url.startswith(("postgres://", "postgresql://")):
         return PostgresTaskStore(database_url, pool_min, pool_max, pool_timeout)
     from .store import TaskStore

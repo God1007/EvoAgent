@@ -11,9 +11,11 @@ import time
 from typing import Any, TypedDict, cast
 
 from .diff_parser import ParsedDiff, parse_unified_diff
+from .errors import safe_exception_summary
 from .models import ChangedLine, Finding, ReviewReport, Severity, TaskState, TraceEvent
+from .ports import ReviewExecutionStorePort
 from .reviewer import Reviewer
-from .store import TaskStore, utc_now
+from .store import utc_now
 
 ALLOWED = {
     TaskState.PENDING: {TaskState.PLANNING, TaskState.FAILED, TaskState.CANCELLED},
@@ -46,7 +48,7 @@ class ReviewHarness:
 
     def __init__(
         self,
-        store: TaskStore,
+        store: ReviewExecutionStorePort,
         reviewer: Reviewer,
         max_steps: int = 8,
         timeout_seconds: int = 120,
@@ -122,23 +124,23 @@ class ReviewHarness:
                 TraceEvent(self._ctx.step, TaskState.SUCCESS, "Review completed", utc_now()),
             )
             return report
-        except TaskCancelled as exc:
+        except TaskCancelled:
             self._ctx.step += 1
             self.store.cancel(
-                task_id, TraceEvent(self._ctx.step, TaskState.CANCELLED, str(exc), utc_now())
+                task_id,
+                TraceEvent(self._ctx.step, TaskState.CANCELLED, "Task was cancelled", utc_now()),
             )
             raise
         except Exception as exc:
             self._ctx.step += 1
+            summary = safe_exception_summary(exc, "review execution failed")
             self.store.fail(
                 task_id,
-                str(exc),
-                TraceEvent(self._ctx.step, TaskState.FAILED, "Review failed: %s" % exc, utc_now()),
+                summary,
+                TraceEvent(self._ctx.step, TaskState.FAILED, summary, utc_now()),
             )
             try:
-                self.store.record_failure_case(
-                    task_id, "execution_error", {"error": str(exc)[:1000]}
-                )
+                self.store.record_failure_case(task_id, "execution_error", {"error": summary})
             except Exception:
                 pass
             raise
@@ -234,7 +236,14 @@ class ReviewHarness:
                 raise
             except Exception as exc:
                 last_error = exc
-                self.store.save_checkpoint(task_id, node, {}, "failed", attempt, str(exc))
+                self.store.save_checkpoint(
+                    task_id,
+                    node,
+                    {},
+                    "failed",
+                    attempt,
+                    safe_exception_summary(exc, "review node failed"),
+                )
         if last_error is None:
             raise RuntimeError("review node failed without an exception")
         raise last_error

@@ -2,10 +2,13 @@ import os
 import tempfile
 import unittest
 from dataclasses import dataclass
+from unittest import mock
 
 from evoagent.config import Settings
-from evoagent.models import Finding, Severity
+from evoagent.metrics import Metrics
+from evoagent.models import Finding, ReviewReport, Severity, TaskState, TraceEvent
 from evoagent.service import ReviewService
+from evoagent.store import utc_now
 
 
 @dataclass
@@ -47,6 +50,118 @@ class ServiceTests(unittest.TestCase):
             github_token="",
             auto_post_review=False,
         )
+
+    def test_fix_publication_result_is_cached_by_durable_effect_key(self):
+        service = ReviewService(self.settings)
+        self.addCleanup(service.close)
+        task_id = "fix-task"
+        service.store.create(task_id, "org/repo", 7, {}, "default")
+        service.store.succeed(
+            task_id,
+            ReviewReport("org/repo", 7, "one issue", "high", [_finding()]),
+            TraceEvent(1, TaskState.SUCCESS, "done", utc_now()),
+        )
+
+        class CountingFixer:
+            calls = 0
+
+            def create_fix_commits(self, *_args, **_kwargs):
+                self.calls += 1
+                return {"branch": "evoagent/fix", "commits": [{"sha": "abc"}]}
+
+        fixer = CountingFixer()
+        service.fixer = fixer
+        service.github_client_for_installation = lambda _installation=None: service.github
+
+        first = service.create_fix(task_id)
+        second = service.create_fix(task_id)
+
+        self.assertEqual(first, second)
+        self.assertEqual(1, fixer.calls)
+
+    def test_feedback_metrics_use_fixed_category_names(self):
+        service = ReviewService(self.settings)
+        self.addCleanup(service.close)
+        service.store.create("feedback-task", "org/repo", 7, {}, "default")
+        captured = Metrics()
+
+        with mock.patch("evoagent.application.reviews.metrics", captured):
+            for category in ("false_positive", "missed_issue", "bad_fix", "accepted"):
+                service.record_feedback("feedback-task", category, None, "operator note")
+
+        output = captured.prometheus()
+        self.assertIn("evoagent_feedback_total 4.0", output)
+        self.assertIn("evoagent_feedback_false_positive_total 1.0", output)
+        self.assertIn("evoagent_feedback_missed_issue_total 1.0", output)
+        self.assertIn("evoagent_feedback_bad_fix_total 1.0", output)
+        self.assertIn("evoagent_feedback_accepted_total 1.0", output)
+
+    def test_readiness_exposes_queue_worker_health_and_fails_closed(self):
+        service = ReviewService(self.settings)
+        self.addCleanup(service.close)
+        ready, detail = service.readiness()
+        self.assertTrue(ready)
+        self.assertTrue(detail["checks"]["queue"]["healthy"])
+
+        service.queue.health = lambda: {  # type: ignore[method-assign]
+            "healthy": False,
+            "backend": service.queue.backend,
+            "workers_running": 0,
+            "workers_expected": 1,
+            "last_error": "worker stopped",
+        }
+        service._readiness_cache = None
+        ready, detail = service.readiness()
+        self.assertFalse(ready)
+        self.assertEqual("not-ready", detail["status"])
+        self.assertRegex(
+            detail["checks"]["queue"]["last_error"],
+            r"^queue dependency failed \[type=unknown; ref=[0-9a-f]{16}\]$",
+        )
+        self.assertNotIn("worker stopped", str(detail))
+
+    def test_review_persists_versioned_repository_policy_snapshot(self):
+        service = ReviewService(self.settings)
+        self.addCleanup(service.close)
+        first = service.set_repository_policy(
+            "default",
+            "org/repo",
+            {"max_diff_bytes": 10},
+            "alice",
+        )
+        self.assertEqual(1, first["version"])
+        diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
+        with self.assertRaisesRegex(ValueError, "repository policy limit"):
+            service.create_review("org/repo", diff, 1)
+
+        second = service.set_repository_policy(
+            "default",
+            "org/repo",
+            {
+                "max_diff_bytes": 1000,
+                "allowed_reviewers": [service.reviewer.name],
+                "allowed_llm_providers": ["local"],
+            },
+            "alice",
+        )
+        result = service.create_review("org/repo", diff, 1)
+        task = service.store.get(result["task_id"], "default")
+        snapshot = task["input"]["repository_policy"]
+        self.assertEqual(2, second["version"])
+        self.assertEqual(2, snapshot["version"])
+        self.assertEqual([service.reviewer.name], snapshot["policy"]["allowed_reviewers"])
+
+    def test_repository_policy_rejects_unknown_fix_rule_before_persisting(self):
+        service = ReviewService(self.settings)
+        self.addCleanup(service.close)
+        with self.assertRaisesRegex(ValueError, "unavailable fix rules"):
+            service.set_repository_policy(
+                "default",
+                "org/repo",
+                {"allowed_fix_rules": ["UNKNOWN-RULE"]},
+                "alice",
+            )
+        self.assertIsNone(service.store.get_repository_policy("default", "org/repo"))
 
     def tearDown(self):
         os.unlink(self.path)

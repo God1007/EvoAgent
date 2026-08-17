@@ -3,10 +3,13 @@ import re
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from typing import Any
 
 from .diff_parser import ParsedDiff
+from .model_gateway import ModelGovernanceContext, ModelMessage, ModelRequest
 from .models import Finding, Severity
+from .ports import ModelGatewayPort
 
 
 class Reviewer(ABC):
@@ -60,6 +63,24 @@ class LocalRuleReviewer(Reviewer):
             "加入引号、注释符和布尔表达式等注入载荷测试。",
         ),
         (
+            "SEC-YAML-LOAD",
+            Severity.HIGH,
+            re.compile(r"\byaml\.load\s*\("),
+            "不安全的 YAML 反序列化",
+            "yaml.load 在 Loader 不受约束时可能构造任意 Python 对象并触发代码执行。",
+            "对于普通数据使用 yaml.safe_load；只有明确需要且输入可信时才选择受限 Loader。",
+            "加入恶意对象标签和普通映射测试，断言不会实例化任意对象。",
+        ),
+        (
+            "SEC-INSECURE-COOKIE",
+            Severity.HIGH,
+            re.compile(r"\bset_cookie\s*\(.*\bsecure\s*=\s*False\b"),
+            "Cookie 显式关闭 Secure 属性",
+            "认证或会话 Cookie 可通过明文 HTTP 发送，增加被窃取和会话劫持的风险。",
+            "对承载敏感状态的 Cookie 启用 secure=True，并结合 HttpOnly 与 SameSite 策略。",
+            "在 HTTPS 响应测试中断言 Set-Cookie 同时包含 Secure 和预期的 SameSite 属性。",
+        ),
+        (
             "REL-EMPTY-EXCEPT",
             Severity.MEDIUM,
             re.compile(r"^\s*except\s*(Exception\s*)?:\s*(pass)?\s*$"),
@@ -105,6 +126,65 @@ class LocalRuleReviewer(Reviewer):
         return findings
 
 
+def _review_messages(diff: str, system_prompt: str = "") -> tuple[ModelMessage, ...]:
+    schema = (
+        'Return JSON only: {"findings":[{"rule_id":"...","severity":"critical|high|medium|low",'
+        '"title":"...","explanation":"...","path":"...","line":1,"evidence":"...",'
+        '"fix":"...","test":"...","confidence":0.0}]}. Report only actionable defects introduced '
+        "by added lines. Do not report style preferences. Line numbers must be new-file line numbers."
+    )
+    return (
+        ModelMessage(
+            "system",
+            (system_prompt or "You are a senior secure code reviewer.") + " " + schema,
+        ),
+        ModelMessage("user", "Review this unified diff:\n\n" + diff),
+    )
+
+
+def _parse_model_findings(content: str, parsed: ParsedDiff) -> list[Finding]:
+    try:
+        result = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("model returned an invalid JSON review response") from exc
+    if not isinstance(result, dict) or not isinstance(result.get("findings", []), list):
+        raise RuntimeError("model returned an invalid JSON review response")
+    valid_locations = {(item.path, item.line) for item in parsed.added_lines}
+    findings: list[Finding] = []
+    for raw in result.get("findings", []):
+        if not isinstance(raw, dict):
+            continue
+        try:
+            path, line = str(raw.get("path", "")), int(raw.get("line", 0))
+        except (TypeError, ValueError):
+            continue
+        if (path, line) not in valid_locations:
+            continue
+        try:
+            severity = Severity(str(raw.get("severity", "medium")).lower())
+        except ValueError:
+            severity = Severity.MEDIUM
+        try:
+            confidence = float(raw.get("confidence", 0.7))
+        except (TypeError, ValueError):
+            confidence = 0.7
+        findings.append(
+            Finding(
+                rule_id=str(raw.get("rule_id", "LLM-REVIEW"))[:80],
+                severity=severity,
+                title=str(raw.get("title", "Review finding"))[:200],
+                explanation=str(raw.get("explanation", ""))[:2000],
+                path=path,
+                line=line,
+                evidence=str(raw.get("evidence", ""))[:240],
+                fix=str(raw.get("fix", ""))[:2000],
+                test=str(raw.get("test", ""))[:2000],
+                confidence=max(0.0, min(1.0, confidence)),
+            )
+        )
+    return findings
+
+
 class OpenAICompatibleReviewer(Reviewer):
     name = "openai-compatible"
 
@@ -132,23 +212,12 @@ class OpenAICompatibleReviewer(Reviewer):
         self._breaker = breaker
 
     def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
-        schema = (
-            'Return JSON only: {"findings":[{"rule_id":"...","severity":"critical|high|medium|low",'
-            '"title":"...","explanation":"...","path":"...","line":1,"evidence":"...",'
-            '"fix":"...","test":"...","confidence":0.0}]}. Report only actionable defects introduced '
-            "by added lines. Do not report style preferences. Line numbers must be new-file line numbers."
-        )
+        messages = _review_messages(diff, self.system_prompt)
         payload = {
             "model": self.model,
             "temperature": 0,
             "messages": [
-                {
-                    "role": "system",
-                    "content": (self.system_prompt or "You are a senior secure code reviewer.")
-                    + " "
-                    + schema,
-                },
-                {"role": "user", "content": "Review this unified diff:\n\n" + diff},
+                {"role": message.role, "content": message.content} for message in messages
             ],
             "response_format": {"type": "json_object"},
         }
@@ -182,36 +251,18 @@ class OpenAICompatibleReviewer(Reviewer):
             raise RuntimeError("%s review request failed: %s" % (self.provider, exc)) from exc
         try:
             content = body["choices"][0]["message"]["content"]
-            result = json.loads(content)
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            if not isinstance(content, str):
+                raise TypeError("model content is not text")
+        except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(
                 "%s returned an invalid JSON review response" % self.provider
             ) from exc
-        valid_locations = {(item.path, item.line) for item in parsed.added_lines}
-        findings: list[Finding] = []
-        for raw in result.get("findings", []):
-            path, line = str(raw.get("path", "")), int(raw.get("line", 0))
-            if (path, line) not in valid_locations:
-                continue
-            try:
-                severity = Severity(str(raw.get("severity", "medium")).lower())
-            except ValueError:
-                severity = Severity.MEDIUM
-            findings.append(
-                Finding(
-                    rule_id=str(raw.get("rule_id", "LLM-REVIEW"))[:80],
-                    severity=severity,
-                    title=str(raw.get("title", "Review finding"))[:200],
-                    explanation=str(raw.get("explanation", ""))[:2000],
-                    path=path,
-                    line=line,
-                    evidence=str(raw.get("evidence", ""))[:240],
-                    fix=str(raw.get("fix", ""))[:2000],
-                    test=str(raw.get("test", ""))[:2000],
-                    confidence=max(0.0, min(1.0, float(raw.get("confidence", 0.7)))),
-                )
-            )
-        return findings
+        try:
+            return _parse_model_findings(content, parsed)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "%s returned an invalid JSON review response" % self.provider
+            ) from exc
 
     def _open(self, request: "urllib.request.Request"):
         if self._breaker is None:
@@ -227,6 +278,56 @@ class OpenAICompatibleReviewer(Reviewer):
             raise
         self._breaker.record_success()
         return response
+
+
+class GatewayReviewer(Reviewer):
+    """Domain reviewer backed by the governed ModelGatewayPort."""
+
+    def __init__(
+        self,
+        gateway: ModelGatewayPort,
+        task_context: Callable[[str], ModelGovernanceContext],
+        system_prompt: str = "",
+    ):
+        self.gateway = gateway
+        self.task_context = task_context
+        self.system_prompt = system_prompt
+        route = gateway.route_info()
+        self.name = "%s:%s" % (route.get("provider", "model"), route.get("model", "unknown"))
+
+    def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
+        return self._review(
+            "",
+            ModelGovernanceContext("system", "evaluation"),
+            "evaluation",
+            diff,
+            parsed,
+        )
+
+    def review_with_context(self, task_id: str, diff: str, parsed: ParsedDiff) -> list[Finding]:
+        return self._review(task_id, self.task_context(task_id), "review", diff, parsed)
+
+    def _review(
+        self,
+        task_id: str,
+        context: ModelGovernanceContext,
+        purpose: str,
+        diff: str,
+        parsed: ParsedDiff,
+    ) -> list[Finding]:
+        response = self.gateway.complete(
+            ModelRequest(
+                tenant_id=context.tenant_id,
+                repository=context.repository,
+                task_id=task_id,
+                purpose=purpose,
+                messages=_review_messages(diff, self.system_prompt),
+                allowed_providers=context.allowed_providers,
+                allowed_models=context.allowed_models,
+                required_region=context.required_region,
+            )
+        )
+        return _parse_model_findings(response.content, parsed)
 
 
 class CompositeReviewer(Reviewer):

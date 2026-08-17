@@ -75,7 +75,12 @@ class VerifierArchiveTests(unittest.TestCase):
         )
         self.assertIsNone(returncode)
         self.assertFalse(timed_out)
-        self.assertIn("failed to launch", detail)
+        self.assertRegex(
+            detail,
+            r"^verification launch failed \[type=builtins\.FileNotFoundError; "
+            r"ref=[0-9a-f]{16}\]$",
+        )
+        self.assertNotIn("evoagent-nonexistent-binary-xyz", detail)
 
 
 @unittest.skipIf(os.name == "nt", "POSIX host-isolation behaviour")

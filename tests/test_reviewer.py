@@ -45,6 +45,18 @@ class LocalReviewerTests(unittest.TestCase):
             rules,
         )
 
+    def test_detects_yaml_load_and_explicit_insecure_cookie(self):
+        diff = """--- a/web.py
++++ b/web.py
+@@ -0,0 +1,2 @@
++payload = yaml.load(raw)
++response.set_cookie("sid", value, secure=False)
+"""
+        rules = {
+            item.rule_id for item in LocalRuleReviewer().review(diff, parse_unified_diff(diff))
+        }
+        self.assertEqual({"SEC-YAML-LOAD", "SEC-INSECURE-COOKIE"}, rules)
+
     def test_lock_and_generated_files_are_skipped(self):
         # The .lock line is deliberately secret-shaped to prove the path skip
         # short-circuits before any rule runs. It is a synthetic fixture, so the

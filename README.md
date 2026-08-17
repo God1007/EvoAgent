@@ -10,14 +10,14 @@
 [![CI](https://github.com/God1007/EvoAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/God1007/EvoAgent/actions/workflows/ci.yml)
 [![Security](https://github.com/God1007/EvoAgent/actions/workflows/security.yml/badge.svg)](https://github.com/God1007/EvoAgent/actions/workflows/security.yml)
 [![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Coverage](https://img.shields.io/badge/coverage-~84%25-brightgreen)](docs/evaluation.md)
+[![Coverage](https://img.shields.io/badge/coverage-85%25-brightgreen)](docs/evaluation.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![PostgreSQL](https://img.shields.io/badge/Storage-SQLite%20%7C%20PostgreSQL-4169E1?logo=postgresql&logoColor=white)](#运行模式)
 [![Redis](https://img.shields.io/badge/Queue-In--Process%20%7C%20Redis-DC382D?logo=redis&logoColor=white)](#运行模式)
 [![OpenAI Compatible](https://img.shields.io/badge/LLM-OpenAI%20Compatible-412991)](#接入大模型)
 
-[快速开始](#快速开始) · [工作原理](#工作原理) · [GitHub 接入](#接入-github) · [API](#api-概览) · [生产部署](#生产部署)
+[快速开始](#快速开始) · [工作原理](#工作原理) · [插件架构](docs/plugin-system.md) · [企业演进路线](docs/enterprise-roadmap.md) · [GitHub 接入](#接入-github) · [API](#api-概览) · [生产部署](#生产部署)
 
 </div>
 
@@ -39,14 +39,25 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **精确 Diff 定位** | 只接受 Unified Diff 新文件行号上的发现，降低错误定位和模型幻觉 |
 | **PR 会话连续性** | 同一 PR 多次 push 归入同一会话，跨轮次跟踪问题的新增/仍存在/已修复/移动，稳定 Marker 评论原地更新 |
 | **代码影响面图谱** | 基于 `ast` 的 Python 符号/调用/导入图，回答「改了这些文件，哪些符号在影响半径内」 |
-| **可执行证据阶梯** | Proof Runner 以「补丁前失败、补丁后通过」的沙箱复现将判断升级为 L1–L4 证据，基础设施失败判为不确定而非冒充证据 |
-| **双运行模式** | 本地使用 SQLite + 进程内队列；生产环境切换 PostgreSQL + Redis Streams |
+| **可执行证据阶梯** | 可插拔 Proof Runner 以「补丁前失败、补丁后通过」将判断升级为 L1–L4；生产可用双向签名的独立 Runner 隔离不可信执行 |
+| **双运行模式** | 本地使用 SQLite + 进程内队列；生产环境切换 PostgreSQL + 单节点或 Cluster Redis Streams |
 | **GitHub 自动化** | 支持 PR Webhook、幂等投递、Diff 拉取、评论 upsert 和独立修复 PR |
 | **保守型自动修复** | 仅处理可确定转换的规则，在新分支生成原子提交，并经过编译与可选测试门禁 |
 | **受控能力演进** | 从误报、漏报和坏修复中生成候选 Prompt，通过 Validation/Holdout 回放门禁后才允许激活 |
-| **动态 Skills** | 基于 manifest 加载自定义审查器，支持哈希/签名校验、超时、内存限制和隔离进程 |
-| **生产治理** | JWT、RBAC、多租户、仓库隔离、审计日志、灰度发布、影子流量、告警与死信队列 |
-| **可观测性** | 任务 Trace、Agent 消息、Prometheus 指标和 OpenTelemetry Trace |
+| **动态 Skills** | 基于 manifest 事务加载内容寻址的审查器快照，支持哈希/签名、输出/时间/内存上限、隔离进程及生产强制容器 |
+| **可插拔微内核** | Store、Queue、Model Gateway、Proof Executor、Reviewer、Review Engine、代码托管、可观测性和 FixRule 通过稳定 Capability 组合，支持依赖校验、启动回滚、内容寻址的分层 Profile 与作用域覆盖 |
+| **模型治理网关** | 任务级租户/仓库上下文、凭据脱敏、HTTPS/出口主机限制、结构化输出门禁、Token/成本预算与元数据用量账本 |
+| **生产治理** | JWT、RBAC、多租户、仓库隔离、事务 Outbox、审计日志、灰度发布、影子流量、告警与死信队列 |
+| **租户容量隔离** | 数据库原子协调的跨副本租户审查槽位，覆盖异步重试、离线恢复与恢复代际，过载返回可重试的 429，抑制单租户无限占用持久任务容量 |
+| **租户公平调度** | Redis Streams 上可选的跨副本加权轮转；内容寻址策略、匿名租户键、原子延后/准入索引、在途租约心跳与崩溃接管在保留 ACK、重试和 DLQ 语义的同时避免连续突发长期垄断 Worker |
+| **Redis Cluster 队列** | 版本化命名空间把 Stream、去重、公平索引与恢复 Epoch 固定到同一 Hash Slot；协议清单拒绝不兼容实例，真实三主分片 CI 验证原子语义 |
+| **安全 HTTP 边界** | 全响应请求关联 ID、无内部细节的统一 500、过滤 query/异常原文的结构化日志、一致安全响应头，以及默认不信任转发头的可信代理链客户端身份解析 |
+| **无消息故障契约** | Task/Trace/Checkpoint、Agent、Queue/DLQ、Outbox/Effect、Readiness、插件与遥测只记录异常类型和稳定故障引用，不落异常原文 |
+| **可观测性** | 任务 Trace、Agent 消息、固定基数的模型成本/容量/修复/反馈 Prometheus 指标和 OpenTelemetry Trace |
+| **SLO 与告警** | 版本化 30 天 SLO、错误预算、快/慢燃烧率告警、模型容量与预算、修复验证和反馈趋势告警、Grafana Dashboard 与处置 Runbook |
+| **灾备证据** | SQLite/PostgreSQL 执行隔离恢复与 RPO/RTO 校验，并可从 PostgreSQL/Outbox 向全新 Redis 离线重建未完成任务 |
+| **数据生命周期** | 默认关闭、显式启用的状态感知历史保留；分批清理终态 Trace 与过期会话快照，同时保留最新事件和跨轮次连续性锚点 |
+| **质量证据治理** | 双人盲标与独立裁决、标注包/数据集哈希、许可与来源审计、仓库隔离、语言/CWE/Rule 切片及置信度校准 |
 | **Web 控制台** | 提供运行总览、发起审查、任务中心、Skill 管理、演进实验室和 GitHub 配置页面 |
 
 ## 工作原理
@@ -66,13 +77,15 @@ flowchart TB
     subgraph RUNTIME["02 · DURABLE RUNTIME"]
         direction LR
         SERVICE(["ReviewService"])
+        OUTBOX["Transactional Outbox<br/>Lease · Retry · Dedupe"]
         QUEUE["Task Queue<br/>Memory · Redis Streams"]
         HARNESS(["Review Harness<br/>Budget · Retry · Checkpoint"])
         PARSER["Unified Diff Parser"]
         STORE[("Task Store<br/>SQLite · PostgreSQL")]
 
-        SERVICE --> QUEUE --> HARNESS --> PARSER
+        SERVICE --> OUTBOX --> QUEUE --> HARNESS --> PARSER
         SERVICE -. "persist" .-> STORE
+        OUTBOX -. "claim" .-> STORE
         HARNESS -. "trace" .-> STORE
     end
 
@@ -243,6 +256,8 @@ curl 'http://127.0.0.1:8080/v1/tasks/<task-id>/report'
 | `SEC-SUBPROCESS-SHELL` | High | `shell=True` 命令注入风险 | ✓ |
 | `SEC-HARDCODED-SECRET` | High | 硬编码 Password、Token、Secret、API Key | ✓ |
 | `SEC-SQL-CONCAT` | High | SQL 字符串拼接 | — |
+| `SEC-YAML-LOAD` | High | `yaml.load(...)` 不安全反序列化 | ✓ |
+| `SEC-INSECURE-COOKIE` | High | `set_cookie(..., secure=False)` | ✓ |
 | `REL-EMPTY-EXCEPT` | Medium | 宽泛捕获并吞掉异常 | — |
 | `REL-DEBUG-PRINT` | Low | 新增 `print()` / `console.log()` | ✓ |
 
@@ -256,9 +271,25 @@ curl 'http://127.0.0.1:8080/v1/tasks/<task-id>/report'
 4. 如果配置了测试命令，则在隔离的仓库副本中运行测试；
 5. 所有门禁通过后，以一个原子提交创建 Draft Pull Request。
 
+对于 `SEC-YAML-LOAD` 与 `SEC-INSECURE-COOKIE` Finding，仅当 Python AST 精确匹配
+单参数 `yaml.load(...)` 或显式 `secure=False` 时，才分别替换为
+`yaml.safe_load(...)` 和 `secure=True`；自定义 Loader、额外参数等不确定形态会拒绝自动修复。
+
+安全与可靠性审查器也已实现为独立 `review.reviewer` Provider；企业插件可以新增
+Reviewer、调整优先级或通过 TOML Profile 禁用一个内置 Reviewer，而无需替换
+`ReviewEngine`。以上五种确定性修复均实现为独立 `fix.rule` Provider，同样可以独立
+启停或扩展，而无需修改 `SafeFixer`。
+部署配置可以把基础 Profile、区域和环境覆盖层按顺序组合；最终有效配置与每层文件
+都带 SHA-256 指纹，便于发布审计和回滚比对。
+插件协议、生命周期、信任边界和开发示例见
+[`docs/plugin-system.md`](docs/plugin-system.md)。
+
 ## 接入大模型
 
-EvoAgent 使用 OpenAI Chat Completions 兼容协议。无论使用哪个模型，输出都必须符合结构化 JSON Schema，并且发现位置必须属于 Diff 新增行。
+EvoAgent 使用 OpenAI Chat Completions 兼容协议。生产评审统一经过可替换的
+`model.gateway`，而不是由 Reviewer 直接持有端点和密钥。网关在调用前脱敏常见
+凭据并按租户/仓库原子预占当日预算，调用后校验 JSON 对象、输出 Token 上限并
+记账；原始 Prompt 和响应不会写入用量账本。发现位置仍必须属于 Diff 新增行。
 
 ### DeepSeek
 
@@ -296,7 +327,20 @@ export EVOAGENT_LLM_MODEL='<model-name>'
 python -m evoagent
 ```
 
-密钥只从环境变量读取，不要提交到代码仓库。
+密钥只从环境变量读取，不要提交到代码仓库。生产环境建议显式配置
+`EVOAGENT_LLM_ALLOWED_HOSTS`；它只接受精确 DNS 主机名。Token/成本上限和计价
+变量见 [`.env.example`](.env.example)，详细语义与多路由边界见
+[`docs/model-gateway.md`](docs/model-gateway.md)。
+
+企业部署可以通过 `EVOAGENT_LLM_ROUTES_FILE` 加载多个按优先级排列的 TOML
+路由；每条路由只引用 API Key 的环境变量名，并可限制租户、仓库模式和驻留区域。
+瞬时故障只会在 `EVOAGENT_LLM_FALLBACK_ATTEMPTS` 的有界预算内切换备用路由，
+每条路由使用独立熔断器。v2 配置还支持同优先级确定性加权、候选模型影子运行和
+只读晋级门禁，以及由数据库跨副本协调的并发/分钟容量上限；容量耗尽会在有界
+预算内回退，管理接口只给出权重建议而不会自动改生产配置。候选结果不会进入
+正式审查，激活仍需评审配置并重新部署。示例见
+[`examples/model-routes.toml`](examples/model-routes.toml) 和
+[`examples/model-routes-v2.toml`](examples/model-routes-v2.toml)。
 
 ## 接入 GitHub
 
@@ -438,9 +482,11 @@ flowchart TB
 - 严重级别准确率；
 - 高风险召回率；
 - 干净样本准确率；
-- 执行成功率。
+- 执行成功率；
+- 按语言、CWE 与 Rule 的切片指标；
+- finding 置信度的 ECE、Brier 与非法值计数。
 
-只有验证集达到最小提升，且验证集与隐藏集的受保护指标没有超过允许退化范围时，候选版本才能激活。评测记录包含 Prompt 和数据集 SHA-256 指纹；Holdout 只持久化聚合指标，不通过 API 暴露案例内容。
+只有基线与候选使用完全相同的数据集、验证集达到最小提升，且验证集与隐藏集的受保护指标没有超过允许退化范围时，候选版本才能激活。真实数据还必须通过许可审查、不可变 GitHub 来源、仓库隔离、双人盲标、独立裁决和 sidecar 哈希绑定；只修改来源字段不能绕过门禁。评测记录包含 Prompt 和数据集 SHA-256 指纹；Holdout 只持久化聚合指标，不通过 API 暴露案例内容。
 
 没有配置 LLM、数据不足或安全完整性检查未通过时，候选只会保存为 `deferred` 或 `rejected`，不会直接上线。
 
@@ -481,7 +527,7 @@ curl -X POST 'http://127.0.0.1:8080/v1/skills/reload'
 | 组件 | 本地模式 | 生产模式 |
 | --- | --- | --- |
 | 数据库 | SQLite | PostgreSQL 16 |
-| 任务队列 | 进程内线程队列 | Redis Streams |
+| 任务队列 | 进程内线程队列 | Redis Streams / Redis Cluster Streams |
 | Worker | 当前进程 | 多 Worker、ACK、租约和过期任务回收 |
 | 失败处理 | 任务记录 | 指数退避、最大尝试次数、死信队列和重放 |
 | 登录 | 默认关闭 | JWT + RBAC + Tenant 隔离 |
@@ -490,7 +536,7 @@ curl -X POST 'http://127.0.0.1:8080/v1/skills/reload'
 如果未配置 `EVOAGENT_DATABASE_URL` 和 `EVOAGENT_REDIS_URL`，系统会自动使用本地模式。
 
 > [!IMPORTANT]
-> 死信队列、指数退避重试与重放的**持久化保证仅在 `redis-streams` 队列下成立**。本地进程内队列（`/health` 中 `queue` 为 `memory-ephemeral`、`queue_durable` 为 `false`）是非持久的：进程退出会丢失待处理、执行中、待重试与死信任务，仅适用于单进程开发环境。配置了 PostgreSQL 却未配置 Redis 时，服务会在启动时打印非持久告警。
+> 死信队列、指数退避重试与重放的**持久化保证仅在 Redis Streams 队列下成立**。本地进程内队列（`/health` 中 `queue` 为 `memory-ephemeral`、`queue_durable` 为 `false`）是非持久的：进程退出会丢失待处理、执行中、待重试与死信任务，仅适用于单进程开发环境。配置了 PostgreSQL 却未配置 Redis 时，服务会在启动时打印非持久告警。
 
 ## 生产部署
 
@@ -545,6 +591,16 @@ docker compose up --build -d
 docker compose ps
 ```
 
+升级生产环境时，先按变更流程备份数据库，再用相同镜像运行独立迁移任务：
+
+```bash
+docker compose run --rm evoagent python -m evoagent.migrate
+```
+
+迁移历史带版本、名称和 SHA-256 校验和；服务会拒绝连接由更高版本程序创建的
+数据库。并发实例启动由数据库迁移锁串行化。备份、恢复与 expand/migrate/contract
+流程见 [`docs/database-migrations.md`](docs/database-migrations.md)。
+
 Compose 会启动：
 
 - EvoAgent：`0.0.0.0:8080`
@@ -569,6 +625,42 @@ curl http://127.0.0.1:8080/health
 }
 ```
 
+### 4. 隔离恢复演练
+
+在带有 `pg_dump` / `pg_restore` 的独立运维 Job 中执行，不要给常驻服务容器授予建库权限：
+
+```bash
+export EVOAGENT_DATABASE_URL='postgresql://...'
+evoagent-dr --backend postgresql \
+  --output-dir /var/lib/evoagent/recovery \
+  --max-rpo-seconds 3600 \
+  --max-rto-seconds 900
+```
+
+工具只会恢复到内部生成的 `evoagent_drill_<uuid>` 数据库，并在逐表内容指纹、迁移
+校验和、应用读写及 RPO/RTO 全部通过后删除临时库、输出 JSON 证据。数据备份不会上传
+到普通 CI Artifact；生产加密、对象锁和演练流程见
+[`docs/disaster-recovery.md`](docs/disaster-recovery.md)。
+
+区域故障后应保持应用和 Worker 停止，先对全新空 Redis v1 数据库或空 v2 命名空间执行
+dry-run，再使用同一恢复 UUID `--apply`；工具会拒绝活动队列、终态任务、取消任务和缺失
+恢复载荷的隐式放行。Cluster 模式需同时设置 `EVOAGENT_REDIS_CLUSTER=true` 和新的
+`EVOAGENT_QUEUE_NAMESPACE`：
+
+```bash
+recovery_id="$(python -c 'import uuid; print(uuid.uuid4())')"
+evoagent-recover-queue \
+  --recovery-id "$recovery_id" \
+  --confirm-database restored_evoagent > queue-recovery-plan.json
+plan_sha256="$(python -c 'import json; print(json.load(open("queue-recovery-plan.json"))["plan"]["plan_sha256"])')"
+# 核对不含原始 Diff 的 JSON 计划后，按原计划哈希执行
+evoagent-recover-queue \
+  --recovery-id "$recovery_id" \
+  --confirm-database restored_evoagent \
+  --expect-plan-sha256 "$plan_sha256" \
+  --apply
+```
+
 ## 登录与 API 鉴权
 
 启用 `EVOAGENT_AUTH_REQUIRED=true` 后，业务 API 需要 Bearer Token：
@@ -589,7 +681,20 @@ curl 'http://127.0.0.1:8080/api/dashboard' \
 
 Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webhook 路径使用独立的 GitHub 签名校验，不需要 Bearer Token。
 
+管理员可以通过版本化仓库策略为每个 Tenant/Repository 限制 Reviewer、LLM
+Provider/Model、Diff 大小、GitHub 评论和确定性 FixRule。每次变更会原子写入历史与
+审计日志，任务接收时固化策略快照，紧急禁用仍会阻止未执行任务。字段、兼容规则与
+API 示例见 [`docs/repository-policies.md`](docs/repository-policies.md)。
+
+GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在同一个
+数据库事务中提交；并发重复 delivery 只绑定一个任务，任一步失败都会整体回滚，避免
+“Webhook 已接收但任务不存在”的悬挂状态。
+
 ## API 概览
+
+所有响应都会返回 `X-Request-ID`。调用方可传入 1–64 位字母、数字、点、下划线或
+连字符组成的请求 ID；非法或缺失时服务会生成随机 ID。意外的服务端异常只返回通用
+错误与该 ID，运维人员通过结构化日志关联排查，不会向客户端暴露异常、密钥或堆栈。
 
 ### 审查与任务
 
@@ -651,9 +756,12 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 
 > 复现契约：命令必须在 `original` 上失败、在 `patched` 上通过。仅「原始代码上真实
 > 非零退出」才算复现；超时/启动失败等基础设施问题一律判为「不确定」而不冒充证据。
-> 由于该路径同时运行不可信 PR 代码与调用方提供的命令，**证据运行强制要求容器隔离**：
-> 未配置 `EVOAGENT_REPAIR_CONTAINER_IMAGE` 时该步返回 error 并停留在 L1，绝不在宿主机执行。
-> 强隔离 microVM（Firecracker/Kata）与托管静态分析（CodeQL）为后续工作。
+> 由于该路径同时运行不可信 PR 代码与调用方提供的命令，**证据运行强制要求容器隔离**。
+> 未配置远程 Runner 时，`proof.executor` 使用本地容器执行器；未设置
+> `EVOAGENT_REPAIR_CONTAINER_IMAGE` 则返回 error 并停留在 L1，绝不在宿主机执行。
+> 生产环境可配置独立 `evoagent-proof-runner`：请求/响应由 HMAC-SHA256 双向签名，绑定
+> request/input/evidence 摘要，限制重放、出口、容量和字节数，并返回可寻址证据引用。
+> 完整部署和剩余边界见 [`docs/remote-proof-runner.md`](docs/remote-proof-runner.md)。
 
 ### GitHub、Skill 与演进
 
@@ -675,6 +783,7 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 | --- | --- | --- |
 | `GET` | `/health` | 健康检查 |
 | `GET` | `/metrics` | Prometheus 文本指标 |
+| `GET` | `/v1/plugins` | 当前 Profile、插件激活顺序与 Capability Provider 清单 |
 | `GET` | `/api/dashboard` | Dashboard 聚合数据 |
 | `GET` | `/api/tasks` | 任务列表 |
 | `GET` | `/api/skills` | Skill 列表 |
@@ -683,6 +792,13 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 | `GET` | `/api/alerts` | 持久化告警 |
 | `GET` | `/api/queue/dead-letters` | 死信任务列表 |
 | `POST` | `/v1/queue/dead-letters/replay` | 重放指定死信任务 |
+| `GET` | `/api/outbox` | 按状态查询事务 Outbox 消息 |
+| `POST` | `/v1/outbox/replay` | 审计并重放指定 Outbox 死消息 |
+| `GET` | `/api/model-usage` | 管理员按当前租户/可选仓库查询模型用量元数据 |
+| `POST` | `/v1/model-usage/reconcile` | 按供应商账单原子结算超时的模型用量预占并写入审计 |
+| `GET` | `/api/model-routes/promotion` | 按租户/仓库查询候选路由只读晋级门禁 |
+| `GET` | `/api/model-routes/capacity` | 查询路由容量、熔断状态和只读权重建议；共享池精确计数脱敏 |
+| `GET` | `/api/tenant-review-capacity` | 管理员查询当前租户的审查槽位、上限、饱和状态、最老占用时间及队列权重/策略摘要 |
 
 `POST /v1/reviews` 的 Diff 默认最大为 1 MiB；单任务默认最多 8 步、120 秒。可通过 `.env.example` 中的环境变量调整。
 
@@ -694,18 +810,65 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 | --- | --- | --- |
 | `EVOAGENT_HOST` | `127.0.0.1` | HTTP 监听地址 |
 | `EVOAGENT_PORT` | `8080` | HTTP 端口 |
+| `EVOAGENT_TRUSTED_PROXY_CIDRS` | 空 | 可解释 `X-Forwarded-For` 的直接代理规范 CIDR，逗号分隔；空值始终使用 socket peer |
+| `EVOAGENT_RATE_LIMIT_RPS` | `0` | 每个已解析客户端地址的每秒请求上限；0 为关闭 |
+| `EVOAGENT_RATE_LIMIT_BURST` | `0` | 客户端令牌桶突发容量；0 时跟随 RPS |
+| `EVOAGENT_MAX_INFLIGHT_HEAVY` | `0` | 同进程重端点最大在途数；0 为关闭 |
+| `EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS` | `0` | 跨副本每租户未完成审查硬上限；0 不拒绝但仍记录槽位 |
+| `EVOAGENT_TENANT_CAPACITY_RETRY_SECONDS` | `5` | 租户容量 429 响应的 `Retry-After` 秒数 |
 | `EVOAGENT_MAX_DIFF_BYTES` | `1048576` | 单次 Diff 最大字节数 |
 | `EVOAGENT_MAX_STEPS` | `8` | 单任务最大状态步数 |
 | `EVOAGENT_TIMEOUT_SECONDS` | `120` | 审查任务超时 |
+| `EVOAGENT_QUEUE_SHUTDOWN_TIMEOUT_SECONDS` | `30` | 关闭存储前等待队列在途任务完成的最长秒数 |
+| `EVOAGENT_QUEUE_NAMESPACE` | 空 | 稳定、非敏感的 v2 队列命名空间；隔离环境并将所有原子键放入同一 Cluster Hash Slot |
+| `EVOAGENT_REDIS_CLUSTER` | `false` | 使用拓扑感知 Redis Cluster 客户端；要求命名空间且只能使用逻辑数据库 0 |
+| `EVOAGENT_QUEUE_FAIR_SCHEDULING` | `false` | 是否对 Redis 新消息启用跨副本加权租户轮转；Memory 后端不支持 |
+| `EVOAGENT_QUEUE_TENANT_WEIGHTS_FILE` | 空 | [v1 权重 TOML](examples/tenant-queue-weights.toml)；稳定策略 ID，默认/单租户权重范围 1–100，内容摘要随消息快照 |
+| `EVOAGENT_OUTBOX_MAX_ATTEMPTS` | `20` | Outbox 发布进入 dead 前的最大尝试次数 |
+| `EVOAGENT_OUTBOX_LEASE_SECONDS` | `30` | Outbox Dispatcher 的消息所有权租约秒数 |
+| `EVOAGENT_PLUGIN_PROFILE` | 空 | Trusted Plugin TOML Profile 路径 |
+| `EVOAGENT_PLUGIN_PROFILE_LAYERS` | 空 | 在基础 Profile 后依次应用的 TOML 覆盖层路径，逗号分隔 |
+| `EVOAGENT_PLUGIN_DISCOVERY` | `false` | 是否发现已安装的可信插件 Entry Point |
+| `EVOAGENT_PLUGIN_ALLOWLIST` | 空 | 允许加载的可信 Plugin ID，逗号分隔 |
 | `EVOAGENT_LLM_PROVIDER` | `local` | `local`、`deepseek`、`openrouter-free` 或 `custom` |
+| `EVOAGENT_LLM_ALLOWED_HOSTS` | 当前路由主机 | 模型出口精确 DNS 主机 allowlist，逗号分隔 |
+| `EVOAGENT_LLM_MAX_INPUT_TOKENS` | `120000` | 单请求估算输入 Token 上限 |
+| `EVOAGENT_LLM_MAX_OUTPUT_TOKENS` | `4096` | 单请求最大输出 Token |
+| `EVOAGENT_LLM_DAILY_TOKEN_BUDGET` | `0` | 每租户/仓库/UTC 日 Token 预算；0 为关闭 |
+| `EVOAGENT_LLM_DAILY_COST_MICROS` | `0` | 每租户/仓库/UTC 日成本预算（微单位）；0 为关闭 |
+| `EVOAGENT_LLM_ROUTES_FILE` | 空 | v1/v2 多路由 TOML；设置后替代单 Provider 预设 |
+| `EVOAGENT_LLM_FALLBACK_ATTEMPTS` | `1` | 主路由失败后最多尝试的额外候选路由数 |
+| `EVOAGENT_LLM_RESERVATION_TTL_SECONDS` | `600` | 模型预占转为待对账状态前的秒数，必须大于请求超时 |
+| `EVOAGENT_LLM_SHADOW_WORKERS` | `2` | 候选模型影子执行线程数；0 禁用执行但保留 shed 观测 |
+| `EVOAGENT_LLM_SHADOW_MAX_INFLIGHT` | `8` | 单进程影子调用在途上限（执行中 + 排队） |
+| `EVOAGENT_LLM_SHADOW_DAILY_TOKEN_BUDGET` | `0` | 影子专属日 Token 上限；仍受总预算约束，0 不设额外上限 |
+| `EVOAGENT_LLM_SHADOW_DAILY_COST_MICROS` | `0` | 影子专属日成本上限（微单位）；仍受总预算约束 |
+| `EVOAGENT_LLM_CAPACITY_LEASE_SECONDS` | `180` | 跨副本路由并发租约秒数，必须大于模型请求超时 |
+| `EVOAGENT_LLM_CAPACITY_WINDOW_RETENTION_HOURS` | `48` | 路由分钟容量计数保留小时数 |
 | `EVOAGENT_DATABASE_URL` | 空 | PostgreSQL URL；为空时使用 SQLite |
 | `EVOAGENT_REDIS_URL` | 空 | Redis URL；为空时使用进程内队列 |
+| `EVOAGENT_HISTORY_RETENTION_DAYS` | `0` | 终态 Trace 与可淘汰会话快照的保留天数；0 表示关闭 |
+| `EVOAGENT_HISTORY_MAINTENANCE_SECONDS` | `3600` | 历史保留维护周期；启用时至少 60 秒 |
+| `EVOAGENT_HISTORY_PRUNE_BATCH_SIZE` | `1000` | 每批最多处理的 Trace 行与会话轮次，最大 10000 |
 | `EVOAGENT_ASYNC_WORKERS` | `2` | 异步 Worker 数量 |
 | `EVOAGENT_AUTH_REQUIRED` | `false` | 是否启用登录和 API 鉴权 |
 | `EVOAGENT_AUTO_POST_REVIEW` | `false` | 是否自动向 GitHub PR 回写报告 |
 | `EVOAGENT_REPAIR_TEST_COMMAND` | 空 | 自动修复后运行的仓库测试命令 |
+| `EVOAGENT_PROOF_RUNNER_URL` | 空 | 独立 Proof Runner `/v1/execute` 地址；非回环必须 HTTPS |
+| `EVOAGENT_PROOF_RUNNER_ALLOWED_HOSTS` | 空 | Runner 精确主机白名单（启用远程执行时必填） |
+| `EVOAGENT_PROOF_RUNNER_SIGNING_KEY_ID` | `default` | 当前 HMAC 密钥的非敏感版本 ID，写入签名证明 |
+| `EVOAGENT_PROOF_RUNNER_REPLAY_REDIS_URL` | 空 | Runner 多副本共享 nonce 存储；生产横向扩容时配置 |
+| `EVOAGENT_PROOF_RUNNER_REQUIRE_SHARED_REPLAY` | `false` | 是否禁止 Runner 使用进程内防重放存储 |
+| `EVOAGENT_PROOF_RUNNER_ARTIFACT_S3_BUCKET` | 空 | 启用了 Versioning 与 Object Lock 的不可变证明桶；与本地目录互斥 |
+| `EVOAGENT_PROOF_RUNNER_ARTIFACT_S3_RETENTION_MODE` | `COMPLIANCE` | 证明对象留存模式：`COMPLIANCE` 或 `GOVERNANCE` |
+| `EVOAGENT_PROOF_RUNNER_ARTIFACT_S3_RETENTION_DAYS` | `2555` | 每个证明对象的最短留存天数；同内容再次写入会延长而不会缩短 |
+| `EVOAGENT_PROOF_RUNNER_REQUIRE_ARTIFACTS` | `false` | 证明存储未配置或不可用时是否禁止产生远程执行证明 |
+| `EVOAGENT_PROOF_REQUIRE_REMOTE` | `false` | 是否要求远程 Runner 完整配置，否则启动失败 |
 | `EVOAGENT_SKILL_SANDBOX` | `true` | 动态 Skill 是否运行在沙箱中 |
+| `EVOAGENT_SKILL_CONTAINER_IMAGE` | 空 | Dynamic Skill 的独立容器镜像（生产建议固定 digest） |
+| `EVOAGENT_SKILL_REQUIRE_CONTAINER` | `false` | 存在 Dynamic Skill 时是否强制要求容器，否则启动失败 |
 | `EVOAGENT_OTEL_ENDPOINT` | 空 | OTLP HTTP Exporter 地址 |
+| `EVOAGENT_PROMETHEUS_URL` | `http://127.0.0.1:9090` | `evoagent-slo` 查询地址（非服务进程配置） |
 
 ## 项目结构
 
@@ -713,12 +876,31 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 .
 ├── evoagent/
 │   ├── api.py                    # HTTP API 与静态控制台
-│   ├── service.py                # 业务入口与组件装配
+│   ├── application/              # Review/Webhook/Session/Repair/Policy 用例层
+│   ├── service.py                # Capability 组装、生命周期与兼容门面
+│   ├── plugins.py                # 插件依赖图、生命周期、Scope 与事件总线
+│   ├── ports.py                  # Store / Queue / CodeHost 领域端口
+│   ├── migrations.py             # 带校验和与兼容门禁的数据库迁移历史
+│   ├── outbox.py                 # 事务发布、租约重试与故障恢复
+│   ├── capabilities.py           # 稳定类型化 Capability 定义
+│   ├── bootstrap.py              # 默认 Provider Catalog 与应用组装
+│   ├── review_extensions.py      # Reviewer Contribution 稳定能力合同
+│   ├── review_engine.py          # 可替换 Reviewer Graph 与 Harness 组装
+│   ├── skills.py                 # Dynamic Skill 候选快照与事务 reload
+│   ├── skill_runner.py           # 有界、无权限的 Skill 子进程协议
+│   ├── model_gateway.py          # 模型脱敏、出口、预算、输出与用量治理
+│   ├── proof.py                  # L1–L4 证据阶梯与执行器端口消费
+│   ├── proof_remote.py           # 双向签名远程执行协议与独立 Runner
+│   ├── proof_artifacts.py        # 本地内容寻址 / S3 Object Lock 证明存储
+│   ├── slo.py                    # 版本化 SLO 与 Prometheus 评估 CLI
+│   ├── dr.py                     # 隔离备份恢复演练与 RPO/RTO 证据
+│   ├── recovery.py               # PostgreSQL/Outbox 到空 Redis 的离线任务重建
 │   ├── harness.py                # LangGraph、状态机与 Checkpoint
 │   ├── agents.py                 # 多 Agent 协作协议
 │   ├── reviewer.py               # 本地规则与 OpenAI-compatible Reviewer
 │   ├── skills.py                 # 动态 Skill 注册、校验和隔离执行
-│   ├── fixer.py                  # 确定性自动修复
+│   ├── fix_rules.py              # 可插拔确定性修复规则
+│   ├── fixer.py                  # 修复验证与安全发布
 │   ├── verifier.py               # 编译与测试门禁
 │   ├── evolution.py              # Prompt 版本与回放门禁
 │   ├── evaluation_harness.py     # 端到端评测框架
@@ -729,7 +911,9 @@ Web 控制台会把登录状态保存在当前浏览器的 `localStorage`。Webh
 ├── web/                          # 零构建 Web 控制台
 ├── tests/                        # 单元与集成测试
 ├── scripts/                      # 数据导入、评测和报告脚本
+├── ops/                          # SLO、Prometheus 规则与 Grafana Dashboard
 ├── evaluation_data/              # 版本化评测数据
+├── examples/profiles/            # Trusted Plugin Profile 示例
 ├── docs/adr/                     # 架构决策记录
 ├── pyproject.toml                # 包元数据与质量工具统一配置
 ├── requirements.lock            # 运行依赖及跨平台哈希
@@ -757,20 +941,22 @@ make check
 - 锁定依赖漏洞审计；
 - sdist / wheel 构建验证。
 
-当前整体行覆盖率约 83%，其中 `reviewer`、`fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
+当前整体行覆盖率约 85%，其中 `fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
 
-GitHub 额外执行 Gitleaks、CodeQL、依赖审计和 Docker 构建冒烟测试（构建镜像、启动容器并校验 `/health` 与 `/v1/reviews`）。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)，边界适配器的集成测试范围与后续收敛计划记录在 [`docs/adr/0001-engineering-quality-gates.md`](docs/adr/0001-engineering-quality-gates.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
+GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16、Redis 7 与三主 Redis Cluster，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、同槽原子去重、加权租户轮转、长任务租约心跳、命名空间恢复、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离、远程 Proof Runner 的签名 HTTP → 禁网容器全链路、PostgreSQL 隔离备份恢复、空 Redis 任务重建，以及生产镜像的 `/ready` → Outbox → Redis → Worker 流程。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；后续架构决策记录在 [`docs/adr/`](docs/adr/)，模型治理见 [`ADR 0007`](docs/adr/0007-governed-model-gateway.md)，远程证据边界见 [`ADR 0009`](docs/adr/0009-authenticated-remote-proof-runner.md)，数据库恢复边界见 [`ADR 0011`](docs/adr/0011-isolated-database-recovery-drills.md) 与 [`ADR 0012`](docs/adr/0012-offline-queue-reconstruction.md)，Redis Cluster 键空间见 [`ADR 0028`](docs/adr/0028-versioned-redis-cluster-keyspace.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
 
-更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)，性能 SLO、压测方法与可复现基线见 [`docs/performance.md`](docs/performance.md) 与 [`docs/performance-baseline.md`](docs/performance-baseline.md)。
+更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，仓库策略见 [`docs/repository-policies.md`](docs/repository-policies.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)，SLO 告警与处置见 [`docs/operations.md`](docs/operations.md)，数据库灾备见 [`docs/disaster-recovery.md`](docs/disaster-recovery.md)，性能压测方法与可复现基线见 [`docs/performance.md`](docs/performance.md) 与 [`docs/performance-baseline.md`](docs/performance-baseline.md)。
 
 ## 生产级性能与压测
 
 面向生产的水平/垂直扩展与过载保护均已内置，压测方法学（百分位而非均值、恒定到达率以规避 coordinated omission）详见 [`docs/performance.md`](docs/performance.md)：
 
 - **多核 HTTP 扩展**：`EVOAGENT_WEB_WORKERS` 通过 `SO_REUSEPORT` 派生多个 worker 进程，master 监督进程负责崩溃重启（带退避与风暴上限）与 `SIGTERM` 优雅摘流（`/ready` 转 503 → 等待在途请求 → 到期 `SIGKILL` 兜底）。
-- **过载保护（背压）**：按客户端的令牌桶限流 + 重端点的有界并发闸门，过载时返回 `429`/`503` + `Retry-After` 而非雪崩（`EVOAGENT_RATE_LIMIT_RPS`、`EVOAGENT_MAX_INFLIGHT_HEAVY`）。
+- **过载保护（背压）**：按客户端的令牌桶限流 + 重端点的有界并发闸门，过载时返回 `429`/`503` + `Retry-After` 而非雪崩。默认只信 socket peer；配置 `EVOAGENT_TRUSTED_PROXY_CIDRS` 后才从右向左验证 `X-Forwarded-For` 代理链，避免伪造地址绕过限流。
+- **租户噪声隔离**：PostgreSQL/SQLite 在任务与 Outbox 同一事务内原子占用租户槽位；异步失败在重试与离线队列恢复期间保留槽位，成功、取消或最终死信才释放。生产 Redis 可进一步启用内容寻址的加权租户轮转，限制持久占用并公平分配任务启动机会。
 - **依赖韧性**：GitHub / LLM 出站调用包裹熔断器（closed/open/half-open + 退避抖动），仅对连接/超时类传输故障计数，上游宕机时快速失败而非占满线程。
-- **连接池**：Postgres 使用 `psycopg_pool` 连接池（`postgres-pool` 可选依赖，缺失时自动回退到每次新建连接），池指标经 `/metrics` 暴露。
+- **连接池**：Postgres 使用核心依赖 `psycopg_pool` 的有界连接池；池大小、可用连接和等待请求经 `/metrics` 暴露，真实耗尽/恢复行为由 CI 门禁验证。
+- **历史保留**：可选的状态感知维护器分批清理过期运行历史，不删除活跃任务、每个任务的最后事件、会话最新完成快照或乱序完成仍需读取的连续性锚点。
 - **可观测性**：`/metrics` 新增延迟直方图（p50/p95/p99 可推导）、在途请求、被拒计数、队列深度、连接池与熔断器状态。
 - **压测工具**：纯 Python 恒定到达率压测器 [`scripts/loadgen.py`](scripts/loadgen.py)（离线/CI 可用，阈值超限即非零退出）、k6 脚本 [`perf/`](perf)、全栈 [`docker-compose.perf.yml`](docker-compose.perf.yml)，以及热点路径微基准 [`scripts/microbench.py`](scripts/microbench.py)。CI 由 [`.github/workflows/perf.yml`](.github/workflows/perf.yml) 作为性能回归门禁。
 
@@ -800,6 +986,25 @@ python scripts/run_e2e_evaluation.py
 python scripts/run_e2e_evaluation.py --reuse-dataset
 ```
 
+真实公共 PR 数据先导入不含答案的案例，由至少两人盲标并经第三人裁决，再编译为带
+sidecar 证据的数据集：
+
+```bash
+python scripts/import_github_pr_dataset.py public-pr-manifest.jsonl public-pr-inputs.jsonl
+evoagent-eval-labels \
+  --cases public-pr-inputs.jsonl \
+  --annotations annotation-packets.jsonl \
+  --output public-pr-labelled.jsonl \
+  --evidence annotation-evidence.json
+python scripts/run_e2e_evaluation.py \
+  --reuse-dataset --dataset public-pr-labelled.jsonl \
+  --annotation-evidence annotation-evidence.json
+```
+
+详细数据协议、权利审查字段和门禁见
+[`docs/evaluation.md`](docs/evaluation.md)。原始标注包可能包含内部身份映射，应存放在受控
+数据域；评测数据只保存匿名 reviewer ID 和 SHA-256。
+
 报告会写入：
 
 ```text
@@ -816,8 +1021,10 @@ output/evaluation/evaluation-report.md
 - LLM 密钥、GitHub Token 和认证密钥只从环境变量读取；
 - 对外部传入的 GitHub URL（如 Webhook 中的 `diff_url`）强制 HTTPS 与 GitHub 域名白名单校验，跨域名重定向会剥离 Authorization，并对响应大小设上限，避免 Token 外泄与内存放大；
 - Webhook Secret 与登录 Secret 用途不同，不能混用；
+- 所有 HTTP 响应携带经过约束的请求关联 ID；访问日志不记录 query，意外 500 不向调用方或边界日志复制异常原文；
 - 动态 Skill 不获得宿主权限，并运行在受限进程中；
 - 自动修复不写入原 PR Head，只创建独立分支和 Draft PR；
+- 生产 Proof Runner 可独立部署；API 仅访问精确白名单 HTTPS 地址，签名验证失败、重放、超时或容量不足均只能产生“不确定”，不能升级证据等级；
 - 只有配置测试命令后，才会在仓库副本中执行测试：配置容器镜像时以禁网、只读根、丢弃 capability、CPU/内存/进程数限额的容器运行（推荐用于不可信 PR 代码）；未配置镜像时以宿主回退模式运行，施加 CPU/内存/文件大小/进程数 `rlimit` 且超时会终止整个进程组，但不具备网络隔离，仅适用于可信仓库；
 - 私有仓库、评论回写和自动修复应使用最小权限 Token；
 - 公网部署必须启用认证，并通过反向代理限制暴露路径。

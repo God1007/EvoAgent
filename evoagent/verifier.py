@@ -28,6 +28,8 @@ import uuid
 import zipfile
 from io import BytesIO
 
+from .errors import safe_exception_summary
+
 
 class RepairVerifier:
     def __init__(
@@ -121,7 +123,7 @@ class RepairVerifier:
                 start_new_session=os.name != "nt",
             )
         except (FileNotFoundError, OSError) as exc:
-            return None, "failed to launch verification command: %s" % exc, False
+            return None, safe_exception_summary(exc, "verification launch failed"), False
         if process.stdout is None:  # pragma: no cover - defensive
             return process.wait(), "", False
         deadline = time.monotonic() + self.timeout_seconds

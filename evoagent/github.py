@@ -11,6 +11,9 @@ import urllib.request
 from datetime import datetime
 from typing import Any, ClassVar
 
+from . import __version__
+from .errors import AccessDeniedError
+
 
 def verify_signature(secret: str, body: bytes, signature: str) -> bool:
     if not secret or not signature.startswith("sha256="):
@@ -96,7 +99,7 @@ class GitHubClient:
     def _headers(self, accept: str = "application/vnd.github+json") -> dict[str, str]:
         headers = {
             "Accept": accept,
-            "User-Agent": "EvoAgent/0.1",
+            "User-Agent": "EvoAgent/%s" % __version__,
             "X-GitHub-Api-Version": "2022-11-28",
         }
         if self.token:
@@ -216,10 +219,31 @@ class GitHubClient:
     def get_repository(self, repository: str) -> dict:
         return self._json("GET", "https://api.github.com/repos/%s" % repository)
 
+    def get_branch(self, repository: str, branch: str) -> dict | None:
+        try:
+            return self._json(
+                "GET",
+                "https://api.github.com/repos/%s/git/ref/heads/%s"
+                % (repository, urllib.parse.quote(branch, safe="")),
+            )
+        except RuntimeError as exc:
+            if "HTTP 404" in str(exc):
+                return None
+            raise
+
+    def find_pull_request_by_head(self, repository: str, branch: str) -> dict | None:
+        owner = repository.split("/", 1)[0]
+        values = self._json(
+            "GET",
+            "https://api.github.com/repos/%s/pulls?state=all&head=%s"
+            % (repository, urllib.parse.quote("%s:%s" % (owner, branch), safe="")),
+        )
+        return values[0] if values else None
+
     def ensure_repository_access(self, repository: str) -> None:
         result = self.get_repository(repository)
         if str(result.get("full_name", "")).lower() != repository.lower():
-            raise PermissionError("GitHub installation is not authorized for this repository")
+            raise AccessDeniedError("GitHub installation is not authorized for this repository")
 
     def create_branch(self, repository: str, branch: str, sha: str) -> None:
         self._json(
@@ -343,7 +367,7 @@ class GitHubAppAuthenticator:
                 "Authorization": "Bearer " + self.app_jwt(),
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "EvoAgent/0.3",
+                "User-Agent": "EvoAgent/%s" % __version__,
                 "Content-Type": "application/json",
             },
         )

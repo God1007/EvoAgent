@@ -12,7 +12,9 @@ from dataclasses import asdict, dataclass
 from typing import Any, TypedDict, cast
 
 from .diff_parser import ParsedDiff
+from .errors import safe_exception_summary
 from .models import Finding, Severity
+from .ports import AgentMessageStorePort
 from .reviewer import Reviewer
 
 
@@ -276,7 +278,7 @@ class MultiAgentCoordinator(Reviewer):
         self,
         agents: list[Reviewer],
         max_workers: int = 4,
-        store=None,
+        store: AgentMessageStorePort | None = None,
     ):
         self.agents = agents
         self.max_workers = max_workers
@@ -364,13 +366,17 @@ class MultiAgentCoordinator(Reviewer):
     def _specialist_node(self, state: CollaborationState) -> dict[str, Any]:
         findings: list[Finding] = []
         failures = []
+
+        def invoke(agent: Reviewer) -> list[Finding]:
+            contextual = getattr(agent, "review_with_context", None)
+            if contextual:
+                return contextual(state.get("task_id", ""), state["diff"], state["parsed"])
+            return agent.review(state["diff"], state["parsed"])
+
         with ThreadPoolExecutor(
             max_workers=min(self.max_workers, max(1, len(self.agents)))
         ) as pool:
-            futures = {
-                pool.submit(agent.review, state["diff"], state["parsed"]): agent
-                for agent in self.agents
-            }
+            futures = {pool.submit(invoke, agent): agent for agent in self.agents}
             for future in as_completed(futures):
                 agent = futures[future]
                 try:
@@ -384,13 +390,14 @@ class MultiAgentCoordinator(Reviewer):
                         {"findings": [item.to_dict() for item in output]},
                     )
                 except Exception as exc:
-                    failures.append("%s: %s" % (agent.name, exc))
+                    summary = safe_exception_summary(exc, "review agent failed")
+                    failures.append("%s: %s" % (agent.name, summary))
                     self._emit(
                         state,
                         agent.name,
                         self.planner.name,
                         "agent_failure",
-                        {"error": str(exc)[:1000]},
+                        {"error": summary},
                     )
         if failures and not findings and len(failures) == len(self.agents):
             raise RuntimeError("all review agents failed: " + "; ".join(failures))

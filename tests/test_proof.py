@@ -132,6 +132,22 @@ class ProofLadderTests(unittest.TestCase):
         self.assertEqual(int(EvidenceLevel.L3_FIX_VERIFIED), result["evidence_level"])
         self.assertIn("could not be run", result["note"])
 
+    def test_executor_exception_detail_does_not_expose_exception_message(self):
+        class FailingExecutor:
+            def execute(self, _files, _command):
+                raise RuntimeError("runner-token=proof-secret")
+
+        result = ProofRunner(executor=FailingExecutor()).prove(
+            {"a.py": "BUG\n"}, {"a.py": "fixed\n"}, REPRO
+        )
+
+        self.assertEqual("error", result["steps"][0]["status"])
+        self.assertRegex(
+            result["steps"][0]["detail"],
+            r"^proof executor failed \[type=builtins\.RuntimeError; ref=[0-9a-f]{16}\]$",
+        )
+        self.assertNotIn("proof-secret", str(result))
+
 
 class MaterializeSafetyTests(unittest.TestCase):
     def test_rejects_path_traversal(self):

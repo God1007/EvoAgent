@@ -14,6 +14,10 @@ class FakeConn:
 
     def execute(self, sql, *args):
         self.executed.append(sql)
+        return self
+
+    def fetchone(self):
+        return {"database_name": "evoagent"}
 
 
 class PoolExhausted(RuntimeError):
@@ -79,6 +83,10 @@ class PoolCheckoutTests(unittest.TestCase):
         store = _store_with_pool(pool)
         store.ping()
         self.assertEqual(0, pool.checked_out)
+
+    def test_database_confirmation_uses_server_reported_identity(self):
+        store = _store_with_pool(FakePool())
+        self.assertEqual("evoagent", store.connected_database_name())
 
     def test_exhaustion_timeout_propagates(self):
         pool = FakePool()

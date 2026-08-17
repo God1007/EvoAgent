@@ -12,6 +12,97 @@ import threading
 import time
 from collections import OrderedDict
 from contextlib import contextmanager
+from dataclasses import dataclass
+from ipaddress import (
+    IPv4Address,
+    IPv4Network,
+    IPv6Address,
+    IPv6Network,
+    ip_address,
+    ip_network,
+)
+
+IPAddress = IPv4Address | IPv6Address
+IPNetwork = IPv4Network | IPv6Network
+
+
+@dataclass(frozen=True)
+class ClientIdentity:
+    """One bounded, spoof-resistant request identity for admission and logs."""
+
+    address: str
+    peer: str
+    source: str
+    forwarded_hops: int = 0
+
+
+class TrustedProxyResolver:
+    """Resolve ``X-Forwarded-For`` only across explicitly trusted proxy hops.
+
+    The socket peer is authoritative unless it belongs to a configured CIDR.
+    Starting at that peer, the chain is consumed from right to left and stops at
+    the first untrusted address. Anything further left is attacker-controlled.
+    Malformed or oversized chains fail closed to the socket peer.
+    """
+
+    MAX_HEADER_BYTES = 4096
+    MAX_HOPS = 32
+
+    def __init__(self, trusted_cidrs: tuple[str, ...] = ()):
+        self.networks: tuple[IPNetwork, ...] = tuple(
+            ip_network(value, strict=True) for value in trusted_cidrs
+        )
+
+    @staticmethod
+    def _parse_address(value: str, *, socket_peer: bool = False) -> IPAddress | None:
+        candidate = value.strip()
+        if socket_peer and "%" in candidate:
+            # A kernel-supplied IPv6 scope identifier is not part of the address
+            # and can never be supplied by an X-Forwarded-For hop.
+            candidate = candidate.split("%", 1)[0]
+        if not candidate or len(candidate) > 64 or "%" in candidate:
+            return None
+        try:
+            parsed = ip_address(candidate)
+        except ValueError:
+            return None
+        if isinstance(parsed, IPv6Address) and parsed.ipv4_mapped is not None:
+            return parsed.ipv4_mapped
+        return parsed
+
+    def _trusted(self, address: IPAddress) -> bool:
+        return any(
+            address.version == network.version and address in network for network in self.networks
+        )
+
+    def resolve(self, peer: str, forwarded_for: str = "") -> ClientIdentity:
+        raw_peer = (peer or "unknown").strip()[:128] or "unknown"
+        parsed_peer = self._parse_address(raw_peer, socket_peer=True)
+        canonical_peer = str(parsed_peer) if parsed_peer is not None else raw_peer
+        if not forwarded_for:
+            return ClientIdentity(canonical_peer, canonical_peer, "socket")
+        if parsed_peer is None or not self._trusted(parsed_peer):
+            return ClientIdentity(canonical_peer, canonical_peer, "ignored")
+        if len(forwarded_for.encode("utf-8", errors="replace")) > self.MAX_HEADER_BYTES:
+            return ClientIdentity(canonical_peer, canonical_peer, "invalid")
+        raw_hops = forwarded_for.split(",")
+        if not 1 <= len(raw_hops) <= self.MAX_HOPS or any(not hop.strip() for hop in raw_hops):
+            return ClientIdentity(canonical_peer, canonical_peer, "invalid")
+        hops = [self._parse_address(hop) for hop in raw_hops]
+        if any(hop is None for hop in hops):
+            return ClientIdentity(canonical_peer, canonical_peer, "invalid")
+
+        current = parsed_peer
+        consumed = 0
+        for hop in reversed(hops):
+            if not self._trusted(current):
+                break
+            # None was rejected above; this keeps the narrowing explicit for mypy.
+            if hop is None:  # pragma: no cover - defensive narrowing
+                break
+            current = hop
+            consumed += 1
+        return ClientIdentity(str(current), canonical_peer, "forwarded", consumed)
 
 
 class TokenBucket:

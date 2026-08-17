@@ -10,6 +10,9 @@ import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from .errors import AccessDeniedError, ClientInputError
+from .ports import AuthStorePort
+
 ROLE_PERMISSIONS = {
     "admin": {"read", "review", "fix", "manage", "audit"},
     "maintainer": {"read", "review", "fix"},
@@ -19,7 +22,7 @@ ROLE_PERMISSIONS = {
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
     if len(password) < 10:
-        raise ValueError("password must contain at least 10 characters")
+        raise ClientInputError("password must contain at least 10 characters")
     salt = salt or os.urandom(16)
     digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 310_000)
     return "pbkdf2_sha256$310000$%s$%s" % (
@@ -63,7 +66,7 @@ class Principal:
 class AuthManager:
     def __init__(
         self,
-        store,
+        store: AuthStorePort,
         secret: str,
         ttl_seconds: int = 3600,
         bootstrap_username: str = "",
@@ -86,11 +89,11 @@ class AuthManager:
     def login(self, username: str, password: str, tenant_id: str = "") -> dict[str, object]:
         user = self.store.get_user(username)
         if not user or not user["active"] or not verify_password(password, user["password_hash"]):
-            raise PermissionError("invalid username or password")
+            raise AccessDeniedError("invalid username or password")
         memberships = {item["tenant_id"]: item["role"] for item in user["memberships"]}
         selected = tenant_id or (next(iter(memberships)) if len(memberships) == 1 else "")
         if not selected or selected not in memberships:
-            raise PermissionError("user is not a member of the requested tenant")
+            raise AccessDeniedError("user is not a member of the requested tenant")
         now = int(time.time())
         payload = {
             "sub": user["id"],
@@ -111,7 +114,7 @@ class AuthManager:
 
     def authenticate(self, authorization: str) -> Principal:
         if not authorization.startswith("Bearer "):
-            raise PermissionError("Bearer token is required")
+            raise AccessDeniedError("Bearer token is required")
         payload = self._decode(authorization[7:].strip())
         return Principal(
             str(payload["sub"]),
@@ -124,7 +127,7 @@ class AuthManager:
     def require(principal: Principal, permissions: Iterable[str]) -> None:
         missing = [permission for permission in permissions if not principal.can(permission)]
         if missing:
-            raise PermissionError("permission denied")
+            raise AccessDeniedError("permission denied")
 
     def _encode(self, payload: dict[str, object]) -> str:
         header = _b64(b'{"alg":"HS256","typ":"JWT"}')
@@ -139,14 +142,14 @@ class AuthManager:
             signing_input = (header + "." + body).encode("ascii")
             expected = _b64(hmac.new(self.secret, signing_input, hashlib.sha256).digest())
             if not hmac.compare_digest(expected, supplied):
-                raise PermissionError("invalid token")
+                raise AccessDeniedError("invalid token")
             payload = json.loads(_unb64(body).decode("utf-8"))
             if int(payload["exp"]) < int(time.time()):
-                raise PermissionError("token has expired")
+                raise AccessDeniedError("token has expired")
             if payload.get("role") not in ROLE_PERMISSIONS:
-                raise PermissionError("invalid role")
+                raise AccessDeniedError("invalid role")
             return payload
-        except PermissionError:
+        except AccessDeniedError:
             raise
         except Exception as exc:
-            raise PermissionError("invalid token") from exc
+            raise AccessDeniedError("invalid token") from exc

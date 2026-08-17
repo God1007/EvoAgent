@@ -4,6 +4,7 @@ import time
 import unittest
 
 from evoagent.auth import AuthManager
+from evoagent.config import Settings
 from evoagent.harness import ReviewHarness
 from evoagent.reviewer import LocalRuleReviewer
 from evoagent.rollout import ReleaseManager
@@ -58,11 +59,13 @@ class ProductionFeatureTests(unittest.TestCase):
         self.assertEqual(["a"], [item["task_id"] for item in cases])
 
     def test_failed_graph_resumes_after_last_completed_checkpoint(self):
+        secret = "provider-token=temporary-secret"
+
         class BrokenReviewer:
             name = "broken"
 
             def review(self, _diff, _parsed):
-                raise RuntimeError("temporary provider failure")
+                raise RuntimeError(secret)
 
         self.store.create("task", "org/repo", 1, {})
         with self.assertRaises(RuntimeError):
@@ -72,6 +75,18 @@ class ProductionFeatureTests(unittest.TestCase):
         checkpoints = self.store.load_checkpoints("task")
         self.assertEqual("completed", checkpoints["planning"]["status"])
         self.assertEqual("failed", checkpoints["executing"]["status"])
+        failed_task = self.store.get("task")
+        failure_cases = self.store.list_failure_cases()
+        persisted = str({"task": failed_task, "checkpoints": checkpoints, "cases": failure_cases})
+        self.assertNotIn(secret, persisted)
+        self.assertRegex(
+            failed_task["error"],
+            r"^review execution failed \[type=builtins\.RuntimeError; ref=[0-9a-f]{16}\]$",
+        )
+        self.assertRegex(
+            checkpoints["executing"]["error"],
+            r"^review node failed \[type=builtins\.RuntimeError; ref=[0-9a-f]{16}\]$",
+        )
 
         report = ReviewHarness(self.store, LocalRuleReviewer(), node_retries=0).resume(
             "task", "org/repo", 1, DIFF
@@ -83,8 +98,10 @@ class ProductionFeatureTests(unittest.TestCase):
         self.assertEqual(1, len(planning_events))
 
     def test_queue_moves_terminal_failure_to_dlq(self):
+        secret = "queue-password=terminal-secret"
+
         def broken(_payload):
-            raise RuntimeError("boom")
+            raise RuntimeError(secret)
 
         queue = TaskQueue(broken, workers=1, max_attempts=1)
         queue.submit({"task_id": "dead"})
@@ -95,18 +112,42 @@ class ProductionFeatureTests(unittest.TestCase):
         letters = queue.dead_letters()
         queue.close()
         self.assertEqual("dead", letters[0]["message_id"])
-        self.assertIn("boom", letters[0]["error"])
+        self.assertRegex(
+            letters[0]["error"],
+            r"^task delivery failed \[type=builtins\.RuntimeError; ref=[0-9a-f]{16}\]$",
+        )
+        self.assertNotIn(secret, str(letters))
 
     def test_dead_letter_marks_pending_task_failed(self):
         self.store.create("dead", "org/repo", 1, {}, "tenant")
-        service = ReviewService.__new__(ReviewService)
-        service.store = self.store
+        service = ReviewService(
+            Settings(
+                host="127.0.0.1",
+                port=8080,
+                db_path=self.path,
+                max_diff_bytes=10_000,
+                max_steps=8,
+                timeout_seconds=10,
+                llm_base_url="",
+                llm_api_key="",
+                llm_model="",
+                github_webhook_secret="",
+                github_token="",
+                auto_post_review=False,
+            )
+        )
+        self.addCleanup(service.close)
 
-        service._on_dead_letter({"task_id": "dead", "tenant_id": "tenant"}, "boom")
+        secret = "redis-url=terminal-secret"
+        service._on_dead_letter({"task_id": "dead", "tenant_id": "tenant"}, secret)
 
         task = self.store.get("dead", "tenant")
         self.assertEqual("FAILED", task["state"])
-        self.assertEqual("boom", task["error"])
+        self.assertRegex(
+            task["error"],
+            r"^task delivery failed \[type=unknown; ref=[0-9a-f]{16}\]$",
+        )
+        self.assertNotIn(secret, str(task))
 
     def test_canary_assignment_and_error_budget_rollback(self):
         release = ReleaseManager(self.store)

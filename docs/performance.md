@@ -11,6 +11,12 @@ workload, a stated environment, and percentiles (not averages).**
 
 ## 1. Service level objectives
 
+The table below is the per-instance engineering performance target. The formal
+30-day production contract (99.9% non-probe availability, 99% async intake
+within 500 ms, and 99% terminal review success) is machine-readable in
+[`ops/slo.toml`](../ops/slo.toml), evaluated by `evoagent-slo`, and paired with
+multi-window burn alerts in the [operations runbook](operations.md).
+
 Targets are per API instance on a modern 4-core host. They are goals for the
 load-test gate, not guarantees; recalibrate against your hardware and record the
 result in [`performance-baseline.md`](performance-baseline.md).
@@ -38,6 +44,13 @@ scenarios (see `SCENARIOS` in [`scripts/loadgen.py`](../scripts/loadgen.py)):
 - **Webhook `synchronize` bursts**: many pushes to the same PR in a short window.
   Stresses session get-or-create, the `UNIQUE(session_id, sequence)` constraint,
   and the Postgres advisory lock.
+- **Noisy-neighbor intake**: one tenant drives its durable outstanding-review
+  limit while another continues admitting work. Assert atomic cross-replica
+  occupancy, bounded 429 + `Retry-After`, release after success/cancel/DLQ, and
+  no cross-tenant rejection. With Redis fairness enabled, additionally assert
+  weighted dispatch-start ratios, bounded tail deferrals, retry/reclaim
+  accounting, heartbeat protection for work exceeding the reclaim lease, and
+  latency for the non-bursting tenant.
 - **CPU-heavy**: `/v1/codegraph/impact` on large source sets.
 - **Sandboxed**: `/v1/proofs` (container-isolated; excluded from the default
   latency SLO, measured for saturation and correctness only).
@@ -114,28 +127,49 @@ python scripts/microbench.py --json micro.json
   Graceful drain flips `/ready` to 503 (LB stops routing) and lets in-flight
   HTTP requests finish; in-flight async queue work is only recovered with the
   durable Redis backend (the in-memory queue loses it on exit).
-- **Backpressure**: a global + per-tenant token-bucket rate limiter and a
+- **Backpressure**: a per-client token-bucket rate limiter and a
   bounded-concurrency gate for heavy endpoints shed load with `429`/`503` +
-  `Retry-After` instead of collapsing.
+  `Retry-After` instead of collapsing. The client key is the socket peer unless
+  that peer matches `EVOAGENT_TRUSTED_PROXY_CIDRS`; only then is the bounded
+  `X-Forwarded-For` chain consumed from right to left. Invalid or attacker-added
+  prefixes fail closed to a previously verified hop rather than creating a new
+  bucket.
+- **Tenant durable capacity**: `EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS` bounds each
+  tenant's outstanding review intents across database-sharing replicas. Slots
+  survive async retries and offline reconstruction, preventing unlimited
+  durable backlog growth. The Redis-only fair scheduler can then rotate handler
+  starts by bounded v1 tenant weights across replicas. It does not equalize task
+  duration or model cost, and both controls should be sized from end-to-end
+  completion capacity.
 - **Resilience**: outbound GitHub and LLM calls are wrapped in a circuit breaker
   with exponential backoff + jitter, so an upstream outage fails fast instead of
   exhausting workers.
-- **Storage**: Postgres uses a real connection pool (`psycopg_pool`, install the
-  `postgres-pool` extra; without it the store transparently falls back to a
-  connection per query). Size the pool with `EVOAGENT_PG_POOL_MAX`. Note the
+- **Storage**: Postgres uses a real connection pool (`psycopg_pool` is a core
+  runtime dependency). Size the pool with `EVOAGENT_PG_POOL_MAX`. Note the
   total backend budget is roughly `web_workers * pg_pool_max` (each worker
   process owns its own pool), so keep it under the server's `max_connections`.
   SQLite is single-writer and intended for single-node/dev.
 - **Queue**: use Redis Streams (`EVOAGENT_REDIS_URL`) in production for durable,
-  crash-safe delivery; the in-process queue is non-durable.
+  crash-safe delivery; the in-process queue is non-durable. A v2
+  `EVOAGENT_QUEUE_NAMESPACE` co-locates the complete queue in one hash slot and
+  enables the topology-aware Cluster client. This provides environment
+  isolation and node routing, not automatic throughput striping: one hot queue
+  can still saturate its owning master, so measure per-node CPU, command latency,
+  network, memory, and slot migration during the production-shaped soak.
+- **Metrics topology**: the built-in registry is process-local. Run one web
+  worker per production pod and scale pods horizontally so each Prometheus
+  scrape is complete; `SO_REUSEPORT` multi-worker mode is a load-test/dev option,
+  not an in-process metrics aggregation mechanism.
 
 ## 7. Known follow-ups (not yet implemented)
 
 - Full ASGI/FastAPI rewrite (kept stdlib + multi-process by design for now).
-- PgBouncer, read replicas, and partitioning + TTL for `trace_events` and
-  `session_findings` (both grow unbounded today).
-- microVM isolation (Firecracker/gVisor) for `/v1/proofs`.
-- Versioned schema migrations (Alembic) instead of `CREATE TABLE IF NOT EXISTS`.
-- Trusted-proxy `X-Forwarded-For` parsing for the rate limiter (today it keys on
-  the socket peer, so behind a proxy all clients share one bucket) and a
-  dedicated concurrency guard for `/webhooks/github` `synchronize` fan-out.
+- PgBouncer, read replicas, and native partitioning/managed TTL. The application
+  now offers opt-in, invariant-aware bounded retention for `trace_events` and
+  superseded `session_findings`, but a multi-hour PostgreSQL soak and physical
+  table-reclamation policy remain deployment work.
+- microVM isolation (Firecracker/Kata) as an alternative `proof.executor`
+  provider for hostile public multi-tenancy.
+- A dedicated concurrency guard for `/webhooks/github` `synchronize` fan-out.
+- Runtime-cost-aware tenant shares and a production-shaped multi-tenant soak;
+  the current weighted scheduler governs dispatch starts, not CPU/model time.

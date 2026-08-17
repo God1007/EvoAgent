@@ -21,7 +21,9 @@ classifiers = [
   "Topic :: Software Development :: Quality Assurance",
 ]
 dependencies = [
+  "boto3>=1.35,<2",
   "psycopg[binary]>=3.1,<4",
+  "psycopg-pool>=3.2,<4",
   "redis>=5,<9",
   "PyJWT[crypto]>=2.8,<3",
   "langgraph>=0.2,<2",
@@ -30,9 +32,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-postgres-pool = [
-  "psycopg-pool>=3.2,<4",
-]
 dev = [
   "build>=1.2,<2",
   "mypy>=1.15,<3",
@@ -47,6 +46,12 @@ dev = [
 
 [project.scripts]
 evoagent = "evoagent.api:run"
+evoagent-migrate = "evoagent.migrate:run"
+evoagent-proof-runner = "evoagent.proof_remote:run"
+evoagent-slo = "evoagent.slo:run"
+evoagent-dr = "evoagent.dr:run"
+evoagent-recover-queue = "evoagent.recovery:run"
+evoagent-eval-labels = "evoagent.evaluation_labels:run"
 
 [project.urls]
 Homepage = "https://github.com/God1007/EvoAgent"
@@ -58,6 +63,9 @@ version = { attr = "evoagent.__version__" }
 [tool.setuptools.packages.find]
 include = ["evoagent*"]
 
+[tool.setuptools.package-data]
+evoagent = ["py.typed"]
+
 [tool.setuptools.data-files]
 "share/evoagent/web" = ["web/*.css", "web/*.html", "web/*.js"]
 "share/evoagent/skills/code-quality" = [
@@ -65,6 +73,10 @@ include = ["evoagent*"]
   "skills/code-quality/skill.json",
   "skills/code-quality/skill.py",
 ]
+"share/evoagent/ops" = ["ops/slo.toml"]
+"share/evoagent/ops/prometheus" = ["ops/prometheus/evoagent.rules.yml"]
+"share/evoagent/ops/grafana" = ["ops/grafana/evoagent-overview.json"]
+"share/evoagent/examples" = ["examples/tenant-queue-weights.toml"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

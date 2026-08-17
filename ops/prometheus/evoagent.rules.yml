@@ -1,0 +1,185 @@
+groups:
+  - name: evoagent-slo-recording
+    interval: 30s
+    rules:
+      - record: evoagent:sli:http_availability_5m
+        expr: 1 - ((sum(rate(evoagent_http_nonprobe_responses_5xx_total[5m])) or vector(0)) / clamp_min((sum(rate(evoagent_http_nonprobe_requests_total[5m])) or vector(0)), 0.000001))
+      - record: evoagent:sli:intake_p99_seconds_10m
+        expr: histogram_quantile(0.99, sum by (le) (rate(evoagent_http_request_intake_bucket[10m])))
+      - record: evoagent:sli:review_success_30m
+        expr: (sum(increase(evoagent_reviews_total[30m])) or vector(0)) / clamp_min((sum(increase(evoagent_reviews_total[30m])) or vector(0)) + (sum(increase(evoagent_reviews_failed_total[30m])) or vector(0)), 1)
+      - record: evoagent:ratio:model_capacity_rejected_15m
+        expr: (sum(increase(evoagent_model_route_capacity_rejections_total[15m])) or vector(0)) / clamp_min((sum(increase(evoagent_model_requests_total[15m])) or vector(0)) + (sum(increase(evoagent_model_requests_failed_total[15m])) or vector(0)) + (sum(increase(evoagent_model_route_capacity_rejections_total[15m])) or vector(0)), 1)
+      - record: evoagent:cost:model_micros_per_terminal_review_30m
+        expr: (sum(increase(evoagent_model_cost_micros_total[30m])) or vector(0)) / clamp_min((sum(increase(evoagent_reviews_total[30m])) or vector(0)) + (sum(increase(evoagent_reviews_failed_total[30m])) or vector(0)), 1)
+      - record: evoagent:ratio:repair_verification_blocked_6h
+        expr: (sum(increase(evoagent_fix_verification_blocked_total[6h])) or vector(0)) / clamp_min(sum(increase(evoagent_fix_attempts_total[6h])), 1)
+      - record: evoagent:ratio:negative_feedback_24h
+        expr: ((sum(increase(evoagent_feedback_false_positive_total[24h])) or vector(0)) + (sum(increase(evoagent_feedback_missed_issue_total[24h])) or vector(0)) + (sum(increase(evoagent_feedback_bad_fix_total[24h])) or vector(0))) / clamp_min(sum(increase(evoagent_feedback_total[24h])), 1)
+      - record: evoagent:ratio:tenant_review_capacity_rejected_15m
+        expr: (sum(increase(evoagent_review_admission_rejections_total[15m])) or vector(0)) / clamp_min((sum(increase(evoagent_review_admissions_total[15m])) or vector(0)) + (sum(increase(evoagent_review_admission_rejections_total[15m])) or vector(0)), 1)
+      - record: evoagent:ratio:queue_fair_deferrals_15m
+        expr: (sum(increase(evoagent_queue_fair_deferrals_total[15m])) or vector(0)) / clamp_min((sum(increase(evoagent_queue_fair_grants_total[15m])) or vector(0)) + (sum(increase(evoagent_queue_fair_deferrals_total[15m])) or vector(0)), 1)
+
+  - name: evoagent-slo-alerts
+    rules:
+      - alert: EvoAgentAvailabilityFastBurn
+        expr: |
+          ((sum(rate(evoagent_http_nonprobe_responses_5xx_total[5m])) or vector(0)) / clamp_min(sum(rate(evoagent_http_nonprobe_requests_total[5m])), 0.000001) > 0.0144)
+          and
+          ((sum(rate(evoagent_http_nonprobe_responses_5xx_total[1h])) or vector(0)) / clamp_min(sum(rate(evoagent_http_nonprobe_requests_total[1h])), 0.000001) > 0.0144)
+          and sum(increase(evoagent_http_nonprobe_requests_total[5m])) > 20
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: EvoAgent is rapidly consuming its 99.9% availability budget
+          runbook: docs/operations.md#availability-fast-burn
+
+      - alert: EvoAgentAvailabilitySlowBurn
+        expr: |
+          ((sum(rate(evoagent_http_nonprobe_responses_5xx_total[30m])) or vector(0)) / clamp_min(sum(rate(evoagent_http_nonprobe_requests_total[30m])), 0.000001) > 0.006)
+          and
+          ((sum(rate(evoagent_http_nonprobe_responses_5xx_total[6h])) or vector(0)) / clamp_min(sum(rate(evoagent_http_nonprobe_requests_total[6h])), 0.000001) > 0.006)
+          and sum(increase(evoagent_http_nonprobe_requests_total[30m])) > 100
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: EvoAgent is steadily consuming its availability budget
+          runbook: docs/operations.md#availability-slow-burn
+
+      - alert: EvoAgentIntakeLatencyHigh
+        expr: evoagent:sli:intake_p99_seconds_10m > 0.5 and sum(increase(evoagent_http_request_intake_count[10m])) > 20
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Async intake p99 is above 500 ms
+          runbook: docs/operations.md#intake-latency
+
+      - alert: EvoAgentQueueStale
+        expr: evoagent_queue_oldest_age_seconds > 60
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: The oldest review queue item is over 60 seconds old
+          runbook: docs/operations.md#queue-or-outbox-stale
+
+      - alert: EvoAgentQueueLeaseHeartbeatFailing
+        expr: sum(increase(evoagent_queue_lease_heartbeat_failures_total[10m])) > 2
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Active Redis deliveries are not renewing their consumer lease
+          runbook: docs/operations.md#queue-or-outbox-stale
+
+      - alert: EvoAgentOutboxStale
+        expr: evoagent_outbox_oldest_age_seconds > 30
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: A committed review has not reached the queue within 30 seconds
+          runbook: docs/operations.md#queue-or-outbox-stale
+
+      - alert: EvoAgentDeadLettersPresent
+        expr: evoagent_dead_letter_depth > 0 or evoagent_outbox_dead > 0
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: EvoAgent has durable work requiring operator replay or remediation
+          runbook: docs/operations.md#dead-letters
+
+      - alert: EvoAgentReviewFailureRateHigh
+        expr: (1 - evoagent:sli:review_success_30m) > 0.01 and (sum(increase(evoagent_reviews_total[30m])) + sum(increase(evoagent_reviews_failed_total[30m]))) > 20
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Review terminal failure rate is above 1%
+          runbook: docs/operations.md#review-failures
+
+      - alert: EvoAgentModelCapacitySaturated
+        expr: evoagent:ratio:model_capacity_rejected_15m > 0.1 and ((sum(increase(evoagent_model_requests_total[15m])) or vector(0)) + (sum(increase(evoagent_model_requests_failed_total[15m])) or vector(0)) + (sum(increase(evoagent_model_route_capacity_rejections_total[15m])) or vector(0))) > 20
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: More than 10% of recent model-route admissions are capacity-rejected
+          runbook: docs/operations.md#model-route-capacity
+
+      - alert: EvoAgentModelBudgetRejected
+        expr: sum(increase(evoagent_model_budget_rejections_total[1h])) > 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: A repository exhausted its configured model budget
+          runbook: docs/operations.md#model-economics
+
+      - alert: EvoAgentRepairVerificationBlockedHigh
+        expr: evoagent:ratio:repair_verification_blocked_6h > 0.2 and sum(increase(evoagent_fix_attempts_total[6h])) > 10
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: More than 20% of repair attempts are blocked by verification
+          runbook: docs/operations.md#repair-outcomes
+
+      - alert: EvoAgentNegativeFeedbackHigh
+        expr: evoagent:ratio:negative_feedback_24h > 0.2 and sum(increase(evoagent_feedback_total[24h])) > 20
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Negative operator feedback exceeds 20% over 24 hours
+          runbook: docs/operations.md#quality-feedback
+
+      - alert: EvoAgentPluginRuntimeNotReady
+        expr: evoagent_plugin_runtime_ready < 1
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: EvoAgent plugin graph is not running
+          runbook: docs/operations.md#plugin-runtime
+
+      - alert: EvoAgentRetentionMaintenanceStalled
+        expr: evoagent_retention_enabled > 0 and (time() - evoagent_retention_last_success_timestamp_seconds) > clamp_min(2 * evoagent_retention_maintenance_interval_seconds, 600)
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Operational-history retention has not completed on schedule
+          runbook: docs/operations.md#history-retention
+
+      - alert: EvoAgentTenantReviewCapacitySaturated
+        expr: evoagent:ratio:tenant_review_capacity_rejected_15m > 0.1 and sum(increase(evoagent_review_admission_rejections_total[15m])) > 5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Tenant review admission is rejecting a sustained share of requests
+          runbook: docs/operations.md#tenant-review-capacity
+
+      - alert: EvoAgentTenantFairnessChurnHigh
+        expr: evoagent:ratio:queue_fair_deferrals_15m > 0.5 and sum(increase(evoagent_queue_fair_deferrals_total[15m])) > 100
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Tenant-fair scheduling is spending over half of decisions deferring burst traffic
+          runbook: docs/operations.md#tenant-fair-scheduling
+
+      - alert: EvoAgentQueueKeyspaceVersionMixed
+        expr: count(count_values("keyspace_version", evoagent_queue_keyspace_version)) > 1
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: Serving EvoAgent replicas expose different Redis queue keyspace versions
+          runbook: docs/operations.md#redis-cluster-queue

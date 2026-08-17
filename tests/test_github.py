@@ -183,6 +183,16 @@ class GitHubApiMethodTests(unittest.TestCase):
         client, _ = self._client([{"full_name": "O/R"}])
         client.ensure_repository_access("o/r")  # does not raise
 
+    def test_branch_and_pull_request_lookup_use_deterministic_head(self):
+        client, opener = self._client(
+            [{"object": {"sha": "abc"}}, [{"number": 7, "state": "open"}]]
+        )
+        branch = "evoagent/fix-pr-1-key"
+        self.assertEqual("abc", client.get_branch("o/r", branch)["object"]["sha"])
+        self.assertEqual(7, client.find_pull_request_by_head("o/r", branch)["number"])
+        self.assertIn("/git/ref/heads/evoagent%2Ffix-pr-1-key", opener.requests[0].full_url)
+        self.assertIn("head=o%3Aevoagent%2Ffix-pr-1-key", opener.requests[1].full_url)
+
     def test_create_atomic_commit_creates_tree_commit_and_branch(self):
         client, opener = self._client(
             [

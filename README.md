@@ -17,7 +17,7 @@
 [![Redis](https://img.shields.io/badge/Queue-In--Process%20%7C%20Redis-DC382D?logo=redis&logoColor=white)](#运行模式)
 [![OpenAI Compatible](https://img.shields.io/badge/LLM-OpenAI%20Compatible-412991)](#接入大模型)
 
-[快速开始](#快速开始) · [工作原理](#工作原理) · [插件架构](docs/plugin-system.md) · [企业演进路线](docs/enterprise-roadmap.md) · [GitHub 接入](#接入-github) · [API](#api-概览) · [生产部署](#生产部署)
+[项目亮点](#项目亮点) · [快速开始](#快速开始) · [工作原理](#工作原理) · [插件架构](docs/plugin-system.md) · [企业演进路线](docs/enterprise-roadmap.md) · [GitHub 接入](#接入-github) · [API](#api-概览) · [生产部署](#生产部署)
 
 </div>
 
@@ -30,6 +30,22 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 它不是一个简单的“把 Diff 发给大模型”的脚本。一次审查会经过规划、并行分析、证据质疑、静态复现、结果仲裁和最终验证；任务执行由 Harness 统一管理状态、预算、重试、Checkpoint 与恢复。
 
 默认情况下，EvoAgent 使用确定性的本地规则运行，不需要 API Key，也不会向外部模型发送代码。配置 DeepSeek、OpenRouter 或自定义 OpenAI-compatible 端点后，可以额外启用上下文感知的 AI 审查。
+
+## 项目亮点
+
+| 维度 | 关键设计 | 可验证结果 |
+| --- | --- | --- |
+| **审查与修复闭环** | 多 Agent 并行审查、Diff 新增行约束、Critic/Test/Synthesizer 证据过滤、L1–L4 Proof Runner 与白名单确定性修复 | 在 100 条受控合成 PR Diff 上，候选方案 F1 为 82.5%，相对单 Agent 基线提升 7.5 个百分点；28 个满足白名单条件的风险样本全部通过五道修复门禁 |
+| **可靠异步执行** | PostgreSQL 事务 Outbox、Redis Streams/Cluster、幂等消息、ACK/租约/重试/DLQ、优雅停机与离线队列重建 | 必选 CI 使用真实 PostgreSQL 16、Redis 7、三主 Redis Cluster 和 Docker，覆盖连接池恢复、消费者接管、同槽原子操作、恢复演练及完整 Outbox → Worker 链路 |
+| **多租户与模型治理** | 仓库策略快照、跨副本租户容量、加权公平调度、模型路由/预算/容量、Shadow/Canary 与只读晋级建议 | 数据库和 Redis 原子协调关键状态；故障、重试、死信和区域恢复期间保持容量及任务语义一致 |
+| **工程化与安全基线** | Ruff、mypy、Python 3.11/3.12、覆盖率门禁、哈希锁依赖、CodeQL、Gitleaks、依赖审计、构建/容器/性能门禁 | 500+ 自动化测试、约 85% 行覆盖率；CI 对 300 req/s 只读流量和 150 req/s 异步接入分别执行 p99 与错误率回归门禁 |
+
+> [!NOTE]
+> 评测指标来自版本化的受控合成数据集，用于可复现回归，不代表真实生产 PR 的效果；
+> 性能数字也必须结合测试环境解读。完整口径见
+> [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)、
+> [`docs/performance-baseline.md`](docs/performance-baseline.md) 和
+> [`docs/integration-testing.md`](docs/integration-testing.md)。
 
 ## 核心能力
 
@@ -177,8 +193,8 @@ PENDING → PLANNING → EXECUTING → REVIEWING → SUCCESS
 ### 1. 本地启动
 
 ```bash
-git clone <your-repository-url>
-cd EvoAgent-py
+git clone https://github.com/God1007/EvoAgent.git
+cd EvoAgent
 
 python -m pip install --require-hashes -r requirements.lock
 cp .env.example .env
@@ -924,7 +940,15 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 
 ## 工程质量基线
 
-一期工程门禁在本地与 GitHub Actions 使用同一组命令：
+| 门禁 | 当前证据 |
+| --- | --- |
+| 正确性 | 500+ 自动化测试，约 85% 整体行覆盖率，核心覆盖率门槛 70% |
+| 兼容性 | Python 3.11 / 3.12 矩阵、sdist / wheel 构建与安装后资源冒烟 |
+| 生产边界 | 真实 PostgreSQL 16、Redis 7、三主 Redis Cluster、Docker 与远程 Proof Runner 全链路 |
+| 安全与供应链 | CodeQL、Gitleaks、pip-audit、哈希锁依赖、非 root 生产镜像 |
+| 性能回归 | 恒定到达率 p99 / 错误率门禁与热点路径微基准；阈值超限时 CI 失败 |
+
+本地与 GitHub Actions 使用同一组工程门禁命令：
 
 ```bash
 python -m pip install "pip<26"

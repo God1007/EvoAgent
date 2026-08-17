@@ -65,6 +65,7 @@ class TaskQueue:
         self._last_worker_error = ""
         self._memory_dlq: list[dict[str, Any]] = []
         self._memory_published_ids: dict[str, float] = {}
+        self._memory_submission_times: dict[str, float] = {}
         self._lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
         self._drain_condition = threading.Condition()
@@ -156,9 +157,15 @@ class TaskQueue:
                     self._memory_published_ids.pop(next(iter(self._memory_published_ids)))
         if deduplicate:
             self._memory_published_ids[message_id] = time.monotonic()
+        with self._lock:
+            self._memory_submission_times.setdefault(
+                message_id, float(envelope.get("submitted_at") or time.time())
+            )
         try:
             self._schedule_memory(envelope)
         except Exception:
+            with self._lock:
+                self._memory_submission_times.pop(message_id, None)
             if deduplicate:
                 self._memory_published_ids.pop(message_id, None)
             raise
@@ -170,6 +177,7 @@ class TaskQueue:
             envelope["attempt"] = int(envelope.get("attempt", 0)) + 1
             try:
                 self.handler(envelope["payload"])
+                self._forget_memory_envelope(envelope)
                 return True
             except PermanentTaskError as exc:
                 self._dead_letter(envelope, str(exc))
@@ -287,6 +295,7 @@ class TaskQueue:
         else:
             with self._lock:
                 self._memory_dlq.append(item)
+                self._memory_submission_times.pop(str(envelope.get("message_id", "")), None)
         if self.on_dead_letter:
             self.on_dead_letter(envelope.get("payload") or {}, item["error"])
 
@@ -327,6 +336,41 @@ class TaskQueue:
                 return self._scheduled_memory
         except Exception:  # pragma: no cover - defensive probe isolation
             return -1
+
+    def oldest_age_seconds(self) -> float:
+        """Age of the oldest unacknowledged message, or -1 when unknown."""
+        try:
+            if self._redis:
+                rows = self._redis.xrange(self.STREAM, min="-", max="+", count=1)
+                if not rows:
+                    return 0.0
+                redis_id, fields = rows[0]
+                try:
+                    submitted_at = float(json.loads(fields["envelope"])["submitted_at"])
+                except Exception:
+                    submitted_at = int(str(redis_id).split("-", 1)[0]) / 1000.0
+                return max(0.0, time.time() - submitted_at)
+            with self._lock:
+                if not self._memory_submission_times:
+                    return 0.0
+                return max(0.0, time.time() - min(self._memory_submission_times.values()))
+        except Exception:  # pragma: no cover - defensive probe isolation
+            return -1.0
+
+    def dead_letter_depth(self) -> int:
+        try:
+            if self._redis:
+                return int(self._redis.xlen(self.DLQ))
+            with self._lock:
+                return len(self._memory_dlq)
+        except Exception:  # pragma: no cover - defensive probe isolation
+            return -1
+
+    def _forget_memory_envelope(self, envelope: dict[str, Any]) -> None:
+        if self._redis:
+            return
+        with self._lock:
+            self._memory_submission_times.pop(str(envelope.get("message_id", "")), None)
 
     def health(self) -> dict[str, Any]:
         """Return a dependency and worker-liveness snapshot for readiness."""

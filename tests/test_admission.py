@@ -179,6 +179,9 @@ class AdmissionControlTests(unittest.TestCase):
         body = response.read().decode("utf-8")
         self.assertIn("evoagent_http_rejected_total", body)
         self.assertIn("evoagent_http_in_flight", body)
+        self.assertIn("evoagent_http_requests_total", body)
+        self.assertIn("evoagent_http_read_responses_4xx_total", body)
+        self.assertIn("evoagent_http_request_read_count", body)
 
     def test_sync_review_shed_but_async_exempt_when_heavy_gate_full(self):
         host, port = self._serve(self._settings(max_inflight_heavy=1))

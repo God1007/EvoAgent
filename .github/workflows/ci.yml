@@ -37,6 +37,11 @@ jobs:
           python -m ruff format --check .
       - name: Type check
         run: python -m mypy
+      - name: Validate Prometheus recording and alert rules
+        run: |
+          docker run --rm --entrypoint=/bin/promtool \
+            -v "$PWD/ops/prometheus:/rules:ro" \
+            prom/prometheus:v3.5.0 check rules /rules/evoagent.rules.yml
       - name: Test with coverage gate
         run: python -m pytest --cov=evoagent --cov-report=term-missing --cov-report=xml
       - name: Build distributions
@@ -64,6 +69,10 @@ jobs:
           done
           curl -fsS http://127.0.0.1:18081/ | grep -q '<!doctype html>'
           test -f "$wheel_env/share/evoagent/skills/code-quality/SKILL.md"
+          test -f "$wheel_env/share/evoagent/ops/slo.toml"
+          test -f "$wheel_env/share/evoagent/ops/prometheus/evoagent.rules.yml"
+          test -f "$wheel_env/share/evoagent/ops/grafana/evoagent-overview.json"
+          "$wheel_env/bin/evoagent-slo" --help >/dev/null
           "$wheel_env/bin/evoagent-migrate" | grep -q '"schema_version": 7'
           kill -TERM "$wheel_pid"
           wait "$wheel_pid"

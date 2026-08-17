@@ -185,14 +185,23 @@ class TaskStore:
                 "SELECT COUNT(*) AS total,"
                 "SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,"
                 "SUM(CASE WHEN status='publishing' THEN 1 ELSE 0 END) AS publishing,"
-                "SUM(CASE WHEN status='dead' THEN 1 ELSE 0 END) AS dead "
+                "SUM(CASE WHEN status='dead' THEN 1 ELSE 0 END) AS dead,"
+                "MIN(CASE WHEN status IN ('pending','publishing') THEN created_at END) "
+                "AS oldest_active "
                 "FROM outbox_messages"
             ).fetchone()
+        oldest_active = row["oldest_active"]
+        oldest_age = (
+            max(0.0, (datetime.now(UTC) - datetime.fromisoformat(oldest_active)).total_seconds())
+            if oldest_active
+            else 0.0
+        )
         return {
             "total": int(row["total"] or 0),
             "pending": int(row["pending"] or 0),
             "publishing": int(row["publishing"] or 0),
             "dead": int(row["dead"] or 0),
+            "oldest_age_seconds": oldest_age,
         }
 
     def list_outbox(self, status: str = "dead", limit: int = 100) -> list:

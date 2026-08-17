@@ -49,6 +49,22 @@ class ApiHandler(BaseHTTPRequestHandler):
     settings: Settings
     server_version = "EvoAgent/%s" % __version__
 
+    def send_response(self, code: int, message: str | None = None) -> None:
+        if getattr(self, "_metric_counted", False) and not getattr(
+            self, "_metric_response_recorded", False
+        ):
+            request_class = getattr(self, "_metric_class", "other")
+            family = "%dxx" % (code // 100)
+            metrics.inc("http_responses_total")
+            metrics.inc("http_responses_%s_total" % family)
+            metrics.inc("http_%s_responses_total" % request_class)
+            metrics.inc("http_%s_responses_%s_total" % (request_class, family))
+            if request_class != "probe":
+                metrics.inc("http_nonprobe_responses_total")
+                metrics.inc("http_nonprobe_responses_%s_total" % family)
+            self._metric_response_recorded = True
+        super().send_response(code, message)
+
     def log_message(self, fmt: str, *args: Any) -> None:
         print("%s - %s" % (self.address_string(), fmt % args))
 
@@ -159,6 +175,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         shed here (429/503 + Retry-After) rather than allowed to pile up."""
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        request_class = self._request_metric_class(method, parsed)
+        self._metric_class = request_class
+        self._metric_counted = True
+        self._metric_response_recorded = False
+        metrics.inc("http_requests_total")
+        metrics.inc("http_%s_requests_total" % request_class)
+        if request_class != "probe":
+            metrics.inc("http_nonprobe_requests_total")
         if path not in PROBE_PATHS:
             client = self.client_address[0] if self.client_address else "unknown"
             allowed, retry_after = self.service.rate_limiter.check(client)
@@ -179,12 +203,33 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         metrics.add_gauge("http_in_flight", 1)
         try:
-            with metrics.latency("http_request_%s" % method):
+            with (
+                metrics.latency("http_request_%s" % method),
+                metrics.latency("http_request_%s" % request_class),
+            ):
                 handler()
         finally:
             metrics.add_gauge("http_in_flight", -1)
             if gate is not None:
                 gate.release()
+
+    @staticmethod
+    def _request_metric_class(method: str, parsed: urllib.parse.ParseResult) -> str:
+        path = parsed.path
+        if path in PROBE_PATHS:
+            return "probe"
+        if method == "POST" and path == "/webhooks/github":
+            return "intake"
+        if method == "POST" and path == "/v1/reviews":
+            async_values = urllib.parse.parse_qs(parsed.query).get("async", ["false"])
+            return "intake" if async_values[0].lower() in {"true", "1", "yes"} else "heavy"
+        if path == "/v1/proofs":
+            return "proof"
+        if method == "POST" and path in HEAVY_PATHS:
+            return "heavy"
+        if method == "GET":
+            return "read"
+        return "write"
 
     def _reject(self, status: int, retry_after: float, message: str) -> None:
         metrics.inc("http_rejected_total")

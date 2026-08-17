@@ -1,0 +1,28 @@
+version = 1
+
+[[objectives]]
+id = "api-availability"
+description = "Non-probe HTTP requests return something other than 5xx."
+target = 0.999
+window = "30d"
+min_samples = 100
+indicator_query = "1 - (sum(increase(evoagent_http_nonprobe_responses_5xx_total[$window])) / clamp_min(sum(increase(evoagent_http_nonprobe_requests_total[$window])), 1))"
+sample_query = "sum(increase(evoagent_http_nonprobe_requests_total[$window]))"
+
+[[objectives]]
+id = "async-intake-latency"
+description = "Async review and webhook intake completes within 500 ms."
+target = 0.99
+window = "30d"
+min_samples = 100
+indicator_query = "sum(increase(evoagent_http_request_intake_bucket{le=\"0.5\"}[$window])) / clamp_min(sum(increase(evoagent_http_request_intake_count[$window])), 1)"
+sample_query = "sum(increase(evoagent_http_request_intake_count[$window]))"
+
+[[objectives]]
+id = "review-success"
+description = "Accepted reviews reach a successful terminal result."
+target = 0.99
+window = "30d"
+min_samples = 50
+indicator_query = "sum(increase(evoagent_reviews_total[$window])) / clamp_min(sum(increase(evoagent_reviews_total[$window])) + sum(increase(evoagent_reviews_failed_total[$window])), 1)"
+sample_query = "sum(increase(evoagent_reviews_total[$window])) + sum(increase(evoagent_reviews_failed_total[$window]))"

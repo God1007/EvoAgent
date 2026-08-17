@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.11.0)
+## Current maturity (v0.12.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -19,6 +19,7 @@ It is an execution plan, not a marketing checklist.
 | Multi-tenancy/governance | Implemented baseline | JWT, RBAC, tenant/repository authorization, audit, canary/shadow/rollback |
 | Model governance | Implemented advanced baseline | Replaceable gateway, scoped policy routing/residency, bounded fallback, per-route breakers, redaction, egress/output limits, atomic budgets, correlated metadata-only ledger; route shadow promotion remains pending |
 | Strong untrusted execution | Implemented baseline | Replaceable remote Proof Runner, mutually authenticated evidence manifests, container-only jobs, replay/size/capacity gates, and content-addressed artifacts; microVM and distributed replay store remain pending |
+| Service-level operations | Implemented baseline | Fixed-cardinality availability/latency/success SLIs, versioned 30-day SLO catalog, multi-window burn alerts, queue/Outbox age, DLQ depth, dashboard, runbooks, and hardened Prometheus evaluator |
 | Quality evidence | Synthetic benchmark only | 100-case controlled corpus; production activation gate remains blocked without independent labels |
 | HA/DR operational proof | Pending | No documented backup/restore drill, regional failover, or sustained production SLO evidence |
 
@@ -236,6 +237,19 @@ Define and continuously measure:
 Deliver dashboards, alert rules, runbooks, capacity tests, backup/restore drills,
 and a release rollback exercise. A release is enterprise-ready only when these
 procedures are repeatable by someone other than the author.
+
+Implemented SLO baseline: HTTP responses are classified into fixed probe/read/
+intake/heavy/proof/write families; review duration is a histogram; Queue and
+Outbox export oldest work age plus current DLQ depth. `ops/slo.toml` defines the
+versioned 30-day contract, `evoagent-slo` evaluates scalar Prometheus queries
+through an exact-host HTTPS/no-redirect/no-proxy client, Prometheus rules encode
+fast/slow budget burn and dependency backlog alerts, and the packaged Grafana
+dashboard links to actionable runbooks. CI validates the rules with `promtool`
+and verifies all operational assets in the wheel.
+
+Still pending in this phase: an automated PostgreSQL backup/restore integrity
+drill, declared RPO/RTO evidence, regional failover exercise, and a sustained
+production-shaped soak. SLO instrumentation is not a claim of DR readiness.
 
 ## Phase 6 — Independent quality evidence
 

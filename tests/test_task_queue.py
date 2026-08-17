@@ -117,9 +117,43 @@ class TaskQueueBackendTests(unittest.TestCase):
             release.set()
             self.assertTrue(queue.drain(2))
             self.assertEqual(0, queue.depth())
+            self.assertEqual(0.0, queue.oldest_age_seconds())
         finally:
             release.set()
             queue.close(2)
+
+    def test_oldest_age_and_dead_letter_depth_track_current_backlog(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_handler(_payload):
+            started.set()
+            release.wait(5)
+
+        queue = TaskQueue(slow_handler, workers=1)
+        try:
+            queue.submit({"task_id": "aged"})
+            self.assertTrue(started.wait(2))
+            time.sleep(0.01)
+            self.assertGreater(queue.oldest_age_seconds(), 0.0)
+            self.assertEqual(0, queue.dead_letter_depth())
+            release.set()
+            self.assertTrue(queue.drain(2))
+            self.assertEqual(0.0, queue.oldest_age_seconds())
+        finally:
+            release.set()
+            queue.close(2)
+
+        failed = TaskQueue(
+            lambda _payload: (_ for _ in ()).throw(PermanentTaskError("bad")),
+            workers=1,
+        )
+        try:
+            failed.submit({"task_id": "dead"})
+            self.assertTrue(_wait(lambda: failed.dead_letter_depth() == 1))
+            self.assertEqual(0.0, failed.oldest_age_seconds())
+        finally:
+            failed.close(2)
 
     def test_close_waits_for_scheduled_work_before_returning(self):
         started = threading.Event()

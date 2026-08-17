@@ -204,7 +204,7 @@ class ReviewUseCases:
                     tenant_id=tenant_id,
                     repository=repository,
                 ),
-                metrics.timer("review_duration"),
+                metrics.latency("review_duration"),
             ):
                 report = self.execute_review(task_id, repository, pull_request, diff, tenant_id)
             self.run_shadow(task_id, tenant_id, diff, report)
@@ -299,7 +299,7 @@ class ReviewUseCases:
                 self.observability.span(
                     "review.async", task_id, task_id=task_id, tenant_id=tenant_id
                 ),
-                metrics.timer("review_duration"),
+                metrics.latency("review_duration"),
             ):
                 report = self.execute_review(
                     task_id,
@@ -319,7 +319,6 @@ class ReviewUseCases:
             ):
                 self._post_review_comment(payload, task_id, report, continuity)
         except Exception as exc:
-            metrics.inc("reviews_failed_total")
             self._review_failed(task_id, tenant_id, repository, exc, "asynchronous")
             raise
 
@@ -407,6 +406,7 @@ class ReviewUseCases:
         error: Exception,
         mode: str,
     ) -> None:
+        metrics.inc("reviews_failed_total")
         task = self.store.get(task_id, tenant_id) or {}
         lane = (task.get("input") or {}).get("release_lane", "stable")
         self.releases.observe(tenant_id, "llm-review", True, lane)

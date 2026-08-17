@@ -1,0 +1,92 @@
+groups:
+  - name: evoagent-slo-recording
+    interval: 30s
+    rules:
+      - record: evoagent:sli:http_availability_5m
+        expr: 1 - (sum(rate(evoagent_http_nonprobe_responses_5xx_total[5m])) / clamp_min(sum(rate(evoagent_http_nonprobe_requests_total[5m])), 0.000001))
+      - record: evoagent:sli:intake_p99_seconds_10m
+        expr: histogram_quantile(0.99, sum by (le) (rate(evoagent_http_request_intake_bucket[10m])))
+      - record: evoagent:sli:review_success_30m
+        expr: sum(increase(evoagent_reviews_total[30m])) / clamp_min(sum(increase(evoagent_reviews_total[30m])) + sum(increase(evoagent_reviews_failed_total[30m])), 1)
+
+  - name: evoagent-slo-alerts
+    rules:
+      - alert: EvoAgentAvailabilityFastBurn
+        expr: |
+          (sum(rate(evoagent_http_nonprobe_responses_5xx_total[5m])) / clamp_min(sum(rate(evoagent_http_nonprobe_requests_total[5m])), 0.000001) > 0.0144)
+          and
+          (sum(rate(evoagent_http_nonprobe_responses_5xx_total[1h])) / clamp_min(sum(rate(evoagent_http_nonprobe_requests_total[1h])), 0.000001) > 0.0144)
+          and sum(increase(evoagent_http_nonprobe_requests_total[5m])) > 20
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: EvoAgent is rapidly consuming its 99.9% availability budget
+          runbook: docs/operations.md#availability-fast-burn
+
+      - alert: EvoAgentAvailabilitySlowBurn
+        expr: |
+          (sum(rate(evoagent_http_nonprobe_responses_5xx_total[30m])) / clamp_min(sum(rate(evoagent_http_nonprobe_requests_total[30m])), 0.000001) > 0.006)
+          and
+          (sum(rate(evoagent_http_nonprobe_responses_5xx_total[6h])) / clamp_min(sum(rate(evoagent_http_nonprobe_requests_total[6h])), 0.000001) > 0.006)
+          and sum(increase(evoagent_http_nonprobe_requests_total[30m])) > 100
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: EvoAgent is steadily consuming its availability budget
+          runbook: docs/operations.md#availability-slow-burn
+
+      - alert: EvoAgentIntakeLatencyHigh
+        expr: evoagent:sli:intake_p99_seconds_10m > 0.5 and sum(increase(evoagent_http_request_intake_count[10m])) > 20
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Async intake p99 is above 500 ms
+          runbook: docs/operations.md#intake-latency
+
+      - alert: EvoAgentQueueStale
+        expr: evoagent_queue_oldest_age_seconds > 60
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: The oldest review queue item is over 60 seconds old
+          runbook: docs/operations.md#queue-or-outbox-stale
+
+      - alert: EvoAgentOutboxStale
+        expr: evoagent_outbox_oldest_age_seconds > 30
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: A committed review has not reached the queue within 30 seconds
+          runbook: docs/operations.md#queue-or-outbox-stale
+
+      - alert: EvoAgentDeadLettersPresent
+        expr: evoagent_dead_letter_depth > 0 or evoagent_outbox_dead > 0
+        for: 1m
+        labels:
+          severity: ticket
+        annotations:
+          summary: EvoAgent has durable work requiring operator replay or remediation
+          runbook: docs/operations.md#dead-letters
+
+      - alert: EvoAgentReviewFailureRateHigh
+        expr: (1 - evoagent:sli:review_success_30m) > 0.01 and (sum(increase(evoagent_reviews_total[30m])) + sum(increase(evoagent_reviews_failed_total[30m]))) > 20
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Review terminal failure rate is above 1%
+          runbook: docs/operations.md#review-failures
+
+      - alert: EvoAgentPluginRuntimeNotReady
+        expr: evoagent_plugin_runtime_ready < 1
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: EvoAgent plugin graph is not running
+          runbook: docs/operations.md#plugin-runtime

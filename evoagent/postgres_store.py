@@ -258,9 +258,16 @@ class PostgresTaskStore:
                 "SELECT COUNT(*) AS total,"
                 "COUNT(*) FILTER(WHERE status='pending') AS pending,"
                 "COUNT(*) FILTER(WHERE status='publishing') AS publishing,"
-                "COUNT(*) FILTER(WHERE status='dead') AS dead FROM outbox_messages"
+                "COUNT(*) FILTER(WHERE status='dead') AS dead,"
+                "EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - "
+                "MIN(created_at) FILTER(WHERE status IN ('pending','publishing')))) "
+                "AS oldest_age_seconds FROM outbox_messages"
             ).fetchone()
-        return {key: int(row[key] or 0) for key in ("total", "pending", "publishing", "dead")}
+        result: dict[str, Any] = {
+            key: int(row[key] or 0) for key in ("total", "pending", "publishing", "dead")
+        }
+        result["oldest_age_seconds"] = float(row["oldest_age_seconds"] or 0.0)
+        return result
 
     def list_outbox(self, status: str = "dead", limit: int = 100) -> list:
         if status not in {"pending", "publishing", "published", "dead"}:

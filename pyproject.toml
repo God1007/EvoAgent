@@ -47,6 +47,7 @@ dev = [
 evoagent = "evoagent.api:run"
 evoagent-migrate = "evoagent.migrate:run"
 evoagent-proof-runner = "evoagent.proof_remote:run"
+evoagent-slo = "evoagent.slo:run"
 
 [project.urls]
 Homepage = "https://github.com/God1007/EvoAgent"
@@ -68,6 +69,9 @@ evoagent = ["py.typed"]
   "skills/code-quality/skill.json",
   "skills/code-quality/skill.py",
 ]
+"share/evoagent/ops" = ["ops/slo.toml"]
+"share/evoagent/ops/prometheus" = ["ops/prometheus/evoagent.rules.yml"]
+"share/evoagent/ops/grafana" = ["ops/grafana/evoagent-overview.json"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

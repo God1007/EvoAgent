@@ -11,6 +11,12 @@ workload, a stated environment, and percentiles (not averages).**
 
 ## 1. Service level objectives
 
+The table below is the per-instance engineering performance target. The formal
+30-day production contract (99.9% non-probe availability, 99% async intake
+within 500 ms, and 99% terminal review success) is machine-readable in
+[`ops/slo.toml`](../ops/slo.toml), evaluated by `evoagent-slo`, and paired with
+multi-window burn alerts in the [operations runbook](operations.md).
+
 Targets are per API instance on a modern 4-core host. They are goals for the
 load-test gate, not guarantees; recalibrate against your hardware and record the
 result in [`performance-baseline.md`](performance-baseline.md).
@@ -127,13 +133,18 @@ python scripts/microbench.py --json micro.json
   SQLite is single-writer and intended for single-node/dev.
 - **Queue**: use Redis Streams (`EVOAGENT_REDIS_URL`) in production for durable,
   crash-safe delivery; the in-process queue is non-durable.
+- **Metrics topology**: the built-in registry is process-local. Run one web
+  worker per production pod and scale pods horizontally so each Prometheus
+  scrape is complete; `SO_REUSEPORT` multi-worker mode is a load-test/dev option,
+  not an in-process metrics aggregation mechanism.
 
 ## 7. Known follow-ups (not yet implemented)
 
 - Full ASGI/FastAPI rewrite (kept stdlib + multi-process by design for now).
 - PgBouncer, read replicas, and partitioning + TTL for `trace_events` and
   `session_findings` (both grow unbounded today).
-- microVM isolation (Firecracker/gVisor) for `/v1/proofs`.
+- microVM isolation (Firecracker/Kata) as an alternative `proof.executor`
+  provider for hostile public multi-tenancy.
 - Trusted-proxy `X-Forwarded-For` parsing for the rate limiter (today it keys on
   the socket peer, so behind a proxy all clients share one bucket) and a
   dedicated concurrency guard for `/webhooks/github` `synchronize` fan-out.

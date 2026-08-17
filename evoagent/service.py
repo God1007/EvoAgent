@@ -170,11 +170,17 @@ class ReviewService:
                 metrics.inc("plugin_cleanup_failures_total")
             raise
         metrics.register_gauge_source("queue_depth", self.queue.depth)
+        metrics.register_gauge_source("queue_oldest_age_seconds", self.queue.oldest_age_seconds)
+        metrics.register_gauge_source("dead_letter_depth", self.queue.dead_letter_depth)
         metrics.register_gauge_source(
             "outbox_pending", lambda: float(self.store.outbox_stats()["pending"])
         )
         metrics.register_gauge_source(
             "outbox_dead", lambda: float(self.store.outbox_stats()["dead"])
+        )
+        metrics.register_gauge_source(
+            "outbox_oldest_age_seconds",
+            lambda: float(self.store.outbox_stats()["oldest_age_seconds"]),
         )
         # Admission control: per-client rate limit + a bounded gate for the
         # CPU/sandbox-heavy endpoints so overload sheds instead of collapsing.

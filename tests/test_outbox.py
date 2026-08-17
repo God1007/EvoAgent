@@ -78,10 +78,12 @@ class TransactionalOutboxTests(unittest.TestCase):
         dispatcher = OutboxDispatcher(self.store, queue, autostart=False)
         try:
             self.assertEqual(1, self.store.outbox_stats()["pending"])
+            self.assertGreaterEqual(self.store.outbox_stats()["oldest_age_seconds"], 0.0)
             self.assertEqual(1, dispatcher.dispatch_once())
             self.assertTrue(delivered.wait(2))
             self.assertEqual([task_id], seen)
             self.assertEqual(0, self.store.outbox_stats()["pending"])
+            self.assertEqual(0.0, self.store.outbox_stats()["oldest_age_seconds"])
         finally:
             dispatcher.close()
             queue.close(2)

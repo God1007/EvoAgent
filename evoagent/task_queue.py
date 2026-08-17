@@ -27,6 +27,8 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
+from .errors import coerce_safe_summary, safe_exception_summary
+
 
 class PermanentTaskError(RuntimeError):
     """An error that must not be retried."""
@@ -180,11 +182,17 @@ class TaskQueue:
                 self._forget_memory_envelope(envelope)
                 return True
             except PermanentTaskError as exc:
-                self._dead_letter(envelope, str(exc))
+                self._dead_letter(
+                    envelope,
+                    safe_exception_summary(exc, "task delivery failed"),
+                )
                 return False
             except Exception as exc:
                 if envelope["attempt"] >= self.max_attempts:
-                    self._dead_letter(envelope, str(exc))
+                    self._dead_letter(
+                        envelope,
+                        safe_exception_summary(exc, "task delivery failed"),
+                    )
                 elif self._redis:
                     self._redis.xadd(
                         self.STREAM,
@@ -245,7 +253,7 @@ class TaskQueue:
                 # A Redis restart or transient network failure must not silently
                 # retire the worker Future forever. Leave unacknowledged entries
                 # pending and reconnect with bounded exponential backoff.
-                self._last_worker_error = str(exc)[:500]
+                self._last_worker_error = safe_exception_summary(exc, "queue dependency failed")
                 self._stop.wait(retry_delay)
                 retry_delay = min(retry_delay * 2, 5.0)
 
@@ -259,7 +267,10 @@ class TaskQueue:
                 "payload": {},
                 "submitted_at": time.time(),
             }
-            self._dead_letter(envelope, "invalid queue envelope: %s" % exc)
+            self._dead_letter(
+                envelope,
+                safe_exception_summary(exc, "task delivery failed"),
+            )
             self._ack_redis_entry(redis_id)
             return
         self._deliver(envelope)
@@ -289,6 +300,7 @@ class TaskQueue:
             self._consume_redis_entry(redis_id, fields)
 
     def _dead_letter(self, envelope: dict[str, Any], error: str) -> None:
+        error = coerce_safe_summary(error, "task delivery failed")
         item = {**envelope, "error": error[:2000], "failed_at": time.time()}
         if self._redis:
             self._redis.xadd(self.DLQ, {"envelope": json.dumps(item, ensure_ascii=False)})
@@ -302,9 +314,17 @@ class TaskQueue:
     def dead_letters(self, limit: int = 100) -> list:
         if self._redis:
             rows = self._redis.xrevrange(self.DLQ, count=max(1, min(limit, 500)))
-            return [json.loads(fields["envelope"]) for _id, fields in rows]
-        with self._lock:
-            return list(reversed(self._memory_dlq[-limit:]))
+            values = [json.loads(fields["envelope"]) for _id, fields in rows]
+        else:
+            with self._lock:
+                values = list(reversed(self._memory_dlq[-limit:]))
+        return [
+            {
+                **item,
+                "error": coerce_safe_summary(item.get("error"), "task delivery failed"),
+            }
+            for item in values
+        ]
 
     def replay_dead_letter(self, message_id: str) -> bool:
         for item in self.dead_letters(500):
@@ -388,7 +408,9 @@ class TaskQueue:
         try:
             dependency_ok = bool(self._redis.ping())
         except Exception as exc:
-            error = str(exc)[:500]
+            error = safe_exception_summary(exc, "queue dependency failed")
+        if error:
+            error = coerce_safe_summary(error, "queue dependency failed")
         expected = len(self._redis_workers)
         return {
             "healthy": dependency_ok and running == expected and not self._stop.is_set(),

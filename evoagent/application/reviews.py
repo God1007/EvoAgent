@@ -8,7 +8,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from ..errors import AccessDeniedError, ClientInputError
+from ..errors import (
+    AccessDeniedError,
+    ClientInputError,
+    coerce_safe_summary,
+    safe_exception_fields,
+    safe_exception_summary,
+)
 from ..metrics import metrics
 from ..models import TaskState, TraceEvent
 from ..policy import RepositoryPolicy, RepositoryPolicyResolver
@@ -364,7 +370,11 @@ class ReviewUseCases:
                 client.upsert_comment(payload["github_issue_url"], body, marker)
                 self.store.complete_effect(effect_key, owner, {"marker": marker})
             except Exception as exc:
-                self.store.release_effect(effect_key, owner, str(exc))
+                self.store.release_effect(
+                    effect_key,
+                    owner,
+                    safe_exception_summary(exc, "external effect failed"),
+                )
                 raise
         elif receipt["status"] == "busy":
             metrics.inc("effect_receipt_busy_total")
@@ -420,18 +430,21 @@ class ReviewUseCases:
         lane = (task.get("input") or {}).get("release_lane", "stable")
         self.releases.observe(tenant_id, "llm-review", True, lane)
         self.alerts.evaluate(tenant_id)
+        failure = safe_exception_fields(error)
         self.publish_event(
             "review.failed",
             {
                 "task_id": task_id,
                 "tenant_id": tenant_id,
                 "repository": repository,
-                "error_type": type(error).__name__,
+                "error_type": failure["error_type"],
+                "error_ref": failure["error_ref"],
                 "mode": mode,
             },
         )
 
     def on_dead_letter(self, payload: dict[str, Any], error: str) -> None:
+        error = coerce_safe_summary(error, "task delivery failed")
         task_id = payload.get("task_id", "")
         tenant_id = payload.get("tenant_id", "default")
         task = self.store.get(task_id, tenant_id) if task_id else None
@@ -447,7 +460,7 @@ class ReviewUseCases:
                 TraceEvent(
                     step,
                     TaskState.FAILED,
-                    "Task entered the dead-letter queue: %s" % error,
+                    error,
                     utc_now(),
                 ),
             )
@@ -455,7 +468,7 @@ class ReviewUseCases:
             tenant_id,
             "dlq:%s" % (task_id or "unknown"),
             "critical",
-            "Task %s entered the dead-letter queue: %s" % (task_id, error),
+            error,
         )
         metrics.inc("dead_letters_total")
         self.publish_event(

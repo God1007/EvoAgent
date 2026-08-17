@@ -142,8 +142,9 @@ class ProofLadderTests(unittest.TestCase):
         )
 
         self.assertEqual("error", result["steps"][0]["status"])
-        self.assertEqual(
-            "proof executor failed (builtins.RuntimeError)", result["steps"][0]["detail"]
+        self.assertRegex(
+            result["steps"][0]["detail"],
+            r"^proof executor failed \[type=builtins\.RuntimeError; ref=[0-9a-f]{16}\]$",
         )
         self.assertNotIn("proof-secret", str(result))
 

@@ -8,6 +8,7 @@ import threading
 import uuid
 from typing import Any
 
+from .errors import safe_exception_summary
 from .metrics import metrics
 from .ports import OutboxStorePort, TaskQueuePort
 
@@ -82,7 +83,7 @@ class OutboxDispatcher:
                 self.store.release_outbox(
                     str(message["id"]),
                     self.owner,
-                    str(exc),
+                    safe_exception_summary(exc, "outbox dispatch failed"),
                     delay,
                     self.max_attempts,
                 )
@@ -121,4 +122,6 @@ class OutboxDispatcher:
 
     def _set_error(self, error: Exception | None) -> None:
         with self._last_error_lock:
-            self._last_error = "" if error is None else str(error)[:1000]
+            self._last_error = (
+                "" if error is None else safe_exception_summary(error, "outbox dispatch failed")
+            )

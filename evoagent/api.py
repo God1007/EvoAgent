@@ -18,7 +18,7 @@ from typing import Any
 from . import __version__
 from .auth import Principal
 from .config import Settings
-from .errors import AccessDeniedError, ClientInputError
+from .errors import AccessDeniedError, ClientInputError, safe_exception_fields
 from .github import verify_signature
 from .metrics import metrics
 from .report import to_markdown
@@ -129,11 +129,11 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _send_internal_error(self, exc: Exception) -> None:
         metrics.inc("http_errors_total")
-        error_type = "%s.%s" % (type(exc).__module__, type(exc).__qualname__)
+        fields = safe_exception_fields(exc)
         self._structured_log(
             "http_internal_error",
             level="error",
-            error_type=error_type[:160],
+            **fields,
         )
         if getattr(self, "_response_started", False):
             # A second status line would corrupt a response already on the wire.

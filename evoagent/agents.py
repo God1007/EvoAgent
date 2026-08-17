@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, TypedDict, cast
 
 from .diff_parser import ParsedDiff
+from .errors import safe_exception_summary
 from .models import Finding, Severity
 from .ports import AgentMessageStorePort
 from .reviewer import Reviewer
@@ -389,13 +390,14 @@ class MultiAgentCoordinator(Reviewer):
                         {"findings": [item.to_dict() for item in output]},
                     )
                 except Exception as exc:
-                    failures.append("%s: %s" % (agent.name, exc))
+                    summary = safe_exception_summary(exc, "review agent failed")
+                    failures.append("%s: %s" % (agent.name, summary))
                     self._emit(
                         state,
                         agent.name,
                         self.planner.name,
                         "agent_failure",
-                        {"error": str(exc)[:1000]},
+                        {"error": summary},
                     )
         if failures and not findings and len(failures) == len(self.agents):
             raise RuntimeError("all review agents failed: " + "; ".join(failures))

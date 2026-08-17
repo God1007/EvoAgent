@@ -20,6 +20,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Generic, Protocol, TypeVar, cast, runtime_checkable
 
+from .errors import safe_exception_summary
+
 PLUGIN_API_VERSION = "evoagent.plugin/v1"
 PLUGIN_ENTRYPOINT_GROUP = "evoagent.plugins"
 
@@ -420,7 +422,12 @@ class EventBus:
             try:
                 listener.handler(event)
             except Exception as exc:  # observer failures must not break the review path
-                failures.append(EventFailure(listener.plugin_id, str(exc)[:1000]))
+                failures.append(
+                    EventFailure(
+                        listener.plugin_id,
+                        safe_exception_summary(exc, "plugin listener failed"),
+                    )
+                )
         return failures
 
 
@@ -676,7 +683,9 @@ class PluginRuntime:
                 self.state = RuntimeState.FAILED
                 if isinstance(exc, PluginConfigurationError):
                     raise
-                raise PluginActivationError("plugin runtime activation failed: %s" % exc) from exc
+                raise PluginActivationError(
+                    safe_exception_summary(exc, "plugin activation failed")
+                ) from exc
             self.state = RuntimeState.RUNNING
         return self
 
@@ -702,7 +711,11 @@ class PluginRuntime:
             self.parent._detach_child(self)
         if errors:
             raise PluginShutdownError(
-                "%d plugin cleanup callback(s) failed; first error: %s" % (len(errors), errors[0])
+                "%d plugin cleanup callback(s) failed; first error: %s"
+                % (
+                    len(errors),
+                    safe_exception_summary(errors[0], "plugin shutdown failed"),
+                )
             )
 
     def create_scope(

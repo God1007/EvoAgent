@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from ..errors import ClientInputError
+from ..errors import ClientInputError, safe_exception_summary
 from ..metrics import metrics
 from ..policy import RepositoryPolicyResolver
 from ..ports import (
@@ -140,7 +140,11 @@ class RepairUseCases:
             if not self.store.complete_effect(effect_key, owner, result):
                 raise RuntimeError("repair publication lease was lost before completion")
         except Exception as exc:
-            self.store.release_effect(effect_key, owner, str(exc))
+            self.store.release_effect(
+                effect_key,
+                owner,
+                safe_exception_summary(exc, "external effect failed"),
+            )
             raise
         metrics.inc("fix_runs_total")
         self.publish_event(

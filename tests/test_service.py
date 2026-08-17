@@ -95,7 +95,11 @@ class ServiceTests(unittest.TestCase):
         ready, detail = service.readiness()
         self.assertFalse(ready)
         self.assertEqual("not-ready", detail["status"])
-        self.assertEqual("worker stopped", detail["checks"]["queue"]["last_error"])
+        self.assertRegex(
+            detail["checks"]["queue"]["last_error"],
+            r"^queue dependency failed \[type=unknown; ref=[0-9a-f]{16}\]$",
+        )
+        self.assertNotIn("worker stopped", str(detail))
 
     def test_review_persists_versioned_repository_policy_snapshot(self):
         service = ReviewService(self.settings)

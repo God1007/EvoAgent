@@ -11,6 +11,7 @@ import uuid
 from contextlib import AbstractContextManager
 from typing import Any
 
+from .errors import preserve_safe_summary, safe_exception_summary
 from .migrations import migrate_postgres, validate_current_schema_history
 from .models import ReviewReport, TaskState, TraceEvent
 from .ports import ApplicationStorePort
@@ -66,7 +67,7 @@ class PostgresTaskStore:
                 except Exception as exc:
                     print(
                         "WARNING: could not create Postgres pool (%s); using per-call connections"
-                        % exc
+                        % safe_exception_summary(exc, "store readiness failed")
                     )
                     self._pool = None
         try:
@@ -256,6 +257,7 @@ class PostgresTaskStore:
     ) -> bool:
         now = utc_now()
         available_at = utc_after(retry_delay_seconds)
+        error = preserve_safe_summary(error, "outbox dispatch failed")
         with self._connect() as conn:
             cursor = conn.execute(
                 "UPDATE outbox_messages SET "
@@ -712,6 +714,7 @@ class PostgresTaskStore:
 
     def release_effect(self, effect_key: str, owner: str, error: str) -> bool:
         now = utc_now()
+        error = preserve_safe_summary(error, "external effect failed")
         with self._connect() as conn:
             cursor = conn.execute(
                 "UPDATE effect_receipts SET lease_until=%s,last_error=%s,updated_at=%s "
@@ -748,6 +751,7 @@ class PostgresTaskStore:
             )
 
     def fail(self, task_id: str, error: str, event: TraceEvent) -> None:
+        error = preserve_safe_summary(error, "review execution failed")
         with self._connect() as conn:
             conn.execute(
                 "UPDATE tasks SET state=%s,error=%s,updated_at=%s WHERE id=%s",
@@ -755,7 +759,7 @@ class PostgresTaskStore:
             )
             conn.execute(
                 "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (%s,%s,%s,%s,%s)",
-                (task_id, event.step, event.state.value, event.message, event.created_at),
+                (task_id, event.step, event.state.value, error, event.created_at),
             )
 
     def get(self, task_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
@@ -794,6 +798,9 @@ class PostgresTaskStore:
         return value
 
     def record_agent_message(self, task_id: str, message: dict[str, Any]) -> None:
+        content = dict(message.get("content", {}))
+        if message.get("kind") == "agent_failure":
+            content = {"error": preserve_safe_summary(content.get("error"), "review agent failed")}
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO agent_messages(task_id,sender,recipient,kind,correlation_id,"
@@ -804,7 +811,7 @@ class PostgresTaskStore:
                     message["recipient"],
                     message["kind"],
                     message.get("correlation_id", ""),
-                    json.dumps(message.get("content", {}), ensure_ascii=False),
+                    json.dumps(content, ensure_ascii=False),
                     utc_now(),
                 ),
             )
@@ -1030,6 +1037,11 @@ class PostgresTaskStore:
         return values
 
     def record_failure_case(self, task_id: str, category: str, payload: dict[str, Any]) -> None:
+        payload = dict(payload)
+        if category == "execution_error":
+            payload = {
+                "error": preserve_safe_summary(payload.get("error"), "review execution failed")
+            }
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO failure_cases(task_id,category,payload_json,created_at) VALUES (%s,%s,%s::jsonb,%s)",
@@ -1265,6 +1277,8 @@ class PostgresTaskStore:
         attempt: int = 1,
         error: str = "",
     ) -> None:
+        if error:
+            error = preserve_safe_summary(error, "review node failed")
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO checkpoints(task_id,node,status,attempt,state_json,error,updated_at) "
@@ -1624,6 +1638,10 @@ class PostgresTaskStore:
         resource: str,
         detail: dict[str, Any] | None = None,
     ) -> None:
+        if action == "shadow.failed":
+            detail = {
+                "error": preserve_safe_summary((detail or {}).get("error"), "shadow review failed")
+            }
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO audit_log(tenant_id,actor,action,resource,detail_json,created_at) "
@@ -1806,6 +1824,8 @@ class PostgresTaskStore:
         severity: str,
         message: str,
     ) -> None:
+        if alert_key.startswith("dlq:"):
+            message = preserve_safe_summary(message, "task delivery failed")
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO alerts(tenant_id,alert_key,severity,message,status,created_at,updated_at) "

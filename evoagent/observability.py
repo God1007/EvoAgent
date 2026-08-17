@@ -4,6 +4,7 @@ import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
 
+from .errors import safe_exception_fields
 from .ports import AlertStorePort
 
 trace_id_var: ContextVar[str] = ContextVar("trace_id", default="")
@@ -33,14 +34,21 @@ class Observability:
     def span(self, name: str, trace_id: str = "", **attributes):
         token = trace_id_var.set(trace_id or trace_id_var.get())
         if self.tracer:
-            with self.tracer.start_as_current_span(name) as span:
+            with self.tracer.start_as_current_span(
+                name,
+                record_exception=False,
+                set_status_on_exception=False,
+            ) as span:
                 for key, value in attributes.items():
                     if value is not None:
                         span.set_attribute(key, value)
                 try:
                     yield span
                 except Exception as exc:
-                    span.record_exception(exc)
+                    fields = safe_exception_fields(exc)
+                    span.set_attribute("error.type", fields["error_type"])
+                    span.set_attribute("error.ref", fields["error_ref"])
+                    span.add_event("evoagent.failure", fields)
                     raise
                 finally:
                     trace_id_var.reset(token)

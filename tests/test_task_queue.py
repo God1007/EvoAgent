@@ -78,7 +78,14 @@ class TaskQueueBackendTests(unittest.TestCase):
             time.sleep(0.2)
             self.assertEqual(1, len(calls))
             self.assertEqual(1, len(dead))
-            self.assertIn("do not retry", queue.dead_letters()[0]["error"])
+            error = queue.dead_letters()[0]["error"]
+            self.assertRegex(
+                error,
+                r"^task delivery failed \[type=evoagent\.task_queue\.PermanentTaskError; "
+                r"ref=[0-9a-f]{16}\]$",
+            )
+            self.assertNotIn("do not retry", error)
+            self.assertEqual(error, dead[0][1])
         finally:
             queue.close()
 

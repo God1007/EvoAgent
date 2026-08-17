@@ -43,7 +43,7 @@ class _ImmediateRetryStore:
 
 class _FailingQueue:
     def submit(self, _payload, message_id=""):
-        raise RuntimeError("queue unavailable")
+        raise RuntimeError("queue-token=outbox-secret")
 
 
 class TransactionalOutboxTests(unittest.TestCase):
@@ -135,6 +135,12 @@ class TransactionalOutboxTests(unittest.TestCase):
         self.assertEqual(0, stats["pending"])
         dead = self.store.list_outbox("dead")
         self.assertEqual("review:" + task_id, dead[0]["id"])
+        self.assertRegex(
+            dead[0]["last_error"],
+            r"^outbox dispatch failed \[type=builtins\.RuntimeError; ref=[0-9a-f]{16}\]$",
+        )
+        self.assertNotIn("outbox-secret", str(dead))
+        self.assertNotIn("outbox-secret", dispatcher.last_error)
         self.assertTrue(self.store.requeue_outbox(dead[0]["id"]))
         self.assertEqual(1, self.store.outbox_stats()["pending"])
 

@@ -35,6 +35,7 @@ from .capabilities import (
 )
 from .config import Settings
 from .diff_parser import parse_unified_diff
+from .errors import coerce_safe_summary, safe_exception_summary
 from .github import GitHubAppAuthenticator, GitHubClient
 from .metrics import metrics
 from .outbox import OutboxDispatcher
@@ -333,8 +334,14 @@ class ReviewService:
             checks["schema_version"] = self.store.schema_version()
         except Exception as exc:
             ready = False
-            checks["store"] = "error: %s" % exc
+            checks["store"] = safe_exception_summary(exc, "store readiness failed")
         queue_health = self.queue.health()
+        queue_error = queue_health.get("last_error", "")
+        if queue_error:
+            queue_health = {
+                **queue_health,
+                "last_error": coerce_safe_summary(queue_error, "queue dependency failed"),
+            }
         depth = self.queue.depth()
         checks["queue"] = queue_health
         if not queue_health["healthy"] or depth < 0:
@@ -350,7 +357,7 @@ class ReviewService:
             if not outbox["dispatcher_running"] or outbox["dead"]:
                 ready = False
         except Exception as exc:
-            checks["outbox"] = "error: %s" % exc
+            checks["outbox"] = safe_exception_summary(exc, "outbox readiness failed")
             ready = False
         if self.settings.proof_require_remote:
             try:
@@ -461,12 +468,11 @@ class ReviewService:
             )
             metrics.inc("shadow_reviews_total")
         except Exception as exc:
+            error = safe_exception_summary(exc, "shadow review failed")
             self.releases.observe_shadow(
                 tenant_id, "llm-review", task_id, lane, primary, None, True
             )
-            self.store.audit(
-                tenant_id, "system", "shadow.failed", task_id, {"error": str(exc)[:500]}
-            )
+            self.store.audit(tenant_id, "system", "shadow.failed", task_id, {"error": error})
             metrics.inc("shadow_reviews_failed_total")
 
     def _record_session_turn(self, payload: dict[str, Any], report) -> str:

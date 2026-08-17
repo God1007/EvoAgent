@@ -74,6 +74,30 @@ detail is required, add it to access-controlled component tracing with explicit
 redaction. Treat caller-provided request IDs as untrusted labels; never use them
 to authorize a replay, reconciliation, or tenant operation.
 
+## Operational failure references
+
+Asynchronous and component failures use this message-free shape:
+
+```text
+task delivery failed [type=builtins.RuntimeError; ref=4d8f6a19c3e57021]
+```
+
+`type` identifies the bounded exception class. `ref` hashes that class and the
+traceback's module/function/line locations; it never hashes the exception
+message, arguments, locals, request values, or source content. Group the same
+`type + ref` within one image/version to find a common failure site, then use
+deployment metadata, request/task IDs, dependency metrics, and code ownership
+to investigate. A reference is neither globally unique nor an authorization or
+idempotency key, and source-line changes can change it between releases.
+
+Task/Trace/Checkpoint, Agent failure, Queue/DLQ, Outbox/effect, readiness,
+shadow/evaluation failure, Proof/Verifier, plugin lifecycle, and OpenTelemetry
+paths must not be temporarily switched back to raw exception messages. Schema
+version 10 replaces legacy values in these persisted operational fields. The
+model usage ledger's credential-redacted provider diagnostics and authorized
+sandbox command output are separate, access-controlled retention surfaces; do
+not copy them into general task or readiness records.
+
 ## Intake latency
 
 1. Compare intake RPS, p99, `outbox_oldest_age_seconds`, Postgres pool available,

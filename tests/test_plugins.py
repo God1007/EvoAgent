@@ -136,12 +136,17 @@ class PluginRuntimeTests(unittest.TestCase):
         )
         runtime = PluginRuntime([broken, source_plugin])
 
-        with self.assertRaisesRegex(PluginActivationError, "boom"):
+        with self.assertRaises(PluginActivationError) as raised:
             runtime.start()
 
         self.assertEqual(RuntimeState.FAILED, runtime.state)
         self.assertFalse(runtime.capabilities.has(source.name))
         self.assertEqual(["source-closed"], cleanup)
+        self.assertRegex(
+            str(raised.exception),
+            r"^plugin activation failed \[type=builtins\.RuntimeError; ref=[0-9a-f]{16}\]$",
+        )
+        self.assertNotIn("boom", str(raised.exception))
 
     def test_missing_dependency_and_cycles_fail_before_activation(self):
         a = CapabilityKey[str]("test.a")
@@ -200,10 +205,12 @@ class PluginRuntimeTests(unittest.TestCase):
 
         plugin = _CallbackPlugin(PluginManifest("test.cleanup", "1.0.0", ()), start)
         runtime = PluginRuntime([plugin]).start()
-        with self.assertRaisesRegex(PluginShutdownError, "cleanup failed"):
+        with self.assertRaises(PluginShutdownError) as raised:
             runtime.stop()
         self.assertEqual(["first", "broken", "last"], calls)
         self.assertEqual(RuntimeState.STOPPED, runtime.state)
+        self.assertIn("plugin shutdown failed [type=builtins.RuntimeError;", str(raised.exception))
+        self.assertNotIn("cleanup failed", str(raised.exception))
 
     def test_priority_and_child_scope_shadow_parent(self):
         key = CapabilityKey[str]("test.value")
@@ -258,6 +265,11 @@ class PluginRuntimeTests(unittest.TestCase):
         failures = runtime.publish("review.completed", {"task_id": "1"})
         self.assertEqual(["review.completed"], seen)
         self.assertEqual("test.observer", failures[0].plugin_id)
+        self.assertRegex(
+            failures[0].error,
+            r"^plugin listener failed \[type=builtins\.RuntimeError; ref=[0-9a-f]{16}\]$",
+        )
+        self.assertNotIn("observer unavailable", failures[0].error)
 
         runtime.stop()
         self.assertEqual([], runtime.publish("review.completed", {"task_id": "2"}))
@@ -561,7 +573,7 @@ class ApplicationCompositionTests(unittest.TestCase):
             ),
         )
 
-        with self.assertRaisesRegex(PluginActivationError, "duplicate reviewer contribution"):
+        with self.assertRaisesRegex(PluginConfigurationError, "duplicate reviewer contribution"):
             ReviewService(_settings(self.path), plugins=[plugin])
 
     def test_service_can_replace_a_builtin_provider_by_stable_plugin_id(self):

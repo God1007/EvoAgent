@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .diff_parser import parse_unified_diff
+from .errors import safe_exception_summary
 from .evaluation_dataset import dataset_fingerprint, normalized_path
 from .evaluation_metrics import (
     RULE_TO_CWE,
@@ -346,7 +347,7 @@ class EndToEndEvaluationHarness:
                 and result["repair_passed"] == len(expected)
             )
         except Exception as exc:
-            result["error"] = str(exc)[:1000]
+            result["error"] = safe_exception_summary(exc, "evaluation case failed")
         return result
 
 

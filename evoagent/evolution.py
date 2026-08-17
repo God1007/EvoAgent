@@ -6,7 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .diff_parser import parse_unified_diff
-from .errors import ClientInputError
+from .errors import ClientInputError, safe_exception_summary
 from .ports import EvolutionStorePort
 from .reviewer import Reviewer
 from .store import utc_now
@@ -150,7 +150,8 @@ class RegressionEvaluator:
                     >= SEVERITY_RANK["high"]
                     for item in expected_items
                 )
-                errors.append({"name": case["name"], "error": str(exc)[:500]})
+                error = safe_exception_summary(exc, "evaluation case failed")
+                errors.append({"name": case["name"], "error": error})
                 case_results.append(
                     {
                         "id": case.get("id"),
@@ -160,7 +161,7 @@ class RegressionEvaluator:
                         "fn": len(expected_items),
                         "findings": 0,
                         "severity_hits": 0,
-                        "error": str(exc)[:500],
+                        "error": error,
                     }
                 )
 

@@ -29,7 +29,7 @@ import tempfile
 from enum import IntEnum
 from typing import Any
 
-from .errors import ClientInputError
+from .errors import ClientInputError, safe_exception_summary
 from .ports import ProofExecutorPort
 from .verifier import RepairVerifier
 
@@ -183,14 +183,13 @@ class ProofRunner:
         try:
             outcome = self.executor.execute(files, command)
         except Exception as exc:
-            error_type = "%s.%s" % (type(exc).__module__, type(exc).__qualname__)
             outcome = {
                 "passed": False,
                 "status": "error",
                 "checks": [
                     {
                         "name": "proof-executor",
-                        "detail": "proof executor failed (%s)" % error_type[:160],
+                        "detail": safe_exception_summary(exc, "proof executor failed"),
                     }
                 ],
             }

@@ -93,6 +93,106 @@ class SQLiteMigrationTests(unittest.TestCase):
         self.assertEqual(CURRENT_SCHEMA_VERSION, store.schema_version())
         self.assertEqual("previous-release", store.get(task_id, "tenant-a")["input"]["source"])
 
+    def test_forward_migration_removes_legacy_operational_exception_text(self):
+        task_id = "legacy-error-" + uuid.uuid4().hex
+        secret = "password=legacy-operational-secret"
+        now = utc_now()
+        with self.connect() as conn:
+            migrate_sqlite(conn, CURRENT_SCHEMA_VERSION - 1)
+            conn.execute(
+                "INSERT INTO tasks(id,state,repository,pull_request,input_json,report_json,error,"
+                "created_at,updated_at,tenant_id,cancel_requested) "
+                "VALUES (?,?,?,?,?,NULL,?,?,?,?,0)",
+                (task_id, TaskState.FAILED.value, "acme/widgets", 1, "{}", secret, now, now, "t"),
+            )
+            conn.execute(
+                "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (?,?,?,?,?)",
+                (task_id, 1, TaskState.FAILED.value, secret, now),
+            )
+            conn.execute(
+                "INSERT INTO failure_cases(task_id,category,payload_json,resolved,created_at) "
+                "VALUES (?,?,?,?,?)",
+                (task_id, "execution_error", json.dumps({"error": secret}), 0, now),
+            )
+            conn.execute(
+                "INSERT INTO checkpoints(task_id,node,status,attempt,state_json,error,updated_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (task_id, "reviewing", "failed", 1, "{}", secret, now),
+            )
+            conn.execute(
+                "INSERT INTO agent_messages(task_id,sender,recipient,kind,correlation_id,"
+                "content_json,created_at) VALUES (?,?,?,?,?,?,?)",
+                (
+                    task_id,
+                    "agent",
+                    "planner",
+                    "agent_failure",
+                    "",
+                    json.dumps({"error": secret}),
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,attempts,"
+                "available_at,last_error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ("outbox", "review", "outbox", "{}", "dead", 1, now, secret, now, now),
+            )
+            conn.execute(
+                "INSERT INTO effect_receipts(effect_key,status,attempts,last_error,created_at,"
+                "updated_at) VALUES (?,?,?,?,?,?)",
+                ("effect", "pending", 1, secret, now, now),
+            )
+            conn.execute(
+                "INSERT INTO alerts(tenant_id,alert_key,severity,message,status,created_at,"
+                "updated_at) VALUES (?,?,?,?,?,?,?)",
+                ("t", "dlq:" + task_id, "critical", secret, "open", now, now),
+            )
+            conn.execute(
+                "INSERT INTO audit_log(tenant_id,actor,action,resource,detail_json,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                ("t", "system", "shadow.failed", task_id, json.dumps({"error": secret}), now),
+            )
+            conn.commit()
+            migrate_sqlite(conn)
+            values = {
+                "task": conn.execute("SELECT error FROM tasks WHERE id=?", (task_id,)).fetchone()[
+                    0
+                ],
+                "trace": conn.execute(
+                    "SELECT message FROM trace_events WHERE task_id=?", (task_id,)
+                ).fetchone()[0],
+                "failure": conn.execute(
+                    "SELECT payload_json FROM failure_cases WHERE task_id=?", (task_id,)
+                ).fetchone()[0],
+                "checkpoint": conn.execute(
+                    "SELECT error FROM checkpoints WHERE task_id=?", (task_id,)
+                ).fetchone()[0],
+                "agent": conn.execute(
+                    "SELECT content_json FROM agent_messages WHERE task_id=?", (task_id,)
+                ).fetchone()[0],
+                "outbox": conn.execute(
+                    "SELECT last_error FROM outbox_messages WHERE id='outbox'"
+                ).fetchone()[0],
+                "effect": conn.execute(
+                    "SELECT last_error FROM effect_receipts WHERE effect_key='effect'"
+                ).fetchone()[0],
+                "alert": conn.execute(
+                    "SELECT message FROM alerts WHERE alert_key=?", ("dlq:" + task_id,)
+                ).fetchone()[0],
+                "audit": conn.execute(
+                    "SELECT detail_json FROM audit_log WHERE action='shadow.failed'"
+                ).fetchone()[0],
+            }
+
+        self.assertNotIn(secret, json.dumps(values))
+        self.assertEqual("review execution failed", values["task"].split(" [", 1)[0])
+        self.assertEqual(
+            "review agent failed", json.loads(values["agent"])["error"].split(" [", 1)[0]
+        )
+        self.assertEqual(
+            "shadow review failed", json.loads(values["audit"])["error"].split(" [", 1)[0]
+        )
+
     def test_adopts_unversioned_legacy_schema_and_preserves_rows(self):
         task_id = "legacy-" + uuid.uuid4().hex
         now = utc_now()

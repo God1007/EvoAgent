@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.19.0)
+## Current maturity (v0.20.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -21,6 +21,7 @@ It is an execution plan, not a marketing checklist.
 | Strong untrusted execution | Implemented baseline | Replaceable remote Proof Runner, mutually authenticated evidence manifests, container-only jobs, replay/size/capacity gates, and content-addressed artifacts; microVM and distributed replay store remain pending |
 | Service-level operations | Implemented baseline | Fixed-cardinality availability/latency/success SLIs, versioned 30-day SLO catalog, multi-window burn alerts, queue/Outbox age, DLQ depth, dashboard, runbooks, and hardened Prometheus evaluator |
 | HTTP edge security | Implemented baseline | Validated/generated request correlation, explicit client-safe 4xx types, bounded list reads, generic 5xx envelopes, query-free structured access logs, consistent hardening headers, and no interpreter-version disclosure |
+| Operational failure security | Implemented baseline | Allowlisted message-free failure summaries, stable code-location references, persistence-adapter enforcement, legacy-data migration, and exception-message-free OpenTelemetry/plugin/proof paths |
 | Quality evidence | Governance baseline implemented | Reproducible synthetic regression plus blind dual-annotation/adjudication compiler, rights/content/split/evidence audit, per-language/CWE/rule slices, and confidence calibration; production gate remains blocked until a real approved corpus is supplied |
 | HA/DR operational proof | Implemented recovery baseline | SQLite/PostgreSQL isolated restore validates schema/content/application/RPO/RTO; an offline audited epoch reconstructs incomplete PostgreSQL/Outbox intent only into empty Redis and is proven against real CI services; managed PITR and regional routing exercise remain pending |
 
@@ -259,6 +260,15 @@ failures return no exception detail, and structured access/error records omit
 query strings and exception messages. Response-start tracking prevents a late
 failure from corrupting an already-started HTTP stream. See
 [`ADR 0017`](adr/0017-correlated-safe-http-boundary.md).
+
+The v0.20 increment extends that rule behind the HTTP edge. Task/Trace/
+Checkpoint, Agent messages, Queue/DLQ, Outbox/effect receipts, readiness,
+shadow/evaluation failures, proof/verifier launch failures, plugin lifecycle,
+and OpenTelemetry now carry only an allowlisted operation, bounded exception
+type, and message-independent code-location reference. Both Store adapters
+reject raw operational strings, while migration 10 removes legacy messages from
+known persistence fields. See
+[`ADR 0018`](adr/0018-message-free-operational-failures.md).
 
 Implemented database recovery baseline: `evoagent-dr` performs SQLite online
 backup/restore or a PostgreSQL exported-snapshot `pg_dump` followed by

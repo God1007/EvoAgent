@@ -35,7 +35,8 @@ event without enabling verbose public errors.
 - Structured access records contain timestamp, event, request identifier,
   method, normalized path, client address, status, and byte count. Query strings
   are deliberately omitted. Internal-error records add only the bounded Python
-  exception type.
+  exception type and a message-independent code-location reference. The latter
+  is standardized across operational failures by ADR 0018.
 - All responses, including redirects and overload responses, receive the same
   request identifier and browser hardening headers. The `Server` header does not
   expose the Python interpreter version.
@@ -46,7 +47,7 @@ event without enabling verbose public errors.
 - Collection `limit` parameters are parsed once and bounded to 1–1000 before a
   Store query, preventing malformed or extreme values from amplifying reads.
 - Proof Executor adapter exceptions use the same rule: an inconclusive proof may
-  expose a bounded exception type, but never the adapter exception message.
+  expose a bounded exception type and reference, but never the adapter exception message.
   Deliberately captured sandbox command output remains part of authorized proof
   evidence and is a separate data-retention concern.
 

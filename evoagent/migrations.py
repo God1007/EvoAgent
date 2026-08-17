@@ -463,6 +463,55 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ON model_usage(status,created_at)",
         ),
     ),
+    Migration(
+        10,
+        "sanitize-legacy-operational-errors",
+        (
+            "UPDATE tasks SET error='review execution failed "
+            "[type=legacy; ref=0000000000000000]' WHERE error IS NOT NULL AND error<>''",
+            "UPDATE trace_events SET message='review execution failed "
+            "[type=legacy; ref=0000000000000000]' WHERE state='FAILED'",
+            "UPDATE checkpoints SET error='review node failed "
+            "[type=legacy; ref=0000000000000000]' WHERE error IS NOT NULL AND error<>''",
+            'UPDATE failure_cases SET payload_json=\'{"error":"review execution failed '
+            "[type=legacy; ref=0000000000000000]\"}' WHERE category='execution_error'",
+            'UPDATE agent_messages SET content_json=\'{"error":"review agent failed '
+            "[type=legacy; ref=0000000000000000]\"}' WHERE kind='agent_failure'",
+            "UPDATE outbox_messages SET last_error='outbox dispatch failed "
+            "[type=legacy; ref=0000000000000000]' "
+            "WHERE last_error IS NOT NULL AND last_error<>''",
+            "UPDATE effect_receipts SET last_error='external effect failed "
+            "[type=legacy; ref=0000000000000000]' "
+            "WHERE last_error IS NOT NULL AND last_error<>''",
+            "UPDATE alerts SET message='task delivery failed "
+            "[type=legacy; ref=0000000000000000]' WHERE alert_key LIKE 'dlq:%'",
+            'UPDATE audit_log SET detail_json=\'{"error":"shadow review failed '
+            "[type=legacy; ref=0000000000000000]\"}' WHERE action='shadow.failed'",
+        ),
+        (
+            "UPDATE tasks SET error='review execution failed "
+            "[type=legacy; ref=0000000000000000]' WHERE error IS NOT NULL AND error<>''",
+            "UPDATE trace_events SET message='review execution failed "
+            "[type=legacy; ref=0000000000000000]' WHERE state='FAILED'",
+            "UPDATE checkpoints SET error='review node failed "
+            "[type=legacy; ref=0000000000000000]' WHERE error IS NOT NULL AND error<>''",
+            'UPDATE failure_cases SET payload_json=\'{"error":"review execution failed '
+            "[type=legacy; ref=0000000000000000]\"}'::jsonb "
+            "WHERE category='execution_error'",
+            'UPDATE agent_messages SET content_json=\'{"error":"review agent failed '
+            "[type=legacy; ref=0000000000000000]\"}'::jsonb WHERE kind='agent_failure'",
+            "UPDATE outbox_messages SET last_error='outbox dispatch failed "
+            "[type=legacy; ref=0000000000000000]' "
+            "WHERE last_error IS NOT NULL AND last_error<>''",
+            "UPDATE effect_receipts SET last_error='external effect failed "
+            "[type=legacy; ref=0000000000000000]' "
+            "WHERE last_error IS NOT NULL AND last_error<>''",
+            "UPDATE alerts SET message='task delivery failed "
+            "[type=legacy; ref=0000000000000000]' WHERE alert_key LIKE 'dlq:%'",
+            'UPDATE audit_log SET detail_json=\'{"error":"shadow review failed '
+            "[type=legacy; ref=0000000000000000]\"}'::jsonb WHERE action='shadow.failed'",
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1].version

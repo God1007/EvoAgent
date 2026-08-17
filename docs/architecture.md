@@ -169,6 +169,12 @@ The full analysis lives in [`threat-model.md`](threat-model.md). Key boundaries:
 - **HTTP metadata and failures are untrusted** — request IDs are correlation
   labels only; access logs omit query strings and unexpected 5xx responses never
   expose exception messages.
+- **Operational exception messages are untrusted data** — task failures,
+  checkpoints, agent failures, Queue/DLQ, Outbox/effect records, readiness,
+  plugin lifecycle failures, proof launch failures, and OpenTelemetry spans use
+  a message-free `operation [type=...; ref=...]` contract. SQLite and PostgreSQL
+  enforce it again at their write boundary. See
+  [`ADR 0018`](adr/0018-message-free-operational-failures.md).
 - **Untrusted code execution** only happens in the verifier, and only when a
   test command is configured (container isolation recommended; host fallback is
   for trusted repositories only).
@@ -202,7 +208,8 @@ The full analysis lives in [`threat-model.md`](threat-model.md). Key boundaries:
   `evoagent.ports`, pass the shared adapter contracts, and declare dependencies
   in its manifest.
 - **New lifecycle observer**: subscribe to sanitized events such as
-  `review.completed`; observer failures are isolated from the review path.
+  `review.completed`; observer failures are isolated from the review path and
+  expose only a bounded type plus failure reference.
 - **New application operation**: add a focused object under
   `evoagent.application`, declare only the Ports it consumes, test it directly,
   and expose a compatibility delegate from `ReviewService` when required.

@@ -9,6 +9,7 @@ from .config import Settings
 from .harness import ReviewHarness
 from .model_gateway import ModelGovernanceContext
 from .observability import Observability
+from .plugins import PluginConfigurationError
 from .ports import ModelGatewayPort, ReviewWorkflowStorePort
 from .review_extensions import ReviewerContribution
 from .reviewer import GatewayReviewer, Reviewer
@@ -47,7 +48,9 @@ class ReviewEngine:
             if contribution_ids.count(contribution_id) > 1
         )
         if duplicates:
-            raise ValueError("duplicate reviewer contribution ids: %s" % ", ".join(duplicates))
+            raise PluginConfigurationError(
+                "duplicate reviewer contribution ids: %s" % ", ".join(duplicates)
+            )
         for contribution in reviewer_contributions:
             self.registry.register(
                 contribution.contribution_id,

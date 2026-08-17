@@ -378,6 +378,20 @@ class ModelUsageStorePort(Protocol):
         error: str = "",
     ) -> bool: ...
 
+    def expire_model_usage_reservations(self, cutoff: str, limit: int = 1000) -> int: ...
+
+    def reconcile_model_usage(
+        self,
+        tenant_id: str,
+        actor: str,
+        request_id: str,
+        status: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_micros: int,
+        error: str = "",
+    ) -> bool: ...
+
     def list_model_usage(
         self, tenant_id: str, repository: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]: ...

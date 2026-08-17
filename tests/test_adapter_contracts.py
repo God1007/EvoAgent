@@ -390,7 +390,12 @@ class _StoreBehaviorContract:
         tenant_id = self.unique("model-tenant")
         repository = "acme/" + self.unique("model-repository")
 
-        def record(request_id: str, tokens: int, cost: int) -> dict:
+        def record(
+            request_id: str,
+            tokens: int,
+            cost: int,
+            created_at: str | None = None,
+        ) -> dict:
             return {
                 "request_id": request_id,
                 "tenant_id": tenant_id,
@@ -403,7 +408,7 @@ class _StoreBehaviorContract:
                 "reserved_cost_micros": cost,
                 "redactions": 1,
                 "request_sha256": "a" * 64,
-                "created_at": utc_now(),
+                "created_at": created_at or utc_now(),
             }
 
         first = self.unique("model-request")
@@ -429,6 +434,69 @@ class _StoreBehaviorContract:
         self.assertEqual(
             {"contract-model-a"},
             {item["route_id"] for item in usage},
+        )
+
+        stale_late = self.unique("model-request")
+        stale_manual = self.unique("model-request")
+        next_request = self.unique("model-request")
+        self.assertTrue(
+            self.store.reserve_model_usage(
+                record(stale_late, 60, 60, "2000-01-01T01:00:00+00:00"),
+                period_start,
+            )
+        )
+        self.assertTrue(
+            self.store.reserve_model_usage(
+                record(stale_manual, 60, 60, "2000-01-01T01:00:01+00:00"),
+                period_start,
+            )
+        )
+        self.assertEqual(
+            2,
+            self.store.expire_model_usage_reservations("2001-01-01T00:00:00+00:00"),
+        )
+        self.assertEqual(
+            0,
+            self.store.expire_model_usage_reservations("2001-01-01T00:00:00+00:00"),
+        )
+        self.assertTrue(self.store.complete_model_usage(stale_late, "success", 5, 5, 10))
+        self.assertFalse(
+            self.store.reserve_model_usage(record(next_request, 30, 30), period_start, 100, 100)
+        )
+        self.assertFalse(
+            self.store.reconcile_model_usage(
+                tenant_id + "-other", "contract-admin", stale_manual, "failed", 2, 3, 5
+            )
+        )
+        self.assertTrue(
+            self.store.reconcile_model_usage(
+                tenant_id,
+                "contract-admin",
+                stale_manual,
+                "failed",
+                2,
+                3,
+                5,
+                "provider bill verified",
+            )
+        )
+        self.assertTrue(
+            self.store.reserve_model_usage(record(next_request, 30, 30), period_start, 100, 100)
+        )
+        self.assertTrue(self.store.complete_model_usage(next_request, "success", 10, 10, 20))
+
+        final_usage = {
+            item["request_id"]: item
+            for item in self.store.list_model_usage(tenant_id, repository, 20)
+        }
+        self.assertEqual("success", final_usage[stale_late]["status"])
+        self.assertEqual("failed", final_usage[stale_manual]["status"])
+        self.assertEqual(5, final_usage[stale_manual]["cost_micros"])
+        self.assertTrue(
+            any(
+                item["action"] == "model-usage.reconciled" and item["resource"] == stale_manual
+                for item in self.store.list_audit(tenant_id, 20)
+            )
         )
 
     def test_concurrent_model_budget_reservations_cannot_overspend(self):

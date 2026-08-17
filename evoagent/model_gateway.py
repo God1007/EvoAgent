@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 import re
+import threading
+import time
 import tomllib
 import urllib.error
 import urllib.parse
@@ -13,7 +15,7 @@ import urllib.request
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from fnmatch import fnmatchcase
 from typing import Any, Protocol
 
@@ -86,6 +88,8 @@ class ModelGatewayOptions:
     daily_cost_micros: int = 0
     max_response_bytes: int = 2 * 1024 * 1024
     fallback_attempts: int = 1
+    reservation_ttl_seconds: int = 600
+    reservation_sweep_limit: int = 1000
 
 
 class ModelProviderPort(Protocol):
@@ -426,6 +430,10 @@ class EnterpriseModelGateway:
         )
         self.route = self.routes[0] if self.routes else None
         self.options = options
+        if options.reservation_ttl_seconds <= 0:
+            raise ValueError("model reservation TTL must be positive")
+        if not 1 <= options.reservation_sweep_limit <= 10_000:
+            raise ValueError("model reservation sweep limit must be between 1 and 10000")
         keys = [_route_key(item) for item in self.routes]
         if len(keys) != len(set(keys)):
             raise ValueError("model route ids must be unique")
@@ -441,6 +449,9 @@ class EnterpriseModelGateway:
         else:
             self.providers = {key: provider for key in keys}
         self.provider = provider
+        self._maintenance_lock = threading.Lock()
+        self._next_maintenance_at = 0.0
+        self.expire_stale_reservations(force=True)
 
     @property
     def configured(self) -> bool:
@@ -491,6 +502,7 @@ class EnterpriseModelGateway:
         return max(states, default=0)
 
     def complete(self, request: ModelRequest) -> ModelResponse:
+        self.expire_stale_reservations()
         if not self.routes:
             raise RuntimeError("no model route is configured")
         if not request.tenant_id or not request.repository:
@@ -541,6 +553,25 @@ class EnterpriseModelGateway:
         if last_error is not None:  # pragma: no cover - defensive loop invariant
             raise last_error
         raise RuntimeError("model gateway has no executable route")  # pragma: no cover
+
+    def expire_stale_reservations(self, *, force: bool = False) -> int:
+        """Quarantine stale calls at startup and periodically without releasing budget."""
+        now_monotonic = time.monotonic()
+        if not force and now_monotonic < self._next_maintenance_at:
+            return 0
+        with self._maintenance_lock:
+            now_monotonic = time.monotonic()
+            if not force and now_monotonic < self._next_maintenance_at:
+                return 0
+            cutoff = datetime.now(UTC) - timedelta(seconds=self.options.reservation_ttl_seconds)
+            expired = self.store.expire_model_usage_reservations(
+                cutoff.isoformat(), self.options.reservation_sweep_limit
+            )
+            interval = max(1.0, min(60.0, self.options.reservation_ttl_seconds / 4.0))
+            self._next_maintenance_at = now_monotonic + interval
+        if expired:
+            metrics.inc("model_reservations_expired_total", expired)
+        return expired
 
     def _candidate_routes(self, request: ModelRequest) -> list[ModelRoute]:
         candidates = []

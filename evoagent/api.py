@@ -555,6 +555,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self._send_json(201, result)
                 return
+            if path == "/v1/model-usage/reconcile":
+                principal = self._principal("manage")
+                payload = self._read_json(body)
+                result = self.service.reconcile_model_usage(
+                    principal.tenant_id,
+                    principal.username,
+                    payload.get("request_id", ""),
+                    payload.get("status", ""),
+                    payload.get("input_tokens", -1),
+                    payload.get("output_tokens", -1),
+                    payload.get("cost_micros", -1),
+                    payload.get("error", ""),
+                )
+                self._send_json(200 if result["reconciled"] else 404, result)
+                return
             if path == "/webhooks/github":
                 if self.headers.get("X-GitHub-Event", "") != "pull_request":
                     self._send_json(202, {"ignored": True, "reason": "unsupported GitHub event"})

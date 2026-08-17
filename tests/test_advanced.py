@@ -114,6 +114,18 @@ class AdvancedFeatureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pricing is required"):
             configured.validate_evolution()
 
+    def test_model_reservation_ttl_must_exceed_provider_timeout(self):
+        configured = settings(self.path)
+        configured = configured.__class__(
+            **{
+                **configured.__dict__,
+                "timeout_seconds": 120,
+                "llm_reservation_ttl_seconds": 120,
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "must exceed"):
+            configured.validate_evolution()
+
     def test_feedback_candidate_is_deferred_without_a_model(self):
         store = TaskStore(self.path)
         store.create("task", "org/repo", 1, {"source": "test"})

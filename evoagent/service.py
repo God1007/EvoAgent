@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from .application import (
+    ModelUsageUseCases,
     PolicyUseCases,
     RepairOptions,
     RepairUseCases,
@@ -84,6 +85,7 @@ class ReviewService:
                 self.policies,
                 lambda: tuple(getattr(self.fixer, "rule_ids", ())),
             )
+            self.model_usage_use_cases = ModelUsageUseCases(self.store)
             self.repair_use_cases = RepairUseCases(
                 self.store,
                 self.policies,
@@ -254,6 +256,28 @@ class ReviewService:
         if replayed:
             self.outbox.notify()
         return replayed
+
+    def reconcile_model_usage(
+        self,
+        tenant_id: str,
+        actor: str,
+        request_id: str,
+        status: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_micros: int,
+        error: str = "",
+    ) -> dict[str, Any]:
+        return self.model_usage_use_cases.reconcile(
+            tenant_id,
+            actor,
+            request_id,
+            status,
+            input_tokens,
+            output_tokens,
+            cost_micros,
+            error,
+        )
 
     def _register_pool_metrics(self) -> None:
         """Expose Postgres pool utilization. Registered in both branches (with a

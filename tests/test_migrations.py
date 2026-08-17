@@ -56,6 +56,7 @@ class SQLiteMigrationTests(unittest.TestCase):
         self.assertEqual(CURRENT_SCHEMA_VERSION, validate_current_schema_history(list(rows)))
         self.assertIn("idx_tasks_recovery", indexes)
         self.assertIn("idx_audit_recovery_epoch", indexes)
+        self.assertIn("idx_model_usage_reconciliation", indexes)
 
     def test_read_only_operational_gate_refuses_an_old_schema(self):
         with self.connect() as conn:

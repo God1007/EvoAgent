@@ -4,20 +4,20 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.17.0)
+## Current maturity (v0.18.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
 | Reproducible engineering | Implemented | Hash locks, Ruff, mypy, tests, coverage gate, package build, dependency audit |
 | Application composition | Implemented | Trusted plugin graph, typed service-definition/provider/consumer seams, bounded content-addressed Profile layers, Scope, rollback, and reverse shutdown |
-| Application boundaries | Implemented baseline | Focused Review/Webhook/Session/Repair/Policy use cases behind a compatible facade; evolution is an independent capability |
+| Application boundaries | Implemented baseline | Focused Review/Webhook/Session/Repair/Policy/Model Usage use cases behind a compatible facade; evolution is an independent capability |
 | Review extensibility | Implemented advanced baseline | Multi-provider `review.reviewer` contributions feed the unchanged Engine; Dynamic Skill reload is transactional and content-addressed, with optional mandatory container execution |
 | Repair extensibility | Implemented | Independent `fix.rule` providers; verifier and publication gates remain centralized |
 | Local durability | Development only | SQLite + memory queue is explicitly non-durable |
-| Production persistence | Implemented baseline | PostgreSQL + Redis Streams, migration CLI, Outbox, ACK/lease/DLQ, and mandatory real-service CI; backup/restore drill remains pending |
+| Production persistence | Implemented advanced baseline | PostgreSQL + Redis Streams, migration CLI, Outbox, ACK/lease/DLQ, isolated backup/restore, queue reconstruction, and mandatory real-service CI; managed PITR remains pending |
 | Graceful lifecycle | Implemented | Readiness drain plus bounded queue drain before Store/plugin shutdown |
 | Multi-tenancy/governance | Implemented baseline | JWT, RBAC, tenant/repository authorization, audit, canary/shadow/rollback |
-| Model governance | Implemented advanced baseline | Replaceable gateway, scoped policy routing/residency, bounded fallback, per-route breakers, redaction, egress/output limits, atomic budgets, correlated metadata-only ledger; route shadow promotion remains pending |
+| Model governance | Implemented advanced baseline | Replaceable gateway, scoped policy routing/residency, bounded fallback, per-route breakers, redaction, egress/output limits, atomic budgets, correlated metadata-only ledger, and conservative crash reconciliation; route shadow promotion remains pending |
 | Strong untrusted execution | Implemented baseline | Replaceable remote Proof Runner, mutually authenticated evidence manifests, container-only jobs, replay/size/capacity gates, and content-addressed artifacts; microVM and distributed replay store remain pending |
 | Service-level operations | Implemented baseline | Fixed-cardinality availability/latency/success SLIs, versioned 30-day SLO catalog, multi-window burn alerts, queue/Outbox age, DLQ depth, dashboard, runbooks, and hardened Prometheus evaluator |
 | Quality evidence | Governance baseline implemented | Reproducible synthetic regression plus blind dual-annotation/adjudication compiler, rights/content/split/evidence audit, per-language/CWE/rule slices, and confidence calibration; production gate remains blocked until a real approved corpus is supplied |
@@ -47,7 +47,7 @@ contract against SQLite/PostgreSQL and Memory/Redis (production backends are
 enabled by explicit test URLs). This extraction also found and fixed missing
 PostgreSQL shadow-observation/automatic-promotion parity.
 
-### 2.2 Versioned database migrations — implemented, restore drill pending
+### 2.2 Versioned database migrations — implemented with isolated restore proof
 
 Replace constructor-time ad-hoc schema mutation with an explicit migration
 history and startup compatibility check.
@@ -64,9 +64,9 @@ name, checksum, and timestamp; SQLite and PostgreSQL acquire migration locks;
 startup rejects newer, discontinuous, or modified histories; an unversioned
 legacy database is adopted without row loss; an injected DDL failure proves
 transaction rollback. `evoagent-migrate` supports a separate deployment job and
-`/ready` exposes the schema version. The actual PostgreSQL backup/restore drill
-remains part of the integration/operations phase because it requires dedicated
-external infrastructure.
+`/ready` exposes the schema version. The mandatory PostgreSQL integration job
+now performs the isolated backup/restore proof described in Phase 5; managed
+PITR remains a deployment-provider responsibility.
 
 ### 2.3 Transactional task/outbox semantics — implemented baseline
 
@@ -188,9 +188,14 @@ bounded, occurs only for classified eligible failures, and every route owns an
 independent breaker. Schema version 7 correlates attempts by root request and
 route id.
 
+The v0.18 increment quarantines reservations left by a process crash as
+`uncertain`, retains their worst-case budget charge, and permits only a
+tenant-scoped administrator to apply provider-verified actual usage. Ledger and
+audit update atomically, and SQLite/PostgreSQL share the same expiry, late
+completion, tenant isolation, budget, and reconciliation contracts.
+
 Still pending before this item is complete: candidate-route shadow/promotion
-gates, weighted load balancing, and reconciliation of reservations left by a
-process crash. Multi-route support improves dependency resilience but is not a
+gates and weighted load balancing. Multi-route support improves dependency resilience but is not a
 claim of regional HA without deployment-level network and capacity proof.
 
 ### Remote proof runner — authenticated baseline implemented

@@ -68,6 +68,58 @@ class AdmissionControlTests(unittest.TestCase):
         self.assertEqual(429, second.status)
         self.assertIsNotNone(second.getheader("Retry-After"))
 
+    def test_model_usage_reconciliation_http_boundary_is_state_guarded(self):
+        host, port = self._serve(self._settings())
+        request_id = "http-stale-request"
+        self.service.store.reserve_model_usage(
+            {
+                "request_id": request_id,
+                "tenant_id": "default",
+                "repository": "org/repo",
+                "purpose": "review",
+                "provider": "provider",
+                "model": "model",
+                "reserved_tokens": 100,
+                "request_sha256": "a" * 64,
+                "created_at": "2000-01-01T00:00:00+00:00",
+            },
+            "2000-01-01T00:00:00+00:00",
+        )
+        self.service.store.expire_model_usage_reservations("2001-01-01T00:00:00+00:00")
+        payload = json.dumps(
+            {
+                "request_id": request_id,
+                "status": "success",
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "cost_micros": 7,
+            }
+        )
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        self.addCleanup(conn.close)
+
+        conn.request(
+            "POST",
+            "/v1/model-usage/reconcile",
+            body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        first = conn.getresponse()
+        first_body = json.loads(first.read())
+        self.assertEqual(200, first.status)
+        self.assertTrue(first_body["reconciled"])
+
+        conn.request(
+            "POST",
+            "/v1/model-usage/reconcile",
+            body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        second = conn.getresponse()
+        second_body = json.loads(second.read())
+        self.assertEqual(404, second.status)
+        self.assertFalse(second_body["reconciled"])
+
     def test_probes_are_exempt_from_rate_limiting(self):
         host, port = self._serve(self._settings(rate_limit_rps=1, rate_limit_burst=1))
         conn = http.client.HTTPConnection(host, port, timeout=5)

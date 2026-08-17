@@ -28,7 +28,8 @@ history record; PostgreSQL migrations run in the connection transaction and
 are likewise rolled back by the adapter on startup failure.
 
 Schema version 8 adds the bounded queue-recovery scan index and a partial unique
-audit index for recovery epochs. Disaster-recovery inspection and queue
+audit index for recovery epochs. Schema version 9 adds the bounded status/time
+scan used to quarantine stale model reservations. Disaster-recovery inspection and queue
 reconstruction open the Store with migrations disabled and require the complete
 current checksummed history; privileged operational tools therefore cannot
 silently mutate a restored database before integrity evidence is collected.
@@ -47,7 +48,7 @@ python -m evoagent.migrate
 Successful output is machine-readable and contains no database credentials:
 
 ```json
-{"backend": "postgresql", "schema_version": 8, "status": "migrated"}
+{"backend": "postgresql", "schema_version": 9, "status": "migrated"}
 ```
 
 Schema compatibility errors exit with status `2`. Normal application startup

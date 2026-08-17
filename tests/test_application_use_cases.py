@@ -1,8 +1,10 @@
 import os
+import sqlite3
 import tempfile
 import unittest
 
 from evoagent.application import (
+    ModelUsageUseCases,
     PolicyUseCases,
     RepairOptions,
     RepairUseCases,
@@ -60,6 +62,86 @@ class ApplicationUseCaseTests(unittest.TestCase):
         timeline = sessions.get_for_pull_request("org/repo", 7, "tenant")
         self.assertEqual(1, len(timeline["turns"]))
         self.assertEqual(1, timeline["turns"][0]["summary"]["new"])
+
+    def test_model_usage_reconciliation_is_tenant_scoped_and_audited(self):
+        request_id = "stale-model-request"
+        self.assertTrue(
+            self.store.reserve_model_usage(
+                {
+                    "request_id": request_id,
+                    "tenant_id": "tenant",
+                    "repository": "org/repo",
+                    "purpose": "review",
+                    "provider": "provider",
+                    "model": "model",
+                    "reserved_tokens": 100,
+                    "reserved_cost_micros": 50,
+                    "request_sha256": "a" * 64,
+                    "created_at": "2000-01-01T00:00:00+00:00",
+                },
+                "2000-01-01T00:00:00+00:00",
+            )
+        )
+        self.assertEqual(
+            1,
+            self.store.expire_model_usage_reservations("2001-01-01T00:00:00+00:00"),
+        )
+        use_cases = ModelUsageUseCases(self.store)
+
+        hidden = use_cases.reconcile("other-tenant", "operator", request_id, "failed", 0, 0, 0)
+        result = use_cases.reconcile("tenant", "operator", request_id, "success", 11, 7, 9)
+
+        self.assertFalse(hidden["reconciled"])
+        self.assertTrue(result["reconciled"])
+        usage = self.store.list_model_usage("tenant", "org/repo")[0]
+        self.assertEqual(
+            ("success", 11, 7, 9),
+            (
+                usage["status"],
+                usage["input_tokens"],
+                usage["output_tokens"],
+                usage["cost_micros"],
+            ),
+        )
+        audit = self.store.list_audit("tenant")
+        self.assertEqual("model-usage.reconciled", audit[0]["action"])
+        self.assertEqual(request_id, audit[0]["resource"])
+
+        with self.assertRaisesRegex(ValueError, "non-negative integer"):
+            use_cases.reconcile("tenant", "operator", "another", "failed", True, 0, 0)
+
+    def test_model_usage_reconciliation_rolls_back_when_audit_write_fails(self):
+        request_id = "stale-model-request"
+        self.store.reserve_model_usage(
+            {
+                "request_id": request_id,
+                "tenant_id": "tenant",
+                "repository": "org/repo",
+                "purpose": "review",
+                "provider": "provider",
+                "model": "model",
+                "reserved_tokens": 100,
+                "request_sha256": "a" * 64,
+                "created_at": "2000-01-01T00:00:00+00:00",
+            },
+            "2000-01-01T00:00:00+00:00",
+        )
+        self.store.expire_model_usage_reservations("2001-01-01T00:00:00+00:00")
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                "CREATE TRIGGER fail_model_usage_audit BEFORE INSERT ON audit_log "
+                "WHEN NEW.action='model-usage.reconciled' "
+                "BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END"
+            )
+
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "audit unavailable"):
+            ModelUsageUseCases(self.store).reconcile(
+                "tenant", "operator", request_id, "success", 11, 7, 9
+            )
+
+        usage = self.store.list_model_usage("tenant", "org/repo")[0]
+        self.assertEqual("uncertain", usage["status"])
+        self.assertIsNone(usage["completed_at"])
 
     def test_policy_use_case_rejects_rules_missing_from_runtime(self):
         policies = RepositoryPolicyResolver(self.store)

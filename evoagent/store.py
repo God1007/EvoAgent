@@ -415,12 +415,14 @@ class TaskStore:
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             used = conn.execute(
-                "SELECT COALESCE(SUM(CASE WHEN status='reserved' THEN reserved_tokens "
+                "SELECT COALESCE(SUM(CASE WHEN status IN ('reserved','uncertain') "
+                "THEN reserved_tokens "
                 "ELSE input_tokens+output_tokens END),0) AS tokens,"
-                "COALESCE(SUM(CASE WHEN status='reserved' THEN reserved_cost_micros "
+                "COALESCE(SUM(CASE WHEN status IN ('reserved','uncertain') "
+                "THEN reserved_cost_micros "
                 "ELSE cost_micros END),0) AS cost FROM model_usage "
                 "WHERE tenant_id=? AND repository=? AND created_at>=? "
-                "AND status IN ('reserved','success','failed')",
+                "AND status IN ('reserved','uncertain','success','failed')",
                 (record["tenant_id"], record["repository"], period_start),
             ).fetchone()
             if (
@@ -472,7 +474,8 @@ class TaskStore:
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 "UPDATE model_usage SET status=?,input_tokens=?,output_tokens=?,cost_micros=?,"
-                "error=?,completed_at=? WHERE request_id=? AND status='reserved'",
+                "error=?,completed_at=? WHERE request_id=? "
+                "AND status IN ('reserved','uncertain')",
                 (
                     status,
                     max(0, input_tokens),
@@ -483,6 +486,79 @@ class TaskStore:
                     request_id,
                 ),
             )
+        return cursor.rowcount > 0
+
+    def expire_model_usage_reservations(self, cutoff: str, limit: int = 1000) -> int:
+        """Quarantine expired in-flight calls without releasing unknown provider cost."""
+        bounded_limit = max(1, min(limit, 10_000))
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT request_id FROM model_usage WHERE status='reserved' AND created_at<? "
+                "ORDER BY created_at,request_id LIMIT ?",
+                (cutoff, bounded_limit),
+            ).fetchall()
+            expired = 0
+            for row in rows:
+                cursor = conn.execute(
+                    "UPDATE model_usage SET status='uncertain',"
+                    "error='reservation expired before durable completion; reconciliation required' "
+                    "WHERE request_id=? AND status='reserved'",
+                    (row["request_id"],),
+                )
+                expired += cursor.rowcount
+        return expired
+
+    def reconcile_model_usage(
+        self,
+        tenant_id: str,
+        actor: str,
+        request_id: str,
+        status: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_micros: int,
+        error: str = "",
+    ) -> bool:
+        """Apply operator-verified provider usage to one uncertain reservation."""
+        if status not in {"success", "failed"}:
+            raise ValueError("model usage status must be success or failed")
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "UPDATE model_usage SET status=?,input_tokens=?,output_tokens=?,cost_micros=?,"
+                "error=?,completed_at=? WHERE tenant_id=? AND request_id=? "
+                "AND status='uncertain'",
+                (
+                    status,
+                    max(0, input_tokens),
+                    max(0, output_tokens),
+                    max(0, cost_micros),
+                    error[:2000] or None,
+                    utc_now(),
+                    tenant_id,
+                    request_id,
+                ),
+            )
+            if cursor.rowcount:
+                detail = {
+                    "status": status,
+                    "input_tokens": max(0, input_tokens),
+                    "output_tokens": max(0, output_tokens),
+                    "cost_micros": max(0, cost_micros),
+                }
+                conn.execute(
+                    "INSERT INTO audit_log(tenant_id,actor,action,resource,detail_json,created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (
+                        tenant_id,
+                        actor,
+                        "model-usage.reconciled",
+                        request_id,
+                        json.dumps(detail, ensure_ascii=False),
+                        utc_now(),
+                    ),
+                )
         return cursor.rowcount > 0
 
     def list_model_usage(

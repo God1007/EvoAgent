@@ -107,6 +107,34 @@ class ModelGatewayTests(unittest.TestCase):
         self.assertEqual([], provider.calls)
         self.assertEqual([], self.store.list_model_usage("tenant-a", "org/repo"))
 
+    def test_gateway_startup_quarantines_stale_reservations_and_throttles_scans(self):
+        self.store.reserve_model_usage(
+            {
+                "request_id": "stale-request",
+                "tenant_id": "tenant-a",
+                "repository": "org/repo",
+                "purpose": "review",
+                "provider": "test-provider",
+                "model": "model-a",
+                "reserved_tokens": 100,
+                "request_sha256": "a" * 64,
+                "created_at": "2000-01-01T00:00:00+00:00",
+            },
+            "2000-01-01T00:00:00+00:00",
+        )
+        with mock.patch.object(
+            self.store,
+            "expire_model_usage_reservations",
+            wraps=self.store.expire_model_usage_reservations,
+        ) as expire:
+            gateway = self.gateway()
+            gateway.complete(self.request())
+            gateway.complete(self.request())
+
+        self.assertEqual(1, expire.call_count)
+        usage = self.store.list_model_usage("tenant-a", "org/repo")
+        self.assertIn("uncertain", {item["status"] for item in usage})
+
     def test_invalid_structured_output_is_a_failed_usage_record(self):
         gateway = self.gateway(FakeProvider("not-json"))
 

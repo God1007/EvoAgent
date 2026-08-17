@@ -451,6 +451,18 @@ MIGRATIONS: tuple[Migration, ...] = (
             "WHERE tenant_id='system' AND action='recovery.queue.stage'",
         ),
     ),
+    Migration(
+        9,
+        "model-usage-reconciliation",
+        (
+            "CREATE INDEX IF NOT EXISTS idx_model_usage_reconciliation "
+            "ON model_usage(status,created_at)",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_model_usage_reconciliation "
+            "ON model_usage(status,created_at)",
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1].version

@@ -26,9 +26,11 @@ maximum output is counted before network I/O. On success it is replaced by
 actual provider usage (or a conservative local estimate when usage is absent).
 If a response consumes tokens but later fails the output gate, its known actual
 usage remains chargeable; a transport failure with no usage information releases
-the reservation. A process crash may leave a `reserved` row consuming that UTC
-day's budget; this is fail-closed and clears at the next period, while explicit
-stale-reservation recovery remains future operational work.
+the reservation. A process crash may leave a call without known provider usage.
+At startup and during rate-limited maintenance, reservations older than
+`EVOAGENT_LLM_RESERVATION_TTL_SECONDS` become `uncertain`. They continue to
+consume their worst-case reserved Token and cost amounts; timeout alone never
+releases possibly billed usage.
 
 SQLite serializes reservation with `BEGIN IMMEDIATE`; PostgreSQL uses a
 transaction advisory lock keyed by tenant/repository/day. Therefore concurrent
@@ -36,7 +38,7 @@ workers cannot both pass a quota check and overspend the same budget.
 
 ## Stored data and access
 
-Schema version 7 stores request id, root request id, route id, attempt number,
+Schema version 9 stores request id, root request id, route id, attempt number,
 tenant/repository/task scope, purpose,
 provider/model, reserved and actual usage, micro-unit cost, redaction count,
 SHA-256 of the redacted canonical request, timestamps, status, and sanitized
@@ -50,6 +52,31 @@ curl 'http://127.0.0.1:8080/api/model-usage?repository=acme%2Fpayments&limit=100
   -H 'Authorization: Bearer <token>'
 ```
 
+### Reconcile an uncertain reservation
+
+An administrator first matches the request/route metadata to the provider's
+billing or usage export. Only then can the tenant-scoped `uncertain` row be
+settled to actual usage:
+
+```bash
+curl -X POST 'http://127.0.0.1:8080/v1/model-usage/reconcile' \
+  -H 'Authorization: Bearer <admin-token>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_id": "<request-id>",
+    "status": "success",
+    "input_tokens": 1240,
+    "output_tokens": 183,
+    "cost_micros": 417
+  }'
+```
+
+The transition is allowed only from `uncertain`; it is idempotent by state and
+cannot address another tenant. The ledger update and `model-usage.reconciled`
+audit event commit in one database transaction. A verified zero-usage provider
+record may use `failed` with zero counts; absence of evidence is not grounds to
+release the conservative charge. Metrics expose expired and reconciled totals.
+
 ## Configuration semantics
 
 - `EVOAGENT_LLM_ALLOWED_HOSTS` contains exact DNS names. When empty, only the
@@ -57,6 +84,8 @@ curl 'http://127.0.0.1:8080/api/model-usage?repository=acme%2Fpayments&limit=100
 - HTTPS is mandatory except for explicit loopback development endpoints.
 - token and cost budgets are scoped per tenant/repository/UTC day; `0` disables
   the corresponding budget.
+- `EVOAGENT_LLM_RESERVATION_TTL_SECONDS` defaults to 600 and must exceed the
+  configured provider/request timeout. Expiry quarantines; it does not forgive cost.
 - cost uses integer micro units. Enabling a cost budget requires at least one
   non-zero input/output price per million tokens.
 - redaction covers common secret assignments, Bearer values, PEM private keys,
@@ -108,7 +137,6 @@ LLM breaker metric reports the worst route state.
 
 An enterprise deployment can replace plugin id `evoagent.model-gateway` and
 provide the same `ModelGatewayPort`, without changing the review graph. The
-built-in v0.10 implementation supports declarative selection, residency,
-bounded provider fallback, and per-route breakers. Candidate-route shadowing
-and promotion, weighted load balancing, and stale-reservation reconciliation
-are not yet claimed.
+built-in implementation supports declarative selection, residency, bounded
+provider fallback, per-route breakers, and conservative crash reconciliation.
+Candidate-route shadowing/promotion and weighted load balancing are not yet claimed.

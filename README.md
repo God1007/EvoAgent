@@ -778,6 +778,7 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `GET` | `/api/outbox` | 按状态查询事务 Outbox 消息 |
 | `POST` | `/v1/outbox/replay` | 审计并重放指定 Outbox 死消息 |
 | `GET` | `/api/model-usage` | 管理员按当前租户/可选仓库查询模型用量元数据 |
+| `POST` | `/v1/model-usage/reconcile` | 按供应商账单原子结算超时的模型用量预占并写入审计 |
 
 `POST /v1/reviews` 的 Diff 默认最大为 1 MiB；单任务默认最多 8 步、120 秒。可通过 `.env.example` 中的环境变量调整。
 
@@ -807,6 +808,7 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `EVOAGENT_LLM_DAILY_COST_MICROS` | `0` | 每租户/仓库/UTC 日成本预算（微单位）；0 为关闭 |
 | `EVOAGENT_LLM_ROUTES_FILE` | 空 | v1 多路由 TOML；设置后替代单 Provider 预设 |
 | `EVOAGENT_LLM_FALLBACK_ATTEMPTS` | `1` | 主路由失败后最多尝试的额外候选路由数 |
+| `EVOAGENT_LLM_RESERVATION_TTL_SECONDS` | `600` | 模型预占转为待对账状态前的秒数，必须大于请求超时 |
 | `EVOAGENT_DATABASE_URL` | 空 | PostgreSQL URL；为空时使用 SQLite |
 | `EVOAGENT_REDIS_URL` | 空 | Redis URL；为空时使用进程内队列 |
 | `EVOAGENT_ASYNC_WORKERS` | `2` | 异步 Worker 数量 |

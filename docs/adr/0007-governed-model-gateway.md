@@ -47,7 +47,8 @@ single-route in this increment and state that boundary explicitly.
   rejects a non-zero cost budget with zero input/output prices.
 - Redaction reduces accidental disclosure but does not replace organizational
   DLP, network egress controls, or provider retention contracts.
-- A crash can leave a reservation consuming budget for the remainder of the UTC
-  day. This is fail-closed; reconciliation is deferred.
+- Crash-left reservations are governed by
+  [ADR 0016](0016-conservative-model-usage-reconciliation.md); timeout alone
+  never releases unknown provider cost.
 - Multi-route fallback, per-route circuit breakers, residency policy, and route
   shadow promotion are intentionally not claimed by this decision.

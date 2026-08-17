@@ -420,6 +420,7 @@ def _model_gateway(context: PluginContext) -> EnterpriseModelGateway:
             daily_token_budget=settings.llm_daily_token_budget,
             daily_cost_micros=settings.llm_daily_cost_micros,
             fallback_attempts=settings.llm_fallback_attempts,
+            reservation_ttl_seconds=settings.llm_reservation_ttl_seconds,
         ),
     )
 

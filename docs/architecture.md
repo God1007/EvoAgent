@@ -13,14 +13,14 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Composition | `evoagent/capabilities.py` | Stable typed capability definitions for providers and consumers |
 | Domain boundary | `evoagent/ports.py` | Focused Store, Queue, CodeHost, Model Gateway, and Proof Executor behavioral contracts |
 | Composition | `evoagent/bootstrap.py` | Replaceable built-in provider catalog and transactional application startup |
-| Application | `evoagent/application/` | Focused Review, Webhook, Session, Repair, and Policy use cases |
+| Application | `evoagent/application/` | Focused Review, Webhook, Session, Repair, Policy, and Model Usage use cases |
 | Composition facade | `evoagent/service.py` | Capability wiring, lifecycle/health, canary/shadow runtime selection, API compatibility |
 | Runtime | `evoagent/harness.py` | LangGraph state machine, budget, retry, checkpoint/resume |
 | Runtime | `evoagent/task_queue.py` | In-process queue or Redis Streams (ACK, lease, DLQ, replay) |
 | Runtime | `evoagent/outbox.py` | Store-to-queue transactional publication, leases, retry and recovery |
 | Review | `evoagent/review_extensions.py`, `review_engine.py`, `agents.py` | Stable reviewer-contribution seam, replaceable engine, and default multi-agent collaboration protocol |
 | Review | `evoagent/reviewer.py` | Local deterministic rules + governed gateway reviewer + composite |
-| Model gateway | `evoagent/model_gateway.py` | Secret redaction, egress/output limits, budget reservation, and usage accounting |
+| Model gateway | `evoagent/model_gateway.py` | Secret redaction, egress/output limits, budget reservation, crash quarantine, and usage accounting |
 | Review | `evoagent/skills.py`, `skill_runner.py` | Transactional dynamic-skill snapshots, manifest/hash/signature checks, bounded sandboxed execution |
 | Delivery | `evoagent/fix_rules.py`, `fixer.py` | Pluggable deterministic transforms plus verified auto-repair on a dedicated branch |
 | Delivery | `evoagent/verifier.py` | Compile/test gates with container or host isolation |
@@ -118,6 +118,10 @@ See [`plugin-system.md`](plugin-system.md) and
 
 - **Task store** (`store.py` / `postgres_store.py`) is the source of truth for
   task state, findings, feedback, skill versions, audit log, and alerts.
+- **Model usage recovery** changes expired in-flight reservations to
+  `uncertain` while retaining their worst-case budget charge. A tenant-scoped
+  administrator can replace that charge only with provider-verified actual
+  usage; reconciliation and its audit record commit in the same transaction.
 - **Schema history** is forward-only and checksummed. Startup serializes pending
   migrations and refuses a database created by a newer application. See
   [`database-migrations.md`](database-migrations.md) and

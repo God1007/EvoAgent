@@ -126,5 +126,6 @@ artifact retention, and replica limits.
 
 The complete procedure and evidence contract are in the
 [disaster-recovery runbook](disaster-recovery.md). Database recoverability is
-automated; Redis rehydration, regional failover, and a production-shaped soak
-remain required before claiming full service disaster-recovery readiness.
+automated together with offline Redis task reconstruction; regional
+infrastructure/routing failover and a production-shaped soak remain required
+before claiming full service disaster-recovery readiness.

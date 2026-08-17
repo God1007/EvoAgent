@@ -314,6 +314,41 @@ class _StoreBehaviorContract:
         cached = self.store.claim_effect(effect_key, "another-worker", 30)
         self.assertEqual({"published": True}, cached["result"])
 
+    def test_offline_queue_recovery_contract(self):
+        async_task = self.unique("recovery-async")
+        sync_task = self.unique("recovery-sync")
+        self.store.create_review_task(
+            async_task,
+            "acme/widgets",
+            20,
+            {"source": "contract"},
+            "tenant-a",
+            "--- a/a.py\n+++ b/a.py\n+value = 1\n",
+            {"task_id": async_task, "repository": "acme/widgets"},
+        )
+        self.store.create_review_task(
+            sync_task,
+            "acme/api",
+            21,
+            {"source": "contract"},
+            "tenant-b",
+            "--- a/b.py\n+++ b/b.py\n+value = 2\n",
+        )
+        candidates = [
+            item
+            for item in self.store.queue_recovery_candidates(100_001)
+            if item["task_id"] in {async_task, sync_task}
+        ]
+        recovery_id = str(uuid.uuid4())
+
+        result = self.store.stage_queue_recovery(recovery_id, "a" * 64, candidates)
+
+        self.assertEqual(2, result["staged"])
+        self.assertFalse(result["already_applied"])
+        self.assertEqual("a" * 64, self.store.get_queue_recovery(recovery_id)["plan_sha256"])
+        pending = self.store.list_outbox("pending", 500)
+        self.assertTrue({async_task, sync_task}.issubset({item["message_key"] for item in pending}))
+
     def test_versioned_repository_policy_contract(self):
         tenant_id = self.unique("policy-tenant")
         repository = "acme/" + self.unique("policy-repository")

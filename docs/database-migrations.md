@@ -27,6 +27,12 @@ schema transition. A failed SQLite migration rolls back both its DDL and
 history record; PostgreSQL migrations run in the connection transaction and
 are likewise rolled back by the adapter on startup failure.
 
+Schema version 8 adds the bounded queue-recovery scan index and a partial unique
+audit index for recovery epochs. Disaster-recovery inspection and queue
+reconstruction open the Store with migrations disabled and require the complete
+current checksummed history; privileged operational tools therefore cannot
+silently mutate a restored database before integrity evidence is collected.
+
 ## Deployment command
 
 Run migrations as a dedicated deployment job or init container before rolling
@@ -41,7 +47,7 @@ python -m evoagent.migrate
 Successful output is machine-readable and contains no database credentials:
 
 ```json
-{"backend": "postgresql", "schema_version": 7, "status": "migrated"}
+{"backend": "postgresql", "schema_version": 8, "status": "migrated"}
 ```
 
 Schema compatibility errors exit with status `2`. Normal application startup

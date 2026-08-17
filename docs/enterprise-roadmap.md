@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.13.0)
+## Current maturity (v0.14.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -21,7 +21,7 @@ It is an execution plan, not a marketing checklist.
 | Strong untrusted execution | Implemented baseline | Replaceable remote Proof Runner, mutually authenticated evidence manifests, container-only jobs, replay/size/capacity gates, and content-addressed artifacts; microVM and distributed replay store remain pending |
 | Service-level operations | Implemented baseline | Fixed-cardinality availability/latency/success SLIs, versioned 30-day SLO catalog, multi-window burn alerts, queue/Outbox age, DLQ depth, dashboard, runbooks, and hardened Prometheus evaluator |
 | Quality evidence | Synthetic benchmark only | 100-case controlled corpus; production activation gate remains blocked without independent labels |
-| HA/DR operational proof | Implemented database baseline | SQLite online restore and PostgreSQL exported-snapshot `pg_dump`/isolated `pg_restore` validate checksummed schema, bounded-memory table fingerprints, Store read/write smoke, cleanup, and RPO/RTO evidence; Redis rehydration and regional failover remain pending |
+| HA/DR operational proof | Implemented recovery baseline | SQLite/PostgreSQL isolated restore validates schema/content/application/RPO/RTO; an offline audited epoch reconstructs incomplete PostgreSQL/Outbox intent only into empty Redis and is proven against real CI services; managed PITR and regional routing exercise remain pending |
 
 ## Phase 2 — Ports, persistence, and integration proof
 
@@ -256,10 +256,19 @@ artifact SHA-256, and explicit RPO/RTO gates. CI runs the real PostgreSQL path
 and retains only the non-row-data evidence manifests. See
 [`ADR 0011`](adr/0011-isolated-database-recovery-drills.md).
 
-Still pending in this phase: reconciliation of incomplete work after a regional
-Redis loss, managed PITR/object-lock integration, a separate-region failover
-exercise, and a sustained production-shaped soak. A same-cluster database drill
-is not a claim of full service DR readiness.
+Implemented queue recovery baseline: `evoagent-recover-queue` produces a
+payload-hash-only plan for non-terminal/non-cancelled tasks, rejects non-empty
+Redis, binds apply to the reviewed plan SHA-256, reserves a plan-bound recovery
+epoch, and transactionally resets or
+reconstructs Outbox intent with an idempotent audit record. Missing Diff and
+Outbox data fail closed; terminal duplicates ACK before external or release
+effects. CI exercises this against PostgreSQL and a fresh Redis logical DB. See
+[`ADR 0012`](adr/0012-offline-queue-reconstruction.md).
+
+Still pending in this phase: managed PITR/object-lock integration, a
+separate-region infrastructure and routing failover exercise, and a sustained
+production-shaped soak. Same-cluster database and queue drills are not a claim
+of full regional DR readiness.
 
 ## Phase 6 — Independent quality evidence
 

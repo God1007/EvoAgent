@@ -120,8 +120,8 @@ Recommended cadence:
 4. Run migration checksum, schema, content sampling, tenant isolation, and
    `PostgresTaskStore` smoke checks before attaching application credentials.
 5. Provision a clean Redis Streams deployment. Redis is a delivery mechanism,
-   not the only copy of accepted task intent; reconcile incomplete tasks from
-   PostgreSQL/Outbox before enabling workers.
+   not the only copy of accepted task intent; run the offline queue
+   reconstruction below before enabling workers.
 6. Start one canary application pod with outbound GitHub/model publication
    disabled. Verify `/ready`, task/session reads, audit writes, and SLO metrics.
 7. Enable workers, then external effects, then traffic in that order. Watch
@@ -129,9 +129,56 @@ Recommended cadence:
 8. Record actual data-loss interval and recovery time. Keep the old database
    isolated until the incident owner approves disposal.
 
-Queue reconciliation after a regional Redis loss and automated cross-region
-failover are deliberately separate follow-ups. Until both are exercised, this
-milestone proves database recoverability rather than complete service DR.
+### Reconstruct incomplete work into a clean Redis
+
+Keep every application pod, Outbox dispatcher, and worker stopped. Use a new,
+dedicated Redis logical database; the command refuses a non-empty target and
+requires TLS outside loopback. Generate one UUID and retain it for dry-run and
+apply:
+
+```bash
+export EVOAGENT_DATABASE_URL='postgresql://.../restored_evoagent'
+export EVOAGENT_REDIS_URL='rediss://.../0'
+recovery_id="$(python -c 'import uuid; print(uuid.uuid4())')"
+
+evoagent-recover-queue \
+  --recovery-id "$recovery_id" \
+  --confirm-database restored_evoagent > queue-recovery-plan.json
+
+plan_sha256="$(python -c 'import json; print(json.load(open("queue-recovery-plan.json"))["plan"]["plan_sha256"])')"
+
+evoagent-recover-queue \
+  --recovery-id "$recovery_id" \
+  --confirm-database restored_evoagent \
+  --expect-plan-sha256 "$plan_sha256" \
+  --apply
+```
+
+The plan selects only `PENDING`, `PLANNING`, `EXECUTING`, or `REVIEWING` tasks
+without a cancellation request. It retains an existing Outbox payload (including
+GitHub delivery/session metadata), or reconstructs the minimal payload when the
+stored Diff exists. Apply reserves `evoagent:recovery:epoch` atomically in Redis,
+requires the exact SHA-256 from the reviewed dry-run so a changed task set cannot
+silently pass the approval boundary, resets selected unpublished Outbox rows to
+`pending`, preserves published/dead
+history by creating a separate recovery intent, inserts missing rows, and writes
+a single PostgreSQL audit record containing plan/count evidence.
+
+If any task has neither a valid Outbox payload nor stored Diff, the command fails.
+`--allow-unrecoverable` is an explicit incident-owner exception; the report
+lists up to 100 affected task IDs and records truncation. Never use it merely to
+make the gate green.
+
+After apply succeeds, start components in this order: Outbox dispatcher,
+workers, external GitHub/model effects, then API traffic. Existing checkpoints
+resume computation and effect receipts suppress repeated completed
+publications. A reused recovery UUID is accepted only for the same reserved
+target before queue activity starts; a new target requires a new UUID.
+
+Queue reconstruction is executable and CI exercises it against real PostgreSQL
+plus an empty Redis logical database. Automated cross-region
+provisioning/routing and a timed regional exercise remain follow-ups, so this is
+still not a claim of complete regional DR.
 
 ## Failure handling
 
@@ -143,3 +190,5 @@ milestone proves database recoverability rather than complete service DR.
 - A missed RPO/RTO exits `1`; tool/input/restore errors exit `2`.
 - Keep failed manifests and tool logs, but never paste connection strings or
   database artifacts into tickets.
+- If queue reconstruction reports a non-empty Redis target, do not flush it.
+  Verify the target URL and provision a new logical database instead.

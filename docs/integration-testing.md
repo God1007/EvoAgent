@@ -20,6 +20,7 @@ Redis 7, and Docker.
 | Verifier | Real Docker run has no network, read-only root, bounded resources, no ambient host secret, and timeout cleanup |
 | Remote Proof Runner | Signed loopback HTTP reaches a real netless job container and returns content-addressed input/evidence attestations without leaking an ambient secret |
 | PostgreSQL recovery | One exported MVCC snapshot is dumped, restored only into a generated database, compared table-by-table, exercised through the Store adapter, and removed within RPO/RTO |
+| Queue reconstruction | A previously published incomplete task is planned, audited, restaged, and published through the production Outbox/TaskQueue path only after reserving an empty Redis logical database |
 | Distribution | The installed wheel serves packaged web assets and contains the bundled Skill |
 | Production image | `/ready` sees Postgres, Redis workers, schema and Outbox; async review reaches `SUCCESS`; SIGTERM exits cleanly |
 

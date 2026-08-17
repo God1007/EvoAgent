@@ -249,6 +249,12 @@ class ReviewUseCases:
         task = self.store.get(task_id)
         if not task:
             raise PermanentTaskError("task record no longer exists")
+        if task.get("state") in {TaskState.SUCCESS.value, TaskState.CANCELLED.value}:
+            # Redis Streams is at-least-once and recovery deliberately rebuilds
+            # intent. A late duplicate must ACK as a no-op before shadow runs,
+            # release accounting, or external publication are repeated.
+            metrics.inc("queue_terminal_duplicates_total")
+            return
         tenant_id = payload.get("tenant_id") or task.get("tenant_id") or "default"
         repository = payload["repository"]
         task_input = task.get("input") or {}

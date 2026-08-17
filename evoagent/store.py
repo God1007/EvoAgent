@@ -230,6 +230,180 @@ class TaskStore:
             )
         return cursor.rowcount > 0
 
+    def queue_recovery_candidates(self, limit: int) -> list[dict[str, Any]]:
+        """Describe non-terminal task intents without mutating queue state."""
+        bounded = max(1, min(int(limit), 100_001))
+        with self._connect() as conn:
+            tasks = conn.execute(
+                "SELECT id,repository,pull_request,tenant_id FROM tasks "
+                "WHERE state NOT IN (?,?,?) AND cancel_requested=0 "
+                "ORDER BY created_at,id LIMIT ?",
+                (
+                    TaskState.SUCCESS.value,
+                    TaskState.FAILED.value,
+                    TaskState.CANCELLED.value,
+                    bounded,
+                ),
+            ).fetchall()
+            candidates = []
+            for task in tasks:
+                outbox = conn.execute(
+                    "SELECT status,payload_json FROM outbox_messages WHERE id=?",
+                    ("review:" + task["id"],),
+                ).fetchone()
+                has_payload = (
+                    conn.execute(
+                        "SELECT 1 FROM task_payloads WHERE task_id=?", (task["id"],)
+                    ).fetchone()
+                    is not None
+                )
+                payload = (
+                    json.loads(outbox["payload_json"])
+                    if outbox
+                    else {
+                        "task_id": task["id"],
+                        "repository": task["repository"],
+                        "pull_request": task["pull_request"],
+                        "tenant_id": task["tenant_id"],
+                    }
+                    if has_payload
+                    else None
+                )
+                if isinstance(payload, dict):
+                    payload = {
+                        **payload,
+                        "task_id": task["id"],
+                        "repository": task["repository"],
+                        "pull_request": task["pull_request"],
+                        "tenant_id": task["tenant_id"],
+                    }
+                recoverable = isinstance(payload, dict)
+                candidates.append(
+                    {
+                        "task_id": task["id"],
+                        "tenant_id": task["tenant_id"],
+                        "outbox_status": outbox["status"] if outbox else "missing",
+                        "payload": payload,
+                        "recoverable": recoverable,
+                        "reason": "" if recoverable else "valid recovery payload is missing",
+                    }
+                )
+        return candidates
+
+    def get_queue_recovery(self, recovery_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT detail_json,created_at FROM audit_log "
+                "WHERE tenant_id='system' AND action='recovery.queue.stage' AND resource=? "
+                "ORDER BY id DESC LIMIT 1",
+                (recovery_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {**json.loads(row["detail_json"]), "created_at": row["created_at"]}
+
+    def stage_queue_recovery(
+        self,
+        recovery_id: str,
+        plan_sha256: str,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT detail_json FROM audit_log WHERE tenant_id='system' "
+                "AND action='recovery.queue.stage' AND resource=? ORDER BY id DESC LIMIT 1",
+                (recovery_id,),
+            ).fetchone()
+            if existing:
+                detail = json.loads(existing["detail_json"])
+                if detail.get("plan_sha256") != plan_sha256:
+                    raise ValueError("recovery id was already used for a different plan")
+                return {**detail, "already_applied": True}
+            staged = 0
+            skipped_terminal = 0
+            skipped_unrecoverable = 0
+            preserved_outbox_history = 0
+            tenants = set()
+            for candidate in candidates:
+                task = conn.execute(
+                    "SELECT state,cancel_requested,tenant_id FROM tasks WHERE id=?",
+                    (candidate["task_id"],),
+                ).fetchone()
+                if (
+                    not task
+                    or task["state"]
+                    in {
+                        TaskState.SUCCESS.value,
+                        TaskState.FAILED.value,
+                        TaskState.CANCELLED.value,
+                    }
+                    or bool(task["cancel_requested"])
+                ):
+                    skipped_terminal += 1
+                    continue
+                payload = candidate.get("payload")
+                if not isinstance(payload, dict):
+                    skipped_unrecoverable += 1
+                    continue
+                message_id = "review:" + candidate["task_id"]
+                serialized = json.dumps(payload, ensure_ascii=False)
+                outbox = conn.execute(
+                    "SELECT id,status FROM outbox_messages WHERE id=?", (message_id,)
+                ).fetchone()
+                if outbox and outbox["status"] in {"published", "dead"}:
+                    recovery_message_id = "recovery:%s:%s" % (
+                        recovery_id,
+                        candidate["task_id"],
+                    )
+                    conn.execute(
+                        "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,"
+                        "attempts,available_at,created_at,updated_at) "
+                        "VALUES (?,'review',?,?,'pending',0,?,?,?)",
+                        (
+                            recovery_message_id,
+                            "%s:%s" % (recovery_id, candidate["task_id"]),
+                            serialized,
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                    preserved_outbox_history += 1
+                elif outbox:
+                    conn.execute(
+                        "UPDATE outbox_messages SET payload_json=?,status='pending',attempts=0,"
+                        "available_at=?,lease_owner=NULL,lease_until=NULL,last_error=NULL,"
+                        "updated_at=? WHERE id=?",
+                        (serialized, now, now, message_id),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,"
+                        "attempts,available_at,created_at,updated_at) "
+                        "VALUES (?,'review',?,?,'pending',0,?,?,?)",
+                        (message_id, candidate["task_id"], serialized, now, now, now),
+                    )
+                staged += 1
+                tenants.add(str(task["tenant_id"]))
+            detail = {
+                "recovery_id": recovery_id,
+                "plan_sha256": plan_sha256,
+                "candidate_count": len(candidates),
+                "staged": staged,
+                "skipped_terminal": skipped_terminal,
+                "skipped_unrecoverable": skipped_unrecoverable,
+                "preserved_outbox_history": preserved_outbox_history,
+                "tenant_count": len(tenants),
+            }
+            conn.execute(
+                "INSERT INTO audit_log(tenant_id,actor,action,resource,detail_json,created_at) "
+                "VALUES ('system','evoagent-recover','recovery.queue.stage',?,?,?)",
+                (recovery_id, json.dumps(detail, ensure_ascii=False), now),
+            )
+        return {**detail, "already_applied": False}
+
     def reserve_model_usage(
         self,
         record: dict[str, Any],

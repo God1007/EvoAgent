@@ -74,7 +74,8 @@ jobs:
           test -f "$wheel_env/share/evoagent/ops/grafana/evoagent-overview.json"
           "$wheel_env/bin/evoagent-slo" --help >/dev/null
           "$wheel_env/bin/evoagent-dr" --help >/dev/null
-          "$wheel_env/bin/evoagent-migrate" | grep -q '"schema_version": 7'
+          "$wheel_env/bin/evoagent-recover-queue" --help >/dev/null
+          "$wheel_env/bin/evoagent-migrate" | grep -q '"schema_version": 8'
           kill -TERM "$wheel_pid"
           wait "$wheel_pid"
           trap - EXIT
@@ -198,7 +199,7 @@ jobs:
           EVOAGENT_DATABASE_URL: ${{ env.EVOAGENT_TEST_POSTGRES_URL }}
         run: |
           python -m evoagent.migrate | tee migration.json
-          python -c "import json; d=json.load(open('migration.json')); assert d == {'backend':'postgresql','schema_version':7,'status':'migrated'}"
+          python -c "import json; d=json.load(open('migration.json')); assert d == {'backend':'postgresql','schema_version':8,'status':'migrated'}"
       - name: Run adapter contracts and restart fault tests
         run: |
           python -m pytest -q \
@@ -255,7 +256,7 @@ jobs:
             fi
             sleep 1
           done
-          python -c "import json; d=json.load(open('ready.json')); assert d['status']=='ready'; assert d['queue_backend']=='redis-streams'; assert d['checks']['schema_version']==7; assert d['checks']['queue']['healthy']"
+          python -c "import json; d=json.load(open('ready.json')); assert d['status']=='ready'; assert d['queue_backend']=='redis-streams'; assert d['checks']['schema_version']==8; assert d['checks']['queue']['healthy']"
           curl -fsS -X POST 'http://127.0.0.1:18080/v1/reviews?async=true' \
             -H 'Content-Type: application/json' \
             -d '{"repository":"ci/full-stack","pull_request":17,"diff":"diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n+value = 1\n+print(value)"}' \
@@ -278,6 +279,48 @@ jobs:
         run: |
           docker stop --time 20 evoagent-full-stack
           test "$(docker inspect -f '{{.State.ExitCode}}' evoagent-full-stack)" = 0
+      - name: Prove incomplete-task reconstruction into a fresh Redis DB
+        env:
+          EVOAGENT_DATABASE_URL: ${{ env.EVOAGENT_TEST_POSTGRES_URL }}
+          EVOAGENT_REDIS_URL: redis://127.0.0.1:6379/1
+        run: |
+          recovery_task_id="ci-regional-recovery-$(python -c 'import uuid; print(uuid.uuid4().hex)')"
+          python scripts/queue_recovery_smoke.py seed --task-id "$recovery_task_id"
+          recovery_id=$(python -c "import uuid; print(uuid.uuid4())")
+          python -m evoagent.recovery \
+            --recovery-id "$recovery_id" \
+            --confirm-database evoagent \
+            --max-tasks 10000 > queue-recovery-plan.json
+          plan_sha256=$(python -c "import json; print(json.load(open('queue-recovery-plan.json'))['plan']['plan_sha256'])")
+          python -m evoagent.recovery \
+            --recovery-id "$recovery_id" \
+            --confirm-database evoagent \
+            --max-tasks 10000 \
+            --expect-plan-sha256 "$plan_sha256" \
+            --apply > queue-recovery-report.json
+          cat queue-recovery-report.json
+          python -c "import json; d=json.load(open('queue-recovery-report.json')); assert d['status']=='pass'; assert d['redis_target_state']=='reserved'; assert d['staging']['staged']==d['plan']['recoverable']"
+          python -m evoagent.recovery \
+            --recovery-id "$recovery_id" \
+            --confirm-database evoagent \
+            --max-tasks 10000 \
+            --expect-plan-sha256 "$plan_sha256" \
+            --apply > queue-recovery-retry.json
+          python -c "import json; d=json.load(open('queue-recovery-retry.json')); assert d['status']=='pass'; assert d['already_applied']; assert d['staging']['already_applied']"
+          python scripts/queue_recovery_smoke.py verify \
+            --task-id "$recovery_task_id" \
+            --report queue-recovery-report.json
+      - name: Retain queue recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: queue-recovery-evidence
+          path: |
+            queue-recovery-plan.json
+            queue-recovery-report.json
+            queue-recovery-retry.json
+          if-no-files-found: warn
+          retention-days: 14
       - name: Tear down
         if: always()
         run: docker rm -f evoagent-full-stack 2>/dev/null || true

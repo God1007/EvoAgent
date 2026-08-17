@@ -213,8 +213,10 @@ class ApplicationUseCaseTests(unittest.TestCase):
                 self.comments += 1
 
         code_host = CodeHost()
+        executions = []
 
         def execute(task_id, _repository, _pull_request, _diff, _tenant_id):
+            executions.append(task_id)
             self.store.succeed(
                 task_id,
                 report,
@@ -260,6 +262,7 @@ class ApplicationUseCaseTests(unittest.TestCase):
 
         self.assertEqual(1, code_host.fetches)
         self.assertEqual(1, code_host.comments)
+        self.assertEqual([task_id], executions)
         self.assertEqual("org/repo", code_host.repository)
         self.assertEqual(14_096, code_host.max_bytes)
         task = self.store.get(task_id, "tenant")

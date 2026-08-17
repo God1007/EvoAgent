@@ -346,6 +346,19 @@ class OutboxStorePort(Protocol):
     def requeue_outbox(self, message_id: str) -> bool: ...
 
 
+class RecoveryStorePort(Protocol):
+    def queue_recovery_candidates(self, limit: int) -> list[dict[str, Any]]: ...
+
+    def get_queue_recovery(self, recovery_id: str) -> dict[str, Any] | None: ...
+
+    def stage_queue_recovery(
+        self,
+        recovery_id: str,
+        plan_sha256: str,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]: ...
+
+
 class ModelUsageStorePort(Protocol):
     def reserve_model_usage(
         self,
@@ -525,6 +538,7 @@ class ApplicationStorePort(
     AlertStorePort,
     RepositoryPolicyStorePort,
     OutboxStorePort,
+    RecoveryStorePort,
     ModelUsageStorePort,
     ServiceStorePort,
     Protocol,

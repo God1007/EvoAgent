@@ -433,6 +433,24 @@ MIGRATIONS: tuple[Migration, ...] = (
             SQLiteColumn("model_usage", "attempt", "INTEGER NOT NULL DEFAULT 1"),
         ),
     ),
+    Migration(
+        8,
+        "queue-recovery-operations",
+        (
+            "CREATE INDEX IF NOT EXISTS idx_tasks_recovery "
+            "ON tasks(cancel_requested,state,created_at,id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_recovery_epoch "
+            "ON audit_log(action,resource) "
+            "WHERE tenant_id='system' AND action='recovery.queue.stage'",
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_tasks_recovery "
+            "ON tasks(cancel_requested,state,created_at,id)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_recovery_epoch "
+            "ON audit_log(action,resource) "
+            "WHERE tenant_id='system' AND action='recovery.queue.stage'",
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1].version
@@ -484,6 +502,17 @@ def _validate_history(rows: list[Any], target_version: int) -> set[int]:
             % (newest, target_version)
         )
     return set(versions)
+
+
+def validate_current_schema_history(rows: list[Any]) -> int:
+    """Read-only gate for operational tools that must never migrate a database."""
+    applied = _validate_history(rows, CURRENT_SCHEMA_VERSION)
+    expected = set(range(1, CURRENT_SCHEMA_VERSION + 1))
+    if applied != expected:
+        raise SchemaHistoryError(
+            "database schema is not at required version %d" % CURRENT_SCHEMA_VERSION
+        )
+    return CURRENT_SCHEMA_VERSION
 
 
 def _ensure_sqlite_column(conn: sqlite3.Connection, column: SQLiteColumn) -> None:

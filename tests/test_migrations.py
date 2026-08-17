@@ -16,6 +16,7 @@ from evoagent.migrations import (
     SchemaHistoryError,
     SchemaTooNewError,
     migrate_sqlite,
+    validate_current_schema_history,
 )
 from evoagent.models import TaskState
 from evoagent.store import TaskStore, utc_now
@@ -42,10 +43,29 @@ class SQLiteMigrationTests(unittest.TestCase):
             rows = conn.execute(
                 "SELECT version,name,checksum,applied_at FROM schema_migrations ORDER BY version"
             ).fetchall()
+            indexes = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'"
+                ).fetchall()
+            }
         self.assertEqual([item.version for item in MIGRATIONS], [row["version"] for row in rows])
         self.assertEqual([item.name for item in MIGRATIONS], [row["name"] for row in rows])
         self.assertEqual([item.checksum for item in MIGRATIONS], [row["checksum"] for row in rows])
         self.assertTrue(all(row["applied_at"] for row in rows))
+        self.assertEqual(CURRENT_SCHEMA_VERSION, validate_current_schema_history(list(rows)))
+        self.assertIn("idx_tasks_recovery", indexes)
+        self.assertIn("idx_audit_recovery_epoch", indexes)
+
+    def test_read_only_operational_gate_refuses_an_old_schema(self):
+        with self.connect() as conn:
+            migrate_sqlite(conn, CURRENT_SCHEMA_VERSION - 1)
+            rows = conn.execute(
+                "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
+            ).fetchall()
+
+        with self.assertRaisesRegex(SchemaHistoryError, "required version"):
+            validate_current_schema_history(list(rows))
 
     def test_forward_migrates_from_previous_version_without_data_loss(self):
         previous = CURRENT_SCHEMA_VERSION - 1

@@ -34,7 +34,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Cross-cutting | `evoagent/auth.py` | JWT, RBAC, tenant isolation |
 | Cross-cutting | `evoagent/observability.py`, `metrics.py` | Trace, Prometheus metrics, OpenTelemetry |
 | Operations | `evoagent/slo.py`, `ops/` | Versioned SLO evaluation, Prometheus alerts, and Grafana dashboard |
-| Operations | `evoagent/dr.py` | Isolated SQLite/PostgreSQL restore drills and RPO/RTO evidence |
+| Operations | `evoagent/dr.py`, `recovery.py` | Isolated database restore evidence and offline PostgreSQL-to-Redis task reconstruction |
 | Model | `evoagent/models.py` | `Finding`, `Severity`, `ReviewReport`, stable fingerprints |
 | Adapters | `evoagent/github.py`, `diff_parser.py` | Hardened GitHub client, unified-diff parsing |
 
@@ -118,6 +118,11 @@ See [`plugin-system.md`](plugin-system.md) and
   schema/content fingerprints, exercises the Store adapter, and emits versioned
   RPO/RTO evidence. See [`disaster-recovery.md`](disaster-recovery.md) and
   [`ADR 0011`](adr/0011-isolated-database-recovery-drills.md).
+- **Regional queue reconstruction** treats PostgreSQL task/Outbox records as
+  durable intent and Redis Streams as replaceable delivery state. An offline,
+  audited recovery epoch stages only incomplete tasks for controlled publication
+  into a verified empty Redis database. See
+  [`ADR 0012`](adr/0012-offline-queue-reconstruction.md).
 - **Queue durability** depends on the backend. `redis-streams` provides ACK,
   consumer leases, dead-letter queue, and replay. The in-process
   `memory-ephemeral` backend is **not** durable (`/health` reports

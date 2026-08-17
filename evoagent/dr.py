@@ -662,7 +662,13 @@ def run_postgres_drill(
         _compare_fingerprints(source_fingerprint, restored_fingerprint)
         # Avoid background pool threads in the short-lived privileged admin job;
         # pool behavior has its own adapter contract suite.
-        restored_store = PostgresTaskStore(target_url, pool_min=0, pool_max=0, pool_timeout=5)
+        restored_store = PostgresTaskStore(
+            target_url,
+            pool_min=0,
+            pool_max=0,
+            pool_timeout=5,
+            auto_migrate=False,
+        )
         try:
             restored_store.ping()
             restored_store.dashboard_stats()
@@ -790,6 +796,21 @@ def main(argv: list[str] | None = None) -> int:
                     "status": "error",
                     "backend": backend,
                     "error": str(exc),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return 2
+    except Exception as exc:  # pragma: no cover - external driver boundary
+        print(
+            json.dumps(
+                {
+                    "report_schema_version": REPORT_SCHEMA_VERSION,
+                    "status": "error",
+                    "backend": backend,
+                    "error": "recovery drill failed (%s)" % type(exc).__name__,
                 },
                 ensure_ascii=False,
                 sort_keys=True,

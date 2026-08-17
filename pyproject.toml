@@ -49,6 +49,7 @@ evoagent-migrate = "evoagent.migrate:run"
 evoagent-proof-runner = "evoagent.proof_remote:run"
 evoagent-slo = "evoagent.slo:run"
 evoagent-dr = "evoagent.dr:run"
+evoagent-recover-queue = "evoagent.recovery:run"
 
 [project.urls]
 Homepage = "https://github.com/God1007/EvoAgent"

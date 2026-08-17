@@ -11,7 +11,7 @@ import uuid
 from contextlib import AbstractContextManager
 from typing import Any
 
-from .migrations import migrate_postgres
+from .migrations import migrate_postgres, validate_current_schema_history
 from .models import ReviewReport, TaskState, TraceEvent
 from .ports import ApplicationStorePort
 from .store import utc_after, utc_now
@@ -24,6 +24,7 @@ class PostgresTaskStore:
         pool_min: int = 1,
         pool_max: int = 10,
         pool_timeout: float = 10.0,
+        auto_migrate: bool = True,
     ):
         try:
             import psycopg
@@ -34,6 +35,7 @@ class PostgresTaskStore:
         self.dict_row = dict_row
         self.url = url
         self.pool_timeout = float(pool_timeout)
+        self.auto_migrate = bool(auto_migrate)
         # A real connection pool avoids a TCP connect + auth handshake on every
         # single query (the previous per-call `psycopg.connect` was the dominant
         # Postgres cost under load). Keep the import guard so a deliberately
@@ -93,6 +95,12 @@ class PostgresTaskStore:
         with self._connect() as conn:
             conn.execute("SELECT 1")
 
+    def connected_database_name(self) -> str:
+        """Return the server-reported database, not merely the DSN value."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT current_database() AS database_name").fetchone()
+        return str(row["database_name"])
+
     def pool_stats(self) -> dict[str, int] | None:
         """psycopg_pool stats for metrics, or ``None`` when unpooled."""
         if self._pool is None:
@@ -108,7 +116,13 @@ class PostgresTaskStore:
 
     def _init(self) -> None:
         with self._connect() as conn:
-            self._schema_version = migrate_postgres(conn)
+            if self.auto_migrate:
+                self._schema_version = migrate_postgres(conn)
+            else:
+                rows = conn.execute(
+                    "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
+                ).fetchall()
+                self._schema_version = validate_current_schema_history(list(rows))
 
     def schema_version(self) -> int:
         return self._schema_version
@@ -297,6 +311,183 @@ class PostgresTaskStore:
                 (now, now, message_id),
             )
         return cursor.rowcount > 0
+
+    def queue_recovery_candidates(self, limit: int) -> list[dict[str, Any]]:
+        """Describe non-terminal task intents without mutating queue state."""
+        bounded = max(1, min(int(limit), 100_001))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT t.id,t.repository,t.pull_request,t.tenant_id,o.status AS outbox_status,"
+                "o.payload_json,(p.task_id IS NOT NULL) AS has_payload "
+                "FROM tasks t LEFT JOIN outbox_messages o ON o.id='review:'||t.id "
+                "LEFT JOIN task_payloads p ON p.task_id=t.id "
+                "WHERE t.state NOT IN (%s,%s,%s) AND t.cancel_requested=FALSE "
+                "ORDER BY t.created_at,t.id LIMIT %s",
+                (
+                    TaskState.SUCCESS.value,
+                    TaskState.FAILED.value,
+                    TaskState.CANCELLED.value,
+                    bounded,
+                ),
+            ).fetchall()
+        candidates = []
+        for row in rows:
+            raw_payload = row["payload_json"]
+            payload = (
+                json.loads(raw_payload)
+                if isinstance(raw_payload, str)
+                else raw_payload
+                if raw_payload is not None
+                else {
+                    "task_id": row["id"],
+                    "repository": row["repository"],
+                    "pull_request": row["pull_request"],
+                    "tenant_id": row["tenant_id"],
+                }
+                if row["has_payload"]
+                else None
+            )
+            if isinstance(payload, dict):
+                payload = {
+                    **payload,
+                    "task_id": row["id"],
+                    "repository": row["repository"],
+                    "pull_request": row["pull_request"],
+                    "tenant_id": row["tenant_id"],
+                }
+            recoverable = isinstance(payload, dict)
+            candidates.append(
+                {
+                    "task_id": row["id"],
+                    "tenant_id": row["tenant_id"],
+                    "outbox_status": row["outbox_status"] or "missing",
+                    "payload": payload,
+                    "recoverable": recoverable,
+                    "reason": "" if recoverable else "valid recovery payload is missing",
+                }
+            )
+        return candidates
+
+    def get_queue_recovery(self, recovery_id: str) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT detail_json,created_at FROM audit_log "
+                "WHERE tenant_id='system' AND action='recovery.queue.stage' AND resource=%s "
+                "ORDER BY id DESC LIMIT 1",
+                (recovery_id,),
+            ).fetchone()
+        if not row:
+            return None
+        detail = row["detail_json"]
+        return {
+            **(json.loads(detail) if isinstance(detail, str) else detail),
+            "created_at": row["created_at"],
+        }
+
+    def stage_queue_recovery(
+        self,
+        recovery_id: str,
+        plan_sha256: str,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))", ("queue-recovery:" + recovery_id,)
+            )
+            existing = conn.execute(
+                "SELECT detail_json FROM audit_log WHERE tenant_id='system' "
+                "AND action='recovery.queue.stage' AND resource=%s ORDER BY id DESC LIMIT 1",
+                (recovery_id,),
+            ).fetchone()
+            if existing:
+                raw_detail = existing["detail_json"]
+                detail = json.loads(raw_detail) if isinstance(raw_detail, str) else raw_detail
+                if detail.get("plan_sha256") != plan_sha256:
+                    raise ValueError("recovery id was already used for a different plan")
+                return {**detail, "already_applied": True}
+            staged = 0
+            skipped_terminal = 0
+            skipped_unrecoverable = 0
+            preserved_outbox_history = 0
+            tenants = set()
+            for candidate in candidates:
+                task = conn.execute(
+                    "SELECT state,cancel_requested,tenant_id FROM tasks WHERE id=%s FOR UPDATE",
+                    (candidate["task_id"],),
+                ).fetchone()
+                if (
+                    not task
+                    or task["state"]
+                    in {
+                        TaskState.SUCCESS.value,
+                        TaskState.FAILED.value,
+                        TaskState.CANCELLED.value,
+                    }
+                    or bool(task["cancel_requested"])
+                ):
+                    skipped_terminal += 1
+                    continue
+                payload = candidate.get("payload")
+                if not isinstance(payload, dict):
+                    skipped_unrecoverable += 1
+                    continue
+                message_id = "review:" + candidate["task_id"]
+                serialized = json.dumps(payload, ensure_ascii=False)
+                outbox = conn.execute(
+                    "SELECT status FROM outbox_messages WHERE id=%s FOR UPDATE", (message_id,)
+                ).fetchone()
+                if outbox and outbox["status"] in {"published", "dead"}:
+                    recovery_message_id = "recovery:%s:%s" % (
+                        recovery_id,
+                        candidate["task_id"],
+                    )
+                    conn.execute(
+                        "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,"
+                        "attempts,available_at,created_at,updated_at) "
+                        "VALUES (%s,'review',%s,%s::jsonb,'pending',0,%s,%s,%s)",
+                        (
+                            recovery_message_id,
+                            "%s:%s" % (recovery_id, candidate["task_id"]),
+                            serialized,
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                    preserved_outbox_history += 1
+                elif outbox:
+                    conn.execute(
+                        "UPDATE outbox_messages SET payload_json=%s::jsonb,status='pending',"
+                        "attempts=0,available_at=%s,lease_owner=NULL,lease_until=NULL,"
+                        "last_error=NULL,updated_at=%s WHERE id=%s",
+                        (serialized, now, now, message_id),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,"
+                        "attempts,available_at,created_at,updated_at) "
+                        "VALUES (%s,'review',%s,%s::jsonb,'pending',0,%s,%s,%s)",
+                        (message_id, candidate["task_id"], serialized, now, now, now),
+                    )
+                staged += 1
+                tenants.add(str(task["tenant_id"]))
+            detail = {
+                "recovery_id": recovery_id,
+                "plan_sha256": plan_sha256,
+                "candidate_count": len(candidates),
+                "staged": staged,
+                "skipped_terminal": skipped_terminal,
+                "skipped_unrecoverable": skipped_unrecoverable,
+                "preserved_outbox_history": preserved_outbox_history,
+                "tenant_count": len(tenants),
+            }
+            conn.execute(
+                "INSERT INTO audit_log(tenant_id,actor,action,resource,detail_json,created_at) "
+                "VALUES ('system','evoagent-recover','recovery.queue.stage',%s,%s::jsonb,%s)",
+                (recovery_id, json.dumps(detail, ensure_ascii=False), now),
+            )
+        return {**detail, "already_applied": False}
 
     def reserve_model_usage(
         self,

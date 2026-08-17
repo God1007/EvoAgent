@@ -55,6 +55,13 @@ class SQLiteMigrationTests(unittest.TestCase):
             shadow_table = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='model_route_shadows'"
             ).fetchone()
+            capacity_tables = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name LIKE 'model_route_capacity_%'"
+                ).fetchall()
+            }
         self.assertEqual([item.version for item in MIGRATIONS], [row["version"] for row in rows])
         self.assertEqual([item.name for item in MIGRATIONS], [row["name"] for row in rows])
         self.assertEqual([item.checksum for item in MIGRATIONS], [row["checksum"] for row in rows])
@@ -64,10 +71,15 @@ class SQLiteMigrationTests(unittest.TestCase):
         self.assertIn("idx_audit_recovery_epoch", indexes)
         self.assertIn("idx_model_usage_reconciliation", indexes)
         self.assertIn("idx_model_route_shadows_report", indexes)
+        self.assertIn("idx_model_route_capacity_leases", indexes)
+        self.assertIn("idx_model_route_capacity_windows", indexes)
         self.assertEqual(
             {"lane", "topology_sha256"}, {"lane", "topology_sha256"} & model_usage_columns
         )
         self.assertIsNotNone(shadow_table)
+        self.assertEqual(
+            {"model_route_capacity_leases", "model_route_capacity_windows"}, capacity_tables
+        )
 
     def test_read_only_operational_gate_refuses_an_old_schema(self):
         with self.connect() as conn:

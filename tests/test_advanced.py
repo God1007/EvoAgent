@@ -126,6 +126,26 @@ class AdvancedFeatureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must exceed"):
             configured.validate_evolution()
 
+    def test_model_capacity_lease_must_exceed_provider_timeout(self):
+        configured = settings(self.path)
+        configured = configured.__class__(
+            **{
+                **configured.__dict__,
+                "timeout_seconds": 120,
+                "llm_capacity_lease_seconds": 120,
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "CAPACITY_LEASE_SECONDS must exceed"):
+            configured.validate_evolution()
+
+    def test_model_capacity_window_retention_is_bounded(self):
+        configured = settings(self.path)
+        configured = configured.__class__(
+            **{**configured.__dict__, "llm_capacity_window_retention_hours": 721}
+        )
+        with self.assertRaisesRegex(ValueError, "between 1 and 720"):
+            configured.validate_evolution()
+
     def test_feedback_candidate_is_deferred_without_a_model(self):
         store = TaskStore(self.path)
         store.create("task", "org/repo", 1, {"source": "test"})

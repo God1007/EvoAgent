@@ -92,6 +92,8 @@ class ModelRoute:
     evaluation_report_sha256: str = ""
     topology_sha256: str = ""
     config_version: int = 1
+    capacity_max_inflight: int = 0
+    capacity_requests_per_minute: int = 0
 
 
 @dataclass(frozen=True)
@@ -110,6 +112,8 @@ class ModelGatewayOptions:
     shadow_shutdown_timeout_seconds: float = 5.0
     shadow_daily_token_budget: int = 0
     shadow_daily_cost_micros: int = 0
+    capacity_lease_seconds: int = 180
+    capacity_window_retention_hours: int = 48
 
 
 class ModelProviderPort(Protocol):
@@ -134,6 +138,16 @@ class ModelOutputError(RuntimeError):
     """A provider responded, but the response violated the gateway contract."""
 
 
+class ModelRouteCapacityError(RuntimeError):
+    """A shared route bulkhead rejected work before provider/budget use."""
+
+    def __init__(self, route_id: str, reason: str, retry_at: str | None = None):
+        super().__init__("model route capacity is exhausted")
+        self.route_id = route_id
+        self.reason = reason
+        self.retry_at = retry_at
+
+
 _ROUTE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -148,9 +162,21 @@ _V2_ROUTE_FIELDS = frozenset(
         "max_shadow_disagreement_rate",
         "evaluation_dataset_sha256",
         "evaluation_report_sha256",
+        "capacity_max_inflight",
+        "capacity_requests_per_minute",
     }
 )
-_CANDIDATE_ROUTE_FIELDS = _V2_ROUTE_FIELDS.difference({"state", "weight"})
+_CANDIDATE_ROUTE_FIELDS = frozenset(
+    {
+        "shadow_percent",
+        "baseline_route_id",
+        "min_shadow_samples",
+        "max_shadow_error_rate",
+        "max_shadow_disagreement_rate",
+        "evaluation_dataset_sha256",
+        "evaluation_report_sha256",
+    }
+)
 _ROUTE_FIELDS = frozenset(
     {
         "id",
@@ -352,6 +378,16 @@ def load_model_routes(path: str) -> tuple[ModelRoute, ...]:
         )
         if bool(evaluation_dataset_sha256) != bool(evaluation_report_sha256):
             raise ValueError("model route promotion evidence requires both SHA-256 digests")
+        capacity_max_inflight = _non_negative_route_int(
+            raw.get("capacity_max_inflight"), "capacity_max_inflight"
+        )
+        capacity_requests_per_minute = _non_negative_route_int(
+            raw.get("capacity_requests_per_minute"), "capacity_requests_per_minute"
+        )
+        if capacity_max_inflight > 100_000:
+            raise ValueError("model route capacity_max_inflight must be at most 100000")
+        if capacity_requests_per_minute > 10_000_000:
+            raise ValueError("model route capacity_requests_per_minute must be at most 10000000")
         if version == 2 and state == "active" and not 1 <= weight <= 10_000:
             raise ValueError("active model route weight must be between 1 and 10000")
         if state == "candidate":
@@ -403,6 +439,8 @@ def load_model_routes(path: str) -> tuple[ModelRoute, ...]:
                 evaluation_report_sha256=evaluation_report_sha256,
                 topology_sha256=topology_sha256,
                 config_version=version,
+                capacity_max_inflight=capacity_max_inflight,
+                capacity_requests_per_minute=capacity_requests_per_minute,
             )
         )
     active_ids = {_route_key(route) for route in routes if route.state == "active"}
@@ -571,6 +609,12 @@ class EnterpriseModelGateway:
             raise ValueError("model shadow shutdown timeout must be non-negative")
         if options.shadow_daily_token_budget < 0 or options.shadow_daily_cost_micros < 0:
             raise ValueError("model shadow budgets must be non-negative")
+        if options.capacity_lease_seconds <= 0:
+            raise ValueError("model route capacity lease must be positive")
+        if not 1 <= options.capacity_window_retention_hours <= 24 * 30:
+            raise ValueError(
+                "model route capacity window retention must be between 1 and 720 hours"
+            )
         keys = [_route_key(item) for item in self.routes]
         if len(keys) != len(set(keys)):
             raise ValueError("model route ids must be unique")
@@ -635,6 +679,8 @@ class EnterpriseModelGateway:
                     "weight": item.weight,
                     "shadow_percent": item.shadow_percent,
                     "baseline_route_id": item.baseline_route_id,
+                    "capacity_max_inflight": item.capacity_max_inflight,
+                    "capacity_requests_per_minute": item.capacity_requests_per_minute,
                 }
                 for item in self.routes
             ],
@@ -878,13 +924,189 @@ class EnterpriseModelGateway:
             ),
         }
 
+    def capacity_report(self, tenant_id: str, repository: str | None = None) -> dict[str, Any]:
+        if not tenant_id:
+            raise ClientInputError("model route capacity report requires tenant_id")
+        routes = [
+            route
+            for route in self.routes
+            if route.state != "disabled"
+            and (not route.tenant_ids or tenant_id in route.tenant_ids)
+            and (
+                repository is None
+                or not route.repository_patterns
+                or any(fnmatchcase(repository, pattern) for pattern in route.repository_patterns)
+            )
+        ]
+        recommendations = self._capacity_weight_recommendations(routes)
+        now = datetime.now(UTC)
+        window_start = now.replace(second=0, microsecond=0)
+        values = []
+        for route in routes:
+            route_id = _route_key(route)
+            stats = self.store.model_route_capacity_stats(
+                route_id,
+                now.isoformat(),
+                window_start.isoformat(),
+            )
+            provider = self.providers[route_id]
+            breaker = getattr(provider, "breaker", None)
+            breaker_state = getattr(breaker, "state", "closed")
+            concurrency_available = (
+                not route.capacity_max_inflight
+                or stats["active_inflight"] < route.capacity_max_inflight
+            )
+            rate_available = (
+                not route.capacity_requests_per_minute
+                or stats["admitted_this_minute"] < route.capacity_requests_per_minute
+            )
+            tenant_exclusive = route.tenant_ids == (tenant_id,)
+            visible_stats = (
+                stats
+                if tenant_exclusive
+                else {
+                    "active_inflight": None,
+                    "earliest_expiry": None,
+                    "admitted_this_minute": None,
+                    "concurrency_rejections_this_minute": None,
+                    "rate_rejections_this_minute": None,
+                }
+            )
+            recommendation = recommendations.get(route_id)
+            values.append(
+                {
+                    "route_id": route_id,
+                    "state": route.state,
+                    "priority": route.priority,
+                    "configured_weight": route.weight,
+                    "recommended_weight": recommendation[0] if recommendation else None,
+                    "recommendation_basis": recommendation[1] if recommendation else None,
+                    "capacity_max_inflight": route.capacity_max_inflight,
+                    "capacity_requests_per_minute": route.capacity_requests_per_minute,
+                    "breaker_state": breaker_state,
+                    "observation_scope": (
+                        "tenant-exclusive" if tenant_exclusive else "shared-redacted"
+                    ),
+                    "available": (
+                        route.state == "active"
+                        and concurrency_available
+                        and rate_available
+                        and breaker_state != CircuitBreaker.OPEN
+                    ),
+                    **visible_stats,
+                }
+            )
+        return {
+            "topology_sha256": self.topology_sha256,
+            "scope": {"tenant_id": tenant_id, "repository": repository},
+            "window_start": window_start.isoformat(),
+            "routes": values,
+            "activation": "review weight recommendations, change topology, and redeploy",
+        }
+
+    @staticmethod
+    def _capacity_weight_recommendations(
+        routes: list[ModelRoute],
+    ) -> dict[str, tuple[int, str]]:
+        recommendations: dict[str, tuple[int, str]] = {}
+        active = [route for route in routes if route.state == "active"]
+        for priority in sorted({route.priority for route in active}):
+            tier = [route for route in active if route.priority == priority]
+            if all(route.capacity_requests_per_minute > 0 for route in tier):
+                basis = "requests_per_minute"
+                capacities = [route.capacity_requests_per_minute for route in tier]
+            elif all(route.capacity_max_inflight > 0 for route in tier):
+                basis = "max_inflight"
+                capacities = [route.capacity_max_inflight for route in tier]
+            else:
+                continue
+            divisor = capacities[0]
+            for capacity in capacities[1:]:
+                divisor = math.gcd(divisor, capacity)
+            normalized = [capacity // max(1, divisor) for capacity in capacities]
+            if max(normalized) > 10_000:
+                scale = max(normalized) / 10_000
+                normalized = [max(1, round(value / scale)) for value in normalized]
+            for route, weight in zip(tier, normalized, strict=True):
+                recommendations[_route_key(route)] = (weight, basis)
+        return recommendations
+
     @staticmethod
     def _fallback_allowed(exc: Exception) -> bool:
         if isinstance(exc, ModelProviderError):
             return exc.transient
-        return isinstance(exc, (CircuitOpenError, ModelOutputError, PermissionError))
+        return isinstance(
+            exc,
+            (CircuitOpenError, ModelOutputError, ModelRouteCapacityError, PermissionError),
+        )
 
     def _complete_route(
+        self,
+        request: ModelRequest,
+        route: ModelRoute,
+        messages: tuple[ModelMessage, ...],
+        redactions: int,
+        canonical: str,
+        input_tokens: int,
+        max_output_tokens: int,
+        root_request_id: str,
+        attempt: int,
+        lane: str = "active",
+    ) -> ModelResponse:
+        lease_id = ""
+        if route.capacity_max_inflight or route.capacity_requests_per_minute:
+            now = datetime.now(UTC)
+            window_start = now.replace(second=0, microsecond=0)
+            capacity = self.store.acquire_model_route_capacity(
+                {
+                    "lease_id": uuid.uuid4().hex,
+                    "topology_sha256": self.topology_sha256,
+                    "route_id": _route_key(route),
+                    "root_request_id": root_request_id,
+                    "now": now.isoformat(),
+                    "expires_at": (
+                        now + timedelta(seconds=self.options.capacity_lease_seconds)
+                    ).isoformat(),
+                    "window_start": window_start.isoformat(),
+                    "window_end": (window_start + timedelta(minutes=1)).isoformat(),
+                    "retention_cutoff": (
+                        now - timedelta(hours=self.options.capacity_window_retention_hours)
+                    ).isoformat(),
+                },
+                route.capacity_max_inflight,
+                route.capacity_requests_per_minute,
+            )
+            if not capacity["admitted"]:
+                metrics.inc("model_route_capacity_rejections_total")
+                raise ModelRouteCapacityError(
+                    _route_key(route),
+                    str(capacity["reason"]),
+                    capacity.get("retry_at"),
+                )
+            lease_id = str(capacity.get("lease_id") or "")
+        try:
+            return self._complete_admitted_route(
+                request,
+                route,
+                messages,
+                redactions,
+                canonical,
+                input_tokens,
+                max_output_tokens,
+                root_request_id,
+                attempt,
+                lane,
+            )
+        finally:
+            if lease_id:
+                try:
+                    self.store.release_model_route_capacity(lease_id)
+                except Exception:
+                    # The lease is time-bounded; a release outage must not turn
+                    # a completed provider call into a client-visible failure.
+                    metrics.inc("model_route_capacity_release_failures_total")
+
+    def _complete_admitted_route(
         self,
         request: ModelRequest,
         route: ModelRoute,
@@ -1002,6 +1224,8 @@ class EnterpriseModelGateway:
                 "weight": route.weight,
                 "shadow_percent": route.shadow_percent,
                 "baseline_route_id": route.baseline_route_id,
+                "capacity_max_inflight": route.capacity_max_inflight,
+                "capacity_requests_per_minute": route.capacity_requests_per_minute,
             }
             for route in self.routes
         ]
@@ -1155,7 +1379,12 @@ class EnterpriseModelGateway:
             metrics.inc("model_shadow_completed_total")
         except Exception as exc:
             fields = safe_exception_fields(exc)
-            status = "budget-rejected" if isinstance(exc, AccessDeniedError) else "failed"
+            if isinstance(exc, AccessDeniedError):
+                status = "budget-rejected"
+            elif isinstance(exc, ModelRouteCapacityError):
+                status = "capacity-rejected"
+            else:
+                status = "failed"
             self._finish_shadow(
                 observation_id,
                 status,

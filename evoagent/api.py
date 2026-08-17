@@ -517,6 +517,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 ),
             )
             return
+        if path == "/api/model-routes/capacity":
+            if not principal.can("manage"):
+                self._send_json(403, {"error": "permission denied"})
+                return
+            repository = query.get("repository", [None])[0]
+            self._send_json(
+                200,
+                self.service.model_route_capacity_report(principal.tenant_id, repository),
+            )
+            return
         if path == "/v1/repository-policies":
             if not principal.can("manage"):
                 self._send_json(403, {"error": "permission denied"})

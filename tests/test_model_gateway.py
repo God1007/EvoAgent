@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 from unittest import mock
 
@@ -20,6 +21,7 @@ from evoagent.model_gateway import (
     ModelRequest,
     ModelResponse,
     ModelRoute,
+    ModelRouteCapacityError,
     OpenAICompatibleModelProvider,
     load_model_routes,
     redact_model_messages,
@@ -80,6 +82,22 @@ class ModelGatewayTests(unittest.TestCase):
             "review",
             (ModelMessage("user", content),),
         )
+
+    @staticmethod
+    def capacity_record(gateway, route_id):
+        now = datetime.now(UTC)
+        window_start = now.replace(second=0, microsecond=0)
+        return {
+            "lease_id": "lease-" + os.urandom(8).hex(),
+            "topology_sha256": gateway.topology_sha256,
+            "route_id": route_id,
+            "root_request_id": "external-request",
+            "now": now.isoformat(),
+            "expires_at": (now + timedelta(minutes=5)).isoformat(),
+            "window_start": window_start.isoformat(),
+            "window_end": (window_start + timedelta(minutes=1)).isoformat(),
+            "retention_cutoff": (now - timedelta(hours=48)).isoformat(),
+        }
 
     def test_redacts_credentials_and_records_only_governance_metadata(self):
         provider = FakeProvider()
@@ -370,10 +388,12 @@ class ModelGatewayTests(unittest.TestCase):
                 'version = 2\n[[routes]]\nid = "stable"\nstate = "active"\nweight = 3\n'
                 'provider = "provider-a"\nmodel = "model-a"\n'
                 'base_url = "https://a.example/v1"\napi_key_env = "TEST_STABLE_KEY"\n'
+                "capacity_max_inflight = 12\ncapacity_requests_per_minute = 300\n"
                 '[[routes]]\nid = "candidate"\nstate = "candidate"\n'
                 'provider = "provider-b"\nmodel = "model-b"\n'
                 'base_url = "https://b.example/v1"\napi_key_env = "TEST_CANDIDATE_KEY"\n'
                 'baseline_route_id = "stable"\nshadow_percent = 25\nmin_shadow_samples = 7\n'
+                "capacity_max_inflight = 2\ncapacity_requests_per_minute = 40\n"
                 "max_shadow_error_rate = 0.03\nmax_shadow_disagreement_rate = 0.15\n"
                 'evaluation_dataset_sha256 = "' + "a" * 64 + '"\n'
                 'evaluation_report_sha256 = "' + "b" * 64 + '"\n'
@@ -387,7 +407,14 @@ class ModelGatewayTests(unittest.TestCase):
         active = next(route for route in routes if route.state == "active")
         candidate = next(route for route in routes if route.state == "candidate")
         self.assertEqual(3, active.weight)
+        self.assertEqual(
+            (12, 300), (active.capacity_max_inflight, active.capacity_requests_per_minute)
+        )
         self.assertEqual(0, candidate.weight)
+        self.assertEqual(
+            (2, 40),
+            (candidate.capacity_max_inflight, candidate.capacity_requests_per_minute),
+        )
         self.assertEqual(
             ("stable", 25, 7),
             (
@@ -419,6 +446,22 @@ class ModelGatewayTests(unittest.TestCase):
                 {"TEST_STABLE_KEY": "stable-secret", "TEST_CANDIDATE_KEY": "candidate-secret"},
             ),
             self.assertRaisesRegex(ValueError, "baseline must reference an active route"),
+        ):
+            load_model_routes(path)
+
+    def test_capacity_fields_require_topology_v2(self):
+        handle, path = tempfile.mkstemp(suffix=".toml")
+        os.close(handle)
+        self.addCleanup(os.unlink, path)
+        with open(path, "w", encoding="utf-8") as output:
+            output.write(
+                'version = 1\n[[routes]]\nid = "stable"\n'
+                'provider = "a"\nmodel = "a"\nbase_url = "https://a.example/v1"\n'
+                'api_key_env = "TEST_STABLE_KEY"\ncapacity_max_inflight = 3\n'
+            )
+        with (
+            mock.patch.dict(os.environ, {"TEST_STABLE_KEY": "stable-secret"}),
+            self.assertRaisesRegex(ValueError, "require file version 2"),
         ):
             load_model_routes(path)
 
@@ -479,6 +522,162 @@ class ModelGatewayTests(unittest.TestCase):
             [route.route_id for route in gateway._candidate_routes(repeated, "e" * 64)],
             [route.route_id for route in gateway._candidate_routes(repeated, "e" * 64)],
         )
+
+    def test_shared_capacity_rejection_falls_back_before_provider_or_budget_use(self):
+        primary = ModelRoute(
+            "provider-a",
+            "model-a",
+            "https://a.example/v1",
+            "secret-a",
+            route_id="primary",
+            priority=10,
+            tenant_ids=("tenant-a",),
+            capacity_max_inflight=1,
+        )
+        secondary = ModelRoute(
+            "provider-b",
+            "model-b",
+            "https://b.example/v1",
+            "secret-b",
+            route_id="secondary",
+            priority=20,
+            tenant_ids=("tenant-a",),
+        )
+        primary_provider = FakeProvider()
+        secondary_provider = FakeProvider()
+        gateway = EnterpriseModelGateway(
+            self.store,
+            (primary, secondary),
+            {"primary": primary_provider, "secondary": secondary_provider},
+            ModelGatewayOptions(
+                allowed_hosts=("a.example", "b.example"),
+                fallback_attempts=1,
+            ),
+        )
+        lease = self.store.acquire_model_route_capacity(
+            self.capacity_record(gateway, "primary"), 1, 0
+        )
+        self.assertTrue(lease["admitted"])
+
+        response = gateway.complete(self.request())
+
+        self.assertEqual("provider-b", response.provider)
+        self.assertEqual([], primary_provider.calls)
+        self.assertEqual(1, len(secondary_provider.calls))
+        usage = self.store.list_model_usage("tenant-a", "org/repo")
+        self.assertEqual(["secondary"], [item["route_id"] for item in usage])
+        report = gateway.capacity_report("tenant-a", "org/repo")
+        primary_report = next(item for item in report["routes"] if item["route_id"] == "primary")
+        self.assertEqual(1, primary_report["concurrency_rejections_this_minute"])
+        self.assertFalse(primary_report["available"])
+        self.assertTrue(self.store.release_model_route_capacity(lease["lease_id"]))
+
+    def test_capacity_rejection_respects_zero_fallback_budget(self):
+        primary = ModelRoute(
+            "provider-a",
+            "model-a",
+            "https://a.example/v1",
+            "secret-a",
+            route_id="primary",
+            priority=10,
+            capacity_max_inflight=1,
+        )
+        secondary = ModelRoute(
+            "provider-b",
+            "model-b",
+            "https://b.example/v1",
+            "secret-b",
+            route_id="secondary",
+            priority=20,
+        )
+        providers = {"primary": FakeProvider(), "secondary": FakeProvider()}
+        gateway = EnterpriseModelGateway(
+            self.store,
+            (primary, secondary),
+            providers,
+            ModelGatewayOptions(
+                allowed_hosts=("a.example", "b.example"),
+                fallback_attempts=0,
+            ),
+        )
+        lease = self.store.acquire_model_route_capacity(
+            self.capacity_record(gateway, "primary"), 1, 0
+        )
+        self.assertTrue(lease["admitted"])
+
+        with self.assertRaises(ModelRouteCapacityError) as raised:
+            gateway.complete(self.request())
+
+        self.assertEqual("primary", raised.exception.route_id)
+        self.assertEqual("concurrency", raised.exception.reason)
+        self.assertEqual([], providers["primary"].calls)
+        self.assertEqual([], providers["secondary"].calls)
+        self.assertEqual([], self.store.list_model_usage("tenant-a", "org/repo"))
+        self.assertTrue(self.store.release_model_route_capacity(lease["lease_id"]))
+
+    def test_successful_capacity_admission_releases_lease(self):
+        route = ModelRoute(
+            "provider-a",
+            "model-a",
+            "https://a.example/v1",
+            "secret-a",
+            route_id="primary",
+            tenant_ids=("tenant-a",),
+            capacity_max_inflight=1,
+            capacity_requests_per_minute=10,
+        )
+        provider = FakeProvider()
+        gateway = EnterpriseModelGateway(
+            self.store,
+            route,
+            provider,
+            ModelGatewayOptions(allowed_hosts=("a.example",)),
+        )
+
+        gateway.complete(self.request())
+
+        report = gateway.capacity_report("tenant-a", "org/repo")["routes"][0]
+        self.assertEqual(0, report["active_inflight"])
+        self.assertEqual(1, report["admitted_this_minute"])
+        self.assertTrue(report["available"])
+
+    def test_capacity_report_recommends_declared_capacity_weights(self):
+        large = ModelRoute(
+            "provider-a",
+            "model-a",
+            "https://a.example/v1",
+            "secret-a",
+            route_id="large",
+            priority=10,
+            weight=1,
+            capacity_requests_per_minute=300,
+        )
+        small = ModelRoute(
+            "provider-b",
+            "model-b",
+            "https://b.example/v1",
+            "secret-b",
+            route_id="small",
+            priority=10,
+            weight=1,
+            capacity_requests_per_minute=100,
+        )
+        gateway = EnterpriseModelGateway(
+            self.store,
+            (large, small),
+            {"large": FakeProvider(), "small": FakeProvider()},
+            ModelGatewayOptions(allowed_hosts=("a.example", "b.example")),
+        )
+
+        report = gateway.capacity_report("tenant-a", "org/repo")
+
+        routes = {item["route_id"]: item for item in report["routes"]}
+        self.assertEqual(3, routes["large"]["recommended_weight"])
+        self.assertEqual(1, routes["small"]["recommended_weight"])
+        self.assertEqual("requests_per_minute", routes["large"]["recommendation_basis"])
+        self.assertEqual("shared-redacted", routes["large"]["observation_scope"])
+        self.assertIsNone(routes["large"]["admitted_this_minute"])
+        self.assertIn("change topology", report["activation"])
 
     def test_candidate_shadow_is_isolated_metered_and_promotion_gated(self):
         active = ModelRoute(
@@ -622,6 +821,48 @@ class ModelGatewayTests(unittest.TestCase):
         with sqlite3.connect(self.path) as conn:
             status = conn.execute("SELECT status FROM model_route_shadows").fetchone()[0]
         self.assertEqual("budget-rejected", status)
+
+    def test_shadow_capacity_rejection_is_explicit_and_never_calls_candidate(self):
+        active = ModelRoute(
+            "provider-a",
+            "model-a",
+            "https://a.example/v1",
+            "active-secret",
+            route_id="stable",
+            weight=1,
+        )
+        candidate = ModelRoute(
+            "provider-b",
+            "model-b",
+            "https://b.example/v1",
+            "candidate-secret",
+            route_id="candidate",
+            state="candidate",
+            shadow_percent=100,
+            baseline_route_id="stable",
+            capacity_max_inflight=1,
+        )
+        candidate_provider = FakeProvider()
+        gateway = EnterpriseModelGateway(
+            self.store,
+            (active, candidate),
+            {"stable": FakeProvider(), "candidate": candidate_provider},
+            ModelGatewayOptions(allowed_hosts=("a.example", "b.example")),
+        )
+        lease = self.store.acquire_model_route_capacity(
+            self.capacity_record(gateway, "candidate"), 1, 0
+        )
+        self.assertTrue(lease["admitted"])
+
+        response = gateway.complete(self.request())
+        self.assertEqual("provider-a", response.provider)
+        self.assertTrue(gateway.close())
+
+        self.assertEqual([], candidate_provider.calls)
+        with sqlite3.connect(self.path) as conn:
+            status = conn.execute("SELECT status FROM model_route_shadows").fetchone()[0]
+        self.assertEqual("capacity-rejected", status)
+        self.assertTrue(self.store.release_model_route_capacity(lease["lease_id"]))
 
     def test_shadow_does_not_delay_the_active_response_and_close_drains_it(self):
         started = threading.Event()

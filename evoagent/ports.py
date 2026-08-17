@@ -360,6 +360,22 @@ class RecoveryStorePort(Protocol):
 
 
 class ModelUsageStorePort(Protocol):
+    def acquire_model_route_capacity(
+        self,
+        record: dict[str, Any],
+        max_inflight: int = 0,
+        requests_per_minute: int = 0,
+    ) -> dict[str, Any]: ...
+
+    def release_model_route_capacity(self, lease_id: str) -> bool: ...
+
+    def model_route_capacity_stats(
+        self,
+        route_id: str,
+        now: str,
+        window_start: str,
+    ) -> dict[str, Any]: ...
+
     def reserve_model_usage(
         self,
         record: dict[str, Any],
@@ -437,6 +453,8 @@ class ModelGatewayPort(Protocol):
     def promotion_report(
         self, tenant_id: str, candidate_route_id: str, repository: str | None = None
     ) -> dict[str, Any]: ...
+
+    def capacity_report(self, tenant_id: str, repository: str | None = None) -> dict[str, Any]: ...
 
     def complete(self, request: ModelRequest) -> ModelResponse: ...
 

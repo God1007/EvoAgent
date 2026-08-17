@@ -135,6 +135,23 @@ traces and the metadata-only model ledger. Check policy rejections separately
 from execution failures. Roll back a candidate Prompt/Skill if the failure spike
 is lane-correlated; do not weaken evidence or repair gates to restore throughput.
 
+## Model route capacity
+
+Query `/api/model-routes/capacity` in the affected tenant/repository scope. A
+high concurrency rejection count with long-lived leases indicates saturated or
+stuck provider calls; a rate rejection means the declared fixed-minute ceiling
+was reached. Exact counters are tenant-visible only for a route bound solely to
+that tenant; investigate a `shared-redacted` pool through restricted platform
+storage/telemetry. Confirm the provider contract before changing either limit.
+Do not delete leases manually: a crashed owner's lease expires after
+`EVOAGENT_LLM_CAPACITY_LEASE_SECONDS`, while a live call must retain its slot.
+
+If fallback is also saturated, reduce intake or restore provider capacity before
+raising worker count. Weight recommendations are declared-capacity ratios, not
+traffic forecasts. Apply them only through reviewed topology and redeployment;
+never treat the report as authorization for a live database edit. Preserve
+stable route IDs across rolling releases so old and new pods share one pool.
+
 ## Plugin runtime
 
 `plugin_runtime_ready=0` means the capability graph is stopping or failed.

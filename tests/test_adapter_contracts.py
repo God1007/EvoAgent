@@ -549,6 +549,95 @@ class _StoreBehaviorContract:
         self.assertEqual(1, len(usage))
         self.assertEqual("reserved", usage[0]["status"])
 
+    def test_model_route_capacity_contract(self):
+        topology = uuid.uuid4().hex * 2
+        now = "2030-01-01T00:00:00+00:00"
+        window_start = "2030-01-01T00:00:00+00:00"
+
+        def record(route_id: str, *, suffix: str = "", current: str = now) -> dict:
+            return {
+                "lease_id": self.unique("capacity-lease" + suffix),
+                "topology_sha256": topology,
+                "route_id": route_id,
+                "root_request_id": self.unique("capacity-root"),
+                "now": current,
+                "expires_at": "2030-01-01T00:05:00+00:00",
+                "window_start": window_start,
+                "window_end": "2030-01-01T00:01:00+00:00",
+                "retention_cutoff": "2029-12-30T00:00:00+00:00",
+            }
+
+        concurrency_route = self.unique("capacity-concurrency")
+        first = self.store.acquire_model_route_capacity(record(concurrency_route), 1, 0)
+        other_topology = record(concurrency_route)
+        other_topology["topology_sha256"] = "f" * 64
+        rejected = self.store.acquire_model_route_capacity(other_topology, 1, 0)
+        self.assertTrue(first["admitted"])
+        self.assertEqual("concurrency", rejected["reason"])
+        stats = self.store.model_route_capacity_stats(concurrency_route, now, window_start)
+        self.assertEqual(1, stats["active_inflight"])
+        self.assertEqual(1, stats["concurrency_rejections_this_minute"])
+        self.assertTrue(self.store.release_model_route_capacity(first["lease_id"]))
+        replacement = self.store.acquire_model_route_capacity(record(concurrency_route), 1, 0)
+        self.assertTrue(replacement["admitted"])
+        self.assertTrue(self.store.release_model_route_capacity(replacement["lease_id"]))
+
+        rate_route = self.unique("capacity-rate")
+        self.assertTrue(
+            self.store.acquire_model_route_capacity(record(rate_route), 0, 2)["admitted"]
+        )
+        rate_other_topology = record(rate_route)
+        rate_other_topology["topology_sha256"] = "e" * 64
+        self.assertTrue(
+            self.store.acquire_model_route_capacity(rate_other_topology, 0, 2)["admitted"]
+        )
+        rate_third_topology = record(rate_route)
+        rate_third_topology["topology_sha256"] = "d" * 64
+        rate_rejected = self.store.acquire_model_route_capacity(rate_third_topology, 0, 2)
+        self.assertEqual("rate", rate_rejected["reason"])
+        rate_stats = self.store.model_route_capacity_stats(rate_route, now, window_start)
+        self.assertEqual(2, rate_stats["admitted_this_minute"])
+        self.assertEqual(1, rate_stats["rate_rejections_this_minute"])
+
+        expired_route = self.unique("capacity-expired")
+        expired = record(expired_route)
+        expired["expires_at"] = "2030-01-01T00:00:01+00:00"
+        self.assertTrue(self.store.acquire_model_route_capacity(expired, 1, 0)["admitted"])
+        after_expiry = record(
+            expired_route,
+            suffix="-after-expiry",
+            current="2030-01-01T00:00:02+00:00",
+        )
+        self.assertTrue(self.store.acquire_model_route_capacity(after_expiry, 1, 0)["admitted"])
+        self.assertTrue(self.store.release_model_route_capacity(after_expiry["lease_id"]))
+
+        contended_route = self.unique("capacity-contended")
+        barrier = threading.Barrier(2)
+        results: list[dict] = []
+        errors: list[Exception] = []
+
+        def acquire(suffix: str) -> None:
+            try:
+                barrier.wait(timeout=5)
+                results.append(
+                    self.store.acquire_model_route_capacity(
+                        record(contended_route, suffix=suffix), 1, 0
+                    )
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        workers = [threading.Thread(target=acquire, args=(str(index),)) for index in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=10)
+
+        self.assertEqual([], errors)
+        self.assertEqual([False, True], sorted(result["admitted"] for result in results))
+        winner = next(result for result in results if result["admitted"])
+        self.assertTrue(self.store.release_model_route_capacity(winner["lease_id"]))
+
     def test_model_route_shadow_observation_contract(self):
         tenant_id = self.unique("shadow-tenant")
         candidate_route_id = self.unique("candidate-route")

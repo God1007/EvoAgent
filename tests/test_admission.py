@@ -353,6 +353,25 @@ class AdmissionControlTests(unittest.TestCase):
         self.assertEqual(400, missing.status)
         self.assertIn("route_id", missing_payload["error"])
 
+    def test_model_route_capacity_report_http_boundary(self):
+        host, port = self._serve(self._settings())
+        expected = {
+            "topology_sha256": "a" * 64,
+            "routes": [{"route_id": "primary", "available": True}],
+        }
+        with mock.patch.object(
+            self.service.model_gateway, "capacity_report", return_value=expected
+        ) as report:
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            self.addCleanup(conn.close)
+            conn.request("GET", "/api/model-routes/capacity?repository=org%2Frepo")
+            response = conn.getresponse()
+            payload = json.loads(response.read())
+
+        self.assertEqual(200, response.status)
+        self.assertEqual(expected, payload)
+        report.assert_called_once_with("default", "org/repo")
+
     def test_rejected_requests_are_counted_in_metrics(self):
         host, port = self._serve(self._settings(rate_limit_rps=1, rate_limit_burst=1))
         conn = http.client.HTTPConnection(host, port, timeout=5)

@@ -428,6 +428,8 @@ def _model_gateway(context: PluginContext) -> EnterpriseModelGateway:
             shadow_shutdown_timeout_seconds=float(settings.timeout_seconds + 5),
             shadow_daily_token_budget=settings.llm_shadow_daily_token_budget,
             shadow_daily_cost_micros=settings.llm_shadow_daily_cost_micros,
+            capacity_lease_seconds=settings.llm_capacity_lease_seconds,
+            capacity_window_retention_hours=settings.llm_capacity_window_retention_hours,
         ),
     )
 

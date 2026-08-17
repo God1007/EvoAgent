@@ -491,6 +491,132 @@ class PostgresTaskStore:
             )
         return {**detail, "already_applied": False}
 
+    def acquire_model_route_capacity(
+        self,
+        record: dict[str, Any],
+        max_inflight: int = 0,
+        requests_per_minute: int = 0,
+    ) -> dict[str, Any]:
+        """Atomically claim one shared route slot and fixed-window request unit."""
+        if max_inflight < 0 or requests_per_minute < 0:
+            raise ValueError("model route capacity limits must be non-negative")
+        topology = record["topology_sha256"]
+        route_id = record["route_id"]
+        now = record["now"]
+        window_start = record["window_start"]
+        with self._connect() as conn:
+            conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                ("model-capacity:%s" % route_id,),
+            )
+            conn.execute(
+                "DELETE FROM model_route_capacity_leases WHERE route_id=%s AND expires_at<=%s",
+                (route_id, now),
+            )
+            conn.execute(
+                "DELETE FROM model_route_capacity_windows WHERE route_id=%s AND window_start<%s",
+                (route_id, record["retention_cutoff"]),
+            )
+            active = conn.execute(
+                "SELECT COUNT(*) AS count,MIN(expires_at) AS retry_at "
+                "FROM model_route_capacity_leases WHERE route_id=%s AND expires_at>%s",
+                (route_id, now),
+            ).fetchone()
+            if max_inflight and int(active["count"]) >= max_inflight:
+                conn.execute(
+                    "INSERT INTO model_route_capacity_windows(topology_sha256,route_id,"
+                    "window_start,concurrency_rejections,updated_at) VALUES (%s,%s,%s,1,%s) "
+                    "ON CONFLICT(topology_sha256,route_id,window_start) DO UPDATE SET "
+                    "concurrency_rejections=model_route_capacity_windows."
+                    "concurrency_rejections+1,updated_at=EXCLUDED.updated_at",
+                    (topology, route_id, window_start, now),
+                )
+                retry_at = active["retry_at"]
+                return {
+                    "admitted": False,
+                    "reason": "concurrency",
+                    "retry_at": retry_at.isoformat() if retry_at else None,
+                }
+            window = conn.execute(
+                "SELECT COALESCE(SUM(admitted),0) AS admitted "
+                "FROM model_route_capacity_windows WHERE route_id=%s AND window_start=%s",
+                (route_id, window_start),
+            ).fetchone()
+            if requests_per_minute and int(window["admitted"]) >= requests_per_minute:
+                conn.execute(
+                    "INSERT INTO model_route_capacity_windows(topology_sha256,route_id,"
+                    "window_start,rate_rejections,updated_at) VALUES (%s,%s,%s,1,%s) "
+                    "ON CONFLICT(topology_sha256,route_id,window_start) DO UPDATE SET "
+                    "rate_rejections=model_route_capacity_windows.rate_rejections+1,"
+                    "updated_at=EXCLUDED.updated_at",
+                    (topology, route_id, window_start, now),
+                )
+                return {
+                    "admitted": False,
+                    "reason": "rate",
+                    "retry_at": record["window_end"],
+                }
+            conn.execute(
+                "INSERT INTO model_route_capacity_windows(topology_sha256,route_id,window_start,"
+                "admitted,updated_at) VALUES (%s,%s,%s,1,%s) "
+                "ON CONFLICT(topology_sha256,route_id,window_start) DO UPDATE SET "
+                "admitted=model_route_capacity_windows.admitted+1,updated_at=EXCLUDED.updated_at",
+                (topology, route_id, window_start, now),
+            )
+            lease_id = ""
+            if max_inflight:
+                lease_id = record["lease_id"]
+                conn.execute(
+                    "INSERT INTO model_route_capacity_leases(lease_id,topology_sha256,route_id,"
+                    "root_request_id,expires_at,created_at) VALUES (%s,%s,%s,%s,%s,%s)",
+                    (
+                        lease_id,
+                        topology,
+                        route_id,
+                        record["root_request_id"],
+                        record["expires_at"],
+                        now,
+                    ),
+                )
+        return {"admitted": True, "reason": "", "retry_at": None, "lease_id": lease_id}
+
+    def release_model_route_capacity(self, lease_id: str) -> bool:
+        if not lease_id:
+            return False
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM model_route_capacity_leases WHERE lease_id=%s", (lease_id,)
+            )
+        return cursor.rowcount > 0
+
+    def model_route_capacity_stats(
+        self,
+        route_id: str,
+        now: str,
+        window_start: str,
+    ) -> dict[str, Any]:
+        with self._connect() as conn:
+            active = conn.execute(
+                "SELECT COUNT(*) AS active_inflight,MIN(expires_at) AS earliest_expiry "
+                "FROM model_route_capacity_leases WHERE route_id=%s AND expires_at>%s",
+                (route_id, now),
+            ).fetchone()
+            window = conn.execute(
+                "SELECT COALESCE(SUM(admitted),0) AS admitted,"
+                "COALESCE(SUM(concurrency_rejections),0) AS concurrency_rejections,"
+                "COALESCE(SUM(rate_rejections),0) AS rate_rejections "
+                "FROM model_route_capacity_windows WHERE route_id=%s AND window_start=%s",
+                (route_id, window_start),
+            ).fetchone()
+        earliest = active["earliest_expiry"]
+        return {
+            "active_inflight": int(active["active_inflight"]),
+            "earliest_expiry": earliest.isoformat() if earliest else None,
+            "admitted_this_minute": int(window["admitted"]),
+            "concurrency_rejections_this_minute": int(window["concurrency_rejections"]),
+            "rate_rejections_this_minute": int(window["rate_rejections"]),
+        }
+
     def reserve_model_usage(
         self,
         record: dict[str, Any],
@@ -737,7 +863,14 @@ class PostgresTaskStore:
         error_type: str = "",
         error_ref: str = "",
     ) -> bool:
-        if status not in {"success", "failed", "budget-rejected", "shed", "cancelled"}:
+        if status not in {
+            "success",
+            "failed",
+            "budget-rejected",
+            "capacity-rejected",
+            "shed",
+            "cancelled",
+        }:
             raise ValueError("invalid model route shadow status")
         with self._connect() as conn:
             cursor = conn.execute(

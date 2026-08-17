@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.23.0)
+## Current maturity (v0.24.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -17,7 +17,7 @@ It is an execution plan, not a marketing checklist.
 | Production persistence | Implemented advanced baseline | PostgreSQL + Redis Streams, migration CLI, Outbox, ACK/lease/DLQ, isolated backup/restore, queue reconstruction, and mandatory real-service CI; managed PITR remains pending |
 | Graceful lifecycle | Implemented | Readiness drain plus bounded queue drain before Store/plugin shutdown |
 | Multi-tenancy/governance | Implemented baseline | JWT, RBAC, tenant/repository authorization, audit, canary/shadow/rollback |
-| Model governance | Implemented advanced baseline | Replaceable gateway, scoped policy routing/residency, deterministic weighted active routes, bounded fallback, isolated candidate shadows, GitOps promotion gates with offline evidence, per-route breakers, redaction, egress/output limits, total/shadow atomic budgets, metadata-only ledgers, and conservative crash reconciliation; adaptive capacity routing remains pending |
+| Model governance | Implemented advanced baseline | Replaceable gateway, scoped policy routing/residency, deterministic weighted active routes, bounded fallback, isolated candidate shadows, GitOps promotion gates with offline evidence, shared hard capacity leases/rate windows, read-only capacity weight recommendations, per-route breakers, redaction, egress/output limits, total/shadow atomic budgets, metadata-only ledgers, and conservative crash reconciliation; automatic capacity inference remains pending |
 | Strong untrusted execution | Implemented advanced baseline | Replaceable remote Proof Runner, mutually authenticated evidence manifests, container-only jobs, cross-replica Redis nonce claims, dual-key rotation, and pluggable local/S3 Object Lock artifacts; a microVM executor and provider-backed compliance drill remain pending |
 | Service-level operations | Implemented baseline | Fixed-cardinality availability/latency/success SLIs, versioned 30-day SLO catalog, multi-window burn alerts, queue/Outbox age, DLQ depth, dashboard, runbooks, and hardened Prometheus evaluator |
 | HTTP edge security | Implemented baseline | Validated/generated request correlation, explicit client-safe 4xx types, bounded list reads, generic 5xx envelopes, query-free structured access logs, consistent hardening headers, and no interpreter-version disclosure |
@@ -208,8 +208,18 @@ thresholds, no pending observations, and independent evaluation evidence
 digests. Activation remains a reviewed topology change and redeploy rather than
 an API mutation.
 
-Still pending before this item is complete: capacity-aware routing based on
-provider quota/health, automated weight recommendations, and a production
+The v0.24 increment adds declarative max-in-flight and requests-per-minute
+capacity to topology v2. PostgreSQL atomically coordinates leases and fixed
+minute windows across replicas and across rolling topology hashes by stable
+route ID; SQLite provides development-equivalent semantics. Capacity rejects
+happen before budget/provider use and participate in the existing bounded
+fallback budget. Schema version 12 retains content-free lease/counter evidence.
+An administrator report combines live counters and breaker state with normalized
+weight recommendations derived from declared capacity; GitOps remains the only
+mutation path.
+
+Still pending before this item is complete: automatic provider-capacity
+discovery/forecasting, automatically applied weights, and a production
 evaluation corpus. Multi-route support improves dependency resilience but is
 not a claim of regional HA without deployment-level network and capacity proof.
 

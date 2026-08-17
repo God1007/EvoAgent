@@ -554,6 +554,42 @@ MIGRATIONS: tuple[Migration, ...] = (
             SQLiteColumn("model_usage", "topology_sha256", "TEXT"),
         ),
     ),
+    Migration(
+        12,
+        "distributed-model-route-capacity",
+        (
+            """CREATE TABLE IF NOT EXISTS model_route_capacity_leases (
+                lease_id TEXT PRIMARY KEY, topology_sha256 TEXT NOT NULL,
+                route_id TEXT NOT NULL, root_request_id TEXT NOT NULL,
+                expires_at TEXT NOT NULL, created_at TEXT NOT NULL)""",
+            "CREATE INDEX IF NOT EXISTS idx_model_route_capacity_leases "
+            "ON model_route_capacity_leases(route_id,expires_at)",
+            """CREATE TABLE IF NOT EXISTS model_route_capacity_windows (
+                topology_sha256 TEXT NOT NULL, route_id TEXT NOT NULL,
+                window_start TEXT NOT NULL, admitted INTEGER NOT NULL DEFAULT 0,
+                concurrency_rejections INTEGER NOT NULL DEFAULT 0,
+                rate_rejections INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+                PRIMARY KEY(topology_sha256,route_id,window_start))""",
+            "CREATE INDEX IF NOT EXISTS idx_model_route_capacity_windows "
+            "ON model_route_capacity_windows(route_id,window_start)",
+        ),
+        (
+            """CREATE TABLE IF NOT EXISTS model_route_capacity_leases (
+                lease_id TEXT PRIMARY KEY, topology_sha256 TEXT NOT NULL,
+                route_id TEXT NOT NULL, root_request_id TEXT NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL)""",
+            "CREATE INDEX IF NOT EXISTS idx_model_route_capacity_leases "
+            "ON model_route_capacity_leases(route_id,expires_at)",
+            """CREATE TABLE IF NOT EXISTS model_route_capacity_windows (
+                topology_sha256 TEXT NOT NULL, route_id TEXT NOT NULL,
+                window_start TIMESTAMPTZ NOT NULL, admitted BIGINT NOT NULL DEFAULT 0,
+                concurrency_rejections BIGINT NOT NULL DEFAULT 0,
+                rate_rejections BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(topology_sha256,route_id,window_start))""",
+            "CREATE INDEX IF NOT EXISTS idx_model_route_capacity_windows "
+            "ON model_route_capacity_windows(route_id,window_start)",
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1].version

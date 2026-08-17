@@ -14,6 +14,7 @@ task context
   -> enforce estimated input limit
   -> filter active routes by tenant/repository/provider/model/region policy
   -> deterministically weight routes inside each priority tier
+  -> atomically claim shared route concurrency/rate capacity
   -> atomically reserve worst-case token/cost budget for the selected attempt
   -> validate HTTPS and exact destination host
   -> call provider through its independent circuit breaker
@@ -40,14 +41,15 @@ workers cannot both pass a quota check and overspend the same budget.
 
 ## Stored data and access
 
-Schema version 11 stores request id, root request id, route id, attempt number,
+Schema version 12 stores request id, root request id, route id, attempt number,
 tenant/repository/task scope, purpose,
 provider/model, reserved and actual usage, micro-unit cost, redaction count,
 SHA-256 of the redacted canonical request, active/shadow lane, topology hash,
 timestamps, status, and sanitized error text. Shadow observations separately
 store route/scope IDs, input/output hashes, agreement, usage, duration, status,
 and message-free error type/reference. Neither table stores message or response
-content, API keys, or custom provider headers.
+content, API keys, or custom provider headers. Capacity tables contain only
+route/topology/request identifiers, time-bucket counters, and expiring leases.
 
 Administrators can query the current tenant only:
 
@@ -90,6 +92,10 @@ release the conservative charge. Metrics expose expired and reconciled totals.
   the corresponding budget.
 - `EVOAGENT_LLM_RESERVATION_TTL_SECONDS` defaults to 600 and must exceed the
   configured provider/request timeout. Expiry quarantines; it does not forgive cost.
+- `EVOAGENT_LLM_CAPACITY_LEASE_SECONDS` defaults to 180 and must exceed the
+  provider timeout. It bounds crash-held concurrency without cancelling a live call.
+- `EVOAGENT_LLM_CAPACITY_WINDOW_RETENTION_HOURS` defaults to 48 and controls
+  retention of minute counters; it does not change enforcement semantics.
 - cost uses integer micro units. Enabling a cost budget requires at least one
   non-zero input/output price per million tokens.
 - redaction covers common secret assignments, Bearer values, PEM private keys,
@@ -119,6 +125,8 @@ tenant_ids = ["acme"]
 repository_patterns = ["acme/payments-*"]
 input_cost_micros_per_million = 250000
 output_cost_micros_per_million = 1000000
+capacity_max_inflight = 24
+capacity_requests_per_minute = 300
 
 [[routes]]
 id = "eu-fallback"
@@ -134,7 +142,7 @@ repository_patterns = ["acme/payments-*"]
 
 `EVOAGENT_LLM_FALLBACK_ATTEMPTS` is the maximum number of additional routes,
 not total calls. A value of `0` disables fallback. Transport timeouts, 408/425,
-429, 5xx, open circuits, output-contract failures, and route-specific budget
+429, 5xx, open circuits, output-contract failures, and route-capacity
 rejections are eligible. Authentication/validation 4xx errors are not retried
 through another provider. Each route owns a separate circuit breaker; the public
 LLM breaker metric reports the worst **active** route state, so an experimental
@@ -162,6 +170,8 @@ api_key_env = "PROVIDER_A_API_KEY"
 region = "eu-west"
 tenant_ids = ["acme"]
 repository_patterns = ["acme/*"]
+capacity_max_inflight = 24
+capacity_requests_per_minute = 300
 
 [[routes]]
 id = "eu-candidate"
@@ -181,6 +191,8 @@ max_shadow_disagreement_rate = 0.15
 # Replace these valid placeholders with approved immutable evidence digests.
 evaluation_dataset_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 evaluation_report_sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+capacity_max_inflight = 4
+capacity_requests_per_minute = 40
 ```
 
 An active response is completed and accounted before any matching candidate is
@@ -214,6 +226,45 @@ The endpoint never activates a route: promotion requires changing `state` to
 deploying the resulting new topology hash. See
 [`ADR 0021`](adr/0021-gitops-model-route-promotion.md).
 
+### Distributed route capacity (v2)
+
+`capacity_max_inflight` and `capacity_requests_per_minute` are optional hard
+admission ceilings. Zero disables that dimension. Admission occurs before the
+usage reservation and provider call, so a rejected route creates neither a
+provider request nor a misleading usage row. The next already-ordered route may
+run only within `EVOAGENT_LLM_FALLBACK_ATTEMPTS`.
+
+SQLite provides equivalent single-node development behavior. PostgreSQL uses a
+transaction advisory lock plus durable leases and fixed UTC-minute counters, so
+all API/worker replicas share one decision. The stable `route_id` is the
+capacity-pool identity across topology hashes: old and new deployments therefore
+cannot each consume a full allowance during a rolling release. Route IDs must
+not be reused for unrelated provider pools. A dead process's concurrency lease
+expires conservatively; minute admissions are never refunded. Because admission
+precedes budget enforcement, a later budget rejection may consume one rate unit,
+favoring provider protection over maximum utilization.
+
+Administrators can inspect capacity, rejection counters, breaker state, and
+read-only weight recommendations derived from declared capacity:
+
+```bash
+curl 'http://127.0.0.1:8080/api/model-routes/capacity?repository=acme%2Fpayments' \
+  -H 'Authorization: Bearer <admin-token>'
+```
+
+Recommendations normalize all fully-capacity-declared active routes in the same
+priority tier by requests/minute, or by max in-flight when every route declares
+that dimension. They never mutate live topology. Operators review the result,
+change weights in version control, and redeploy. See
+[`ADR 0022`](adr/0022-distributed-model-route-capacity.md).
+
+Because enforcement is global to a provider pool, exact counters on a route
+shared by multiple tenants would reveal cross-tenant activity. The tenant API
+therefore returns `observation_scope=shared-redacted` and only its availability
+for shared routes. Exact counters are returned only when `tenant_ids` binds the
+route to exactly the requesting tenant; platform-wide investigation uses the
+restricted operational database/telemetry boundary.
+
 ## Extension and current boundary
 
 An enterprise deployment can replace plugin id `evoagent.model-gateway` and
@@ -221,4 +272,6 @@ provide the same `ModelGatewayPort`, without changing the review graph. The
 built-in implementation supports declarative selection, residency, bounded
 provider fallback, deterministic weighted routing, isolated candidate shadows,
 GitOps promotion gates, per-route breakers, and conservative crash
-reconciliation. Capacity-aware or automatically adjusted routing is not claimed.
+reconciliation. It also supports database-coordinated capacity fallback and
+declared-capacity weight recommendations. It does not auto-apply weights or infer
+future provider capacity from traffic.

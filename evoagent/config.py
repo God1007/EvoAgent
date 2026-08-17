@@ -80,6 +80,8 @@ class Settings:
     llm_shadow_max_inflight: int = 8
     llm_shadow_daily_token_budget: int = 0
     llm_shadow_daily_cost_micros: int = 0
+    llm_capacity_lease_seconds: int = 180
+    llm_capacity_window_retention_hours: int = 48
     eval_max_cases: int = 5
     eval_min_cases: int = 3
     eval_min_improvement: float = 0.01
@@ -253,6 +255,14 @@ class Settings:
             raise ValueError(
                 "EVOAGENT_LLM_RESERVATION_TTL_SECONDS must exceed EVOAGENT_TIMEOUT_SECONDS"
             )
+        if self.llm_capacity_lease_seconds <= self.timeout_seconds:
+            raise ValueError(
+                "EVOAGENT_LLM_CAPACITY_LEASE_SECONDS must exceed EVOAGENT_TIMEOUT_SECONDS"
+            )
+        if not 1 <= self.llm_capacity_window_retention_hours <= 24 * 30:
+            raise ValueError(
+                "EVOAGENT_LLM_CAPACITY_WINDOW_RETENTION_HOURS must be between 1 and 720"
+            )
         if self.llm_shadow_workers > 32:
             raise ValueError("EVOAGENT_LLM_SHADOW_WORKERS must be at most 32")
         if self.llm_shadow_max_inflight <= 0:
@@ -326,6 +336,10 @@ class Settings:
             ),
             llm_shadow_daily_cost_micros=_non_negative_int(
                 "EVOAGENT_LLM_SHADOW_DAILY_COST_MICROS", 0
+            ),
+            llm_capacity_lease_seconds=_int("EVOAGENT_LLM_CAPACITY_LEASE_SECONDS", 180),
+            llm_capacity_window_retention_hours=_int(
+                "EVOAGENT_LLM_CAPACITY_WINDOW_RETENTION_HOURS", 48
             ),
             eval_max_cases=_int("EVOAGENT_EVAL_MAX_CASES", 5),
             eval_min_cases=_int("EVOAGENT_EVAL_MIN_CASES", 3),

@@ -14,11 +14,11 @@ from evoagent.evaluation_benchmark import (  # noqa: E402
     candidate_reviewer,
     generate_controlled_pr_cases,
 )
+from evoagent.evaluation_dataset import load_jsonl  # noqa: E402
 from evoagent.evaluation_harness import (  # noqa: E402
     EndToEndEvaluationHarness,
     FixtureRepairer,
     comparison_summary,
-    load_jsonl,
 )
 
 
@@ -37,6 +37,14 @@ def markdown_report(baseline, candidate, comparison):
     b = baseline["metrics"]
     c = candidate["metrics"]
     dataset = candidate["dataset"]
+    provenance = dataset.get("provenance") or {}
+    source_note = (
+        "> 注意：本次离线数据是受控合成基准，用于验证评测代码和计算口径，"
+        "不能表述为真实公开 PR 的生产效果。"
+        if dataset["source_kinds"] == ["synthetic-controlled"]
+        else "> 生产数据证据门禁：%s；详见 JSON 报告中的逐项 provenance audit。"
+        % ("PASS" if provenance.get("production_ready") else "BLOCKED")
+    )
     lines = [
         "# EvoAgent 端到端 Evaluation Harness 报告",
         "",
@@ -48,8 +56,7 @@ def markdown_report(baseline, candidate, comparison):
         "- 来源标记：`%s`" % ", ".join(dataset["source_kinds"]),
         "- SHA-256：`%s`" % dataset["sha256"],
         "",
-        "> 注意：本次离线数据是受控合成基准，用于验证评测代码和计算口径，"
-        "不能表述为 100 个真实公开 PR 的生产效果。",
+        source_note,
         "",
         "## 总体结果",
         "",
@@ -111,6 +118,80 @@ def markdown_report(baseline, candidate, comparison):
     lines.extend(
         [
             "",
+            "## 质量切片与置信度",
+            "",
+            "| 语言 | 样本 | Precision | Recall | F1 |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    )
+    for language, metrics in candidate["by_language"].items():
+        lines.append(
+            "| %s | %d | %s | %s | %s |"
+            % (
+                language,
+                metrics["cases"],
+                percent(metrics["precision"]),
+                percent(metrics["recall"]),
+                percent(metrics["f1"]),
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "| CWE | Expected | Predicted | Precision | Recall | F1 |",
+            "|---|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for cwe, metrics in candidate["by_cwe"].items():
+        lines.append(
+            "| %s | %d | %d | %s | %s | %s |"
+            % (
+                cwe,
+                metrics["expected"],
+                metrics["predicted"],
+                percent(metrics["precision"]),
+                percent(metrics["recall"]),
+                percent(metrics["f1"]),
+            )
+        )
+    lines.extend(
+        [
+            "",
+            "| Rule | Predicted | TP/FP | Precision | Mean confidence |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    )
+    for rule, metrics in candidate["by_rule"].items():
+        mean_confidence = metrics["mean_confidence"]
+        lines.append(
+            "| %s | %d | %d/%d | %s | %s |"
+            % (
+                rule,
+                metrics["predicted"],
+                metrics["tp"],
+                metrics["fp"],
+                percent(metrics["precision"]),
+                percent(mean_confidence) if mean_confidence is not None else "—",
+            )
+        )
+    calibration = candidate["confidence_calibration"]
+    ece = calibration["expected_calibration_error"]
+    brier = calibration["brier_score"]
+    lines.extend(
+        [
+            "",
+            "置信度口径仅衡量已报告 finding 是否正确：ECE=%s，Brier=%s，"
+            "非法置信度=%d。"
+            % (
+                percent(ece) if ece is not None else "—",
+                "%.4f" % brier if brier is not None else "—",
+                calibration["invalid_confidences"],
+            ),
+        ]
+    )
+    lines.extend(
+        [
+            "",
             "## 指标口径",
             "",
             "- 一对一匹配：路径相同、CWE 相同，预测行位于标注区间或距离不超过 2 行。",
@@ -152,6 +233,10 @@ def main():
     )
     parser.add_argument("--output-dir", default=os.path.join(ROOT, "output", "evaluation"))
     parser.add_argument(
+        "--annotation-evidence",
+        help="Sidecar JSON emitted by evoagent-eval-labels for production provenance gating",
+    )
+    parser.add_argument(
         "--reuse-dataset",
         action="store_true",
         help="Load the existing JSONL instead of regenerating the controlled corpus.",
@@ -164,13 +249,26 @@ def main():
         cases = generate_controlled_pr_cases()
         write_jsonl(args.dataset, cases)
 
-    baseline = EndToEndEvaluationHarness().run(baseline_reviewer(), cases, "single-agent-baseline")
+    annotation_evidence = None
+    if args.annotation_evidence:
+        with open(args.annotation_evidence, encoding="utf-8") as handle:
+            annotation_evidence = json.load(handle)
+
+    baseline = EndToEndEvaluationHarness().run(
+        baseline_reviewer(),
+        cases,
+        "single-agent-baseline",
+        annotation_evidence,
+    )
     candidate = EndToEndEvaluationHarness(repairer=FixtureRepairer()).run(
-        candidate_reviewer(), cases, "multi-agent-candidate"
+        candidate_reviewer(),
+        cases,
+        "multi-agent-candidate",
+        annotation_evidence,
     )
     comparison = comparison_summary(baseline, candidate)
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "baseline": baseline,
         "candidate": candidate,
         "comparison": comparison,

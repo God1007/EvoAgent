@@ -51,6 +51,7 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **可观测性** | 任务 Trace、Agent 消息、Prometheus 指标和 OpenTelemetry Trace |
 | **SLO 与告警** | 版本化 30 天 SLO、错误预算、快/慢燃烧率告警、Queue/Outbox 新鲜度、Grafana Dashboard 与处置 Runbook |
 | **灾备证据** | SQLite/PostgreSQL 执行隔离恢复与 RPO/RTO 校验，并可从 PostgreSQL/Outbox 向全新 Redis 离线重建未完成任务 |
+| **质量证据治理** | 双人盲标与独立裁决、标注包/数据集哈希、许可与来源审计、仓库隔离、语言/CWE/Rule 切片及置信度校准 |
 | **Web 控制台** | 提供运行总览、发起审查、任务中心、Skill 管理、演进实验室和 GitHub 配置页面 |
 
 ## 工作原理
@@ -466,9 +467,11 @@ flowchart TB
 - 严重级别准确率；
 - 高风险召回率；
 - 干净样本准确率；
-- 执行成功率。
+- 执行成功率；
+- 按语言、CWE 与 Rule 的切片指标；
+- finding 置信度的 ECE、Brier 与非法值计数。
 
-只有验证集达到最小提升，且验证集与隐藏集的受保护指标没有超过允许退化范围时，候选版本才能激活。评测记录包含 Prompt 和数据集 SHA-256 指纹；Holdout 只持久化聚合指标，不通过 API 暴露案例内容。
+只有基线与候选使用完全相同的数据集、验证集达到最小提升，且验证集与隐藏集的受保护指标没有超过允许退化范围时，候选版本才能激活。真实数据还必须通过许可审查、不可变 GitHub 来源、仓库隔离、双人盲标、独立裁决和 sidecar 哈希绑定；只修改来源字段不能绕过门禁。评测记录包含 Prompt 和数据集 SHA-256 指纹；Holdout 只持久化聚合指标，不通过 API 暴露案例内容。
 
 没有配置 LLM、数据不足或安全完整性检查未通过时，候选只会保存为 `deferred` 或 `rejected`，不会直接上线。
 
@@ -881,7 +884,7 @@ make check
 
 当前整体行覆盖率约 85%，其中 `fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
 
-GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16 与 Redis 7，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离、远程 Proof Runner 的签名 HTTP → 禁网容器全链路、PostgreSQL 隔离备份恢复、空 Redis 任务重建，以及生产镜像的 `/ready` → Outbox → Redis → Worker 流程。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；后续架构决策记录在 [`docs/adr/`](docs/adr/)，模型治理见 [`ADR 0007`](docs/adr/0007-governed-model-gateway.md)，远程证据边界见 [`ADR 0009`](docs/adr/0009-authenticated-remote-proof-runner.md)，数据库恢复边界见 [`ADR 0011`](docs/adr/0011-isolated-database-recovery-drills.md) 与 [`ADR 0012`](docs/adr/0012-offline-queue-reconstruction.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
+GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16 与 Redis 7，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离、远程 Proof Runner 的签名 HTTP → 禁网容器全链路、PostgreSQL 隔离备份恢复、空 Redis 任务重建，以及生产镜像的 `/ready` → Outbox → Redis → Worker 流程。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；后续架构决策记录在 [`docs/adr/`](docs/adr/)，模型治理见 [`ADR 0007`](docs/adr/0007-governed-model-gateway.md)，远程证据边界见 [`ADR 0009`](docs/adr/0009-authenticated-remote-proof-runner.md)，数据库恢复边界见 [`ADR 0011`](docs/adr/0011-isolated-database-recovery-drills.md) 与 [`ADR 0012`](docs/adr/0012-offline-queue-reconstruction.md)，独立评测证据见 [`ADR 0013`](docs/adr/0013-independent-evaluation-evidence.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
 
 更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，仓库策略见 [`docs/repository-policies.md`](docs/repository-policies.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)，SLO 告警与处置见 [`docs/operations.md`](docs/operations.md)，数据库灾备见 [`docs/disaster-recovery.md`](docs/disaster-recovery.md)，性能压测方法与可复现基线见 [`docs/performance.md`](docs/performance.md) 与 [`docs/performance-baseline.md`](docs/performance-baseline.md)。
 
@@ -921,6 +924,25 @@ python scripts/run_e2e_evaluation.py
 ```bash
 python scripts/run_e2e_evaluation.py --reuse-dataset
 ```
+
+真实公共 PR 数据先导入不含答案的案例，由至少两人盲标并经第三人裁决，再编译为带
+sidecar 证据的数据集：
+
+```bash
+python scripts/import_github_pr_dataset.py public-pr-manifest.jsonl public-pr-inputs.jsonl
+evoagent-eval-labels \
+  --cases public-pr-inputs.jsonl \
+  --annotations annotation-packets.jsonl \
+  --output public-pr-labelled.jsonl \
+  --evidence annotation-evidence.json
+python scripts/run_e2e_evaluation.py \
+  --reuse-dataset --dataset public-pr-labelled.jsonl \
+  --annotation-evidence annotation-evidence.json
+```
+
+详细数据协议、权利审查字段和门禁见
+[`docs/evaluation.md`](docs/evaluation.md)。原始标注包可能包含内部身份映射，应存放在受控
+数据域；评测数据只保存匿名 reviewer ID 和 SHA-256。
 
 报告会写入：
 

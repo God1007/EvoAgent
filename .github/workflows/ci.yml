@@ -44,6 +44,18 @@ jobs:
             prom/prometheus:v3.5.0 check rules /rules/evoagent.rules.yml
       - name: Test with coverage gate
         run: python -m pytest --cov=evoagent --cov-report=term-missing --cov-report=xml
+      - name: Reproduce controlled evaluation evidence
+        run: |
+          python scripts/run_e2e_evaluation.py --reuse-dataset
+          python -c "import json; d=json.load(open('output/evaluation/evaluation-report.json')); c=d['candidate']; g=d['comparison']['release_gate']; assert d['schema_version']==2; assert c['schema_version']==2; assert c['dataset']['sha256']=='844b6d45c3de39c6c1d8080067bb77900a7234a68891c264f5833b6abdf6e770'; assert g['quantitative_passed']; assert not g['production_activation_allowed']; assert c['confidence_calibration']['invalid_confidences']==0"
+      - name: Retain synthetic evaluation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-evaluation-evidence
+          path: output/evaluation/evaluation-report.*
+          if-no-files-found: warn
+          retention-days: 14
       - name: Build distributions
         run: python -m build
       - name: Smoke-test the installed wheel and packaged resources
@@ -75,6 +87,7 @@ jobs:
           "$wheel_env/bin/evoagent-slo" --help >/dev/null
           "$wheel_env/bin/evoagent-dr" --help >/dev/null
           "$wheel_env/bin/evoagent-recover-queue" --help >/dev/null
+          "$wheel_env/bin/evoagent-eval-labels" --help >/dev/null
           "$wheel_env/bin/evoagent-migrate" | grep -q '"schema_version": 8'
           kill -TERM "$wheel_pid"
           wait "$wheel_pid"

@@ -8,12 +8,13 @@ Reproducible snapshot of the end-to-end evaluation harness. Regenerate with
 
 | Field | Value |
 | --- | --- |
-| EvoAgent version | 0.6.0 |
+| EvoAgent version | 0.15.0 |
 | Python | 3.12 |
 | Dependencies | pinned via `requirements.lock` (hash-locked) |
 | Dataset | `evaluation_data/pr_diff_100.jsonl` |
 | Dataset semantic SHA-256 | `844b6d45c3de39c6c1d8080067bb77900a7234a68891c264f5833b6abdf6e770` |
 | Corpus kind | `synthetic-controlled` (not real production PRs) |
+| Evaluation report schema | 2 |
 
 ## Dataset
 
@@ -46,6 +47,18 @@ repair gates; 5 detected but ambiguous/non-whitelisted risks safely abstained;
 | Validation | 80 | 32/48 | 83.6% | 100.0% | 89.6% |
 | Holdout | 20 | 8/12 | 76.9% | 66.7% | 100.0% |
 
+## Slices and confidence calibration
+
+- Language slice: all 100 controlled cases are Python, so Python F1 is 82.5%.
+  This corpus provides no cross-language performance evidence.
+- The report now emits per-CWE expected/predicted/TP/FP/FN metrics and per-rule
+  precision. Important visible weaknesses include zero recall on CWE-117,
+  CWE-362, CWE-367, CWE-400, CWE-601, and CWE-682; CWE-798 precision is 44.4%.
+- All 40 reported finding confidences are structurally valid. Finding-correctness
+  ECE is 11.7% and Brier score is 0.1571. All predictions currently land in the
+  0.9–1.0 bin (mean confidence 94.2%, observed precision 82.5%), so the candidate
+  is measurably over-confident even though its aggregate F1 improves.
+
 ## Release gate
 
 - Quantitative gate: **PASS**
@@ -56,10 +69,18 @@ repair gates; 5 detected but ambiguous/non-whitelisted risks safely abstained;
 | Gate | Result |
 | --- | --- |
 | `validation_f1_improvement` | PASS |
+| `same_dataset` | PASS |
 | `high_risk_recall_non_regression` | PASS |
 | `clean_accuracy_non_regression` | PASS |
 | `holdout_f1_non_regression` | PASS |
 | `execution_success` | PASS |
+| `confidence_validity` | PASS |
 | `safe_fix_rate` | PASS |
 | `e2e_security_fix_rate` | PASS |
 | `production_data_provenance` | FAIL (expected on synthetic corpus) |
+
+The provenance audit passes sample size, unique content, repository-disjoint
+splits, and holdout coverage. It intentionally fails immutable public-source,
+usage-rights, independent-blind-annotation, single-protocol, and sidecar-binding
+checks. These failures prevent synthetic results from being promoted by merely
+changing a source label.

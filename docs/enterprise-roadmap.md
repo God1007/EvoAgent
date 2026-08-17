@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.14.0)
+## Current maturity (v0.15.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -20,7 +20,7 @@ It is an execution plan, not a marketing checklist.
 | Model governance | Implemented advanced baseline | Replaceable gateway, scoped policy routing/residency, bounded fallback, per-route breakers, redaction, egress/output limits, atomic budgets, correlated metadata-only ledger; route shadow promotion remains pending |
 | Strong untrusted execution | Implemented baseline | Replaceable remote Proof Runner, mutually authenticated evidence manifests, container-only jobs, replay/size/capacity gates, and content-addressed artifacts; microVM and distributed replay store remain pending |
 | Service-level operations | Implemented baseline | Fixed-cardinality availability/latency/success SLIs, versioned 30-day SLO catalog, multi-window burn alerts, queue/Outbox age, DLQ depth, dashboard, runbooks, and hardened Prometheus evaluator |
-| Quality evidence | Synthetic benchmark only | 100-case controlled corpus; production activation gate remains blocked without independent labels |
+| Quality evidence | Governance baseline implemented | Reproducible synthetic regression plus blind dual-annotation/adjudication compiler, rights/content/split/evidence audit, per-language/CWE/rule slices, and confidence calibration; production gate remains blocked until a real approved corpus is supplied |
 | HA/DR operational proof | Implemented recovery baseline | SQLite/PostgreSQL isolated restore validates schema/content/application/RPO/RTO; an offline audited epoch reconstructs incomplete PostgreSQL/Outbox intent only into empty Redis and is proven against real CI services; managed PITR and regional routing exercise remain pending |
 
 ## Phase 2 — Ports, persistence, and integration proof
@@ -272,15 +272,26 @@ of full regional DR readiness.
 
 ## Phase 6 — Independent quality evidence
 
-- import a legally usable public PR dataset with independent labels;
-- keep repository-disjoint validation/holdout splits;
-- blind-review a sample with at least two annotators and record agreement;
-- report per-language, per-rule, and confidence-calibration metrics;
-- preserve the synthetic corpus for deterministic regression, but never combine
-  its metrics with production observations.
+Implemented governance baseline:
 
-The existing `production_data_provenance` gate stays blocked until this phase is
-complete.
+- the public-PR importer emits answer-free, content-addressed inputs with a
+  human rights-review record;
+- `evoagent-eval-labels` requires at least two blind independent annotations and
+  a separate adjudicator, validates labels against added lines, computes
+  agreement, and emits reproducible dataset/annotation hashes;
+- production provenance checks repository-disjoint splits, holdout coverage,
+  unique content, immutable GitHub source, approved usage basis, one annotation
+  protocol, and exact sidecar binding;
+- reports include per-language, per-CWE, per-rule, ECE, Brier, and invalid
+  confidence metrics; baseline and candidate must use the same dataset hash;
+- the synthetic corpus remains a separate deterministic regression benchmark.
+
+Still pending: acquire and human-review a legally usable public PR sample,
+complete independent annotation/adjudication, and retain the resulting private
+raw packets plus public-safe sidecar under the organization's data-retention
+policy. `production_data_provenance` remains blocked until that real evidence is
+provided; metadata alone cannot bypass it. See
+[`ADR 0013`](adr/0013-independent-evaluation-evidence.md).
 
 ## Recommended execution order
 

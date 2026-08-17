@@ -27,7 +27,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Evidence | `evoagent/proof.py`, `proof_remote.py` | L1–L4 grading plus authenticated local/remote execution and attestations |
 | Delivery | `evoagent/report.py` | Injection-safe markdown report rendering |
 | Evolution | `evoagent/evolution.py`, `rollout.py` | Prompt versioning, validation/holdout replay, canary/shadow, rollback |
-| Evolution | `evoagent/evaluation_harness.py`, `evaluation_benchmark.py` | Replay scoring, benchmark dataset |
+| Evolution | `evoagent/evaluation_harness.py`, `evaluation_dataset.py`, `evaluation_provenance.py`, `evaluation_metrics.py`, `evaluation_labels.py`, `evaluation_benchmark.py` | Blind-label compilation, evidence audit, replay orchestration, replaceable slices, and calibration |
 | Storage | `evoagent/store.py`, `postgres_store.py` | Task/finding/feedback/version/audit persistence |
 | Policy | `evoagent/policy.py` | Versioned tenant/repository execution and publication decisions |
 | Storage | `evoagent/migrations.py` | Locked, checksummed SQLite/PostgreSQL schema history and compatibility gate |
@@ -37,6 +37,11 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Operations | `evoagent/dr.py`, `recovery.py` | Isolated database restore evidence and offline PostgreSQL-to-Redis task reconstruction |
 | Model | `evoagent/models.py` | `Finding`, `Severity`, `ReviewReport`, stable fingerprints |
 | Adapters | `evoagent/github.py`, `diff_parser.py` | Hardened GitHub client, unified-diff parsing |
+
+Evaluation is a separate evidence boundary: acquisition contains no answers,
+annotation is blind and independent, adjudication is a different role, and only
+the compiler sidecar can bind labels to a production gate. See
+[`ADR 0013`](adr/0013-independent-evaluation-evidence.md).
 
 ## 2. Review data flow
 

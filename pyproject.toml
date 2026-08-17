@@ -50,6 +50,7 @@ evoagent-proof-runner = "evoagent.proof_remote:run"
 evoagent-slo = "evoagent.slo:run"
 evoagent-dr = "evoagent.dr:run"
 evoagent-recover-queue = "evoagent.recovery:run"
+evoagent-eval-labels = "evoagent.evaluation_labels:run"
 
 [project.urls]
 Homepage = "https://github.com/God1007/EvoAgent"

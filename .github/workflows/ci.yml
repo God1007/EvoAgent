@@ -247,7 +247,18 @@ jobs:
           docker exec evoagent-redis-cluster redis-cli --cluster create \
             127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 \
             --cluster-replicas 0 --cluster-yes
-          docker exec evoagent-redis-cluster redis-cli -p 7000 cluster info | grep -q 'cluster_state:ok'
+          for attempt in $(seq 1 30); do
+            if docker exec evoagent-redis-cluster redis-cli -p 7000 cluster info \
+              | grep -q 'cluster_state:ok'; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              docker exec evoagent-redis-cluster redis-cli -p 7000 cluster info
+              docker logs evoagent-redis-cluster
+              exit 1
+            fi
+            sleep 1
+          done
       - name: Run Redis Cluster queue and recovery contracts
         env:
           EVOAGENT_TEST_REDIS_CLUSTER_URL: redis://127.0.0.1:7000/0

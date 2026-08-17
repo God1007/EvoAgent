@@ -389,6 +389,12 @@ class _StoreBehaviorContract:
         usage = self.store.list_model_usage(tenant_id, repository, 10)
         self.assertEqual({first, second}, {item["request_id"] for item in usage})
         self.assertEqual({"success", "failed"}, {item["status"] for item in usage})
+        self.assertTrue(all(item["root_request_id"] == item["request_id"] for item in usage))
+        self.assertTrue(all(item["attempt"] == 1 for item in usage))
+        self.assertEqual(
+            {"contract-model-a"},
+            {item["route_id"] for item in usage},
+        )
 
     def test_concurrent_model_budget_reservations_cannot_overspend(self):
         tenant_id = self.unique("concurrent-model-tenant")

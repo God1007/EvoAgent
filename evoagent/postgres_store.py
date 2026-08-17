@@ -327,12 +327,15 @@ class PostgresTaskStore:
             ):
                 return False
             conn.execute(
-                "INSERT INTO model_usage(request_id,tenant_id,repository,task_id,purpose,"
-                "provider,model,status,reserved_tokens,reserved_cost_micros,redactions,"
-                "request_sha256,created_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,'reserved',%s,%s,%s,%s,%s)",
+                "INSERT INTO model_usage(request_id,root_request_id,route_id,attempt,tenant_id,"
+                "repository,task_id,purpose,provider,model,status,reserved_tokens,"
+                "reserved_cost_micros,redactions,request_sha256,created_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'reserved',%s,%s,%s,%s,%s)",
                 (
                     record["request_id"],
+                    record.get("root_request_id") or record["request_id"],
+                    record.get("route_id") or "%s-%s" % (record["provider"], record["model"]),
+                    record.get("attempt", 1),
                     record["tenant_id"],
                     record["repository"],
                     record.get("task_id"),

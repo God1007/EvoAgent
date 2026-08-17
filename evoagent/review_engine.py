@@ -5,6 +5,7 @@ from __future__ import annotations
 from .agents import FilteredAgent, MultiAgentCoordinator
 from .config import Settings
 from .harness import ReviewHarness
+from .model_gateway import ModelGovernanceContext
 from .observability import Observability
 from .ports import ModelGatewayPort, ReviewWorkflowStorePort
 from .reviewer import GatewayReviewer, LocalRuleReviewer, Reviewer
@@ -60,11 +61,18 @@ class ReviewEngine:
             raise RuntimeError("no LLM provider is configured")
         return GatewayReviewer(self.model_gateway, self._task_context, prompt)
 
-    def _task_context(self, task_id: str) -> tuple[str, str]:
+    def _task_context(self, task_id: str) -> ModelGovernanceContext:
         task = self.store.get(task_id) if task_id else None
         if not task:
             raise ValueError("model review task context is unavailable")
-        return str(task.get("tenant_id") or "default"), str(task["repository"])
+        snapshot = ((task.get("input") or {}).get("repository_policy") or {}).get("policy") or {}
+        return ModelGovernanceContext(
+            tenant_id=str(task.get("tenant_id") or "default"),
+            repository=str(task["repository"]),
+            allowed_providers=tuple(snapshot.get("allowed_llm_providers") or ()),
+            allowed_models=tuple(snapshot.get("allowed_llm_models") or ()),
+            required_region=str(snapshot.get("llm_region") or ""),
+        )
 
     def build_coordinator(self, reviewers: list[Reviewer]) -> MultiAgentCoordinator:
         return MultiAgentCoordinator(reviewers, store=self.store)

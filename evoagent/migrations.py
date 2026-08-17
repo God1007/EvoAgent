@@ -418,6 +418,21 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX IF NOT EXISTS idx_model_usage_task ON model_usage(task_id,created_at)",
         ),
     ),
+    Migration(
+        7,
+        "model-route-attempt-correlation",
+        (),
+        (
+            "ALTER TABLE model_usage ADD COLUMN IF NOT EXISTS root_request_id TEXT",
+            "ALTER TABLE model_usage ADD COLUMN IF NOT EXISTS route_id TEXT",
+            "ALTER TABLE model_usage ADD COLUMN IF NOT EXISTS attempt INTEGER NOT NULL DEFAULT 1",
+        ),
+        (
+            SQLiteColumn("model_usage", "root_request_id", "TEXT"),
+            SQLiteColumn("model_usage", "route_id", "TEXT"),
+            SQLiteColumn("model_usage", "attempt", "INTEGER NOT NULL DEFAULT 1"),
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1].version

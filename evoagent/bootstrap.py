@@ -42,6 +42,7 @@ from .model_gateway import (
     ModelGatewayOptions,
     ModelRoute,
     OpenAICompatibleModelProvider,
+    load_model_routes,
 )
 from .observability import AlertManager, Observability
 from .plugins import (
@@ -322,35 +323,56 @@ def _observability(context: PluginContext) -> Observability:
 
 def _model_gateway(context: PluginContext) -> EnterpriseModelGateway:
     settings = context.require(SETTINGS)
-    config = settings.resolved_llm()
-    route = (
-        ModelRoute(
-            provider=str(config["provider"]),
-            model=str(config["model"]),
-            base_url=str(config["base_url"]),
-            api_key=str(config["api_key"]),
-            headers=dict(config.get("headers") or {}),
-            input_cost_micros_per_million=settings.llm_input_cost_micros_per_million,
-            output_cost_micros_per_million=settings.llm_output_cost_micros_per_million,
+    if settings.llm_routes_file:
+        routes = load_model_routes(settings.llm_routes_file)
+    else:
+        config = settings.resolved_llm()
+        routes = (
+            (
+                ModelRoute(
+                    provider=str(config["provider"]),
+                    model=str(config["model"]),
+                    base_url=str(config["base_url"]),
+                    api_key=str(config["api_key"]),
+                    headers=dict(config.get("headers") or {}),
+                    input_cost_micros_per_million=settings.llm_input_cost_micros_per_million,
+                    output_cost_micros_per_million=settings.llm_output_cost_micros_per_million,
+                    route_id="default",
+                ),
+            )
+            if config
+            else ()
         )
-        if config
-        else None
-    )
-    provider = OpenAICompatibleModelProvider(
-        settings.llm_allowed_hosts,
-        settings.timeout_seconds,
-        breaker=context.require(LLM_BREAKER),
-    )
+    providers = {}
+    primary_breaker = context.require(LLM_BREAKER)
+    for index, route in enumerate(routes):
+        breaker = (
+            primary_breaker
+            if index == 0
+            else CircuitBreaker(
+                "llm:%s" % (route.route_id or index),
+                settings.breaker_failure_threshold,
+                settings.breaker_reset_seconds,
+            )
+        )
+        providers[route.route_id or "%s-%s" % (route.provider, route.model)] = (
+            OpenAICompatibleModelProvider(
+                settings.llm_allowed_hosts,
+                settings.timeout_seconds,
+                breaker=breaker,
+            )
+        )
     return EnterpriseModelGateway(
         context.require(STORE),
-        route,
-        provider,
+        routes,
+        providers,
         ModelGatewayOptions(
             allowed_hosts=settings.llm_allowed_hosts,
             max_input_tokens=settings.llm_max_input_tokens,
             max_output_tokens=settings.llm_max_output_tokens,
             daily_token_budget=settings.llm_daily_token_budget,
             daily_cost_micros=settings.llm_daily_cost_micros,
+            fallback_attempts=settings.llm_fallback_attempts,
         ),
     )
 

@@ -12,9 +12,11 @@ task context
   -> redact likely credentials
   -> canonicalize + hash (content is not persisted)
   -> enforce estimated input limit
-  -> atomically reserve worst-case token/cost budget
+  -> filter ordered routes by tenant/repository/provider/model/region policy
+  -> atomically reserve worst-case token/cost budget for the selected attempt
   -> validate HTTPS and exact destination host
-  -> call provider through the circuit breaker
+  -> call provider through its independent circuit breaker
+  -> use a bounded fallback route only for an eligible failure
   -> enforce response byte/token limits and JSON-object output
   -> reconcile durable usage to actual values or record sanitized failure
 ```
@@ -34,7 +36,8 @@ workers cannot both pass a quota check and overspend the same budget.
 
 ## Stored data and access
 
-Schema version 6 stores request id, tenant/repository/task scope, purpose,
+Schema version 7 stores request id, root request id, route id, attempt number,
+tenant/repository/task scope, purpose,
 provider/model, reserved and actual usage, micro-unit cost, redaction count,
 SHA-256 of the redacted canonical request, timestamps, status, and sanitized
 error text. It does **not** store message or response content, API keys, or
@@ -60,11 +63,52 @@ curl 'http://127.0.0.1:8080/api/model-usage?repository=acme%2Fpayments&limit=100
   and configured route credentials in errors. It is a guardrail, not a complete
   data-loss-prevention engine.
 
+### Multi-route topology
+
+Set `EVOAGENT_LLM_ROUTES_FILE` to a trusted version-1 TOML file. Routes are
+ordered by ascending priority. Secret values are never stored in TOML; each
+route names an environment variable through `api_key_env`.
+
+```toml
+version = 1
+
+[[routes]]
+id = "eu-primary"
+priority = 10
+provider = "provider-a"
+model = "model-a"
+base_url = "https://eu-a.example/v1"
+api_key_env = "PROVIDER_A_API_KEY"
+region = "eu-west"
+tenant_ids = ["acme"]
+repository_patterns = ["acme/payments-*"]
+input_cost_micros_per_million = 250000
+output_cost_micros_per_million = 1000000
+
+[[routes]]
+id = "eu-fallback"
+priority = 20
+provider = "provider-b"
+model = "model-b"
+base_url = "https://eu-b.example/v1"
+api_key_env = "PROVIDER_B_API_KEY"
+region = "eu-west"
+tenant_ids = ["acme"]
+repository_patterns = ["acme/payments-*"]
+```
+
+`EVOAGENT_LLM_FALLBACK_ATTEMPTS` is the maximum number of additional routes,
+not total calls. A value of `0` disables fallback. Transport timeouts, 408/425,
+429, 5xx, open circuits, output-contract failures, and route-specific budget
+rejections are eligible. Authentication/validation 4xx errors are not retried
+through another provider. Each route owns a separate circuit breaker; the public
+LLM breaker metric reports the worst route state.
+
 ## Extension and current boundary
 
 An enterprise deployment can replace plugin id `evoagent.model-gateway` and
 provide the same `ModelGatewayPort`, without changing the review graph. The
-built-in v0.9 implementation has one configured primary route. Declarative
-multi-route selection, provider/region fallback, per-route breakers, route
-shadowing, residency decisions, and stale-reservation reconciliation are not
-yet claimed; they remain the next model-routing increment.
+built-in v0.10 implementation supports declarative selection, residency,
+bounded provider fallback, and per-route breakers. Candidate-route shadowing
+and promotion, weighted load balancing, and stale-reservation reconciliation
+are not yet claimed.

@@ -89,6 +89,39 @@ class RepositoryPolicyTests(unittest.TestCase):
                 with self.assertRaises(error):
                     self.resolver.authorize_review(baseline, size, reviewer, provider, model)
 
+    def test_route_aware_authorization_accepts_only_an_eligible_region_and_model(self):
+        policy = RepositoryPolicy.from_dict(
+            {
+                "allowed_llm_providers": ["provider-b"],
+                "allowed_llm_models": ["model-b"],
+                "llm_region": "eu-west",
+            }
+        )
+        routes = (
+            {"provider": "provider-a", "model": "model-a", "region": "us-east"},
+            {"provider": "provider-b", "model": "model-b", "region": "eu-west"},
+        )
+        self.resolver.authorize_review(policy, 10, "reviewer", "provider-a", "model-a", routes)
+
+        with self.assertRaisesRegex(PermissionError, "no configured model route"):
+            self.resolver.authorize_review(
+                policy,
+                10,
+                "reviewer",
+                "provider-a",
+                "model-a",
+                (routes[0],),
+            )
+        with self.assertRaisesRegex(PermissionError, "no configured model route"):
+            self.resolver.authorize_review(
+                RepositoryPolicy(),
+                10,
+                "reviewer",
+                "provider-a",
+                "model-a",
+                (),
+            )
+
     def test_fix_authorization_returns_only_policy_allowlist(self):
         policy = RepositoryPolicy.from_dict(
             {"auto_fix": True, "allowed_fix_rules": ["SEC-YAML-LOAD"]}

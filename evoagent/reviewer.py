@@ -7,7 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .diff_parser import ParsedDiff
-from .model_gateway import ModelMessage, ModelRequest
+from .model_gateway import ModelGovernanceContext, ModelMessage, ModelRequest
 from .models import Finding, Severity
 from .ports import ModelGatewayPort
 
@@ -286,7 +286,7 @@ class GatewayReviewer(Reviewer):
     def __init__(
         self,
         gateway: ModelGatewayPort,
-        task_context: Callable[[str], tuple[str, str]],
+        task_context: Callable[[str], ModelGovernanceContext],
         system_prompt: str = "",
     ):
         self.gateway = gateway
@@ -296,28 +296,35 @@ class GatewayReviewer(Reviewer):
         self.name = "%s:%s" % (route.get("provider", "model"), route.get("model", "unknown"))
 
     def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
-        return self._review("", "system", "evaluation", "evaluation", diff, parsed)
+        return self._review(
+            "",
+            ModelGovernanceContext("system", "evaluation"),
+            "evaluation",
+            diff,
+            parsed,
+        )
 
     def review_with_context(self, task_id: str, diff: str, parsed: ParsedDiff) -> list[Finding]:
-        tenant_id, repository = self.task_context(task_id)
-        return self._review(task_id, tenant_id, repository, "review", diff, parsed)
+        return self._review(task_id, self.task_context(task_id), "review", diff, parsed)
 
     def _review(
         self,
         task_id: str,
-        tenant_id: str,
-        repository: str,
+        context: ModelGovernanceContext,
         purpose: str,
         diff: str,
         parsed: ParsedDiff,
     ) -> list[Finding]:
         response = self.gateway.complete(
             ModelRequest(
-                tenant_id=tenant_id,
-                repository=repository,
+                tenant_id=context.tenant_id,
+                repository=context.repository,
                 task_id=task_id,
                 purpose=purpose,
                 messages=_review_messages(diff, self.system_prompt),
+                allowed_providers=context.allowed_providers,
+                allowed_models=context.allowed_models,
+                required_region=context.required_region,
             )
         )
         return _parse_model_findings(response.content, parsed)

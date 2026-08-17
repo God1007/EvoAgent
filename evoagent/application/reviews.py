@@ -55,6 +55,7 @@ class ReviewUseCases:
         code_host_for_installation: Callable[[int | None], CodeHostPort],
         publish_event: Callable[[str, dict[str, Any]], None],
         options: ReviewOptions,
+        model_routes: Callable[[str, str], tuple[dict[str, str], ...] | None] | None = None,
     ):
         self.store = store
         self.policies = policies
@@ -70,6 +71,7 @@ class ReviewUseCases:
         self.code_host_for_installation = code_host_for_installation
         self.publish_event = publish_event
         self.options = options
+        self.model_routes = model_routes or (lambda _tenant_id, _repository: None)
 
     def validate(self, repository: str, diff: str) -> None:
         if not repository or len(repository) > 250:
@@ -90,6 +92,7 @@ class ReviewUseCases:
             reviewer,
             provider,
             model,
+            self.model_routes(tenant_id, repository),
         )
         return policy
 
@@ -277,6 +280,7 @@ class ReviewUseCases:
             reviewer,
             provider,
             model,
+            self.model_routes(tenant_id, repository),
         )
         if fetched_diff:
             encoded = diff.encode("utf-8")

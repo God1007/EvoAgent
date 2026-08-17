@@ -316,8 +316,13 @@ python -m evoagent
 
 密钥只从环境变量读取，不要提交到代码仓库。生产环境建议显式配置
 `EVOAGENT_LLM_ALLOWED_HOSTS`；它只接受精确 DNS 主机名。Token/成本上限和计价
-变量见 [`.env.example`](.env.example)，详细语义与当前单路由边界见
+变量见 [`.env.example`](.env.example)，详细语义与多路由边界见
 [`docs/model-gateway.md`](docs/model-gateway.md)。
+
+企业部署可以通过 `EVOAGENT_LLM_ROUTES_FILE` 加载多个按优先级排列的 TOML
+路由；每条路由只引用 API Key 的环境变量名，并可限制租户、仓库模式和驻留区域。
+瞬时故障只会在 `EVOAGENT_LLM_FALLBACK_ATTEMPTS` 的有界预算内切换备用路由，
+每条路由使用独立熔断器。示例见 [`examples/model-routes.toml`](examples/model-routes.toml)。
 
 ## 接入 GitHub
 
@@ -753,6 +758,8 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `EVOAGENT_LLM_MAX_OUTPUT_TOKENS` | `4096` | 单请求最大输出 Token |
 | `EVOAGENT_LLM_DAILY_TOKEN_BUDGET` | `0` | 每租户/仓库/UTC 日 Token 预算；0 为关闭 |
 | `EVOAGENT_LLM_DAILY_COST_MICROS` | `0` | 每租户/仓库/UTC 日成本预算（微单位）；0 为关闭 |
+| `EVOAGENT_LLM_ROUTES_FILE` | 空 | v1 多路由 TOML；设置后替代单 Provider 预设 |
+| `EVOAGENT_LLM_FALLBACK_ATTEMPTS` | `1` | 主路由失败后最多尝试的额外候选路由数 |
 | `EVOAGENT_DATABASE_URL` | 空 | PostgreSQL URL；为空时使用 SQLite |
 | `EVOAGENT_REDIS_URL` | 空 | Redis URL；为空时使用进程内队列 |
 | `EVOAGENT_ASYNC_WORKERS` | `2` | 异步 Worker 数量 |

@@ -126,6 +126,11 @@ class ReviewService:
                     queue_lease_seconds=settings.queue_lease_seconds,
                     auto_post_review=settings.auto_post_review,
                 ),
+                lambda tenant_id, repository: (
+                    tuple(self.model_gateway.route_catalog(tenant_id, repository))
+                    if self.model_gateway.configured
+                    else None
+                ),
             )
             self.webhook_use_cases = WebhookUseCases(
                 self.store,
@@ -177,7 +182,10 @@ class ReviewService:
         self.heavy_gate = ConcurrencyLimiter(settings.max_inflight_heavy)
         metrics.register_gauge_source("heavy_in_flight", self.heavy_gate.in_flight)
         metrics.register_gauge_source("breaker_github_state", self.github_breaker.state_code)
-        metrics.register_gauge_source("breaker_llm_state", self.llm_breaker.state_code)
+        metrics.register_gauge_source(
+            "breaker_llm_state",
+            getattr(self.model_gateway, "breaker_state_code", self.llm_breaker.state_code),
+        )
         metrics.register_gauge_source(
             "plugins_loaded",
             lambda: float(len(self.plugin_runtime.describe()["plugins"])),

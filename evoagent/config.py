@@ -71,6 +71,8 @@ class Settings:
     llm_daily_cost_micros: int = 0
     llm_input_cost_micros_per_million: int = 0
     llm_output_cost_micros_per_million: int = 0
+    llm_routes_file: str = ""
+    llm_fallback_attempts: int = 1
     eval_max_cases: int = 5
     eval_min_cases: int = 3
     eval_min_improvement: float = 0.01
@@ -224,6 +226,7 @@ class Settings:
             self.llm_daily_cost_micros > 0
             and self.llm_input_cost_micros_per_million == 0
             and self.llm_output_cost_micros_per_million == 0
+            and not self.llm_routes_file
         ):
             raise ValueError(
                 "model input or output pricing is required when the daily cost budget is enabled"
@@ -270,6 +273,8 @@ class Settings:
             llm_output_cost_micros_per_million=_non_negative_int(
                 "EVOAGENT_LLM_OUTPUT_COST_MICROS_PER_MILLION", 0
             ),
+            llm_routes_file=os.getenv("EVOAGENT_LLM_ROUTES_FILE", ""),
+            llm_fallback_attempts=_non_negative_int("EVOAGENT_LLM_FALLBACK_ATTEMPTS", 1),
             eval_max_cases=_int("EVOAGENT_EVAL_MAX_CASES", 5),
             eval_min_cases=_int("EVOAGENT_EVAL_MIN_CASES", 3),
             eval_min_improvement=float(os.getenv("EVOAGENT_EVAL_MIN_IMPROVEMENT", "0.01")),

@@ -16,6 +16,7 @@ repository allowlist.
   "allowed_fix_rules": ["SEC-YAML-LOAD", "SEC-INSECURE-COOKIE"],
   "allowed_llm_providers": ["local"],
   "allowed_llm_models": [],
+  "llm_region": null,
   "max_diff_bytes": 524288
 }
 ```
@@ -31,16 +32,17 @@ rejected before persistence.
 | `max_diff_bytes` | API Diff intake and webhook Diff fetch, in addition to the global cap |
 | `allowed_reviewers` | Review execution using the currently selected reviewer plugin |
 | `allowed_llm_providers` / `allowed_llm_models` | Intake and queued execution |
+| `llm_region` | Intake route eligibility and every gateway call |
 | `post_review_comments` | GitHub comment publication |
 | `auto_fix` | Repair publication |
 | `allowed_fix_rules` | Findings eligible for deterministic repair |
 
-Token/cost budgets are now enforced by the model gateway per tenant/repository
-and UTC day from operator configuration. They are deliberately not duplicated
-inside the versioned policy document yet: per-repository overrides and
-data-residency/multi-route selection require the next routing-policy increment.
-The current `allowed_llm_providers` and `allowed_llm_models` admission rules still
-bind each accepted task to the configured route.
+Token/cost budgets are enforced by the model gateway per tenant/repository and
+UTC day from operator configuration. `llm_region` can bind sensitive repositories
+to routes carrying that exact region identifier; provider and model allowlists
+are evaluated against the complete eligible route catalog at intake and again
+inside the gateway. Per-repository numeric budget overrides are not duplicated
+inside the policy document yet.
 
 ## Version and execution semantics
 

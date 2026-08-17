@@ -17,6 +17,7 @@ _POLICY_FIELDS = frozenset(
         "allowed_fix_rules",
         "allowed_llm_providers",
         "allowed_llm_models",
+        "llm_region",
         "max_diff_bytes",
     }
 )
@@ -49,6 +50,14 @@ def _identifiers(value: Any, field: str) -> tuple[str, ...]:
     return tuple(sorted(normalized))
 
 
+def _optional_identifier(value: Any, field: str) -> str:
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str) or not _IDENTIFIER.fullmatch(value.strip()):
+        raise ValueError("repository policy %s must be a valid identifier or null" % field)
+    return value.strip()
+
+
 @dataclass(frozen=True)
 class RepositoryPolicy:
     enabled: bool = True
@@ -58,6 +67,7 @@ class RepositoryPolicy:
     allowed_fix_rules: tuple[str, ...] = ()
     allowed_llm_providers: tuple[str, ...] = ()
     allowed_llm_models: tuple[str, ...] = ()
+    llm_region: str = ""
     max_diff_bytes: int | None = None
     version: int = 0
     source: str = "default"
@@ -90,6 +100,7 @@ class RepositoryPolicy:
                 value.get("allowed_llm_providers"), "allowed_llm_providers"
             ),
             allowed_llm_models=_identifiers(value.get("allowed_llm_models"), "allowed_llm_models"),
+            llm_region=_optional_identifier(value.get("llm_region"), "llm_region"),
             max_diff_bytes=max_diff_bytes,
         )
 
@@ -102,6 +113,7 @@ class RepositoryPolicy:
             "allowed_fix_rules": list(self.allowed_fix_rules),
             "allowed_llm_providers": list(self.allowed_llm_providers),
             "allowed_llm_models": list(self.allowed_llm_models),
+            "llm_region": self.llm_region or None,
             "max_diff_bytes": self.max_diff_bytes,
         }
 
@@ -155,6 +167,7 @@ class RepositoryPolicyResolver:
         reviewer: str,
         llm_provider: str,
         llm_model: str,
+        llm_routes: tuple[dict[str, str], ...] | None = None,
     ) -> None:
         if not policy.enabled:
             raise PermissionError("repository is disabled by tenant policy")
@@ -164,6 +177,24 @@ class RepositoryPolicyResolver:
             )
         if policy.allowed_reviewers and reviewer not in policy.allowed_reviewers:
             raise PermissionError("reviewer '%s' is not allowed by repository policy" % reviewer)
+        if llm_routes is not None:
+            eligible = [
+                route
+                for route in llm_routes
+                if (
+                    not policy.allowed_llm_providers
+                    or route.get("provider") in policy.allowed_llm_providers
+                )
+                and (
+                    not policy.allowed_llm_models or route.get("model") in policy.allowed_llm_models
+                )
+                and (not policy.llm_region or route.get("region") == policy.llm_region)
+            ]
+            if not eligible:
+                raise PermissionError("no configured model route satisfies repository policy")
+            return
+        if policy.llm_region:
+            raise PermissionError("repository model region requires a routing-aware gateway")
         if policy.allowed_llm_providers and llm_provider not in policy.allowed_llm_providers:
             raise PermissionError(
                 "LLM provider '%s' is not allowed by repository policy" % llm_provider

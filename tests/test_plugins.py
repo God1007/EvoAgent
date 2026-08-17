@@ -364,6 +364,10 @@ class ApplicationCompositionTests(unittest.TestCase):
                 return {}
 
             @staticmethod
+            def route_catalog(_tenant_id, _repository):
+                return ()
+
+            @staticmethod
             def complete(_request):
                 raise AssertionError("disabled fake gateway must not be called")
 
@@ -382,6 +386,36 @@ class ApplicationCompositionTests(unittest.TestCase):
 
         self.assertIs(gateway, service.model_gateway)
         self.assertEqual({}, service.llm_config)
+
+    def test_route_file_composes_multiple_routes_with_independent_breakers(self):
+        handle, route_path = tempfile.mkstemp(suffix=".toml")
+        os.close(handle)
+        self.addCleanup(os.unlink, route_path)
+        with open(route_path, "w", encoding="utf-8") as output:
+            output.write(
+                'version = 1\n[[routes]]\nid = "primary"\npriority = 10\n'
+                'provider = "provider-a"\nmodel = "model-a"\n'
+                'base_url = "https://a.example/v1"\napi_key_env = "ROUTE_A_KEY"\n'
+                '[[routes]]\nid = "fallback"\npriority = 20\n'
+                'provider = "provider-b"\nmodel = "model-b"\n'
+                'base_url = "https://b.example/v1"\napi_key_env = "ROUTE_B_KEY"\n'
+            )
+        configured = _settings(
+            self.path,
+            llm_routes_file=route_path,
+            llm_allowed_hosts=("a.example", "b.example"),
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"ROUTE_A_KEY": "secret-a", "ROUTE_B_KEY": "secret-b"},
+        ):
+            service = ReviewService(configured)
+        self.addCleanup(service.close)
+
+        self.assertEqual(2, service.llm_config["route_count"])
+        providers = list(service.model_gateway.providers.values())
+        self.assertIsNot(providers[0].breaker, providers[1].breaker)
+        self.assertNotIn("secret-a", repr(service.llm_config))
 
     def test_service_publishes_sanitized_lifecycle_events(self):
         events = []

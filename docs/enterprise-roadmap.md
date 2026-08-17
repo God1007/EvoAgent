@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.9.0)
+## Current maturity (v0.10.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -17,7 +17,7 @@ It is an execution plan, not a marketing checklist.
 | Production persistence | Implemented baseline | PostgreSQL + Redis Streams, migration CLI, Outbox, ACK/lease/DLQ, and mandatory real-service CI; backup/restore drill remains pending |
 | Graceful lifecycle | Implemented | Readiness drain plus bounded queue drain before Store/plugin shutdown |
 | Multi-tenancy/governance | Implemented baseline | JWT, RBAC, tenant/repository authorization, audit, canary/shadow/rollback |
-| Model governance | Implemented baseline | Replaceable gateway, scope propagation, redaction, exact-host egress control, structured output, atomic daily budgets, metadata-only usage ledger; fallback routing remains pending |
+| Model governance | Implemented advanced baseline | Replaceable gateway, scoped policy routing/residency, bounded fallback, per-route breakers, redaction, egress/output limits, atomic budgets, correlated metadata-only ledger; route shadow promotion remains pending |
 | Strong untrusted execution | Partial | Container isolation exists; host fallback is not a strong boundary; microVM/remote runner pending |
 | Quality evidence | Synthetic benchmark only | 100-case controlled corpus; production activation gate remains blocked without independent labels |
 | HA/DR operational proof | Pending | No documented backup/restore drill, regional failover, or sustained production SLO evidence |
@@ -160,7 +160,7 @@ contracts, and
 
 ## Phase 4 — Model gateway and execution isolation
 
-### Model gateway — governed single-route baseline implemented
+### Model gateway — governed multi-route baseline implemented
 
 - provider routing, fallback, retry budget, and per-model circuit breakers;
 - request/token/cost accounting by tenant and repository;
@@ -179,10 +179,18 @@ credential redaction in both prompts and errors. `/api/model-usage` is an
 admin-only tenant-scoped operational view, and the complete gateway is
 replaceable through `evoagent.model-gateway`.
 
-Still pending before this item is complete: declarative multi-route policy,
-provider/region fallback with a bounded retry budget, per-route circuit breakers,
-and promotion gates that shadow candidate routes before activation. The current
-single route is intentionally described as a baseline rather than HA routing.
+The v0.10 increment adds a versioned TOML topology whose routes reference
+environment-held credentials, exact tenant/repository selectors, region tags,
+priority, and pricing. Repository policy evaluates the complete route catalog
+at intake and the task snapshot is enforced again for every call. Fallback is
+bounded, occurs only for classified eligible failures, and every route owns an
+independent breaker. Schema version 7 correlates attempts by root request and
+route id.
+
+Still pending before this item is complete: candidate-route shadow/promotion
+gates, weighted load balancing, and reconciliation of reservations left by a
+process crash. Multi-route support improves dependency resilience but is not a
+claim of regional HA without deployment-level network and capacity proof.
 
 ### Remote proof runner
 

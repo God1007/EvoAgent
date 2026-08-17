@@ -64,7 +64,7 @@ jobs:
           done
           curl -fsS http://127.0.0.1:18081/ | grep -q '<!doctype html>'
           test -f "$wheel_env/share/evoagent/skills/code-quality/SKILL.md"
-          "$wheel_env/bin/evoagent-migrate" | grep -q '"schema_version": 6'
+          "$wheel_env/bin/evoagent-migrate" | grep -q '"schema_version": 7'
           kill -TERM "$wheel_pid"
           wait "$wheel_pid"
           trap - EXIT
@@ -182,7 +182,7 @@ jobs:
           EVOAGENT_DATABASE_URL: ${{ env.EVOAGENT_TEST_POSTGRES_URL }}
         run: |
           python -m evoagent.migrate | tee migration.json
-          python -c "import json; d=json.load(open('migration.json')); assert d == {'backend':'postgresql','schema_version':6,'status':'migrated'}"
+          python -c "import json; d=json.load(open('migration.json')); assert d == {'backend':'postgresql','schema_version':7,'status':'migrated'}"
       - name: Run adapter contracts and restart fault tests
         run: |
           python -m pytest -q \
@@ -217,7 +217,7 @@ jobs:
             fi
             sleep 1
           done
-          python -c "import json; d=json.load(open('ready.json')); assert d['status']=='ready'; assert d['queue_backend']=='redis-streams'; assert d['checks']['schema_version']==6; assert d['checks']['queue']['healthy']"
+          python -c "import json; d=json.load(open('ready.json')); assert d['status']=='ready'; assert d['queue_backend']=='redis-streams'; assert d['checks']['schema_version']==7; assert d['checks']['queue']['healthy']"
           curl -fsS -X POST 'http://127.0.0.1:18080/v1/reviews?async=true' \
             -H 'Content-Type: application/json' \
             -d '{"repository":"ci/full-stack","pull_request":17,"diff":"diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n+value = 1\n+print(value)"}' \

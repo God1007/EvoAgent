@@ -11,11 +11,15 @@ from evoagent.diff_parser import parse_unified_diff
 from evoagent.model_gateway import (
     EnterpriseModelGateway,
     ModelGatewayOptions,
+    ModelGovernanceContext,
     ModelMessage,
+    ModelOutputError,
+    ModelProviderError,
     ModelRequest,
     ModelResponse,
     ModelRoute,
     OpenAICompatibleModelProvider,
+    load_model_routes,
     redact_model_messages,
 )
 from evoagent.reviewer import GatewayReviewer
@@ -106,12 +110,12 @@ class ModelGatewayTests(unittest.TestCase):
     def test_invalid_structured_output_is_a_failed_usage_record(self):
         gateway = self.gateway(FakeProvider("not-json"))
 
-        with self.assertRaises(json.JSONDecodeError):
+        with self.assertRaises(ModelOutputError):
             gateway.complete(self.request())
 
         usage = self.store.list_model_usage("tenant-a", "org/repo")
         self.assertEqual("failed", usage[0]["status"])
-        self.assertIn("Expecting value", usage[0]["error"])
+        self.assertIn("not valid JSON", usage[0]["error"])
         self.assertEqual(12, usage[0]["input_tokens"])
         self.assertEqual(5, usage[0]["output_tokens"])
         self.assertEqual(22, usage[0]["cost_micros"])
@@ -135,7 +139,7 @@ class ModelGatewayTests(unittest.TestCase):
         )
         gateway = self.gateway(provider, max_output_tokens=10)
 
-        with self.assertRaisesRegex(ValueError, "output-token limit"):
+        with self.assertRaisesRegex(ModelOutputError, "output-token limit"):
             gateway.complete(self.request())
 
         self.assertEqual("failed", self.store.list_model_usage("tenant-a", "org/repo")[0]["status"])
@@ -171,7 +175,10 @@ class ModelGatewayTests(unittest.TestCase):
             "test": "assert input is data",
         }
         gateway = self.gateway(FakeProvider(json.dumps({"findings": [finding]})))
-        reviewer = GatewayReviewer(gateway, lambda _task_id: ("tenant-a", "org/repo"))
+        reviewer = GatewayReviewer(
+            gateway,
+            lambda _task_id: ModelGovernanceContext("tenant-a", "org/repo"),
+        )
         diff = "--- a/a.py\n+++ b/a.py\n@@ -0,0 +1,1 @@\n+eval(value)\n"
 
         findings = reviewer.review_with_context("task-1", diff, parse_unified_diff(diff))
@@ -179,6 +186,150 @@ class ModelGatewayTests(unittest.TestCase):
         self.assertEqual(["LLM-1"], [item.rule_id for item in findings])
         usage = self.store.list_model_usage("tenant-a", "org/repo")
         self.assertEqual("task-1", usage[0]["task_id"])
+
+    def test_transient_primary_failure_uses_one_bounded_fallback(self):
+        primary = ModelRoute(
+            "provider-a",
+            "model-a",
+            "https://a.example/v1",
+            "secret-a",
+            route_id="primary",
+            priority=10,
+            region="us",
+        )
+        secondary = ModelRoute(
+            "provider-b",
+            "model-b",
+            "https://b.example/v1",
+            "secret-b",
+            route_id="secondary",
+            priority=20,
+            region="us",
+        )
+
+        class TransientProvider:
+            def complete(self, route, messages, max_output_tokens, require_json_object):
+                raise ModelProviderError("temporarily unavailable", transient=True)
+
+        fallback = FakeProvider()
+        gateway = EnterpriseModelGateway(
+            self.store,
+            (secondary, primary),
+            {"primary": TransientProvider(), "secondary": fallback},
+            ModelGatewayOptions(
+                allowed_hosts=("a.example", "b.example"),
+                max_input_tokens=1000,
+                max_output_tokens=100,
+                fallback_attempts=1,
+            ),
+        )
+
+        response = gateway.complete(self.request())
+
+        self.assertEqual("provider-b", response.provider)
+        usage = sorted(
+            self.store.list_model_usage("tenant-a", "org/repo"),
+            key=lambda item: item["attempt"],
+        )
+        self.assertEqual(["primary", "secondary"], [item["route_id"] for item in usage])
+        self.assertEqual(["failed", "success"], [item["status"] for item in usage])
+        self.assertEqual(1, len({item["root_request_id"] for item in usage}))
+
+    def test_zero_fallback_budget_never_calls_secondary(self):
+        primary = ModelRoute(
+            "provider-a",
+            "model-a",
+            "https://a.example/v1",
+            "secret-a",
+            route_id="primary",
+            priority=10,
+        )
+        secondary = ModelRoute(
+            "provider-b",
+            "model-b",
+            "https://b.example/v1",
+            "secret-b",
+            route_id="secondary",
+            priority=20,
+        )
+
+        class TransientProvider:
+            def complete(self, route, messages, max_output_tokens, require_json_object):
+                raise ModelProviderError("temporarily unavailable", transient=True)
+
+        fallback = FakeProvider()
+        gateway = EnterpriseModelGateway(
+            self.store,
+            (primary, secondary),
+            {"primary": TransientProvider(), "secondary": fallback},
+            ModelGatewayOptions(
+                allowed_hosts=("a.example", "b.example"),
+                fallback_attempts=0,
+            ),
+        )
+
+        with self.assertRaisesRegex(ModelProviderError, "temporarily unavailable"):
+            gateway.complete(self.request())
+        self.assertEqual([], fallback.calls)
+
+    def test_route_policy_filters_tenant_repository_provider_and_region(self):
+        restricted = ModelRoute(
+            "provider-eu",
+            "model-eu",
+            "https://eu.example/v1",
+            "secret-eu",
+            route_id="eu-payments",
+            region="eu",
+            tenant_ids=("tenant-a",),
+            repository_patterns=("org/payments-*",),
+        )
+        gateway = EnterpriseModelGateway(
+            self.store,
+            (restricted,),
+            FakeProvider(),
+            ModelGatewayOptions(allowed_hosts=("eu.example",)),
+        )
+        request = ModelRequest(
+            "tenant-a",
+            "org/payments-api",
+            "task-1",
+            "review",
+            (ModelMessage("user", "review"),),
+            allowed_providers=("provider-eu",),
+            allowed_models=("model-eu",),
+            required_region="eu",
+        )
+        self.assertEqual(
+            ("eu-payments",),
+            tuple(
+                item["route_id"] for item in gateway.route_catalog("tenant-a", "org/payments-api")
+            ),
+        )
+        self.assertEqual((), gateway.route_catalog("tenant-b", "org/payments-api"))
+        self.assertEqual("provider-eu", gateway.complete(request).provider)
+
+        denied = self.request()
+        with self.assertRaisesRegex(PermissionError, "governance policy"):
+            gateway.complete(denied)
+
+    def test_route_file_resolves_key_reference_without_storing_it_in_toml(self):
+        handle, path = tempfile.mkstemp(suffix=".toml")
+        os.close(handle)
+        self.addCleanup(os.unlink, path)
+        with open(path, "w", encoding="utf-8") as output:
+            output.write(
+                'version = 1\n[[routes]]\nid = "eu-primary"\n'
+                'provider = "provider-a"\nmodel = "model-a"\n'
+                'base_url = "https://eu.example/v1"\n'
+                'api_key_env = "TEST_MODEL_ROUTE_KEY"\npriority = 5\nregion = "eu"\n'
+                'tenant_ids = ["tenant-a"]\nrepository_patterns = ["org/*"]\n'
+            )
+        with mock.patch.dict(os.environ, {"TEST_MODEL_ROUTE_KEY": "resolved-secret"}):
+            routes = load_model_routes(path)
+
+        self.assertEqual("eu-primary", routes[0].route_id)
+        self.assertEqual("resolved-secret", routes[0].api_key)
+        self.assertNotIn("resolved-secret", open(path, encoding="utf-8").read())
 
 
 class OpenAICompatibleModelProviderTests(unittest.TestCase):
@@ -251,6 +402,25 @@ class OpenAICompatibleModelProviderTests(unittest.TestCase):
 
         self.assertNotIn("route-secret", str(raised.exception))
         self.assertEqual(CircuitBreaker.OPEN, breaker.state)
+
+    def test_non_transient_http_error_does_not_open_transport_breaker(self):
+        breaker = CircuitBreaker("route", failure_threshold=1, reset_seconds=60)
+        provider = OpenAICompatibleModelProvider(("models.example",), breaker=breaker)
+        error = urllib.error.HTTPError(
+            "https://models.example/v1/chat/completions",
+            401,
+            "unauthorized",
+            {},
+            BytesIO(b"invalid credentials"),
+        )
+        with (
+            mock.patch("evoagent.model_gateway.urllib.request.urlopen", side_effect=error),
+            self.assertRaises(ModelProviderError) as raised,
+        ):
+            provider.complete(self.route, self.messages, 10, True)
+
+        self.assertFalse(raised.exception.transient)
+        self.assertEqual(CircuitBreaker.CLOSED, breaker.state)
 
     def test_response_body_cap_is_enforced(self):
         class Response(BytesIO):

@@ -40,7 +40,7 @@ the mitigations that exist in the codebase today, plus known residual risks.
 | T9 | Auth bypass / privilege escalation | JWT with fixed HS256, RBAC, tenant scoping, repository authorization checks | — |
 | T10 | Supply-chain (tampered deps) | Hash-locked `requirements*.lock`, `--require-hashes` installs, dependency-consistency guard test, Dependabot | Transitive lock refresh is manual after Dependabot PRs |
 | T11 | Unexpected in-process plugin activation | Entry-point discovery is disabled by default; enabling it requires an explicit plugin-id allowlist; manifest API/dependencies are validated and startup is transactional | A trusted plugin has process privileges; review and pin it like any production dependency |
-| T12 | Source/API-key leakage through model traffic or errors | Gateway redacts common assignment/Bearer/private-key forms before transport, strips configured credentials from upstream errors, validates exact route host + HTTPS, caps response size/tokens, and persists metadata/hash rather than prompts or responses | Pattern redaction is not a complete DLP system; DNS/network policy and provider retention remain deployment responsibilities |
+| T12 | Source/API-key leakage through model traffic or errors | Gateway redacts common assignment/Bearer/private-key forms before transport, strips configured credentials from upstream errors, validates exact route host + HTTPS, caps response size/tokens, stores route secrets only via environment references, and persists metadata/hash rather than prompts or responses | Pattern redaction is not a complete DLP system; DNS/network policy and provider retention remain deployment responsibilities |
 
 ## 4. Untrusted-execution policy
 
@@ -61,8 +61,8 @@ the mitigations that exist in the codebase today, plus known residual risks.
   rely on container mode (`--network none`) for that.
 - The LLM reviewer's judgments are advisory and not proof; high-confidence
   claims require executable evidence (roadmap: Proof Runner).
-- The built-in model route is currently single-provider. Automatic regional or
-  provider failover is not yet an availability guarantee.
+- Model fallback is bounded and policy-filtered, but is not an availability
+  guarantee without independently provisioned provider/region capacity.
 
 ## 6. Reporting
 

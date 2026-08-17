@@ -2,8 +2,10 @@ import os
 import tempfile
 import unittest
 from dataclasses import dataclass
+from unittest import mock
 
 from evoagent.config import Settings
+from evoagent.metrics import Metrics
 from evoagent.models import Finding, ReviewReport, Severity, TaskState, TraceEvent
 from evoagent.service import ReviewService
 from evoagent.store import utc_now
@@ -76,6 +78,23 @@ class ServiceTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         self.assertEqual(1, fixer.calls)
+
+    def test_feedback_metrics_use_fixed_category_names(self):
+        service = ReviewService(self.settings)
+        self.addCleanup(service.close)
+        service.store.create("feedback-task", "org/repo", 7, {}, "default")
+        captured = Metrics()
+
+        with mock.patch("evoagent.application.reviews.metrics", captured):
+            for category in ("false_positive", "missed_issue", "bad_fix", "accepted"):
+                service.record_feedback("feedback-task", category, None, "operator note")
+
+        output = captured.prometheus()
+        self.assertIn("evoagent_feedback_total 4.0", output)
+        self.assertIn("evoagent_feedback_false_positive_total 1.0", output)
+        self.assertIn("evoagent_feedback_missed_issue_total 1.0", output)
+        self.assertIn("evoagent_feedback_bad_fix_total 1.0", output)
+        self.assertIn("evoagent_feedback_accepted_total 1.0", output)
 
     def test_readiness_exposes_queue_worker_health_and_fails_closed(self):
         service = ReviewService(self.settings)

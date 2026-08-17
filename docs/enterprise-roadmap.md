@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.24.0)
+## Current maturity (v0.25.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -19,7 +19,7 @@ It is an execution plan, not a marketing checklist.
 | Multi-tenancy/governance | Implemented baseline | JWT, RBAC, tenant/repository authorization, audit, canary/shadow/rollback |
 | Model governance | Implemented advanced baseline | Replaceable gateway, scoped policy routing/residency, deterministic weighted active routes, bounded fallback, isolated candidate shadows, GitOps promotion gates with offline evidence, shared hard capacity leases/rate windows, read-only capacity weight recommendations, per-route breakers, redaction, egress/output limits, total/shadow atomic budgets, metadata-only ledgers, and conservative crash reconciliation; automatic capacity inference remains pending |
 | Strong untrusted execution | Implemented advanced baseline | Replaceable remote Proof Runner, mutually authenticated evidence manifests, container-only jobs, cross-replica Redis nonce claims, dual-key rotation, and pluggable local/S3 Object Lock artifacts; a microVM executor and provider-backed compliance drill remain pending |
-| Service-level operations | Implemented baseline | Fixed-cardinality availability/latency/success SLIs, versioned 30-day SLO catalog, multi-window burn alerts, queue/Outbox age, DLQ depth, dashboard, runbooks, and hardened Prometheus evaluator |
+| Service-level operations | Implemented advanced baseline | Fixed-cardinality availability/latency/success SLIs plus model economics, capacity saturation, repair outcomes, and feedback trends; versioned 30-day SLO catalog, multi-window burn/quality alerts, queue/Outbox age, DLQ depth, dashboard, runbooks, and hardened Prometheus evaluator |
 | HTTP edge security | Implemented baseline | Validated/generated request correlation, explicit client-safe 4xx types, bounded list reads, generic 5xx envelopes, query-free structured access logs, consistent hardening headers, and no interpreter-version disclosure |
 | Operational failure security | Implemented baseline | Allowlisted message-free failure summaries, stable code-location references, persistence-adapter enforcement, legacy-data migration, and exception-message-free OpenTelemetry/plugin/proof paths |
 | Quality evidence | Governance baseline implemented | Reproducible synthetic regression plus blind dual-annotation/adjudication compiler, rights/content/split/evidence audit, per-language/CWE/rule slices, and confidence calibration; production gate remains blocked until a real approved corpus is supplied |
@@ -314,6 +314,18 @@ type, and message-independent code-location reference. Both Store adapters
 reject raw operational strings, while migration 10 removes legacy messages from
 known persistence fields. See
 [`ADR 0018`](adr/0018-message-free-operational-failures.md).
+
+The v0.25 increment closes the locally measurable quality/economics gaps.
+Known-billed model tokens and micro-unit cost include successful responses and
+post-response contract failures, with separate fixed active/shadow lanes and
+latency histograms. Capacity rejections split concurrency/rate causes; repair
+attempts terminate as published, abstained, verification-blocked, or failed;
+feedback uses four bounded category counters. Recording rules derive cost per
+terminal review, capacity saturation, verification-block rate, and negative
+feedback trend. Alerts require minimum volumes, dashboards expose each signal,
+and runbooks explicitly prevent sparse feedback from being treated as unbiased
+accuracy evidence. Tenant/repository/route values never become metric labels.
+See [`ADR 0023`](adr/0023-fixed-cardinality-quality-economics.md).
 
 Implemented database recovery baseline: `evoagent-dr` performs SQLite online
 backup/restore or a PostgreSQL exported-snapshot `pg_dump` followed by

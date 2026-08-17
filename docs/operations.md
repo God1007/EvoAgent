@@ -152,6 +152,41 @@ traffic forecasts. Apply them only through reviewed topology and redeployment;
 never treat the report as authorization for a live database edit. Preserve
 stable route IDs across rolling releases so old and new pods share one pool.
 
+## Model economics
+
+`model_input_tokens_total`, `model_output_tokens_total`, and
+`model_cost_micros_total` include successful calls and failed output-contract
+checks when provider usage is already known. Transport failures without usage do
+not invent cost. Active and shadow lane counters are separate fixed metric names,
+and request latency is split into active/shadow histograms without route,
+repository, or tenant labels.
+
+Use `evoagent:cost:model_micros_per_terminal_review_30m` as an operational trend,
+not an invoice: pricing is configured micro-units and providers may reconcile
+usage later. A budget-rejection alert means at least one repository reached its
+explicit ceiling. Identify it through the tenant-authorized model-usage ledger;
+do not add tenant/repository labels to Prometheus or raise the limit before
+confirming ownership and expected workload.
+
+## Repair outcomes
+
+Repair attempts terminate as published, safely abstained, verification-blocked,
+or failed. Abstention means no deterministic allowlisted transformation applied;
+it is not an infrastructure failure. A verification block means a proposed
+change failed compilation/tests and was correctly withheld. Investigate the
+configured verifier/container and recent rule changes before changing a gate.
+Never lower verification requirements to improve the publication ratio.
+
+## Quality feedback
+
+Feedback counters use four fixed names: accepted, false positive, missed issue,
+and bad fix. The 24-hour negative ratio combines the latter three only after a
+minimum sample threshold in the alert. It is a triage signal, not a statistically
+unbiased accuracy estimate: operator reporting is selective. Sample affected
+cases from tenant-authorized failure records, classify rule/model/language
+slices offline, and add independently adjudicated cases to the evaluation
+pipeline before changing prompts or thresholds.
+
 ## Plugin runtime
 
 `plugin_runtime_ready=0` means the capability graph is stopping or failed.

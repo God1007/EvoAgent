@@ -50,8 +50,8 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **生产治理** | JWT、RBAC、多租户、仓库隔离、事务 Outbox、审计日志、灰度发布、影子流量、告警与死信队列 |
 | **安全 HTTP 边界** | 全响应请求关联 ID、无内部细节的统一 500、过滤 query/异常原文的结构化日志与一致安全响应头 |
 | **无消息故障契约** | Task/Trace/Checkpoint、Agent、Queue/DLQ、Outbox/Effect、Readiness、插件与遥测只记录异常类型和稳定故障引用，不落异常原文 |
-| **可观测性** | 任务 Trace、Agent 消息、Prometheus 指标和 OpenTelemetry Trace |
-| **SLO 与告警** | 版本化 30 天 SLO、错误预算、快/慢燃烧率告警、Queue/Outbox 新鲜度、Grafana Dashboard 与处置 Runbook |
+| **可观测性** | 任务 Trace、Agent 消息、固定基数的模型成本/容量/修复/反馈 Prometheus 指标和 OpenTelemetry Trace |
+| **SLO 与告警** | 版本化 30 天 SLO、错误预算、快/慢燃烧率告警、模型容量与预算、修复验证和反馈趋势告警、Grafana Dashboard 与处置 Runbook |
 | **灾备证据** | SQLite/PostgreSQL 执行隔离恢复与 RPO/RTO 校验，并可从 PostgreSQL/Outbox 向全新 Redis 离线重建未完成任务 |
 | **质量证据治理** | 双人盲标与独立裁决、标注包/数据集哈希、许可与来源审计、仓库隔离、语言/CWE/Rule 切片及置信度校准 |
 | **Web 控制台** | 提供运行总览、发起审查、任务中心、Skill 管理、演进实验室和 GitHub 配置页面 |
@@ -790,6 +790,8 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `POST` | `/v1/outbox/replay` | 审计并重放指定 Outbox 死消息 |
 | `GET` | `/api/model-usage` | 管理员按当前租户/可选仓库查询模型用量元数据 |
 | `POST` | `/v1/model-usage/reconcile` | 按供应商账单原子结算超时的模型用量预占并写入审计 |
+| `GET` | `/api/model-routes/promotion` | 按租户/仓库查询候选路由只读晋级门禁 |
+| `GET` | `/api/model-routes/capacity` | 查询路由容量、熔断状态和只读权重建议；共享池精确计数脱敏 |
 
 `POST /v1/reviews` 的 Diff 默认最大为 1 MiB；单任务默认最多 8 步、120 秒。可通过 `.env.example` 中的环境变量调整。
 

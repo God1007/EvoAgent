@@ -20,7 +20,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Runtime | `evoagent/outbox.py` | Store-to-queue transactional publication, leases, retry and recovery |
 | Review | `evoagent/review_extensions.py`, `review_engine.py`, `agents.py` | Stable reviewer-contribution seam, replaceable engine, and default multi-agent collaboration protocol |
 | Review | `evoagent/reviewer.py` | Local deterministic rules + governed gateway reviewer + composite |
-| Model gateway | `evoagent/model_gateway.py` | Secret redaction, egress/output limits, budget reservation, crash quarantine, and usage accounting |
+| Model gateway | `evoagent/model_gateway.py` | Secret redaction, egress/output limits, shared route capacity, budget reservation, crash quarantine, usage accounting, and fixed-cardinality economics telemetry |
 | Review | `evoagent/skills.py`, `skill_runner.py` | Transactional dynamic-skill snapshots, manifest/hash/signature checks, bounded sandboxed execution |
 | Delivery | `evoagent/fix_rules.py`, `fixer.py` | Pluggable deterministic transforms plus verified auto-repair on a dedicated branch |
 | Delivery | `evoagent/verifier.py` | Compile/test gates with container or host isolation |
@@ -32,7 +32,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Policy | `evoagent/policy.py` | Versioned tenant/repository execution and publication decisions |
 | Storage | `evoagent/migrations.py` | Locked, checksummed SQLite/PostgreSQL schema history and compatibility gate |
 | Cross-cutting | `evoagent/auth.py` | JWT, RBAC, tenant isolation |
-| Cross-cutting | `evoagent/observability.py`, `metrics.py` | Trace, Prometheus metrics, OpenTelemetry |
+| Cross-cutting | `evoagent/observability.py`, `metrics.py` | Trace, fixed-cardinality Prometheus quality/economics metrics, OpenTelemetry |
 | Operations | `evoagent/slo.py`, `ops/` | Versioned SLO evaluation, Prometheus alerts, and Grafana dashboard |
 | Operations | `evoagent/dr.py`, `recovery.py` | Isolated database restore evidence and offline PostgreSQL-to-Redis task reconstruction |
 | Model | `evoagent/models.py` | `Finding`, `Severity`, `ReviewReport`, stable fingerprints |

@@ -1078,9 +1078,16 @@ class EnterpriseModelGateway:
             )
             if not capacity["admitted"]:
                 metrics.inc("model_route_capacity_rejections_total")
+                reason = str(capacity["reason"])
+                if reason == "concurrency":
+                    metrics.inc("model_route_capacity_concurrency_rejections_total")
+                elif reason == "rate":
+                    metrics.inc("model_route_capacity_rate_rejections_total")
+                else:
+                    metrics.inc("model_route_capacity_unknown_rejections_total")
                 raise ModelRouteCapacityError(
                     _route_key(route),
-                    str(capacity["reason"]),
+                    reason,
                     capacity.get("retry_at"),
                 )
             lease_id = str(capacity.get("lease_id") or "")
@@ -1155,12 +1162,14 @@ class EnterpriseModelGateway:
         actual_output = 0
         cost = 0
         try:
-            response = self.providers[_route_key(route)].complete(
-                route,
-                messages,
-                max_output_tokens,
-                request.require_json_object,
-            )
+            latency_name = "model_shadow_request" if lane == "shadow" else "model_active_request"
+            with metrics.latency(latency_name):
+                response = self.providers[_route_key(route)].complete(
+                    route,
+                    messages,
+                    max_output_tokens,
+                    request.require_json_object,
+                )
             actual_input = response.input_tokens or input_tokens
             actual_output = response.output_tokens or _estimated_tokens(response.content)
             cost = _cost_micros(actual_input, actual_output, route)
@@ -1190,6 +1199,7 @@ class EnterpriseModelGateway:
                 cost,
                 safe_error,
             )
+            self._record_model_economics(lane, actual_input, actual_output, cost)
             metrics.inc("model_requests_failed_total")
             if safe_error != str(exc):
                 raise ModelProviderError(
@@ -1197,6 +1207,7 @@ class EnterpriseModelGateway:
                     transient=bool(isinstance(exc, ModelProviderError) and exc.transient),
                 ) from None
             raise
+        self._record_model_economics(lane, actual_input, actual_output, cost)
         metrics.inc("model_requests_total")
         if redactions:
             metrics.inc("model_redactions_total", redactions)
@@ -1208,6 +1219,20 @@ class EnterpriseModelGateway:
             actual_output,
             response.request_id or request_id,
         )
+
+    @staticmethod
+    def _record_model_economics(
+        lane: str, input_tokens: int, output_tokens: int, cost_micros: int
+    ) -> None:
+        if not (input_tokens or output_tokens or cost_micros):
+            return
+        lane_prefix = "model_shadow" if lane == "shadow" else "model_active"
+        metrics.inc("model_input_tokens_total", input_tokens)
+        metrics.inc("model_output_tokens_total", output_tokens)
+        metrics.inc("model_cost_micros_total", cost_micros)
+        metrics.inc(lane_prefix + "_input_tokens_total", input_tokens)
+        metrics.inc(lane_prefix + "_output_tokens_total", output_tokens)
+        metrics.inc(lane_prefix + "_cost_micros_total", cost_micros)
 
     def _runtime_topology_sha256(self) -> str:
         topology = [

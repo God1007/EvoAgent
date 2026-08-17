@@ -128,6 +128,7 @@ class RepairUseCases:
             return dict(receipt.get("result") or {})
         if receipt["status"] == "busy":
             raise RuntimeError("a repair publication for this task is already in progress")
+        metrics.inc("fix_attempts_total")
         try:
             result = self.fixer.create_fix_commits(
                 self.code_host_for_installation(installation_id),
@@ -140,6 +141,7 @@ class RepairUseCases:
             if not self.store.complete_effect(effect_key, owner, result):
                 raise RuntimeError("repair publication lease was lost before completion")
         except Exception as exc:
+            metrics.inc("fix_failed_total")
             self.store.release_effect(
                 effect_key,
                 owner,
@@ -147,6 +149,14 @@ class RepairUseCases:
             )
             raise
         metrics.inc("fix_runs_total")
+        commits = len(result.get("commits", []))
+        if result.get("branch"):
+            metrics.inc("fix_published_total")
+            metrics.inc("fix_commits_total", commits)
+        elif "verification" in result:
+            metrics.inc("fix_verification_blocked_total")
+        else:
+            metrics.inc("fix_abstained_total")
         self.publish_event(
             "fix.completed",
             {
@@ -154,7 +164,7 @@ class RepairUseCases:
                 "tenant_id": actual_tenant,
                 "repository": task["repository"],
                 "published": bool(result.get("branch")),
-                "commits": len(result.get("commits", [])),
+                "commits": commits,
             },
         )
         return result

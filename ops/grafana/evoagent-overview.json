@@ -93,6 +93,53 @@
       ],
       "title": "Proof infrastructure uncertainty",
       "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 26},
+      "id": 9,
+      "targets": [
+        {"expr": "evoagent:cost:model_micros_per_terminal_review_30m", "refId": "A"}
+      ],
+      "title": "Model cost micros per terminal review",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 26},
+      "id": 10,
+      "targets": [
+        {"expr": "evoagent:ratio:model_capacity_rejected_15m", "refId": "A"}
+      ],
+      "title": "Model capacity rejection ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "ops"}},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 35},
+      "id": 11,
+      "targets": [
+        {"expr": "sum(rate(evoagent_fix_published_total[30m]))", "legendFormat": "published", "refId": "A"},
+        {"expr": "sum(rate(evoagent_fix_abstained_total[30m]))", "legendFormat": "abstained", "refId": "B"},
+        {"expr": "sum(rate(evoagent_fix_verification_blocked_total[30m]))", "legendFormat": "verification blocked", "refId": "C"},
+        {"expr": "sum(rate(evoagent_fix_failed_total[30m]))", "legendFormat": "failed", "refId": "D"}
+      ],
+      "title": "Repair outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 35},
+      "id": 12,
+      "targets": [
+        {"expr": "evoagent:ratio:negative_feedback_24h", "refId": "A"}
+      ],
+      "title": "Negative feedback ratio",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

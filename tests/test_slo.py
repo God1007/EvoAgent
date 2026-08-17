@@ -53,6 +53,8 @@ class CatalogTests(unittest.TestCase):
             {objective.objective_id for objective in catalog.objectives},
         )
         self.assertTrue(all("$window" in item.indicator_query for item in catalog.objectives))
+        self.assertTrue(all("or vector(0)" in item.indicator_query for item in catalog.objectives))
+        self.assertTrue(all("or vector(0)" in item.sample_query for item in catalog.objectives))
 
     def test_catalog_rejects_duplicate_ids_and_invalid_target(self):
         content = """version = 1
@@ -97,6 +99,11 @@ sample_query = "two"
 
         self.assertIn("EvoAgentAvailabilityFastBurn", rules)
         self.assertIn("evoagent_queue_oldest_age_seconds", rules)
+        self.assertIn("evoagent:cost:model_micros_per_terminal_review_30m", rules)
+        self.assertIn("EvoAgentModelCapacitySaturated", rules)
+        self.assertIn("EvoAgentRepairVerificationBlockedHigh", rules)
+        self.assertIn("EvoAgentNegativeFeedbackHigh", rules)
+        self.assertIn("or vector(0)", rules)
         for anchor in (
             "availability-fast-burn",
             "availability-slow-burn",
@@ -104,12 +111,19 @@ sample_query = "two"
             "queue-or-outbox-stale",
             "dead-letters",
             "review-failures",
+            "model-route-capacity",
+            "model-economics",
+            "repair-outcomes",
+            "quality-feedback",
             "plugin-runtime",
         ):
             self.assertIn("#" + anchor, rules)
             self.assertIn("## " + anchor.replace("-", " "), runbook)
         self.assertEqual("evoagent-enterprise", dashboard["uid"])
-        self.assertGreaterEqual(len(dashboard["panels"]), 8)
+        self.assertGreaterEqual(len(dashboard["panels"]), 12)
+        dashboard_text = json.dumps(dashboard)
+        self.assertIn("evoagent:ratio:model_capacity_rejected_15m", dashboard_text)
+        self.assertIn("evoagent:ratio:negative_feedback_24h", dashboard_text)
 
 
 class PrometheusClientTests(unittest.TestCase):

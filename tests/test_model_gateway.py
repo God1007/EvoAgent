@@ -11,6 +11,7 @@ from unittest import mock
 
 from evoagent.circuit_breaker import CircuitBreaker
 from evoagent.diff_parser import parse_unified_diff
+from evoagent.metrics import Metrics
 from evoagent.model_gateway import (
     EnterpriseModelGateway,
     ModelGatewayOptions,
@@ -167,6 +168,20 @@ class ModelGatewayTests(unittest.TestCase):
         self.assertEqual(12, usage[0]["input_tokens"])
         self.assertEqual(5, usage[0]["output_tokens"])
         self.assertEqual(22, usage[0]["cost_micros"])
+
+    def test_model_economics_include_success_and_known_billed_failure(self):
+        captured = Metrics()
+        with mock.patch("evoagent.model_gateway.metrics", captured):
+            self.gateway(FakeProvider()).complete(self.request())
+            with self.assertRaises(ModelOutputError):
+                self.gateway(FakeProvider("not-json")).complete(self.request())
+
+        output = captured.prometheus()
+        self.assertIn("evoagent_model_input_tokens_total 24.0", output)
+        self.assertIn("evoagent_model_output_tokens_total 10.0", output)
+        self.assertIn("evoagent_model_cost_micros_total 44.0", output)
+        self.assertIn("evoagent_model_active_cost_micros_total 44.0", output)
+        self.assertIn("evoagent_model_active_request_count 2", output)
 
     def test_provider_errors_cannot_persist_or_raise_route_credentials(self):
         gateway = self.gateway(FailingProvider())
@@ -559,7 +574,9 @@ class ModelGatewayTests(unittest.TestCase):
         )
         self.assertTrue(lease["admitted"])
 
-        response = gateway.complete(self.request())
+        captured = Metrics()
+        with mock.patch("evoagent.model_gateway.metrics", captured):
+            response = gateway.complete(self.request())
 
         self.assertEqual("provider-b", response.provider)
         self.assertEqual([], primary_provider.calls)
@@ -570,6 +587,10 @@ class ModelGatewayTests(unittest.TestCase):
         primary_report = next(item for item in report["routes"] if item["route_id"] == "primary")
         self.assertEqual(1, primary_report["concurrency_rejections_this_minute"])
         self.assertFalse(primary_report["available"])
+        self.assertIn(
+            "evoagent_model_route_capacity_concurrency_rejections_total 1.0",
+            captured.prometheus(),
+        )
         self.assertTrue(self.store.release_model_route_capacity(lease["lease_id"]))
 
     def test_capacity_rejection_respects_zero_fallback_budget(self):
@@ -713,13 +734,20 @@ class ModelGatewayTests(unittest.TestCase):
             ModelGatewayOptions(allowed_hosts=("a.example", "b.example")),
         )
 
-        response = gateway.complete(self.request())
-        self.assertEqual('{"a":1,"b":2}', response.content)
-        self.assertEqual(
-            ("stable",),
-            tuple(item["route_id"] for item in gateway.route_catalog("tenant-a", "org/repo")),
-        )
-        self.assertTrue(gateway.close())
+        captured = Metrics()
+        with mock.patch("evoagent.model_gateway.metrics", captured):
+            response = gateway.complete(self.request())
+            self.assertEqual('{"a":1,"b":2}', response.content)
+            self.assertEqual(
+                ("stable",),
+                tuple(item["route_id"] for item in gateway.route_catalog("tenant-a", "org/repo")),
+            )
+            self.assertTrue(gateway.close())
+
+        economics = captured.prometheus()
+        self.assertIn("evoagent_model_active_input_tokens_total 12.0", economics)
+        self.assertIn("evoagent_model_shadow_input_tokens_total 12.0", economics)
+        self.assertIn("evoagent_model_shadow_request_count 1", economics)
 
         usage = self.store.list_model_usage("tenant-a", "org/repo")
         self.assertEqual({"active", "shadow"}, {item["lane"] for item in usage})

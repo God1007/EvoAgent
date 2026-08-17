@@ -490,6 +490,7 @@ class ReviewUseCases:
             raise ClientInputError("unsupported feedback category")
         self.store.record_failure_case(task_id, category, {"finding": finding, "note": note[:2000]})
         metrics.inc("feedback_total")
+        metrics.inc("feedback_%s_total" % category)
         return {"recorded": True, "category": category}
 
     def resume_task(self, task_id: str, tenant_id: str | None = None) -> dict[str, Any]:

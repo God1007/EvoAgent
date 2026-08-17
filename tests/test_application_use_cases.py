@@ -2,6 +2,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from evoagent.application import (
     ModelUsageUseCases,
@@ -14,6 +15,7 @@ from evoagent.application import (
     WebhookOptions,
     WebhookUseCases,
 )
+from evoagent.metrics import Metrics
 from evoagent.models import Finding, ReviewReport, Severity, TaskState, TraceEvent
 from evoagent.observability import AlertManager, Observability
 from evoagent.policy import RepositoryPolicyResolver
@@ -219,13 +221,82 @@ class ApplicationUseCaseTests(unittest.TestCase):
             ),
         )
 
-        first = repairs.create_fix(task_id, tenant_id="tenant")
-        second = repairs.create_fix(task_id, tenant_id="tenant")
+        captured = Metrics()
+        with mock.patch("evoagent.application.repairs.metrics", captured):
+            first = repairs.create_fix(task_id, tenant_id="tenant")
+            second = repairs.create_fix(task_id, tenant_id="tenant")
 
         self.assertEqual(first, second)
         self.assertEqual(1, fixer.calls)
         self.assertEqual(("SEC-EVAL",), fixer.allowed)
         self.assertEqual("fix.completed", events[0][0])
+        output = captured.prometheus()
+        self.assertIn("evoagent_fix_attempts_total 1.0", output)
+        self.assertIn("evoagent_fix_runs_total 1.0", output)
+        self.assertIn("evoagent_fix_published_total 1.0", output)
+        self.assertIn("evoagent_fix_commits_total 1.0", output)
+
+    def test_repair_metrics_distinguish_abstention_verification_and_failure(self):
+        policies = RepositoryPolicyResolver(self.store)
+        options = RepairOptions(10_000, 10, "python:3.12-slim", 256, 64, 1.0, 10_000, 30)
+        outcomes = {
+            "abstained": {"branch": None, "commits": [], "note": "none eligible"},
+            "verification": {
+                "branch": None,
+                "commits": [],
+                "verification": {"passed": False},
+            },
+        }
+
+        class Fixer:
+            rule_ids = ("SEC-EVAL",)
+
+            def __init__(self, outcome=None, error=False):
+                self.outcome = outcome
+                self.error = error
+
+            def create_fix_commits(self, *_args, **_kwargs):
+                if self.error:
+                    raise RuntimeError("publication failed")
+                return self.outcome
+
+        def completed_task(task_id):
+            self.store.create(task_id, "org/repo", 7, {}, "tenant")
+            self.store.succeed(
+                task_id,
+                ReviewReport("org/repo", 7, "one issue", "high", [_finding()]),
+                TraceEvent(1, TaskState.SUCCESS, "done", utc_now()),
+            )
+
+        captured = Metrics()
+        with mock.patch("evoagent.application.repairs.metrics", captured):
+            for name, outcome in outcomes.items():
+                completed_task(name)
+                RepairUseCases(
+                    self.store,
+                    policies,
+                    Fixer(outcome),
+                    lambda _installation_id: object(),
+                    lambda *_args: None,
+                    options,
+                ).create_fix(name, tenant_id="tenant")
+            completed_task("failed")
+            with self.assertRaisesRegex(RuntimeError, "publication failed"):
+                RepairUseCases(
+                    self.store,
+                    policies,
+                    Fixer(error=True),
+                    lambda _installation_id: object(),
+                    lambda *_args: None,
+                    options,
+                ).create_fix("failed", tenant_id="tenant")
+
+        output = captured.prometheus()
+        self.assertIn("evoagent_fix_attempts_total 3.0", output)
+        self.assertIn("evoagent_fix_runs_total 2.0", output)
+        self.assertIn("evoagent_fix_abstained_total 1.0", output)
+        self.assertIn("evoagent_fix_verification_blocked_total 1.0", output)
+        self.assertIn("evoagent_fix_failed_total 1.0", output)
 
     def test_review_use_case_owns_admission_execution_and_events(self):
         report = ReviewReport("org/repo", 7, "one issue", "high", [_finding()])

@@ -5,7 +5,7 @@ import unittest
 from unittest import mock
 
 from evoagent.bootstrap import build_application_runtime
-from evoagent.capabilities import FIX_RULE, GITHUB_CLIENT, MODEL_GATEWAY, STORE
+from evoagent.capabilities import FIX_RULE, GITHUB_CLIENT, MODEL_GATEWAY, PROOF_EXECUTOR, STORE
 from evoagent.config import Settings
 from evoagent.fix_rules import RuleMutation
 from evoagent.plugins import (
@@ -386,6 +386,57 @@ class ApplicationCompositionTests(unittest.TestCase):
 
         self.assertIs(gateway, service.model_gateway)
         self.assertEqual({}, service.llm_config)
+
+    def test_service_can_replace_the_proof_executor_provider(self):
+        class FakeProofExecutor:
+            calls = 0
+
+            def execute(self, _files, _command):
+                self.calls += 1
+                return {
+                    "passed": False,
+                    "status": "failed",
+                    "checks": [],
+                    "duration_seconds": 0.0,
+                }
+
+            @staticmethod
+            def health():
+                return {"healthy": False, "mode": "remote"}
+
+        executor = FakeProofExecutor()
+        replacement = ProviderPlugin(
+            PluginManifest(
+                "evoagent.proof-executor",
+                "2.0.0",
+                (PROOF_EXECUTOR.name,),
+            ),
+            PROOF_EXECUTOR,
+            lambda _context: executor,
+        )
+        service = ReviewService(
+            _settings(
+                self.path,
+                proof_runner_url="https://proof.example/v1/execute",
+                proof_runner_signing_key="proof-test-signing-key-at-least-32-bytes",
+                proof_runner_allowed_hosts=("proof.example",),
+                proof_require_remote=True,
+            ),
+            plugins=[replacement],
+        )
+        self.addCleanup(service.close)
+
+        self.assertIs(executor, service.proof_executor)
+        result = service.run_proof(
+            {"a.py": "bug\n"},
+            {"a.py": "fixed\n"},
+            "pytest -q",
+        )
+        self.assertEqual(2, executor.calls)
+        self.assertEqual("L2-reproduced", result["evidence_label"])
+        ready, detail = service.readiness()
+        self.assertFalse(ready)
+        self.assertFalse(detail["checks"]["proof_runner"]["healthy"])
 
     def test_route_file_composes_multiple_routes_with_independent_breakers(self):
         handle, route_path = tempfile.mkstemp(suffix=".toml")

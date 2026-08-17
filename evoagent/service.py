@@ -25,6 +25,7 @@ from .capabilities import (
     LLM_BREAKER,
     MODEL_GATEWAY,
     OBSERVABILITY,
+    PROOF_EXECUTOR,
     QUEUE_FACTORY,
     RELEASES,
     REPOSITORY_POLICY,
@@ -72,6 +73,7 @@ class ReviewService:
             self.harness = self.review_engine.harness
             self.github = self.plugin_runtime.require(GITHUB_CLIENT)
             self.fixer = self.plugin_runtime.require(FIXER)
+            self.proof_executor = self.plugin_runtime.require(PROOF_EXECUTOR)
             self.auth = self.plugin_runtime.require(AUTH)
             self.releases = self.plugin_runtime.require(RELEASES)
             self.alerts = self.plugin_runtime.require(ALERTS)
@@ -98,6 +100,7 @@ class ReviewService:
                     max_output_bytes=settings.repair_max_output_bytes,
                     effect_lease_seconds=settings.effect_lease_seconds,
                 ),
+                self.proof_executor,
             )
             self.review_use_cases = ReviewUseCases(
                 self.store,
@@ -319,6 +322,14 @@ class ReviewService:
         except Exception as exc:
             checks["outbox"] = "error: %s" % exc
             ready = False
+        if self.settings.proof_require_remote:
+            try:
+                proof_health = self.proof_executor.health()
+            except Exception:
+                proof_health = {"healthy": False, "mode": "remote"}
+            checks["proof_runner"] = proof_health
+            if not proof_health.get("healthy"):
+                ready = False
         return ready, {
             "status": "ready" if ready else "not-ready",
             "checks": checks,

@@ -60,6 +60,7 @@ manifest = PluginManifest(
 | `circuit-breaker.github` | `evoagent.breaker.github` | GitHub 熔断器 |
 | `circuit-breaker.llm` | `evoagent.breaker.llm` | LLM 熔断器 |
 | `model.gateway` | `evoagent.model-gateway` | 模型路由、脱敏、配额与用量账本 |
+| `proof.executor` | `evoagent.proof-executor` | 容器化本地或签名远程证据执行 |
 | `codehost.github` | `evoagent.codehost.github` | GitHub Adapter |
 | `review.engine` | `evoagent.review-engine` | Reviewer Graph 与 Harness |
 | `fix.rule` | `evoagent.fix-rule.*` | 可组合确定性修复规则 |

@@ -382,6 +382,13 @@ class ModelGatewayPort(Protocol):
     def complete(self, request: ModelRequest) -> ModelResponse: ...
 
 
+@runtime_checkable
+class ProofExecutorPort(Protocol):
+    def execute(self, files: dict[str, str], command: str) -> dict[str, Any]: ...
+
+    def health(self) -> dict[str, Any]: ...
+
+
 class ServiceStorePort(Protocol):
     def ping(self) -> None: ...
 

@@ -101,6 +101,14 @@ class Settings:
     repair_cpus: float = 1.0
     repair_require_container: bool = False
     repair_max_output_bytes: int = 16000
+    proof_runner_url: str = ""
+    proof_runner_signing_key: str = ""
+    proof_runner_allowed_hosts: tuple[str, ...] = ()
+    proof_runner_timeout_seconds: int = 150
+    proof_runner_max_request_bytes: int = 12 * 1024 * 1024
+    proof_runner_max_response_bytes: int = 128 * 1024
+    proof_runner_replay_window_seconds: int = 300
+    proof_require_remote: bool = False
     otel_endpoint: str = ""
     otel_service_name: str = "evoagent"
     alert_failure_rate: float = 0.20
@@ -231,6 +239,17 @@ class Settings:
             raise ValueError(
                 "model input or output pricing is required when the daily cost budget is enabled"
             )
+        if self.proof_require_remote and not self.proof_runner_url:
+            raise ValueError(
+                "EVOAGENT_PROOF_RUNNER_URL is required when remote proof execution is mandatory"
+            )
+        if self.proof_runner_url:
+            if len(self.proof_runner_signing_key.encode("utf-8")) < 32:
+                raise ValueError("EVOAGENT_PROOF_RUNNER_SIGNING_KEY must contain at least 32 bytes")
+            if not self.proof_runner_allowed_hosts:
+                raise ValueError(
+                    "EVOAGENT_PROOF_RUNNER_ALLOWED_HOSTS is required for remote proof execution"
+                )
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -305,6 +324,20 @@ class Settings:
             repair_cpus=float(os.getenv("EVOAGENT_REPAIR_CPUS", "1.0")),
             repair_require_container=_bool("EVOAGENT_REPAIR_REQUIRE_CONTAINER", False),
             repair_max_output_bytes=_int("EVOAGENT_REPAIR_MAX_OUTPUT_BYTES", 16000),
+            proof_runner_url=os.getenv("EVOAGENT_PROOF_RUNNER_URL", "").rstrip("/"),
+            proof_runner_signing_key=os.getenv("EVOAGENT_PROOF_RUNNER_SIGNING_KEY", ""),
+            proof_runner_allowed_hosts=_csv("EVOAGENT_PROOF_RUNNER_ALLOWED_HOSTS"),
+            proof_runner_timeout_seconds=_int("EVOAGENT_PROOF_RUNNER_TIMEOUT_SECONDS", 150),
+            proof_runner_max_request_bytes=_int(
+                "EVOAGENT_PROOF_RUNNER_MAX_REQUEST_BYTES", 12 * 1024 * 1024
+            ),
+            proof_runner_max_response_bytes=_int(
+                "EVOAGENT_PROOF_RUNNER_MAX_RESPONSE_BYTES", 128 * 1024
+            ),
+            proof_runner_replay_window_seconds=_int(
+                "EVOAGENT_PROOF_RUNNER_REPLAY_WINDOW_SECONDS", 300
+            ),
+            proof_require_remote=_bool("EVOAGENT_PROOF_REQUIRE_REMOTE", False),
             otel_endpoint=os.getenv("EVOAGENT_OTEL_ENDPOINT", ""),
             otel_service_name=os.getenv("EVOAGENT_OTEL_SERVICE_NAME", "evoagent"),
             alert_failure_rate=float(os.getenv("EVOAGENT_ALERT_FAILURE_RATE", "0.20")),

@@ -17,6 +17,7 @@ from .capabilities import (
     LLM_BREAKER,
     MODEL_GATEWAY,
     OBSERVABILITY,
+    PROOF_EXECUTOR,
     QUEUE_FACTORY,
     RELEASES,
     REPOSITORY_POLICY,
@@ -56,8 +57,10 @@ from .plugins import (
     discover_plugins,
 )
 from .policy import RepositoryPolicyResolver
-from .ports import ApplicationStorePort, AuthStorePort
+from .ports import ApplicationStorePort, AuthStorePort, ProofExecutorPort
 from .postgres_store import create_store
+from .proof import LocalProofExecutor
+from .proof_remote import RemoteProofExecutor
 from .review_engine import ReviewEngine
 from .rollout import ReleaseManager
 from .task_queue import TaskQueue
@@ -157,6 +160,13 @@ def default_plugins(settings: Settings) -> list[Plugin]:
             (SETTINGS, STORE, LLM_BREAKER),
             _model_gateway,
             "Governed model routing, redaction, budget, and usage ledger",
+        ),
+        _provider(
+            "evoagent.proof-executor",
+            PROOF_EXECUTOR,
+            (SETTINGS,),
+            _proof_executor,
+            "Container-isolated local or authenticated remote proof execution",
         ),
         _provider(
             "evoagent.observability",
@@ -390,6 +400,32 @@ def _fixer(settings: Settings, rules: list[FixRule]) -> SafeFixer:
             max_output_bytes=settings.repair_max_output_bytes,
         ),
         rules,
+    )
+
+
+def _proof_executor(context: PluginContext) -> ProofExecutorPort:
+    settings = context.require(SETTINGS)
+    if settings.proof_runner_url:
+        return RemoteProofExecutor(
+            settings.proof_runner_url,
+            settings.proof_runner_signing_key,
+            settings.proof_runner_allowed_hosts,
+            timeout_seconds=settings.proof_runner_timeout_seconds,
+            max_request_bytes=settings.proof_runner_max_request_bytes,
+            max_response_bytes=settings.proof_runner_max_response_bytes,
+            replay_window_seconds=settings.proof_runner_replay_window_seconds,
+        )
+    return LocalProofExecutor(
+        lambda command: RepairVerifier(
+            command,
+            settings.repair_verify_timeout_seconds,
+            container_image=settings.repair_container_image,
+            memory_mb=settings.repair_memory_mb,
+            pids_limit=settings.repair_pids_limit,
+            cpus=settings.repair_cpus,
+            require_container=True,
+            max_output_bytes=settings.repair_max_output_bytes,
+        )
     )
 
 

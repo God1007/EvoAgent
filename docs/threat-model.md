@@ -24,6 +24,7 @@ the mitigations that exist in the codebase today, plus known residual risks.
 5. **Service → dynamic skill** — untrusted third-party reviewer code.
 6. **Service → repair verifier** — execution of untrusted PR code.
 7. **Tenant → tenant** — multi-tenant isolation.
+8. **API/worker → remote Proof Runner → job container** — signed execution and evidence.
 
 ## 3. Threats and mitigations
 
@@ -32,7 +33,7 @@ the mitigations that exist in the codebase today, plus known residual risks.
 | T1 | SSRF / token exfiltration via attacker-supplied `diff_url` | `github.py` enforces HTTPS + host allowlist, rejects embedded credentials/ports, re-validates redirects and strips `Authorization` cross-host, caps response/archive size | Allowlist is GitHub-only; self-hosted GitHub Enterprise needs config |
 | T2 | Prompt injection from PR content | PR content is data, never system/tool instructions; findings must map to added diff lines | LLM reviewers can still be nudged; treated as advisory, gated downstream |
 | T3 | Markdown injection in PR comments | `report.py` escapes all CommonMark punctuation, neutralizes backticks/newlines, dynamic-length fences | — |
-| T4 | Untrusted code execution on host | Verifier runs tests only when configured; container mode = netless, read-only root, dropped caps, `no-new-privileges`, CPU/mem/PID/file rlimits; host fallback applies rlimits + process-group kill and is documented as trusted-repo only | Host fallback is not network-isolated; strong isolation (microVM) is future work |
+| T4 | Untrusted code execution on host | `/v1/proofs` uses a container-required `proof.executor`; production can move execution to the standalone runner trust domain. Jobs are netless, read-only root, dropped caps, `no-new-privileges`, have no injected environment, and enforce CPU/mem/PID/file/output/time limits. Auto-repair can separately require container mode | Auto-repair host fallback is for trusted repositories only; containers share a kernel, so use a microVM provider for hostile public multi-tenancy |
 | T5 | Resource exhaustion (fork bomb, disk fill, output flood) | PID limit (container), file-size rlimit, bounded rolling output buffer, timeout kills the process group | Host-mode fork-bomb containment is best-effort only |
 | T6 | Malicious dynamic skill | Manifest + source SHA-256 + optional HMAC signature + import denylist; runs in a restricted subprocess with timeout/memory limits and no host credentials | Subprocess isolation is not a security boundary against a determined attacker |
 | T7 | Secret leakage in logs/repo | Secrets only from env; `report.py` never echoes secrets; gitleaks + pip-audit in CI | — |
@@ -41,6 +42,8 @@ the mitigations that exist in the codebase today, plus known residual risks.
 | T10 | Supply-chain (tampered deps) | Hash-locked `requirements*.lock`, `--require-hashes` installs, dependency-consistency guard test, Dependabot | Transitive lock refresh is manual after Dependabot PRs |
 | T11 | Unexpected in-process plugin activation | Entry-point discovery is disabled by default; enabling it requires an explicit plugin-id allowlist; manifest API/dependencies are validated and startup is transactional | A trusted plugin has process privileges; review and pin it like any production dependency |
 | T12 | Source/API-key leakage through model traffic or errors | Gateway redacts common assignment/Bearer/private-key forms before transport, strips configured credentials from upstream errors, validates exact route host + HTTPS, caps response size/tokens, stores route secrets only via environment references, and persists metadata/hash rather than prompts or responses | Pattern redaction is not a complete DLP system; DNS/network policy and provider retention remain deployment responsibilities |
+| T13 | Forged, replayed, redirected, or altered remote proof | Canonical request/input/evidence hashes, bidirectional HMAC-SHA256, UUID/timestamp replay gate, exact host allowlist, HTTPS outside loopback, disabled redirects/proxies, and bounded bodies | Replay state is process-local; HMAC rotation has no dual-key overlap yet |
+| T14 | Proof evidence deletion or mutation | Optional fail-closed content-addressed artifacts never overwrite existing content; signed responses expose input/evidence hashes | Local filesystem is not WORM and needs backup; regulated retention requires object lock |
 
 ## 4. Untrusted-execution policy
 
@@ -49,6 +52,9 @@ the mitigations that exist in the codebase today, plus known residual risks.
 - For untrusted PRs, set `EVOAGENT_REPAIR_CONTAINER_IMAGE` and
   `EVOAGENT_REPAIR_REQUIRE_CONTAINER=true`; without an image, `require_container`
   makes the verifier refuse host execution.
+- For production proof workloads, configure `EVOAGENT_PROOF_RUNNER_URL`, its
+  exact allowlist and signing key, then set `EVOAGENT_PROOF_REQUIRE_REMOTE=true`.
+  Keep the runner on dedicated nodes with no Store, Redis, GitHub, or LLM keys.
 - No GitHub token, LLM key, or host environment is injected into the verifier.
 - Plugin Profile and child Scope provide composition/lifecycle isolation only;
   they are not security sandboxes.
@@ -58,9 +64,11 @@ the mitigations that exist in the codebase today, plus known residual risks.
 - Process-based skill/host isolation is **not** equivalent to a VM boundary; do
   not run arbitrary untrusted code with it in production.
 - Cloud metadata endpoints are not explicitly blocked in host fallback mode;
-  rely on container mode (`--network none`) for that.
+  Proof Runner jobs always rely on container mode (`--network none`).
 - The LLM reviewer's judgments are advisory and not proof; high-confidence
-  claims require executable evidence (roadmap: Proof Runner).
+  claims require Proof Runner evidence.
+- The built-in remote runner uses containers and a per-process replay cache; a
+  microVM provider and shared nonce store remain deployment hardening work.
 - Model fallback is bounded and policy-filtered, but is not an availability
   guarantee without independently provisioned provider/region capacity.
 

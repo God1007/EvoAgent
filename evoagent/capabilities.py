@@ -15,6 +15,7 @@ from .ports import (
     ApplicationStorePort,
     CodeHostPort,
     ModelGatewayPort,
+    ProofExecutorPort,
     QueueFactoryPort,
 )
 from .review_engine import ReviewEngine
@@ -27,6 +28,7 @@ OBSERVABILITY = CapabilityKey[Observability]("observability")
 GITHUB_BREAKER = CapabilityKey[CircuitBreaker]("circuit-breaker.github")
 LLM_BREAKER = CapabilityKey[CircuitBreaker]("circuit-breaker.llm")
 MODEL_GATEWAY = CapabilityKey[ModelGatewayPort]("model.gateway")
+PROOF_EXECUTOR = CapabilityKey[ProofExecutorPort]("proof.executor")
 GITHUB_CLIENT = CapabilityKey[CodeHostPort]("codehost.github")
 REVIEW_ENGINE = CapabilityKey[ReviewEngine]("review.engine")
 FIX_RULE = CapabilityKey[FixRule]("fix.rule", multiple=True)

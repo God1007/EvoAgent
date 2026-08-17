@@ -9,8 +9,13 @@ from typing import Any
 
 from ..metrics import metrics
 from ..policy import RepositoryPolicyResolver
-from ..ports import CodeHostPort, RepairApplicationStorePort, RepairPublisherPort
-from ..proof import ProofRunner
+from ..ports import (
+    CodeHostPort,
+    ProofExecutorPort,
+    RepairApplicationStorePort,
+    RepairPublisherPort,
+)
+from ..proof import LocalProofExecutor, ProofRunner
 from ..verifier import RepairVerifier
 
 
@@ -35,6 +40,7 @@ class RepairUseCases:
         code_host_for_installation: Callable[[int | None], CodeHostPort],
         publish_event: Callable[[str, dict[str, Any]], None],
         options: RepairOptions,
+        proof_executor: ProofExecutorPort | None = None,
     ):
         self.store = store
         self.policies = policies
@@ -42,6 +48,7 @@ class RepairUseCases:
         self.code_host_for_installation = code_host_for_installation
         self.publish_event = publish_event
         self.options = options
+        self.proof_executor = proof_executor or LocalProofExecutor(self._proof_verifier)
 
     def _proof_verifier(self, command: str) -> RepairVerifier:
         # Proof commands and PR source are both untrusted. Host fallback is
@@ -81,13 +88,17 @@ class RepairUseCases:
         )
         if total > self.options.max_diff_bytes * 10:
             raise ValueError("proof payload exceeds the maximum analysable size")
-        result = ProofRunner(self._proof_verifier).prove(
-            original,
-            patched,
-            str(reproduction_command or ""),
-            str(regression_command or ""),
-        )
+        with metrics.latency("proof_execution"):
+            result = ProofRunner(executor=self.proof_executor).prove(
+                original,
+                patched,
+                str(reproduction_command or ""),
+                str(regression_command or ""),
+            )
         metrics.inc("proof_runs_total")
+        metrics.inc("proof_evidence_l%d_total" % int(result["evidence_level"]))
+        if any(step.get("status") in {"error", "timeout"} for step in result["steps"]):
+            metrics.inc("proof_inconclusive_total")
         return result
 
     def create_fix(

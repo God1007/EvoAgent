@@ -621,12 +621,25 @@ class ApiHandler(BaseHTTPRequestHandler):
                     str(payload.get("reproduction_command", "")),
                     str(payload.get("regression_command", "")),
                 )
+                steps = result.get("steps")
+                attestations = (
+                    [
+                        step["attestation"]
+                        for step in steps
+                        if isinstance(step, dict) and isinstance(step.get("attestation"), dict)
+                    ]
+                    if isinstance(steps, list)
+                    else []
+                )
                 self.service.store.audit(
                     principal.tenant_id,
                     principal.username,
                     "proof.run",
                     str(result.get("evidence_label", "")),
-                    {"level": result.get("evidence_level")},
+                    {
+                        "level": result.get("evidence_level"),
+                        "attestations": attestations,
+                    },
                 )
                 self._send_json(201, result)
                 return

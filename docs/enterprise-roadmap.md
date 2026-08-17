@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.10.0)
+## Current maturity (v0.11.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -18,7 +18,7 @@ It is an execution plan, not a marketing checklist.
 | Graceful lifecycle | Implemented | Readiness drain plus bounded queue drain before Store/plugin shutdown |
 | Multi-tenancy/governance | Implemented baseline | JWT, RBAC, tenant/repository authorization, audit, canary/shadow/rollback |
 | Model governance | Implemented advanced baseline | Replaceable gateway, scoped policy routing/residency, bounded fallback, per-route breakers, redaction, egress/output limits, atomic budgets, correlated metadata-only ledger; route shadow promotion remains pending |
-| Strong untrusted execution | Partial | Container isolation exists; host fallback is not a strong boundary; microVM/remote runner pending |
+| Strong untrusted execution | Implemented baseline | Replaceable remote Proof Runner, mutually authenticated evidence manifests, container-only jobs, replay/size/capacity gates, and content-addressed artifacts; microVM and distributed replay store remain pending |
 | Quality evidence | Synthetic benchmark only | 100-case controlled corpus; production activation gate remains blocked without independent labels |
 | HA/DR operational proof | Pending | No documented backup/restore drill, regional failover, or sustained production SLO evidence |
 
@@ -192,7 +192,7 @@ gates, weighted load balancing, and reconciliation of reservations left by a
 process crash. Multi-route support improves dependency resilience but is not a
 claim of regional HA without deployment-level network and capacity proof.
 
-### Remote proof runner
+### Remote proof runner — authenticated baseline implemented
 
 - move arbitrary repository execution out of the API/worker trust domain;
 - use short-lived container or microVM jobs with no ambient credentials;
@@ -205,6 +205,23 @@ Acceptance:
   cloud metadata;
 - runner timeout/capacity failure is represented as uncertainty, never proof;
 - every proof can be reproduced from a content-addressed evidence bundle.
+
+Implemented evidence: `ProofExecutorPort` and the stable `proof.executor`
+capability separate evidence grading from execution placement. The API adapter
+uses a canonical, versioned HMAC-SHA256 protocol with exact HTTPS host policy,
+no redirects/proxies, replay and byte caps, and verifies a response bound to the
+same request/input/evidence digests. `evoagent-proof-runner` is an independent
+process that refuses host execution, starts bounded netless containers without
+injected environment variables, and can fail closed on append-only
+content-addressed input/evidence persistence. Each evidence step returns the
+verified attestation; transport/capacity/runner failures remain L1/L2/L3
+uncertainty according to the ladder. Unit attack tests cover tampering, expiry,
+replay, allowlists, artifact immutability, and failure mapping; mandatory Docker
+CI exercises the complete HTTP → signature → runner → netless container path.
+
+Still pending for hostile public multi-tenancy: a microVM executor, shared
+multi-replica replay/nonce storage, dual-key rotation, and object-lock/WORM
+retention. See [`ADR 0009`](adr/0009-authenticated-remote-proof-runner.md).
 
 ## Phase 5 — SLO, operations, and disaster recovery
 

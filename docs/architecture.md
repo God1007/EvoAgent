@@ -11,7 +11,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Intake | `evoagent/api.py` | HTTP API, static web console, `/webhooks/github`, `/health`, `/metrics` |
 | Composition | `evoagent/plugins.py` | Trusted plugin manifests, capability registry, scopes, events, dependency graph, lifecycle rollback |
 | Composition | `evoagent/capabilities.py` | Stable typed capability definitions for providers and consumers |
-| Domain boundary | `evoagent/ports.py` | Focused Store, Queue, CodeHost, and Model Gateway behavioral contracts |
+| Domain boundary | `evoagent/ports.py` | Focused Store, Queue, CodeHost, Model Gateway, and Proof Executor behavioral contracts |
 | Composition | `evoagent/bootstrap.py` | Replaceable built-in provider catalog and transactional application startup |
 | Application | `evoagent/application/` | Focused Review, Webhook, Session, Repair, and Policy use cases |
 | Composition facade | `evoagent/service.py` | Capability wiring, lifecycle/health, canary/shadow runtime selection, API compatibility |
@@ -24,6 +24,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Review | `evoagent/skills.py` | Dynamic skill registry, manifest/hash/signature checks, sandboxed execution |
 | Delivery | `evoagent/fix_rules.py`, `fixer.py` | Pluggable deterministic transforms plus verified auto-repair on a dedicated branch |
 | Delivery | `evoagent/verifier.py` | Compile/test gates with container or host isolation |
+| Evidence | `evoagent/proof.py`, `proof_remote.py` | L1–L4 grading plus authenticated local/remote execution and attestations |
 | Delivery | `evoagent/report.py` | Injection-safe markdown report rendering |
 | Evolution | `evoagent/evolution.py`, `rollout.py` | Prompt versioning, validation/holdout replay, canary/shadow, rollback |
 | Evolution | `evoagent/evaluation_harness.py`, `evaluation_benchmark.py` | Replay scoring, benchmark dataset |
@@ -83,7 +84,7 @@ before the remaining infrastructure is forced closed.
 
 The default graph exposes stable capabilities for settings, store,
 observability, GitHub/LLM circuit breakers, GitHub delivery, the review engine,
-the model gateway, repair rules, the verified fixer, authentication, release
+the model gateway, proof executor, repair rules, the verified fixer, authentication, release
 governance, alerting, evolution, and the queue factory. `ReviewService` consumes
 these contracts and does not instantiate their implementations directly.
 
@@ -142,6 +143,9 @@ The full analysis lives in [`threat-model.md`](threat-model.md). Key boundaries:
 - **Untrusted code execution** only happens in the verifier, and only when a
   test command is configured (container isolation recommended; host fallback is
   for trusted repositories only).
+- **Production proof execution** can cross an authenticated remote boundary.
+  The response is bound to request/input/evidence hashes; the remote process
+  starts container-only jobs with no application credentials or network.
 - **Outbound GitHub requests** are restricted to an HTTPS host allowlist with
   redirect token-stripping and response-size caps.
 - **Outbound model requests** pass through a tenant/repository-aware gateway;
@@ -161,6 +165,9 @@ The full analysis lives in [`threat-model.md`](threat-model.md). Key boundaries:
   README "自定义 Skill" section.
 - **New deterministic repair**: implement `FixRule` and provide the multi-valued
   `FIX_RULE` capability; `SafeFixer` retains verification and publication gates.
+- **New proof runtime**: implement `ProofExecutorPort` and replace the
+  `evoagent.proof-executor` plugin/`proof.executor` capability; the evidence
+  ladder remains centralized and infrastructure errors remain uncertainty.
 - **New storage/queue/code-host/workflow backend**: implement a trusted provider
   for the stable key in `evoagent.capabilities`, satisfy its Protocol in
   `evoagent.ports`, pass the shared adapter contracts, and declare dependencies

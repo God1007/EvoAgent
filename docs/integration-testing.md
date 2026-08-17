@@ -18,6 +18,7 @@ Redis 7, and Docker.
 | Redis DLQ | Permanent failure survives queue restart and explicit replay succeeds |
 | GitHub transport | Auth/version headers, retry response, JSON body, and PATCH upsert cross a real HTTP socket |
 | Verifier | Real Docker run has no network, read-only root, bounded resources, no ambient host secret, and timeout cleanup |
+| Remote Proof Runner | Signed loopback HTTP reaches a real netless job container and returns content-addressed input/evidence attestations without leaking an ambient secret |
 | Distribution | The installed wheel serves packaged web assets and contains the bundled Skill |
 | Production image | `/ready` sees Postgres, Redis workers, schema and Outbox; async review reaches `SUCCESS`; SIGTERM exits cleanly |
 

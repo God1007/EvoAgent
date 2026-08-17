@@ -10,7 +10,7 @@
 [![CI](https://github.com/God1007/EvoAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/God1007/EvoAgent/actions/workflows/ci.yml)
 [![Security](https://github.com/God1007/EvoAgent/actions/workflows/security.yml/badge.svg)](https://github.com/God1007/EvoAgent/actions/workflows/security.yml)
 [![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Coverage](https://img.shields.io/badge/coverage-~84%25-brightgreen)](docs/evaluation.md)
+[![Coverage](https://img.shields.io/badge/coverage-~87%25-brightgreen)](docs/evaluation.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![PostgreSQL](https://img.shields.io/badge/Storage-SQLite%20%7C%20PostgreSQL-4169E1?logo=postgresql&logoColor=white)](#运行模式)
@@ -39,13 +39,13 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **精确 Diff 定位** | 只接受 Unified Diff 新文件行号上的发现，降低错误定位和模型幻觉 |
 | **PR 会话连续性** | 同一 PR 多次 push 归入同一会话，跨轮次跟踪问题的新增/仍存在/已修复/移动，稳定 Marker 评论原地更新 |
 | **代码影响面图谱** | 基于 `ast` 的 Python 符号/调用/导入图，回答「改了这些文件，哪些符号在影响半径内」 |
-| **可执行证据阶梯** | Proof Runner 以「补丁前失败、补丁后通过」的沙箱复现将判断升级为 L1–L4 证据，基础设施失败判为不确定而非冒充证据 |
+| **可执行证据阶梯** | 可插拔 Proof Runner 以「补丁前失败、补丁后通过」将判断升级为 L1–L4；生产可用双向签名的独立 Runner 隔离不可信执行 |
 | **双运行模式** | 本地使用 SQLite + 进程内队列；生产环境切换 PostgreSQL + Redis Streams |
 | **GitHub 自动化** | 支持 PR Webhook、幂等投递、Diff 拉取、评论 upsert 和独立修复 PR |
 | **保守型自动修复** | 仅处理可确定转换的规则，在新分支生成原子提交，并经过编译与可选测试门禁 |
 | **受控能力演进** | 从误报、漏报和坏修复中生成候选 Prompt，通过 Validation/Holdout 回放门禁后才允许激活 |
 | **动态 Skills** | 基于 manifest 加载自定义审查器，支持哈希/签名校验、超时、内存限制和隔离进程 |
-| **可插拔微内核** | Store、Queue、Model Gateway、Review Engine、代码托管、可观测性和 FixRule 通过稳定 Capability 组合，支持依赖校验、启动回滚、Profile 与作用域覆盖 |
+| **可插拔微内核** | Store、Queue、Model Gateway、Proof Executor、Review Engine、代码托管、可观测性和 FixRule 通过稳定 Capability 组合，支持依赖校验、启动回滚、Profile 与作用域覆盖 |
 | **模型治理网关** | 任务级租户/仓库上下文、凭据脱敏、HTTPS/出口主机限制、结构化输出门禁、Token/成本预算与元数据用量账本 |
 | **生产治理** | JWT、RBAC、多租户、仓库隔离、事务 Outbox、审计日志、灰度发布、影子流量、告警与死信队列 |
 | **可观测性** | 任务 Trace、Agent 消息、Prometheus 指标和 OpenTelemetry Trace |
@@ -696,9 +696,12 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 
 > 复现契约：命令必须在 `original` 上失败、在 `patched` 上通过。仅「原始代码上真实
 > 非零退出」才算复现；超时/启动失败等基础设施问题一律判为「不确定」而不冒充证据。
-> 由于该路径同时运行不可信 PR 代码与调用方提供的命令，**证据运行强制要求容器隔离**：
-> 未配置 `EVOAGENT_REPAIR_CONTAINER_IMAGE` 时该步返回 error 并停留在 L1，绝不在宿主机执行。
-> 强隔离 microVM（Firecracker/Kata）与托管静态分析（CodeQL）为后续工作。
+> 由于该路径同时运行不可信 PR 代码与调用方提供的命令，**证据运行强制要求容器隔离**。
+> 未配置远程 Runner 时，`proof.executor` 使用本地容器执行器；未设置
+> `EVOAGENT_REPAIR_CONTAINER_IMAGE` 则返回 error 并停留在 L1，绝不在宿主机执行。
+> 生产环境可配置独立 `evoagent-proof-runner`：请求/响应由 HMAC-SHA256 双向签名，绑定
+> request/input/evidence 摘要，限制重放、出口、容量和字节数，并返回可寻址证据引用。
+> 完整部署和剩余边界见 [`docs/remote-proof-runner.md`](docs/remote-proof-runner.md)。
 
 ### GitHub、Skill 与演进
 
@@ -766,6 +769,9 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `EVOAGENT_AUTH_REQUIRED` | `false` | 是否启用登录和 API 鉴权 |
 | `EVOAGENT_AUTO_POST_REVIEW` | `false` | 是否自动向 GitHub PR 回写报告 |
 | `EVOAGENT_REPAIR_TEST_COMMAND` | 空 | 自动修复后运行的仓库测试命令 |
+| `EVOAGENT_PROOF_RUNNER_URL` | 空 | 独立 Proof Runner `/v1/execute` 地址；非回环必须 HTTPS |
+| `EVOAGENT_PROOF_RUNNER_ALLOWED_HOSTS` | 空 | Runner 精确主机白名单（启用远程执行时必填） |
+| `EVOAGENT_PROOF_REQUIRE_REMOTE` | `false` | 是否要求远程 Runner 完整配置，否则启动失败 |
 | `EVOAGENT_SKILL_SANDBOX` | `true` | 动态 Skill 是否运行在沙箱中 |
 | `EVOAGENT_OTEL_ENDPOINT` | 空 | OTLP HTTP Exporter 地址 |
 
@@ -785,6 +791,8 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 │   ├── bootstrap.py              # 默认 Provider Catalog 与应用组装
 │   ├── review_engine.py          # 可替换 Reviewer Graph 与 Harness 组装
 │   ├── model_gateway.py          # 模型脱敏、出口、预算、输出与用量治理
+│   ├── proof.py                  # L1–L4 证据阶梯与执行器端口消费
+│   ├── proof_remote.py           # 双向签名远程执行协议与独立 Runner
 │   ├── harness.py                # LangGraph、状态机与 Checkpoint
 │   ├── agents.py                 # 多 Agent 协作协议
 │   ├── reviewer.py               # 本地规则与 OpenAI-compatible Reviewer
@@ -832,7 +840,7 @@ make check
 
 当前整体行覆盖率约 87%，其中 `fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
 
-GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16 与 Redis 7，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离，以及生产镜像的 `/ready` → Outbox → Redis → Worker 全链路。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；后续架构决策记录在 [`docs/adr/`](docs/adr/)，模型治理见 [`ADR 0007`](docs/adr/0007-governed-model-gateway.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
+GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16 与 Redis 7，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离、远程 Proof Runner 的签名 HTTP → 禁网容器全链路，以及生产镜像的 `/ready` → Outbox → Redis → Worker 流程。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；后续架构决策记录在 [`docs/adr/`](docs/adr/)，模型治理见 [`ADR 0007`](docs/adr/0007-governed-model-gateway.md)，远程证据边界见 [`ADR 0009`](docs/adr/0009-authenticated-remote-proof-runner.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
 
 更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，仓库策略见 [`docs/repository-policies.md`](docs/repository-policies.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)，性能 SLO、压测方法与可复现基线见 [`docs/performance.md`](docs/performance.md) 与 [`docs/performance-baseline.md`](docs/performance-baseline.md)。
 
@@ -891,6 +899,7 @@ output/evaluation/evaluation-report.md
 - Webhook Secret 与登录 Secret 用途不同，不能混用；
 - 动态 Skill 不获得宿主权限，并运行在受限进程中；
 - 自动修复不写入原 PR Head，只创建独立分支和 Draft PR；
+- 生产 Proof Runner 可独立部署；API 仅访问精确白名单 HTTPS 地址，签名验证失败、重放、超时或容量不足均只能产生“不确定”，不能升级证据等级；
 - 只有配置测试命令后，才会在仓库副本中执行测试：配置容器镜像时以禁网、只读根、丢弃 capability、CPU/内存/进程数限额的容器运行（推荐用于不可信 PR 代码）；未配置镜像时以宿主回退模式运行，施加 CPU/内存/文件大小/进程数 `rlimit` 且超时会终止整个进程组，但不具备网络隔离，仅适用于可信仓库；
 - 私有仓库、评论回写和自动修复应使用最小权限 Token；
 - 公网部署必须启用认证，并通过反向代理限制暴露路径。

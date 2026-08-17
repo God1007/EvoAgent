@@ -16,6 +16,8 @@ groups:
         expr: (sum(increase(evoagent_fix_verification_blocked_total[6h])) or vector(0)) / clamp_min(sum(increase(evoagent_fix_attempts_total[6h])), 1)
       - record: evoagent:ratio:negative_feedback_24h
         expr: ((sum(increase(evoagent_feedback_false_positive_total[24h])) or vector(0)) + (sum(increase(evoagent_feedback_missed_issue_total[24h])) or vector(0)) + (sum(increase(evoagent_feedback_bad_fix_total[24h])) or vector(0))) / clamp_min(sum(increase(evoagent_feedback_total[24h])), 1)
+      - record: evoagent:ratio:tenant_review_capacity_rejected_15m
+        expr: (sum(increase(evoagent_review_admission_rejections_total[15m])) or vector(0)) / clamp_min((sum(increase(evoagent_review_admissions_total[15m])) or vector(0)) + (sum(increase(evoagent_review_admission_rejections_total[15m])) or vector(0)), 1)
 
   - name: evoagent-slo-alerts
     rules:
@@ -143,3 +145,12 @@ groups:
         annotations:
           summary: Operational-history retention has not completed on schedule
           runbook: docs/operations.md#history-retention
+
+      - alert: EvoAgentTenantReviewCapacitySaturated
+        expr: evoagent:ratio:tenant_review_capacity_rejected_15m > 0.1 and sum(increase(evoagent_review_admission_rejections_total[15m])) > 5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Tenant review admission is rejecting a sustained share of requests
+          runbook: docs/operations.md#tenant-review-capacity

@@ -6,6 +6,7 @@ import threading
 import unittest
 import uuid
 
+from evoagent.errors import TenantReviewCapacityError
 from evoagent.github import GitHubClient
 from evoagent.migrations import CURRENT_SCHEMA_VERSION
 from evoagent.models import TaskState, TraceEvent
@@ -415,9 +416,201 @@ class _StoreBehaviorContract:
         cached = self.store.claim_effect(effect_key, "another-worker", 30)
         self.assertEqual({"published": True}, cached["result"])
 
+    def test_tenant_review_admission_is_atomic_and_tracks_delivery_lifecycle(self):
+        tenant = self.unique("admission-tenant")
+        first = self.unique("admission-async")
+        self.store.create_review_task(
+            first,
+            "acme/noisy",
+            1,
+            {"source": "contract"},
+            tenant,
+            "--- a/a.py\n+++ b/a.py\n+value = 1\n",
+            {"task_id": first, "repository": "acme/noisy", "tenant_id": tenant},
+            1,
+        )
+        self.assertEqual(1, self.store.tenant_review_admission_stats(tenant)["active"])
+
+        rejected = self.unique("admission-rejected")
+        with self.assertRaises(TenantReviewCapacityError):
+            self.store.create_review_task(
+                rejected,
+                "acme/noisy",
+                2,
+                {"source": "contract"},
+                tenant,
+                None,
+                {"task_id": rejected, "repository": "acme/noisy", "tenant_id": tenant},
+                1,
+            )
+        self.assertIsNone(self.store.get(rejected, tenant))
+        audit = self.store.list_audit(tenant, 10)
+        rejection = next(item for item in audit if item["action"] == "review.capacity-rejected")
+        self.assertEqual({"active": 1, "limit": 1, "source": "contract"}, rejection["detail"])
+
+        # An async execution failure remains delivery-managed and therefore
+        # keeps its slot through retries. Final DLQ disposition releases it.
+        self.store.fail(
+            first,
+            "review execution failed [type=unknown; ref=0000000000000000]",
+            TraceEvent(1, TaskState.FAILED, "failed", utc_now()),
+        )
+        self.assertEqual(1, self.store.tenant_review_admission_stats(tenant)["active"])
+        self.assertTrue(self.store.release_review_admission(first, "dead-letter", 1))
+        self.assertEqual(0, self.store.tenant_review_admission_stats(tenant)["active"])
+
+        resume_key = self.unique("resume")
+        resumed = self.store.resume_review_task(
+            first,
+            tenant,
+            1,
+            "outbox-" + resume_key,
+            "message-" + resume_key,
+            {"task_id": first, "repository": "acme/noisy", "tenant_id": tenant},
+        )
+        self.assertEqual("resumed", resumed["status"])
+        self.assertEqual(2, resumed["generation"])
+        self.assertEqual(
+            "active",
+            self.store.resume_review_task(
+                first,
+                tenant,
+                1,
+                "unused-outbox-" + resume_key,
+                "unused-message-" + resume_key,
+                {"task_id": first},
+            )["status"],
+        )
+        pending = self.store.list_outbox("pending", 500)
+        self.assertEqual(1, sum(item["message_key"] == "message-" + resume_key for item in pending))
+        resumed_message = next(
+            item for item in pending if item["message_key"] == "message-" + resume_key
+        )
+        self.assertEqual(2, resumed_message["payload"]["admission_generation"])
+        self.assertFalse(self.store.release_review_admission(first, "dead-letter", 1))
+        self.assertEqual(1, self.store.tenant_review_admission_stats(tenant)["active"])
+        self.assertTrue(self.store.release_review_admission(first, "dead-letter", 2))
+
+        # A synchronous failure is terminal for delivery and releases
+        # immediately, unlike the asynchronous retry path above.
+        synchronous = self.unique("admission-sync")
+        self.store.create_review_task(
+            synchronous,
+            "acme/sync",
+            3,
+            {"source": "contract"},
+            tenant,
+            "--- a/b.py\n+++ b/b.py\n+value = 2\n",
+            None,
+            1,
+        )
+        self.store.fail(
+            synchronous,
+            "review execution failed [type=unknown; ref=1111111111111111]",
+            TraceEvent(1, TaskState.FAILED, "failed", utc_now()),
+        )
+        self.assertEqual(0, self.store.tenant_review_admission_stats(tenant)["active"])
+
+        cancelled = self.unique("admission-cancelled")
+        self.store.create_review_task(
+            cancelled,
+            "acme/cancelled",
+            4,
+            {"source": "contract"},
+            tenant,
+            None,
+            {"task_id": cancelled, "repository": "acme/cancelled", "tenant_id": tenant},
+            1,
+        )
+        self.store.cancel(
+            cancelled,
+            TraceEvent(1, TaskState.CANCELLED, "cancelled", utc_now()),
+        )
+        self.assertEqual(0, self.store.tenant_review_admission_stats(tenant)["active"])
+
+    def test_tenant_review_admission_serializes_concurrent_replicas(self):
+        tenant = self.unique("admission-race")
+        barrier = threading.Barrier(2)
+        admitted: list[str] = []
+        rejected: list[str] = []
+        errors: list[Exception] = []
+
+        def create(suffix: str) -> None:
+            task_id = self.unique("admission-race-" + suffix)
+            try:
+                barrier.wait(timeout=5)
+                self.store.create_review_task(
+                    task_id,
+                    "acme/race",
+                    4,
+                    {"source": "contract"},
+                    tenant,
+                    None,
+                    {"task_id": task_id, "repository": "acme/race", "tenant_id": tenant},
+                    1,
+                )
+                admitted.append(task_id)
+            except TenantReviewCapacityError:
+                rejected.append(task_id)
+            except Exception as exc:
+                errors.append(exc)
+
+        workers = [threading.Thread(target=create, args=(str(index),)) for index in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=10)
+
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(admitted))
+        self.assertEqual(1, len(rejected))
+        self.assertEqual(1, self.store.tenant_review_admission_stats(tenant)["active"])
+
+    def test_webhook_capacity_rejection_keeps_retryable_idempotency_claim(self):
+        tenant = self.unique("webhook-capacity")
+        occupied = self.unique("webhook-occupied")
+        self.store.create_review_task(
+            occupied,
+            "acme/webhook",
+            5,
+            {"source": "contract"},
+            tenant,
+            None,
+            {"task_id": occupied, "repository": "acme/webhook", "tenant_id": tenant},
+            1,
+        )
+        delivery = self.unique("delivery-capacity")
+        task_id = self.unique("webhook-task")
+        arguments = (
+            delivery,
+            tenant,
+            "a" * 64,
+            "acme/webhook",
+            6,
+            "head-1",
+            "opened",
+            task_id,
+            {"source": "github-webhook"},
+            {"repository": "acme/webhook", "tenant_id": tenant},
+            1,
+        )
+        with self.assertRaises(TenantReviewCapacityError):
+            self.store.accept_pull_request_webhook(*arguments)
+        claim = self.store.get_webhook(delivery)
+        self.assertEqual("a" * 64, claim["payload_sha256"])
+        self.assertIsNone(claim["task_id"])
+        self.assertIsNone(self.store.get_session(tenant, "acme/webhook", 6))
+
+        self.assertTrue(self.store.release_review_admission(occupied, "dead-letter"))
+        accepted = self.store.accept_pull_request_webhook(*arguments)
+        self.assertTrue(accepted["accepted"])
+        self.assertEqual(task_id, self.store.get_webhook(delivery)["task_id"])
+
     def test_offline_queue_recovery_contract(self):
         async_task = self.unique("recovery-async")
         sync_task = self.unique("recovery-sync")
+        retrying_task = self.unique("recovery-retrying")
+        terminal_failure = self.unique("recovery-terminal-failure")
         self.store.create_review_task(
             async_task,
             "acme/widgets",
@@ -435,20 +628,72 @@ class _StoreBehaviorContract:
             "tenant-b",
             "--- a/b.py\n+++ b/b.py\n+value = 2\n",
         )
+        self.store.create_review_task(
+            retrying_task,
+            "acme/worker",
+            22,
+            {"source": "contract"},
+            "tenant-c",
+            "--- a/c.py\n+++ b/c.py\n+value = 3\n",
+            {"task_id": retrying_task, "repository": "acme/worker"},
+        )
+        self.store.fail(
+            retrying_task,
+            "transient worker failure",
+            TraceEvent(1, TaskState.FAILED, "failed", utc_now()),
+        )
+        self.assertTrue(self.store.release_review_admission(retrying_task, "dead-letter", 1))
+        recovery_resume = self.unique("recovery-resume")
+        resumed = self.store.resume_review_task(
+            retrying_task,
+            "tenant-c",
+            1,
+            "outbox-" + recovery_resume,
+            "message-" + recovery_resume,
+            {"task_id": retrying_task, "repository": "acme/worker"},
+        )
+        self.assertEqual(2, resumed["generation"])
+        self.store.fail(
+            retrying_task,
+            "second transient worker failure",
+            TraceEvent(2, TaskState.FAILED, "failed", utc_now()),
+        )
+        self.store.create_review_task(
+            terminal_failure,
+            "acme/terminal",
+            23,
+            {"source": "contract"},
+            "tenant-d",
+            "--- a/d.py\n+++ b/d.py\n+value = 4\n",
+        )
+        self.store.fail(
+            terminal_failure,
+            "synchronous terminal failure",
+            TraceEvent(1, TaskState.FAILED, "failed", utc_now()),
+        )
         candidates = [
             item
             for item in self.store.queue_recovery_candidates(100_001)
-            if item["task_id"] in {async_task, sync_task}
+            if item["task_id"] in {async_task, sync_task, retrying_task, terminal_failure}
         ]
+        candidate_ids = {item["task_id"] for item in candidates}
+        self.assertIn(retrying_task, candidate_ids)
+        self.assertNotIn(terminal_failure, candidate_ids)
+        retrying_candidate = next(item for item in candidates if item["task_id"] == retrying_task)
+        self.assertEqual(2, retrying_candidate["payload"]["admission_generation"])
         recovery_id = str(uuid.uuid4())
 
         result = self.store.stage_queue_recovery(recovery_id, "a" * 64, candidates)
 
-        self.assertEqual(2, result["staged"])
+        self.assertEqual(3, result["staged"])
         self.assertFalse(result["already_applied"])
         self.assertEqual("a" * 64, self.store.get_queue_recovery(recovery_id)["plan_sha256"])
         pending = self.store.list_outbox("pending", 500)
-        self.assertTrue({async_task, sync_task}.issubset({item["message_key"] for item in pending}))
+        self.assertTrue(
+            {async_task, sync_task, retrying_task}.issubset(
+                {item["message_key"] for item in pending}
+            )
+        )
 
     def test_versioned_repository_policy_contract(self):
         tenant_id = self.unique("policy-tenant")

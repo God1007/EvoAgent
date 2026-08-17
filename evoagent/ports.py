@@ -250,7 +250,24 @@ class ReviewApplicationStorePort(Protocol):
         tenant_id: str,
         diff: str | None = None,
         outbox_payload: dict[str, Any] | None = None,
+        max_active_reviews: int = 0,
     ) -> None: ...
+
+    def tenant_review_admission_stats(self, tenant_id: str | None = None) -> dict[str, Any]: ...
+
+    def release_review_admission(
+        self, task_id: str, reason: str, generation: int | None = None
+    ) -> bool: ...
+
+    def resume_review_task(
+        self,
+        task_id: str,
+        tenant_id: str,
+        max_active_reviews: int,
+        outbox_id: str,
+        message_key: str,
+        outbox_payload: dict[str, Any],
+    ) -> dict[str, Any]: ...
 
     def save_task_payload(self, task_id: str, diff: str) -> None: ...
 
@@ -316,6 +333,7 @@ class WebhookApplicationStorePort(Protocol):
         task_id: str,
         task_payload: dict[str, Any],
         outbox_payload: dict[str, Any],
+        max_active_reviews: int = 0,
     ) -> dict[str, Any]: ...
 
 
@@ -518,7 +536,24 @@ class ServiceStorePort(Protocol):
         tenant_id: str,
         diff: str | None = None,
         outbox_payload: dict[str, Any] | None = None,
+        max_active_reviews: int = 0,
     ) -> None: ...
+
+    def tenant_review_admission_stats(self, tenant_id: str | None = None) -> dict[str, Any]: ...
+
+    def release_review_admission(
+        self, task_id: str, reason: str, generation: int | None = None
+    ) -> bool: ...
+
+    def resume_review_task(
+        self,
+        task_id: str,
+        tenant_id: str,
+        max_active_reviews: int,
+        outbox_id: str,
+        message_key: str,
+        outbox_payload: dict[str, Any],
+    ) -> dict[str, Any]: ...
 
     def list_tasks(self, limit: int = 50, tenant_id: str | None = None) -> list: ...
 
@@ -582,6 +617,7 @@ class ServiceStorePort(Protocol):
         task_id: str,
         task_payload: dict[str, Any],
         outbox_payload: dict[str, Any],
+        max_active_reviews: int = 0,
     ) -> dict[str, Any]: ...
 
     def complete_webhook(self, delivery_id: str, task_id: str | None) -> None: ...

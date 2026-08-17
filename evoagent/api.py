@@ -19,7 +19,12 @@ from . import __version__
 from .auth import Principal
 from .backpressure import ClientIdentity
 from .config import Settings
-from .errors import AccessDeniedError, ClientInputError, safe_exception_fields
+from .errors import (
+    AccessDeniedError,
+    ClientInputError,
+    TenantReviewCapacityError,
+    safe_exception_fields,
+)
 from .github import verify_signature
 from .metrics import metrics
 from .report import to_markdown
@@ -287,6 +292,16 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._request_id_value()
         try:
             self._dispatch_with_admission(method, handler)
+        except TenantReviewCapacityError:
+            if not self._response_started:
+                self._reject(
+                    429,
+                    self.settings.tenant_capacity_retry_seconds,
+                    "tenant review capacity is exhausted",
+                    drain_body=False,
+                )
+            else:
+                self.close_connection = True
         except ClientInputError as exc:
             if not self._response_started:
                 self._send_json(400, {"error": str(exc)})
@@ -363,12 +378,20 @@ class ApiHandler(BaseHTTPRequestHandler):
             return "read"
         return "write"
 
-    def _reject(self, status: int, retry_after: float, message: str) -> None:
+    def _reject(
+        self,
+        status: int,
+        retry_after: float,
+        message: str,
+        *,
+        drain_body: bool = True,
+    ) -> None:
         metrics.inc("http_rejected_total")
         # Drain any request body so the JSON error + Retry-After are delivered
         # cleanly instead of the peer seeing a connection reset (which would make
         # the Retry-After signal unreliable for exactly the shed heavy requests).
-        self._drain_body()
+        if drain_body:
+            self._drain_body()
         body = json.dumps({"error": message}, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -409,6 +432,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "plugin_profile": plugin_status["profile"],
                     "plugins": len(plugin_status["plugins"]),
                     "retention": self.service.retention_status(),
+                    "review_admission": self.service.review_admission_status(),
                 },
             )
             return
@@ -508,6 +532,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                         outbox_status, self._query_limit(query, 100)
                     )
                 },
+            )
+            return
+        if path == "/api/tenant-review-capacity":
+            if not principal.can("manage"):
+                self._send_json(403, {"error": "permission denied"})
+                return
+            self._send_json(
+                200,
+                self.service.tenant_review_capacity_report(principal.tenant_id),
             )
             return
         if path == "/api/model-usage":

@@ -136,6 +136,9 @@ not copy them into general task or readiness records.
 - **Queue stale:** inspect Redis health, worker count, task duration, and lease
   reclaim. Scale workers only if downstream GitHub/model/DB capacity can absorb
   them.
+- **Regional reconstruction:** a `FAILED` async task with an active durable
+  admission is still retry-managed and is included in an offline recovery plan;
+  a synchronous failed task whose slot was released remains terminal.
 - Never edit queue/Outbox rows manually. Use `/v1/outbox/replay` or
   `/v1/queue/dead-letters/replay`, which audit the operation and preserve
   idempotency keys.
@@ -212,6 +215,53 @@ pipeline before changing prompts or thresholds.
 Inspect startup dependency/cycle errors, the active Profile, and the trusted
 plugin allowlist. Roll back the plugin package or Profile as one deployment;
 live global hot-swap is intentionally unsupported.
+
+## Tenant review capacity
+
+`EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS` is a uniform hard limit on outstanding
+review admissions for each tenant across every replica sharing the database.
+The default `0` does not reject work, but v0.28 still records durable admission
+slots so operators can observe actual occupancy before enabling a limit. A
+capacity rejection returns `429` with `Retry-After` set from
+`EVOAGENT_TENANT_CAPACITY_RETRY_SECONDS`, records a tenant-scoped
+`review.capacity-rejected` audit event, and creates no task, session turn, or
+Outbox intent. A rejected webhook delivery claim remains safely retryable.
+
+Schema migration 14 is additive and backfills non-terminal tasks. Apply it and
+complete an all-pod v0.28-or-newer rollout before setting a non-zero limit:
+older writers neither take the tenant advisory lock nor emit admission
+generations. Also drain or explicitly resolve any pre-v0.28 Redis retry backlog;
+a historical task already marked `FAILED` cannot be distinguished from a
+terminal synchronous failure during migration. Enable the limit only after the
+authorized `/api/tenant-review-capacity` view and
+`review_admission_slots_active` agree with the expected backlog.
+
+The Store transaction owns these lifecycle rules:
+
+- a new REST or webhook review reserves a slot before atomically committing its
+  task, Diff/session state, and Outbox message;
+- synchronous failure releases immediately, while asynchronous failure keeps
+  the slot through queue retries and offline queue reconstruction;
+- success, cancellation, or final dead-letter disposition releases the slot;
+- manual resume atomically reacquires capacity and creates a unique Outbox
+  intent; a monotonically increasing admission generation prevents a late
+  callback from an older delivery from releasing the resumed slot.
+
+Investigate `EvoAgentTenantReviewCapacitySaturated` with the fixed-cardinality
+rejection ratio, global active-slot gauge, authorized tenant capacity view,
+Outbox age, queue age, and DLQ depth. First decide whether occupancy is valid
+load or stuck delivery. Repair the dependency and use the audited Outbox/DLQ
+replay APIs. For abandoned queued work, request cancellation through the
+application path and, if delivery is no longer live, replay it so a worker can
+commit the final `CANCELLED` state and release the slot. Do not edit
+`task_admissions` or task state with SQL. Increase
+the limit only through reviewed deployment configuration after checking worker,
+database, model, and GitHub capacity.
+
+This control bounds durable occupancy; it is not weighted-fair queue scheduling.
+A tenant at its limit cannot add more work, but Redis workers may still dequeue
+already-admitted work in stream order. Per-tenant details stay behind tenant
+authorization rather than becoming Prometheus labels.
 
 ## History retention
 

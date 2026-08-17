@@ -138,6 +138,8 @@ class Settings:
     history_retention_days: int = 0
     history_maintenance_seconds: int = 3600
     history_prune_batch_size: int = 1000
+    tenant_max_active_reviews: int = 0
+    tenant_capacity_retry_seconds: int = 5
     breaker_failure_threshold: int = 5
     breaker_reset_seconds: int = 30
     outbound_retries: int = 2
@@ -276,6 +278,10 @@ class Settings:
             raise ValueError("EVOAGENT_HISTORY_PRUNE_BATCH_SIZE must be positive")
         if self.history_prune_batch_size > 10_000:
             raise ValueError("EVOAGENT_HISTORY_PRUNE_BATCH_SIZE must be at most 10000")
+        if not 0 <= self.tenant_max_active_reviews <= 1_000_000:
+            raise ValueError("EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS must be between 0 and 1000000")
+        if not 1 <= self.tenant_capacity_retry_seconds <= 3600:
+            raise ValueError("EVOAGENT_TENANT_CAPACITY_RETRY_SECONDS must be between 1 and 3600")
         if (
             (self.llm_daily_cost_micros > 0 or self.llm_shadow_daily_cost_micros > 0)
             and self.llm_input_cost_micros_per_million == 0
@@ -440,6 +446,8 @@ class Settings:
             history_retention_days=_non_negative_int("EVOAGENT_HISTORY_RETENTION_DAYS", 0),
             history_maintenance_seconds=_int("EVOAGENT_HISTORY_MAINTENANCE_SECONDS", 3600),
             history_prune_batch_size=_int("EVOAGENT_HISTORY_PRUNE_BATCH_SIZE", 1000),
+            tenant_max_active_reviews=_non_negative_int("EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS", 0),
+            tenant_capacity_retry_seconds=_int("EVOAGENT_TENANT_CAPACITY_RETRY_SECONDS", 5),
             breaker_failure_threshold=_int("EVOAGENT_BREAKER_FAILURE_THRESHOLD", 5),
             breaker_reset_seconds=_int("EVOAGENT_BREAKER_RESET_SECONDS", 30),
             outbound_retries=_non_negative_int("EVOAGENT_OUTBOUND_RETRIES", 2),

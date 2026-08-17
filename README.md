@@ -48,6 +48,7 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **可插拔微内核** | Store、Queue、Model Gateway、Proof Executor、Reviewer、Review Engine、代码托管、可观测性和 FixRule 通过稳定 Capability 组合，支持依赖校验、启动回滚、内容寻址的分层 Profile 与作用域覆盖 |
 | **模型治理网关** | 任务级租户/仓库上下文、凭据脱敏、HTTPS/出口主机限制、结构化输出门禁、Token/成本预算与元数据用量账本 |
 | **生产治理** | JWT、RBAC、多租户、仓库隔离、事务 Outbox、审计日志、灰度发布、影子流量、告警与死信队列 |
+| **租户容量隔离** | 数据库原子协调的跨副本租户审查槽位，覆盖异步重试、离线恢复与恢复代际，过载返回可重试的 429，抑制单租户无限占用持久任务容量 |
 | **安全 HTTP 边界** | 全响应请求关联 ID、无内部细节的统一 500、过滤 query/异常原文的结构化日志、一致安全响应头，以及默认不信任转发头的可信代理链客户端身份解析 |
 | **无消息故障契约** | Task/Trace/Checkpoint、Agent、Queue/DLQ、Outbox/Effect、Readiness、插件与遥测只记录异常类型和稳定故障引用，不落异常原文 |
 | **可观测性** | 任务 Trace、Agent 消息、固定基数的模型成本/容量/修复/反馈 Prometheus 指标和 OpenTelemetry Trace |
@@ -793,6 +794,7 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `POST` | `/v1/model-usage/reconcile` | 按供应商账单原子结算超时的模型用量预占并写入审计 |
 | `GET` | `/api/model-routes/promotion` | 按租户/仓库查询候选路由只读晋级门禁 |
 | `GET` | `/api/model-routes/capacity` | 查询路由容量、熔断状态和只读权重建议；共享池精确计数脱敏 |
+| `GET` | `/api/tenant-review-capacity` | 管理员查询当前租户的审查槽位、上限、饱和状态与最老占用时间 |
 
 `POST /v1/reviews` 的 Diff 默认最大为 1 MiB；单任务默认最多 8 步、120 秒。可通过 `.env.example` 中的环境变量调整。
 
@@ -808,6 +810,8 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `EVOAGENT_RATE_LIMIT_RPS` | `0` | 每个已解析客户端地址的每秒请求上限；0 为关闭 |
 | `EVOAGENT_RATE_LIMIT_BURST` | `0` | 客户端令牌桶突发容量；0 时跟随 RPS |
 | `EVOAGENT_MAX_INFLIGHT_HEAVY` | `0` | 同进程重端点最大在途数；0 为关闭 |
+| `EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS` | `0` | 跨副本每租户未完成审查硬上限；0 不拒绝但仍记录槽位 |
+| `EVOAGENT_TENANT_CAPACITY_RETRY_SECONDS` | `5` | 租户容量 429 响应的 `Retry-After` 秒数 |
 | `EVOAGENT_MAX_DIFF_BYTES` | `1048576` | 单次 Diff 最大字节数 |
 | `EVOAGENT_MAX_STEPS` | `8` | 单任务最大状态步数 |
 | `EVOAGENT_TIMEOUT_SECONDS` | `120` | 审查任务超时 |
@@ -941,6 +945,7 @@ GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强
 
 - **多核 HTTP 扩展**：`EVOAGENT_WEB_WORKERS` 通过 `SO_REUSEPORT` 派生多个 worker 进程，master 监督进程负责崩溃重启（带退避与风暴上限）与 `SIGTERM` 优雅摘流（`/ready` 转 503 → 等待在途请求 → 到期 `SIGKILL` 兜底）。
 - **过载保护（背压）**：按客户端的令牌桶限流 + 重端点的有界并发闸门，过载时返回 `429`/`503` + `Retry-After` 而非雪崩。默认只信 socket peer；配置 `EVOAGENT_TRUSTED_PROXY_CIDRS` 后才从右向左验证 `X-Forwarded-For` 代理链，避免伪造地址绕过限流。
+- **租户噪声隔离**：PostgreSQL/SQLite 在任务与 Outbox 同一事务内原子占用租户槽位；异步失败在重试与离线队列恢复期间保留槽位，成功、取消或最终死信才释放。该硬上限限制持久待办占用，但不等同于加权公平调度。
 - **依赖韧性**：GitHub / LLM 出站调用包裹熔断器（closed/open/half-open + 退避抖动），仅对连接/超时类传输故障计数，上游宕机时快速失败而非占满线程。
 - **连接池**：Postgres 使用核心依赖 `psycopg_pool` 的有界连接池；池大小、可用连接和等待请求经 `/metrics` 暴露，真实耗尽/恢复行为由 CI 门禁验证。
 - **历史保留**：可选的状态感知维护器分批清理过期运行历史，不删除活跃任务、每个任务的最后事件、会话最新完成快照或乱序完成仍需读取的连续性锚点。

@@ -343,6 +343,7 @@ class ApplicationUseCaseTests(unittest.TestCase):
         self.assertEqual(0, task["input"]["repository_policy"]["version"])
         self.assertTrue(task["input"]["repository_policy"]["policy"]["enabled"])
         self.assertEqual(["review.started", "review.completed"], [name for name, _ in events])
+        self.assertEqual(0, self.store.tenant_review_admission_stats("tenant")["active"])
 
     def test_review_use_case_fetches_deferred_diff_and_deduplicates_comment(self):
         report = ReviewReport("org/repo", 7, "one issue", "high", [_finding()])
@@ -421,6 +422,69 @@ class ApplicationUseCaseTests(unittest.TestCase):
         task = self.store.get(task_id, "tenant")
         self.assertFalse(task["input"]["diff_pending"])
         self.assertIsNotNone(self.store.get_task_payload(task_id))
+
+    def test_resume_reacquires_capacity_with_transactional_outbox(self):
+        class Queue:
+            backend = "test"
+
+            @staticmethod
+            def submit(*_args, **_kwargs):
+                raise AssertionError("resume must publish through the transactional outbox")
+
+        notifications = []
+        reviews = ReviewUseCases(
+            self.store,
+            RepositoryPolicyResolver(self.store),
+            ReleaseManager(self.store),
+            AlertManager(self.store),
+            Observability(),
+            lambda: Queue(),
+            lambda: notifications.append("ready"),
+            lambda: ("local-rules", "local", ""),
+            lambda *_args: None,
+            lambda *_args: None,
+            lambda *_args: "",
+            lambda _installation_id: object(),
+            lambda *_args: None,
+            ReviewOptions(10_000, 60, False, tenant_max_active_reviews=1),
+        )
+        task_id = "resume-task"
+        self.store.create_review_task(
+            task_id,
+            "org/repo",
+            7,
+            {"source": "api"},
+            "tenant",
+            "--- a/a.py\n+++ b/a.py\n+value = 1\n",
+        )
+        self.store.fail(
+            task_id,
+            "review execution failed [type=unknown; ref=2222222222222222]",
+            TraceEvent(1, TaskState.FAILED, "failed", utc_now()),
+        )
+
+        resumed = reviews.resume_task(task_id, "tenant")
+        duplicate = reviews.resume_task(task_id, "tenant")
+
+        self.assertTrue(resumed["resumed"])
+        self.assertFalse(resumed["already_active"])
+        self.assertFalse(duplicate["resumed"])
+        self.assertTrue(duplicate["already_active"])
+        self.assertEqual(["ready"], notifications)
+        outbox = self.store.list_outbox("pending", 10)
+        resumed_message = next(item for item in outbox if item["id"].startswith("review-resume:"))
+        self.assertEqual(2, resumed_message["payload"]["admission_generation"])
+        dead_letter_error = "task delivery failed [type=unknown; ref=3333333333333333]"
+        reviews.on_dead_letter(
+            {"task_id": task_id, "tenant_id": "tenant", "admission_generation": 1},
+            dead_letter_error,
+        )
+        self.assertEqual(1, self.store.tenant_review_admission_stats("tenant")["active"])
+        reviews.on_dead_letter(
+            {"task_id": task_id, "tenant_id": "tenant", "admission_generation": 2},
+            dead_letter_error,
+        )
+        self.assertEqual(0, self.store.tenant_review_admission_stats("tenant")["active"])
 
     def test_webhook_use_case_creates_one_durable_review_unit(self):
         class Queue:

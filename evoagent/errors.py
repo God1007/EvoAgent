@@ -48,6 +48,13 @@ class AccessDeniedError(PermissionError):
     """An expected authorization/policy denial with a client-safe message."""
 
 
+class TenantReviewCapacityError(RuntimeError):
+    """A tenant has no free durable review-admission slot."""
+
+    def __init__(self):
+        super().__init__("tenant review capacity is exhausted")
+
+
 def exception_type(error: BaseException) -> str:
     """Return a bounded identifier without inspecting the exception message."""
     qualified = "%s.%s" % (type(error).__module__, type(error).__qualname__)

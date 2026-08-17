@@ -49,6 +49,7 @@ the mitigations that exist in the codebase today, plus known residual risks.
 | T17 | Cross-tenant activity disclosure or monitoring collapse through metric labels | Quality/economics telemetry uses fixed names for bounded lane/reason/outcome/category states and never labels tenant, repository, route, model, rule, request, or failure values; attribution remains behind tenant-authorized stores | Aggregate platform trends are intentionally visible to metric operators; per-tenant diagnosis requires authorized ledger/failure access |
 | T18 | Forged forwarded address bypasses per-client admission or poisons access logs | `X-Forwarded-For` is ignored unless the kernel peer matches one of at most 64 canonical trusted CIDRs; the bounded literal-IP chain is evaluated right-to-left and stops at the first untrusted hop; malformed chains fall back to the socket peer and raw headers are never logged or used as metric labels | Correctness still depends on network policy ensuring only the configured proxies can use their source addresses and on operators keeping proxy CIDRs current |
 | T19 | Operational history exhausts storage, or a retention job destroys live continuity/audit state | Retention is disabled by default, bounded per transaction/run, restricted to terminal Trace history and superseded completed session snapshots, and preserves latest events plus pending-turn continuity anchors; durable prune markers, health, fixed metrics, and a stalled-maintenance alert expose its effects | Deletion is irreversible in the live database; backups, legal retention policy, PostgreSQL table growth/partitioning, and enabling only after a complete compatible rollout remain operator responsibilities |
+| T20 | One tenant exhausts durable review backlog, or a stale retry callback releases a resumed tenant slot | REST/webhook intake atomically counts and reserves database-backed per-tenant slots before task/Outbox creation; PostgreSQL serializes writers with a stable advisory lock; async retry and offline recovery retain ownership; terminal disposition releases it; resume advances a generation checked by DLQ release; 429, audit, metrics, health, dashboard, and alerts expose rejection | The uniform hard limit is not weighted-fair scheduling; old writers and pre-v0.28 retry backlog must be drained before enablement, and limit sizing remains an operator capacity decision |
 
 ## 4. Untrusted-execution policy
 
@@ -83,6 +84,9 @@ the mitigations that exist in the codebase today, plus known residual risks.
   guarantee without independently provisioned provider/region capacity.
 - Application retention reduces eligible operational rows but is not a backup,
   legal hold, native table partitioning, or provider-managed lifecycle system.
+- Tenant review admission bounds how much durable work one tenant may own, but
+  it does not guarantee fair Redis dequeue order, per-tenant worker shares, or
+  protection from a badly sized global downstream dependency.
 
 ## 6. Reporting
 

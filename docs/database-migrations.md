@@ -36,7 +36,12 @@ legacy summaries. This is an intentional security migration: historical raw
 diagnostic text in those fields is not retained. Schema version 13 adds
 retention scan indexes plus durable task/turn prune markers. The migration
 itself deletes nothing; a separately enabled maintenance policy performs only
-state-aware transactional pruning after deployment. Disaster-recovery
+state-aware transactional pruning after deployment. Schema version 14 adds
+durable `task_admissions`, an active-tenant scan index, and backfills known
+non-terminal tasks. The backfill cannot infer a Redis-only retry whose task was
+already marked `FAILED`; drain or resolve that pre-v0.28 retry backlog, roll all
+writers to v0.28 or newer, and validate occupancy before enabling a non-zero
+tenant review limit. Disaster-recovery
 inspection and queue reconstruction open the Store with migrations disabled and require
 the complete current checksummed history; privileged operational tools therefore
 cannot silently mutate a restored database before integrity evidence is collected.
@@ -55,7 +60,7 @@ python -m evoagent.migrate
 Successful output is machine-readable and contains no database credentials:
 
 ```json
-{"backend": "postgresql", "schema_version": 13, "status": "migrated"}
+{"backend": "postgresql", "schema_version": 14, "status": "migrated"}
 ```
 
 Schema compatibility errors exit with status `2`. Normal application startup

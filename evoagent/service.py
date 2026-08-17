@@ -132,6 +132,7 @@ class ReviewService:
                     max_diff_bytes=settings.max_diff_bytes,
                     queue_lease_seconds=settings.queue_lease_seconds,
                     auto_post_review=settings.auto_post_review,
+                    tenant_max_active_reviews=settings.tenant_max_active_reviews,
                 ),
                 lambda tenant_id, repository: (
                     tuple(self.model_gateway.route_catalog(tenant_id, repository))
@@ -230,6 +231,18 @@ class ReviewService:
             "retention_maintenance_interval_seconds",
             lambda: float(self.settings.history_maintenance_seconds),
         )
+        metrics.register_gauge_source(
+            "review_admission_capacity_enabled",
+            lambda: 1.0 if self.settings.tenant_max_active_reviews > 0 else 0.0,
+        )
+        metrics.register_gauge_source(
+            "review_admission_limit",
+            lambda: float(self.settings.tenant_max_active_reviews),
+        )
+        metrics.register_gauge_source(
+            "review_admission_slots_active",
+            lambda: float(self.store.tenant_review_admission_stats()["active"]),
+        )
         self._readiness_lock = threading.Lock()
         self._readiness_cache: tuple[float, tuple[bool, dict[str, Any]]] | None = None
         self._readiness_ttl = 1.0
@@ -281,6 +294,13 @@ class ReviewService:
     def retention_status(self) -> dict[str, Any]:
         return self.retention.status()
 
+    def review_admission_status(self) -> dict[str, Any]:
+        return {
+            "enabled": self.settings.tenant_max_active_reviews > 0,
+            "max_active_reviews": self.settings.tenant_max_active_reviews,
+            "retry_seconds": self.settings.tenant_capacity_retry_seconds,
+        }
+
     def replay_outbox(self, message_id: str) -> bool:
         replayed = self.store.requeue_outbox(message_id)
         if replayed:
@@ -318,6 +338,9 @@ class ReviewService:
         self, tenant_id: str, repository: str | None = None
     ) -> dict[str, Any]:
         return self.model_gateway.capacity_report(tenant_id, repository)
+
+    def tenant_review_capacity_report(self, tenant_id: str) -> dict[str, Any]:
+        return self.review_use_cases.tenant_capacity_report(tenant_id)
 
     def _register_pool_metrics(self) -> None:
         """Expose Postgres pool utilization. Registered in both branches (with a

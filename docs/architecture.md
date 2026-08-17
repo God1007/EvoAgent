@@ -28,7 +28,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Delivery | `evoagent/report.py` | Injection-safe markdown report rendering |
 | Evolution | `evoagent/evolution.py`, `rollout.py` | Prompt versioning, validation/holdout replay, canary/shadow, rollback |
 | Evolution | `evoagent/evaluation_harness.py`, `evaluation_dataset.py`, `evaluation_provenance.py`, `evaluation_metrics.py`, `evaluation_labels.py`, `evaluation_benchmark.py` | Blind-label compilation, evidence audit, replay orchestration, replaceable slices, and calibration |
-| Storage | `evoagent/store.py`, `postgres_store.py` | Task/finding/feedback/version/audit persistence |
+| Storage | `evoagent/store.py`, `postgres_store.py` | Task/finding/feedback/version/audit persistence and atomic cross-replica tenant review admission |
 | Policy | `evoagent/policy.py` | Versioned tenant/repository execution and publication decisions |
 | Storage | `evoagent/migrations.py` | Locked, checksummed SQLite/PostgreSQL schema history and compatibility gate |
 | Cross-cutting | `evoagent/auth.py` | JWT, RBAC, tenant isolation |
@@ -56,8 +56,9 @@ process startup
 change (webhook | REST | console)
   → HTTP edge (resolve trusted proxy chain → request id → admission → safe error envelope)
   → WebhookUseCases | ReviewUseCases
-      webhook: delivery + session turn + task + outbox in one transaction
-      REST: task + Diff + outbox in one transaction
+      capacity: tenant slot + rejection audit under one database coordination boundary
+      webhook: delivery + admission + session turn + task + outbox in one transaction
+      REST: admission + task + Diff + outbox in one transaction
   → OutboxDispatcher                        # lease + idempotent publication
   → TaskQueue                               # in-process or Redis Streams
   → ReviewHarness.run                       # LangGraph nodes, checkpoint each step
@@ -135,8 +136,9 @@ See [`plugin-system.md`](plugin-system.md) and
   [`ADR 0011`](adr/0011-isolated-database-recovery-drills.md).
 - **Regional queue reconstruction** treats PostgreSQL task/Outbox records as
   durable intent and Redis Streams as replaceable delivery state. An offline,
-  audited recovery epoch stages only incomplete tasks for controlled publication
-  into a verified empty Redis database. See
+  audited recovery epoch stages incomplete tasks plus retry-managed `FAILED`
+  tasks that still own an active admission for controlled publication into a
+  verified empty Redis database. See
   [`ADR 0012`](adr/0012-offline-queue-reconstruction.md).
 - **Queue durability** depends on the backend. `redis-streams` provides ACK,
   consumer leases, dead-letter queue, and replay. The in-process
@@ -154,6 +156,13 @@ See [`plugin-system.md`](plugin-system.md) and
   task, and outbox in one Store transaction. Concurrent duplicate deliveries
   return the same task, while injected failures leave no partial records. See
   [`ADR 0006`](adr/0006-use-case-boundaries-and-atomic-webhook-intake.md).
+- **Durable tenant review admission** reserves one database-backed slot before
+  review intent commits. PostgreSQL advisory locks coordinate replicas; async
+  failures retain their slot through retry/recovery, terminal disposition
+  releases it, and resume advances a generation so stale delivery callbacks
+  cannot release new work. The uniform cap bounds noisy-neighbor occupancy but
+  does not promise weighted-fair dequeue order. See
+  [`ADR 0026`](adr/0026-durable-tenant-review-admission.md).
 - **Operational-history retention** is opt-in and delegates deletion safety to
   the Store transaction. It prunes only old terminal-task Trace events and old
   completed session snapshots while retaining every task's latest event, the

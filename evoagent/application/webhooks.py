@@ -6,7 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from ..errors import ClientInputError
+from ..errors import ClientInputError, TenantReviewCapacityError
 from ..metrics import metrics
 from ..ports import TaskQueuePort, WebhookApplicationStorePort
 from .reviews import ReviewUseCases
@@ -85,25 +85,30 @@ class WebhookUseCases:
             {"diff_url": diff_url, "trigger": action},
             policy,
         )
-        accepted = self.store.accept_pull_request_webhook(
-            delivery_id,
-            tenant_id,
-            payload_sha256,
-            repository,
-            number,
-            head_sha,
-            action,
-            task_id,
-            task_input,
-            {
-                "repository": repository,
-                "pull_request": number,
-                "github_issue_url": pull.get("issue_url", ""),
-                "installation_id": installation_id,
-                "tenant_id": tenant_id,
-                "diff_url": diff_url,
-            },
-        )
+        try:
+            accepted = self.store.accept_pull_request_webhook(
+                delivery_id,
+                tenant_id,
+                payload_sha256,
+                repository,
+                number,
+                head_sha,
+                action,
+                task_id,
+                task_input,
+                {
+                    "repository": repository,
+                    "pull_request": number,
+                    "github_issue_url": pull.get("issue_url", ""),
+                    "installation_id": installation_id,
+                    "tenant_id": tenant_id,
+                    "diff_url": diff_url,
+                },
+                self.reviews.options.tenant_max_active_reviews,
+            )
+        except TenantReviewCapacityError:
+            metrics.inc("review_admission_rejections_total")
+            raise
         if not accepted["accepted"]:
             current = self.store.get_webhook(delivery_id) or {
                 "payload_sha256": payload_sha256,
@@ -112,6 +117,7 @@ class WebhookUseCases:
             return self._duplicate(current, payload_sha256)
 
         self.notify_outbox()
+        metrics.inc("review_admissions_total")
         metrics.inc("reviews_enqueued_total")
         return {
             "task_id": task_id,

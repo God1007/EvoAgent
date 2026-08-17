@@ -11,7 +11,7 @@ import uuid
 from contextlib import AbstractContextManager
 from typing import Any
 
-from .errors import preserve_safe_summary, safe_exception_summary
+from .errors import TenantReviewCapacityError, preserve_safe_summary, safe_exception_summary
 from .migrations import migrate_postgres, validate_current_schema_history
 from .models import ReviewReport, TaskState, TraceEvent
 from .ports import ApplicationStorePort
@@ -267,45 +267,227 @@ class PostgresTaskStore:
         tenant_id: str,
         diff: str | None = None,
         outbox_payload: dict[str, Any] | None = None,
+        max_active_reviews: int = 0,
     ) -> None:
         """Persist task, optional diff, and queue intent in one transaction."""
         now = utc_now()
+        limit = max(0, int(max_active_reviews))
+        rejected = False
         with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO tasks(id,state,repository,pull_request,input_json,report_json,error,"
-                "created_at,updated_at,tenant_id,cancel_requested) "
-                "VALUES (%s,%s,%s,%s,%s::jsonb,NULL,NULL,%s,%s,%s,FALSE)",
-                (
-                    task_id,
-                    TaskState.PENDING.value,
-                    repository,
-                    pull_request,
-                    json.dumps(payload, ensure_ascii=False),
-                    now,
-                    now,
+            self._lock_tenant_admission(conn, tenant_id)
+            active = self._active_admission_count(conn, tenant_id)
+            if limit and active >= limit:
+                self._record_admission_rejection(
+                    conn,
                     tenant_id,
-                ),
-            )
-            if diff is not None:
-                conn.execute(
-                    "INSERT INTO task_payloads(task_id,diff,created_at) VALUES (%s,%s,%s)",
-                    (task_id, diff, now),
+                    repository,
+                    active,
+                    limit,
+                    str(payload.get("source", "review")),
+                    now,
                 )
-            if outbox_payload is not None:
+                rejected = True
+            else:
                 conn.execute(
-                    "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,"
-                    "attempts,available_at,created_at,updated_at) "
-                    "VALUES (%s,%s,%s,%s::jsonb,'pending',0,%s,%s,%s)",
+                    "INSERT INTO tasks(id,state,repository,pull_request,input_json,report_json,"
+                    "error,created_at,updated_at,tenant_id,cancel_requested) "
+                    "VALUES (%s,%s,%s,%s,%s::jsonb,NULL,NULL,%s,%s,%s,FALSE)",
                     (
-                        "review:" + task_id,
-                        "review",
                         task_id,
-                        json.dumps(outbox_payload, ensure_ascii=False),
+                        TaskState.PENDING.value,
+                        repository,
+                        pull_request,
+                        json.dumps(payload, ensure_ascii=False),
                         now,
                         now,
-                        now,
+                        tenant_id,
                     ),
                 )
+                conn.execute(
+                    "INSERT INTO task_admissions(task_id,tenant_id,active,release_on_failure,"
+                    "generation,acquired_at) VALUES (%s,%s,TRUE,%s,1,%s)",
+                    (task_id, tenant_id, outbox_payload is None, now),
+                )
+                if diff is not None:
+                    conn.execute(
+                        "INSERT INTO task_payloads(task_id,diff,created_at) VALUES (%s,%s,%s)",
+                        (task_id, diff, now),
+                    )
+                if outbox_payload is not None:
+                    conn.execute(
+                        "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,"
+                        "attempts,available_at,created_at,updated_at) "
+                        "VALUES (%s,%s,%s,%s::jsonb,'pending',0,%s,%s,%s)",
+                        (
+                            "review:" + task_id,
+                            "review",
+                            task_id,
+                            json.dumps(
+                                {**outbox_payload, "admission_generation": 1},
+                                ensure_ascii=False,
+                            ),
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+        if rejected:
+            raise TenantReviewCapacityError()
+
+    @staticmethod
+    def _lock_tenant_admission(conn, tenant_id: str) -> None:
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            ("tenant-review-admission:%s" % tenant_id,),
+        )
+
+    @staticmethod
+    def _active_admission_count(conn, tenant_id: str | None = None) -> int:
+        if tenant_id is None:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM task_admissions WHERE active=TRUE"
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM task_admissions WHERE tenant_id=%s AND active=TRUE",
+                (tenant_id,),
+            ).fetchone()
+        return int(row["count"])
+
+    @staticmethod
+    def _record_admission_rejection(
+        conn,
+        tenant_id: str,
+        resource: str,
+        active: int,
+        limit: int,
+        source: str,
+        now: str,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO audit_log(tenant_id,actor,action,resource,detail_json,created_at) "
+            "VALUES (%s,'system','review.capacity-rejected',%s,%s::jsonb,%s)",
+            (
+                tenant_id,
+                resource[:250],
+                json.dumps(
+                    {"active": active, "limit": limit, "source": source[:64]},
+                    ensure_ascii=False,
+                ),
+                now,
+            ),
+        )
+
+    def tenant_review_admission_stats(self, tenant_id: str | None = None) -> dict[str, Any]:
+        with self._connect() as conn:
+            if tenant_id is None:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS active,MIN(acquired_at) AS oldest_acquired_at "
+                    "FROM task_admissions WHERE active=TRUE"
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS active,MIN(acquired_at) AS oldest_acquired_at "
+                    "FROM task_admissions WHERE tenant_id=%s AND active=TRUE",
+                    (tenant_id,),
+                ).fetchone()
+        oldest = row["oldest_acquired_at"]
+        return {
+            "active": int(row["active"]),
+            "oldest_acquired_at": oldest.isoformat() if oldest is not None else None,
+        }
+
+    def release_review_admission(
+        self, task_id: str, reason: str, generation: int | None = None
+    ) -> bool:
+        if reason not in {"success", "cancelled", "failed", "dead-letter"}:
+            raise ValueError("unsupported review admission release reason")
+        with self._connect() as conn:
+            query = (
+                "UPDATE task_admissions SET active=FALSE,released_at=%s,release_reason=%s "
+                "WHERE task_id=%s AND active=TRUE"
+            )
+            params: list[Any] = [utc_now(), reason, task_id]
+            if generation is not None:
+                query += " AND generation=%s"
+                params.append(int(generation))
+            cursor = conn.execute(query, params)
+        return cursor.rowcount > 0
+
+    def resume_review_task(
+        self,
+        task_id: str,
+        tenant_id: str,
+        max_active_reviews: int,
+        outbox_id: str,
+        message_key: str,
+        outbox_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        now = utc_now()
+        limit = max(0, int(max_active_reviews))
+        rejected = False
+        result: dict[str, Any]
+        with self._connect() as conn:
+            self._lock_tenant_admission(conn, tenant_id)
+            row = conn.execute(
+                "SELECT task.state,task.repository,admission.active,admission.generation "
+                "FROM tasks AS task "
+                "LEFT JOIN task_admissions AS admission ON admission.task_id=task.id "
+                "WHERE task.id=%s AND task.tenant_id=%s FOR UPDATE OF task",
+                (task_id, tenant_id),
+            ).fetchone()
+            if row is None:
+                result = {"status": "missing"}
+            elif row["state"] in {TaskState.SUCCESS.value, TaskState.CANCELLED.value}:
+                result = {"status": str(row["state"]).lower()}
+            elif bool(row["active"]):
+                result = {"status": "active"}
+            else:
+                active = self._active_admission_count(conn, tenant_id)
+                if limit and active >= limit:
+                    self._record_admission_rejection(
+                        conn,
+                        tenant_id,
+                        str(row["repository"]),
+                        active,
+                        limit,
+                        "resume",
+                        now,
+                    )
+                    rejected = True
+                    result = {"status": "rejected"}
+                else:
+                    generation = int(row["generation"] or 0) + 1
+                    conn.execute(
+                        "INSERT INTO task_admissions(task_id,tenant_id,active,"
+                        "release_on_failure,generation,acquired_at,released_at,release_reason) "
+                        "VALUES (%s,%s,TRUE,FALSE,%s,%s,NULL,NULL) "
+                        "ON CONFLICT(task_id) DO UPDATE SET "
+                        "tenant_id=EXCLUDED.tenant_id,active=TRUE,release_on_failure=FALSE,"
+                        "generation=EXCLUDED.generation,acquired_at=EXCLUDED.acquired_at,"
+                        "released_at=NULL,release_reason=NULL",
+                        (task_id, tenant_id, generation, now),
+                    )
+                    conn.execute(
+                        "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,"
+                        "attempts,available_at,created_at,updated_at) "
+                        "VALUES (%s,'review',%s,%s::jsonb,'pending',0,%s,%s,%s)",
+                        (
+                            outbox_id,
+                            message_key,
+                            json.dumps(
+                                {**outbox_payload, "admission_generation": generation},
+                                ensure_ascii=False,
+                            ),
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                    result = {"status": "resumed", "generation": generation}
+        if rejected:
+            raise TenantReviewCapacityError()
+        return result
 
     def claim_outbox(
         self,
@@ -419,20 +601,24 @@ class PostgresTaskStore:
         return cursor.rowcount > 0
 
     def queue_recovery_candidates(self, limit: int) -> list[dict[str, Any]]:
-        """Describe non-terminal task intents without mutating queue state."""
+        """Describe incomplete or delivery-managed task intents without mutation."""
         bounded = max(1, min(int(limit), 100_001))
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT t.id,t.repository,t.pull_request,t.tenant_id,o.status AS outbox_status,"
-                "o.payload_json,(p.task_id IS NOT NULL) AS has_payload "
+                "o.payload_json,(p.task_id IS NOT NULL) AS has_payload,"
+                "a.generation AS admission_generation "
                 "FROM tasks t LEFT JOIN outbox_messages o ON o.id='review:'||t.id "
                 "LEFT JOIN task_payloads p ON p.task_id=t.id "
-                "WHERE t.state NOT IN (%s,%s,%s) AND t.cancel_requested=FALSE "
+                "LEFT JOIN task_admissions a ON a.task_id=t.id "
+                "WHERE t.cancel_requested=FALSE AND (t.state NOT IN (%s,%s,%s) "
+                "OR (t.state=%s AND a.active=TRUE)) "
                 "ORDER BY t.created_at,t.id LIMIT %s",
                 (
                     TaskState.SUCCESS.value,
                     TaskState.FAILED.value,
                     TaskState.CANCELLED.value,
+                    TaskState.FAILED.value,
                     bounded,
                 ),
             ).fetchall()
@@ -461,6 +647,8 @@ class PostgresTaskStore:
                     "pull_request": row["pull_request"],
                     "tenant_id": row["tenant_id"],
                 }
+                if row["admission_generation"] is not None:
+                    payload["admission_generation"] = int(row["admission_generation"])
             recoverable = isinstance(payload, dict)
             candidates.append(
                 {
@@ -519,17 +707,18 @@ class PostgresTaskStore:
             tenants = set()
             for candidate in candidates:
                 task = conn.execute(
-                    "SELECT state,cancel_requested,tenant_id FROM tasks WHERE id=%s FOR UPDATE",
+                    "SELECT state,cancel_requested,tenant_id,EXISTS(SELECT 1 FROM "
+                    "task_admissions a WHERE a.task_id=tasks.id AND a.active=TRUE) "
+                    "AS admission_active FROM tasks WHERE id=%s FOR UPDATE",
                     (candidate["task_id"],),
                 ).fetchone()
                 if (
                     not task
-                    or task["state"]
-                    in {
-                        TaskState.SUCCESS.value,
-                        TaskState.FAILED.value,
-                        TaskState.CANCELLED.value,
-                    }
+                    or task["state"] in {TaskState.SUCCESS.value, TaskState.CANCELLED.value}
+                    or (
+                        task["state"] == TaskState.FAILED.value
+                        and not bool(task["admission_active"])
+                    )
                     or bool(task["cancel_requested"])
                 ):
                     skipped_terminal += 1
@@ -1122,6 +1311,11 @@ class PostgresTaskStore:
                 "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (%s,%s,%s,%s,%s)",
                 (task_id, event.step, event.state.value, event.message, event.created_at),
             )
+            conn.execute(
+                "UPDATE task_admissions SET active=FALSE,released_at=%s,"
+                "release_reason='success' WHERE task_id=%s AND active=TRUE",
+                (event.created_at, task_id),
+            )
 
     def fail(self, task_id: str, error: str, event: TraceEvent) -> None:
         error = preserve_safe_summary(error, "review execution failed")
@@ -1133,6 +1327,12 @@ class PostgresTaskStore:
             conn.execute(
                 "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (%s,%s,%s,%s,%s)",
                 (task_id, event.step, event.state.value, error, event.created_at),
+            )
+            conn.execute(
+                "UPDATE task_admissions SET active=FALSE,released_at=%s,"
+                "release_reason='failed' WHERE task_id=%s AND active=TRUE "
+                "AND release_on_failure=TRUE",
+                (event.created_at, task_id),
             )
 
     def get(self, task_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
@@ -1726,6 +1926,11 @@ class PostgresTaskStore:
                 "VALUES (%s,%s,%s,%s,%s)",
                 (task_id, event.step, event.state.value, event.message, event.created_at),
             )
+            conn.execute(
+                "UPDATE task_admissions SET active=FALSE,released_at=%s,"
+                "release_reason='cancelled' WHERE task_id=%s AND active=TRUE",
+                (event.created_at, task_id),
+            )
 
     def claim_webhook(
         self,
@@ -1765,6 +1970,7 @@ class PostgresTaskStore:
         task_id: str,
         task_payload: dict[str, Any],
         outbox_payload: dict[str, Any],
+        max_active_reviews: int = 0,
     ) -> dict[str, Any]:
         """Atomically bind one delivery to its session, task, and queue intent."""
         if not delivery_id:
@@ -1780,7 +1986,8 @@ class PostgresTaskStore:
             ).fetchone()
             if not inserted:
                 existing = conn.execute(
-                    "SELECT payload_sha256,task_id FROM webhook_deliveries WHERE delivery_id=%s",
+                    "SELECT payload_sha256,task_id FROM webhook_deliveries "
+                    "WHERE delivery_id=%s FOR UPDATE",
                     (delivery_id,),
                 ).fetchone()
                 if not existing:
@@ -1789,6 +1996,21 @@ class PostgresTaskStore:
                     raise ValueError("delivery id was already used with a different payload")
                 if existing and existing["task_id"]:
                     return {"accepted": False, "task_id": existing["task_id"]}
+            self._lock_tenant_admission(conn, tenant_id)
+            limit = max(0, int(max_active_reviews))
+            active = self._active_admission_count(conn, tenant_id)
+            if limit and active >= limit:
+                self._record_admission_rejection(
+                    conn,
+                    tenant_id,
+                    repository,
+                    active,
+                    limit,
+                    "github-webhook",
+                    now,
+                )
+                conn.commit()
+                raise TenantReviewCapacityError()
             session = self._start_session_turn_in_transaction(
                 conn,
                 tenant_id,
@@ -1820,6 +2042,11 @@ class PostgresTaskStore:
                 ),
             )
             conn.execute(
+                "INSERT INTO task_admissions(task_id,tenant_id,active,release_on_failure,"
+                "generation,acquired_at) VALUES (%s,%s,TRUE,FALSE,1,%s)",
+                (task_id, tenant_id, now),
+            )
+            conn.execute(
                 "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,"
                 "attempts,available_at,created_at,updated_at) "
                 "VALUES (%s,%s,%s,%s::jsonb,'pending',0,%s,%s,%s)",
@@ -1828,7 +2055,12 @@ class PostgresTaskStore:
                     "review",
                     task_id,
                     json.dumps(
-                        {"task_id": task_id, **outbox_payload, **session_payload},
+                        {
+                            "task_id": task_id,
+                            **outbox_payload,
+                            **session_payload,
+                            "admission_generation": 1,
+                        },
                         ensure_ascii=False,
                     ),
                     now,

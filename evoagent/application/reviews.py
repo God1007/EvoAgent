@@ -11,6 +11,7 @@ from typing import Any
 from ..errors import (
     AccessDeniedError,
     ClientInputError,
+    TenantReviewCapacityError,
     coerce_safe_summary,
     safe_exception_fields,
     safe_exception_summary,
@@ -36,6 +37,7 @@ class ReviewOptions:
     max_diff_bytes: int
     queue_lease_seconds: float
     auto_post_review: bool
+    tenant_max_active_reviews: int = 0
 
 
 class ReviewUseCases:
@@ -124,24 +126,30 @@ class ReviewUseCases:
         task_id = str(uuid.uuid4())
         encoded = diff.encode("utf-8")
         assignment = self.releases.assignment(tenant_id, "llm-review", task_id)
-        self.store.create_review_task(
-            task_id,
-            repository,
-            pull_request,
-            {
-                "source": source,
-                "diff_bytes": len(encoded),
-                "diff_sha256": hashlib.sha256(encoded).hexdigest(),
-                "release_lane": assignment["lane"],
-                "shadow": assignment["shadow"],
-                "repository_policy": self.policies.snapshot(
-                    policy or self.policies.resolve(tenant_id, repository)
-                ),
-            },
-            tenant_id,
-            diff,
-            {"task_id": task_id, **outbox_payload} if outbox_payload is not None else None,
-        )
+        try:
+            self.store.create_review_task(
+                task_id,
+                repository,
+                pull_request,
+                {
+                    "source": source,
+                    "diff_bytes": len(encoded),
+                    "diff_sha256": hashlib.sha256(encoded).hexdigest(),
+                    "release_lane": assignment["lane"],
+                    "shadow": assignment["shadow"],
+                    "repository_policy": self.policies.snapshot(
+                        policy or self.policies.resolve(tenant_id, repository)
+                    ),
+                },
+                tenant_id,
+                diff,
+                {"task_id": task_id, **outbox_payload} if outbox_payload is not None else None,
+                self.options.tenant_max_active_reviews,
+            )
+        except TenantReviewCapacityError:
+            metrics.inc("review_admission_rejections_total")
+            raise
+        metrics.inc("review_admissions_total")
         return task_id
 
     def create_deferred_task(
@@ -157,15 +165,21 @@ class ReviewUseCases:
         task_id, prepared_payload = self.prepare_deferred_task(
             repository, source, tenant_id, payload, policy
         )
-        self.store.create_review_task(
-            task_id,
-            repository,
-            pull_request,
-            prepared_payload,
-            tenant_id,
-            None,
-            {"task_id": task_id, **outbox_payload},
-        )
+        try:
+            self.store.create_review_task(
+                task_id,
+                repository,
+                pull_request,
+                prepared_payload,
+                tenant_id,
+                None,
+                {"task_id": task_id, **outbox_payload},
+                self.options.tenant_max_active_reviews,
+            )
+        except TenantReviewCapacityError:
+            metrics.inc("review_admission_rejections_total")
+            raise
+        metrics.inc("review_admissions_total")
         return task_id
 
     def prepare_deferred_task(
@@ -402,6 +416,7 @@ class ReviewUseCases:
         mode: str,
     ) -> None:
         metrics.inc("reviews_total")
+        metrics.inc("review_admission_releases_total")
         persisted = self.store.get(task_id, tenant_id) or {}
         lane = (persisted.get("input") or {}).get("release_lane", "stable")
         self.releases.observe(tenant_id, "llm-review", False, lane)
@@ -426,6 +441,8 @@ class ReviewUseCases:
         mode: str,
     ) -> None:
         metrics.inc("reviews_failed_total")
+        if mode == "synchronous":
+            metrics.inc("review_admission_releases_total")
         task = self.store.get(task_id, tenant_id) or {}
         lane = (task.get("input") or {}).get("release_lane", "stable")
         self.releases.observe(tenant_id, "llm-review", True, lane)
@@ -464,6 +481,13 @@ class ReviewUseCases:
                     utc_now(),
                 ),
             )
+        raw_generation = payload.get("admission_generation")
+        try:
+            generation = int(raw_generation) if raw_generation is not None else None
+        except (TypeError, ValueError):
+            generation = -1
+        if task_id and self.store.release_review_admission(task_id, "dead-letter", generation):
+            metrics.inc("review_admission_releases_total")
         self.store.create_alert(
             tenant_id,
             "dlq:%s" % (task_id or "unknown"),
@@ -501,16 +525,56 @@ class ReviewUseCases:
             return {"task_id": task_id, "state": "SUCCESS", "report": task["report"]}
         if self.store.get_task_payload(task_id) is None:
             raise ClientInputError("task payload is no longer available")
-        self.queue().submit(
-            {
-                "task_id": task_id,
-                "repository": task["repository"],
-                "pull_request": task.get("pull_request"),
-                "tenant_id": task.get("tenant_id", "default"),
-            },
-            message_id=task_id,
-        )
-        return {"task_id": task_id, "state": "PENDING", "resumed": True}
+        actual_tenant = str(task.get("tenant_id") or tenant_id or "default")
+        resume_id = uuid.uuid4().hex
+        payload = {
+            "task_id": task_id,
+            "repository": task["repository"],
+            "pull_request": task.get("pull_request"),
+            "tenant_id": actual_tenant,
+        }
+        try:
+            result = self.store.resume_review_task(
+                task_id,
+                actual_tenant,
+                self.options.tenant_max_active_reviews,
+                "review-resume:" + resume_id,
+                "review-resume:" + resume_id,
+                payload,
+            )
+        except TenantReviewCapacityError:
+            metrics.inc("review_admission_rejections_total")
+            raise
+        status = result["status"]
+        if status == "missing":
+            raise ClientInputError("task not found")
+        if status == "cancelled":
+            raise ClientInputError("cancelled task cannot be resumed")
+        if status == "success":
+            return {"task_id": task_id, "state": "SUCCESS", "report": task["report"]}
+        if status == "resumed":
+            metrics.inc("review_admissions_total")
+            self.notify_outbox()
+        return {
+            "task_id": task_id,
+            "state": "PENDING",
+            "resumed": status == "resumed",
+            "already_active": status == "active",
+        }
+
+    def tenant_capacity_report(self, tenant_id: str) -> dict[str, Any]:
+        stats = self.store.tenant_review_admission_stats(tenant_id)
+        limit = self.options.tenant_max_active_reviews
+        active = int(stats["active"])
+        return {
+            "tenant_id": tenant_id,
+            "enabled": limit > 0,
+            "max_active_reviews": limit,
+            "active_reviews": active,
+            "available": max(0, limit - active) if limit else None,
+            "saturated": bool(limit and active >= limit),
+            "oldest_acquired_at": stats["oldest_acquired_at"],
+        }
 
     def cancel_task(self, task_id: str, tenant_id: str | None = None) -> bool:
         return self.store.request_cancel(task_id, tenant_id)

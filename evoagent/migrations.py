@@ -610,6 +610,42 @@ MIGRATIONS: tuple[Migration, ...] = (
             SQLiteColumn("session_turns", "findings_pruned_at", "TEXT"),
         ),
     ),
+    Migration(
+        14,
+        "tenant-review-admission",
+        (
+            """CREATE TABLE IF NOT EXISTS task_admissions (
+                task_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                active INTEGER NOT NULL, release_on_failure INTEGER NOT NULL,
+                generation INTEGER NOT NULL,
+                acquired_at TEXT NOT NULL, released_at TEXT, release_reason TEXT,
+                FOREIGN KEY(task_id) REFERENCES tasks(id))""",
+            "CREATE INDEX IF NOT EXISTS idx_task_admissions_tenant_active "
+            "ON task_admissions(tenant_id,active,acquired_at)",
+            "INSERT OR IGNORE INTO task_admissions(task_id,tenant_id,active,"
+            "release_on_failure,generation,acquired_at) SELECT task.id,task.tenant_id,1,"
+            "CASE WHEN EXISTS (SELECT 1 FROM outbox_messages AS outbox "
+            "WHERE outbox.topic='review' AND outbox.message_key=task.id) THEN 0 ELSE 1 END,1,"
+            "task.created_at FROM tasks AS task WHERE task.state IN "
+            "('PENDING','PLANNING','EXECUTING','REVIEWING')",
+        ),
+        (
+            """CREATE TABLE IF NOT EXISTS task_admissions (
+                task_id TEXT PRIMARY KEY REFERENCES tasks(id), tenant_id TEXT NOT NULL,
+                active BOOLEAN NOT NULL, release_on_failure BOOLEAN NOT NULL,
+                generation INTEGER NOT NULL,
+                acquired_at TIMESTAMPTZ NOT NULL, released_at TIMESTAMPTZ,
+                release_reason TEXT)""",
+            "CREATE INDEX IF NOT EXISTS idx_task_admissions_tenant_active "
+            "ON task_admissions(tenant_id,active,acquired_at)",
+            "INSERT INTO task_admissions(task_id,tenant_id,active,release_on_failure,generation,"
+            "acquired_at) SELECT task.id,task.tenant_id,TRUE,NOT EXISTS "
+            "(SELECT 1 FROM outbox_messages AS outbox WHERE outbox.topic='review' "
+            "AND outbox.message_key=task.id),1,task.created_at "
+            "FROM tasks AS task WHERE task.state IN "
+            "('PENDING','PLANNING','EXECUTING','REVIEWING') ON CONFLICT(task_id) DO NOTHING",
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1].version

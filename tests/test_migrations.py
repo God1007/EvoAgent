@@ -68,6 +68,12 @@ class SQLiteMigrationTests(unittest.TestCase):
                     "AND name LIKE 'model_route_capacity_%'"
                 ).fetchall()
             }
+            admission_table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='task_admissions'"
+            ).fetchone()
+            admission_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(task_admissions)").fetchall()
+            }
         self.assertEqual([item.version for item in MIGRATIONS], [row["version"] for row in rows])
         self.assertEqual([item.name for item in MIGRATIONS], [row["name"] for row in rows])
         self.assertEqual([item.checksum for item in MIGRATIONS], [row["checksum"] for row in rows])
@@ -81,6 +87,7 @@ class SQLiteMigrationTests(unittest.TestCase):
         self.assertIn("idx_model_route_capacity_windows", indexes)
         self.assertIn("idx_trace_events_retention", indexes)
         self.assertIn("idx_session_findings_retention", indexes)
+        self.assertIn("idx_task_admissions_tenant_active", indexes)
         self.assertEqual(
             {"lane", "topology_sha256"}, {"lane", "topology_sha256"} & model_usage_columns
         )
@@ -90,6 +97,8 @@ class SQLiteMigrationTests(unittest.TestCase):
         self.assertEqual(
             {"model_route_capacity_leases", "model_route_capacity_windows"}, capacity_tables
         )
+        self.assertIsNotNone(admission_table)
+        self.assertIn("generation", admission_columns)
 
     def test_read_only_operational_gate_refuses_an_old_schema(self):
         with self.connect() as conn:
@@ -125,6 +134,7 @@ class SQLiteMigrationTests(unittest.TestCase):
         store = TaskStore(self.path)
         self.assertEqual(CURRENT_SCHEMA_VERSION, store.schema_version())
         self.assertEqual("previous-release", store.get(task_id, "tenant-a")["input"]["source"])
+        self.assertEqual(1, store.tenant_review_admission_stats("tenant-a")["active"])
 
     def test_forward_migration_removes_legacy_operational_exception_text(self):
         task_id = "legacy-error-" + uuid.uuid4().hex

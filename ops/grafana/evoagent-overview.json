@@ -153,6 +153,28 @@
       ],
       "title": "Operational history retention",
       "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 53},
+      "id": 14,
+      "targets": [
+        {"expr": "evoagent:ratio:tenant_review_capacity_rejected_15m", "refId": "A"}
+      ],
+      "title": "Tenant review capacity rejection ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 53},
+      "id": 15,
+      "targets": [
+        {"expr": "max(evoagent_review_admission_slots_active)", "refId": "A"}
+      ],
+      "title": "Global active review admissions",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

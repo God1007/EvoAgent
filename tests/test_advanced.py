@@ -178,6 +178,21 @@ class AdvancedFeatureTests(unittest.TestCase):
             ):
                 configured.__class__(**{**configured.__dict__, **changes}).validate_evolution()
 
+    def test_tenant_review_capacity_configuration_is_bounded(self):
+        configured = settings(self.path)
+        invalid = (
+            {"tenant_max_active_reviews": -1},
+            {"tenant_max_active_reviews": 1_000_001},
+            {"tenant_capacity_retry_seconds": 0},
+            {"tenant_capacity_retry_seconds": 3601},
+        )
+        for changes in invalid:
+            with (
+                self.subTest(changes=changes),
+                self.assertRaisesRegex(ValueError, "EVOAGENT_TENANT"),
+            ):
+                configured.__class__(**{**configured.__dict__, **changes}).validate_evolution()
+
     def test_feedback_candidate_is_deferred_without_a_model(self):
         store = TaskStore(self.path)
         store.create("task", "org/repo", 1, {"source": "test"})

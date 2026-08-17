@@ -73,6 +73,53 @@ class AdmissionControlTests(unittest.TestCase):
         self.assertEqual(429, second.status)
         self.assertIsNotNone(second.getheader("Retry-After"))
 
+    def test_tenant_review_capacity_returns_retryable_429_after_body_is_consumed(self):
+        host, port = self._serve(
+            self._settings(
+                tenant_max_active_reviews=1,
+                tenant_capacity_retry_seconds=7,
+            )
+        )
+        self.service.store.create_review_task(
+            "occupied",
+            "org/occupied",
+            1,
+            {"source": "test"},
+            "default",
+        )
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        self.addCleanup(conn.close)
+        payload = json.dumps(
+            {
+                "repository": "org/rejected",
+                "diff": "--- a/a.py\n+++ b/a.py\n+value = 1\n",
+                "pull_request": 2,
+            }
+        )
+
+        conn.request(
+            "POST",
+            "/v1/reviews?async=true",
+            body=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        response = conn.getresponse()
+        body = json.loads(response.read())
+
+        self.assertEqual(429, response.status)
+        self.assertEqual("7", response.getheader("Retry-After"))
+        self.assertEqual("tenant review capacity is exhausted", body["error"])
+        self.assertEqual(1, self.service.store.tenant_review_admission_stats("default")["active"])
+        audit = self.service.store.list_audit("default", 10)
+        self.assertEqual("review.capacity-rejected", audit[0]["action"])
+
+        conn.request("GET", "/api/tenant-review-capacity")
+        capacity_response = conn.getresponse()
+        capacity = json.loads(capacity_response.read())
+        self.assertEqual(200, capacity_response.status)
+        self.assertEqual(1, capacity["active_reviews"])
+        self.assertTrue(capacity["saturated"])
+
     def test_trusted_proxy_clients_receive_independent_rate_limit_buckets(self):
         host, port = self._serve(
             self._settings(
@@ -235,6 +282,7 @@ class AdmissionControlTests(unittest.TestCase):
         self.assertEqual("running", health["plugin_runtime"])
         self.assertGreaterEqual(health["plugins"], 10)
         self.assertFalse(health["retention"]["enabled"])
+        self.assertFalse(health["review_admission"]["enabled"])
 
         conn.request("GET", "/v1/plugins")
         inventory_response = conn.getresponse()

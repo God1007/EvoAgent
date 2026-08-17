@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.18.0)
+## Current maturity (v0.19.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -20,6 +20,7 @@ It is an execution plan, not a marketing checklist.
 | Model governance | Implemented advanced baseline | Replaceable gateway, scoped policy routing/residency, bounded fallback, per-route breakers, redaction, egress/output limits, atomic budgets, correlated metadata-only ledger, and conservative crash reconciliation; route shadow promotion remains pending |
 | Strong untrusted execution | Implemented baseline | Replaceable remote Proof Runner, mutually authenticated evidence manifests, container-only jobs, replay/size/capacity gates, and content-addressed artifacts; microVM and distributed replay store remain pending |
 | Service-level operations | Implemented baseline | Fixed-cardinality availability/latency/success SLIs, versioned 30-day SLO catalog, multi-window burn alerts, queue/Outbox age, DLQ depth, dashboard, runbooks, and hardened Prometheus evaluator |
+| HTTP edge security | Implemented baseline | Validated/generated request correlation, explicit client-safe 4xx types, bounded list reads, generic 5xx envelopes, query-free structured access logs, consistent hardening headers, and no interpreter-version disclosure |
 | Quality evidence | Governance baseline implemented | Reproducible synthetic regression plus blind dual-annotation/adjudication compiler, rights/content/split/evidence audit, per-language/CWE/rule slices, and confidence calibration; production gate remains blocked until a real approved corpus is supplied |
 | HA/DR operational proof | Implemented recovery baseline | SQLite/PostgreSQL isolated restore validates schema/content/application/RPO/RTO; an offline audited epoch reconstructs incomplete PostgreSQL/Outbox intent only into empty Redis and is proven against real CI services; managed PITR and regional routing exercise remain pending |
 
@@ -251,6 +252,13 @@ through an exact-host HTTPS/no-redirect/no-proxy client, Prometheus rules encode
 fast/slow budget burn and dependency backlog alerts, and the packaged Grafana
 dashboard links to actionable runbooks. CI validates the rules with `promtool`
 and verifies all operational assets in the wheel.
+
+The v0.19 increment adds one correlated HTTP boundary around admission plus GET
+and POST execution. Every response carries a strict `X-Request-ID`; unexpected
+failures return no exception detail, and structured access/error records omit
+query strings and exception messages. Response-start tracking prevents a late
+failure from corrupting an already-started HTTP stream. See
+[`ADR 0017`](adr/0017-correlated-safe-http-boundary.md).
 
 Implemented database recovery baseline: `evoagent-dr` performs SQLite online
 backup/restore or a PostgreSQL exported-snapshot `pg_dump` followed by

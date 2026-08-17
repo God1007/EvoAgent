@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any
 
+from .errors import AccessDeniedError, ClientInputError
 from .ports import RepositoryPolicyStorePort
 
 _POLICY_FIELDS = frozenset(
@@ -152,11 +153,11 @@ class RepositoryPolicyResolver:
         actor: str,
     ) -> dict[str, Any]:
         if not tenant_id or len(tenant_id) > 200:
-            raise ValueError("tenant_id is required and must be at most 200 characters")
+            raise ClientInputError("tenant_id is required and must be at most 200 characters")
         if not repository or len(repository) > 250:
-            raise ValueError("repository is required and must be at most 250 characters")
+            raise ClientInputError("repository is required and must be at most 250 characters")
         if not actor or len(actor) > 200:
-            raise ValueError("policy actor is required and must be at most 200 characters")
+            raise ClientInputError("policy actor is required and must be at most 200 characters")
         policy = RepositoryPolicy.from_dict(raw_policy)
         return self.store.save_repository_policy(tenant_id, repository, policy.to_dict(), actor)
 
@@ -170,13 +171,13 @@ class RepositoryPolicyResolver:
         llm_routes: tuple[dict[str, str], ...] | None = None,
     ) -> None:
         if not policy.enabled:
-            raise PermissionError("repository is disabled by tenant policy")
+            raise AccessDeniedError("repository is disabled by tenant policy")
         if policy.max_diff_bytes is not None and diff_bytes > policy.max_diff_bytes:
-            raise ValueError(
+            raise ClientInputError(
                 "diff exceeds repository policy limit of %d bytes" % policy.max_diff_bytes
             )
         if policy.allowed_reviewers and reviewer not in policy.allowed_reviewers:
-            raise PermissionError("reviewer '%s' is not allowed by repository policy" % reviewer)
+            raise AccessDeniedError("reviewer '%s' is not allowed by repository policy" % reviewer)
         if llm_routes is not None:
             eligible = [
                 route
@@ -191,23 +192,25 @@ class RepositoryPolicyResolver:
                 and (not policy.llm_region or route.get("region") == policy.llm_region)
             ]
             if not eligible:
-                raise PermissionError("no configured model route satisfies repository policy")
+                raise AccessDeniedError("no configured model route satisfies repository policy")
             return
         if policy.llm_region:
-            raise PermissionError("repository model region requires a routing-aware gateway")
+            raise AccessDeniedError("repository model region requires a routing-aware gateway")
         if policy.allowed_llm_providers and llm_provider not in policy.allowed_llm_providers:
-            raise PermissionError(
+            raise AccessDeniedError(
                 "LLM provider '%s' is not allowed by repository policy" % llm_provider
             )
         if policy.allowed_llm_models and llm_model not in policy.allowed_llm_models:
-            raise PermissionError("LLM model '%s' is not allowed by repository policy" % llm_model)
+            raise AccessDeniedError(
+                "LLM model '%s' is not allowed by repository policy" % llm_model
+            )
 
     @staticmethod
     def authorize_fix(
         policy: RepositoryPolicy, available_rule_ids: tuple[str, ...]
     ) -> tuple[str, ...]:
         if not policy.enabled or not policy.auto_fix:
-            raise PermissionError("automatic repair is not enabled by repository policy")
+            raise AccessDeniedError("automatic repair is not enabled by repository policy")
         if not policy.allowed_fix_rules:
             return available_rule_ids
         unknown = set(policy.allowed_fix_rules).difference(available_rule_ids)

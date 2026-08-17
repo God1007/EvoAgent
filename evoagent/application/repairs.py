@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from ..errors import ClientInputError
 from ..metrics import metrics
 from ..policy import RepositoryPolicyResolver
 from ..ports import (
@@ -72,7 +73,7 @@ class RepairUseCases:
         regression_command: str = "",
     ) -> dict[str, Any]:
         if not isinstance(original_files, dict) or not isinstance(patched_files, dict):
-            raise ValueError("'original' and 'patched' file maps are required")
+            raise ClientInputError("'original' and 'patched' file maps are required")
         original = {
             path: text
             for path, text in original_files.items()
@@ -87,7 +88,7 @@ class RepairUseCases:
             len(text.encode("utf-8")) for text in list(original.values()) + list(patched.values())
         )
         if total > self.options.max_diff_bytes * 10:
-            raise ValueError("proof payload exceeds the maximum analysable size")
+            raise ClientInputError("proof payload exceeds the maximum analysable size")
         with metrics.latency("proof_execution"):
             result = ProofRunner(executor=self.proof_executor).prove(
                 original,
@@ -109,9 +110,9 @@ class RepairUseCases:
     ) -> dict[str, Any]:
         task = self.store.get(task_id, tenant_id)
         if not task or not task.get("report"):
-            raise ValueError("completed task not found")
+            raise ClientInputError("completed task not found")
         if task.get("pull_request") is None:
-            raise ValueError("fix commits require a GitHub pull request task")
+            raise ClientInputError("fix commits require a GitHub pull request task")
         actual_tenant = task.get("tenant_id") or tenant_id or "default"
         policy = self.policies.resolve(actual_tenant, task["repository"])
         available_rule_ids = tuple(getattr(self.fixer, "rule_ids", ()))

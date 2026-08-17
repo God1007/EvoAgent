@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Any, ClassVar
 
 from . import __version__
+from .errors import AccessDeniedError
 
 
 def verify_signature(secret: str, body: bytes, signature: str) -> bool:
@@ -242,7 +243,7 @@ class GitHubClient:
     def ensure_repository_access(self, repository: str) -> None:
         result = self.get_repository(repository)
         if str(result.get("full_name", "")).lower() != repository.lower():
-            raise PermissionError("GitHub installation is not authorized for this repository")
+            raise AccessDeniedError("GitHub installation is not authorized for this repository")
 
     def create_branch(self, repository: str, branch: str, sha: str) -> None:
         self._json(

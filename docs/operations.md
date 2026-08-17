@@ -60,6 +60,20 @@ incident ticket, freeze nonessential releases, compare error types and tenant
 distribution, and schedule remediation before the remaining budget reaches
 zero. Page immediately if the fast-burn alert also fires.
 
+## Correlated HTTP failures
+
+Every response carries `X-Request-ID`. For an unexpected failure, the JSON body
+contains only `internal server error` plus that identifier. Search structured
+container logs for the same `request_id` and `event=http_internal_error`, then
+use the bounded `error_type`, deployment metadata, component telemetry, and task
+trace to locate the failing dependency. The public edge intentionally records no
+exception message, traceback, or query string.
+
+Do not temporarily enable raw client errors during an incident. If additional
+detail is required, add it to access-controlled component tracing with explicit
+redaction. Treat caller-provided request IDs as untrusted labels; never use them
+to authorize a replay, reconciliation, or tenant operation.
+
 ## Intake latency
 
 1. Compare intake RPS, p99, `outbox_oldest_age_seconds`, Postgres pool available,

@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from ..errors import ClientInputError
 from ..metrics import metrics
 from ..ports import TaskQueuePort, WebhookApplicationStorePort
 from .reviews import ReviewUseCases
@@ -35,7 +36,7 @@ class WebhookUseCases:
     @staticmethod
     def _duplicate(existing: dict[str, Any], payload_sha256: str) -> dict[str, Any]:
         if existing.get("payload_sha256") != payload_sha256:
-            raise ValueError("delivery id was already used with a different payload")
+            raise ClientInputError("delivery id was already used with a different payload")
         task_id = existing.get("task_id")
         return {
             "duplicate": True,
@@ -74,7 +75,7 @@ class WebhookUseCases:
         number = payload.get("number")
         diff_url = pull.get("diff_url")
         if not repository or not isinstance(number, int) or not diff_url:
-            raise ValueError("invalid GitHub pull_request payload")
+            raise ClientInputError("invalid GitHub pull_request payload")
         policy = self.reviews.authorize_repository(tenant_id, repository)
         head_sha = (pull.get("head") or {}).get("sha")
         task_id, task_input = self.reviews.prepare_deferred_task(

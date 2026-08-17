@@ -2,17 +2,18 @@
 
 import hashlib
 
+from .errors import ClientInputError
 from .ports import ReleaseStorePort
 
 
 def _percentage(config: dict[str, object], key: str) -> int:
     value = config.get(key, 0)
     if isinstance(value, bool) or not isinstance(value, (int, str)):
-        raise ValueError("%s must be an integer" % key)
+        raise ClientInputError("%s must be an integer" % key)
     try:
         return int(value)
     except ValueError:
-        raise ValueError("%s must be an integer" % key) from None
+        raise ClientInputError("%s must be an integer" % key) from None
 
 
 def _finding_keys(payload: dict[str, object] | None) -> set[str]:
@@ -30,9 +31,9 @@ class ReleaseManager:
         canary = _percentage(config, "canary_percent")
         shadow = _percentage(config, "shadow_percent")
         if not 0 <= canary <= 100 or not 0 <= shadow <= 100:
-            raise ValueError("canary_percent and shadow_percent must be between 0 and 100")
+            raise ClientInputError("canary_percent and shadow_percent must be between 0 and 100")
         if config.get("candidate_version") is None:
-            raise ValueError("candidate_version is required")
+            raise ClientInputError("candidate_version is required")
         self.store.save_deployment(tenant_id, skill_name, config)
         deployment = self.store.get_deployment(tenant_id, skill_name)
         if deployment is None:

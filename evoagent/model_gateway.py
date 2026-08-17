@@ -20,6 +20,7 @@ from fnmatch import fnmatchcase
 from typing import Any, Protocol
 
 from .circuit_breaker import CircuitBreaker, CircuitOpenError
+from .errors import AccessDeniedError, ClientInputError
 from .metrics import metrics
 from .ports import ModelUsageStorePort
 
@@ -515,7 +516,7 @@ class EnterpriseModelGateway:
         )
         input_tokens = _estimated_tokens(canonical)
         if input_tokens > self.options.max_input_tokens:
-            raise ValueError(
+            raise ClientInputError(
                 "model input exceeds the configured limit of %d tokens"
                 % self.options.max_input_tokens
             )
@@ -528,7 +529,7 @@ class EnterpriseModelGateway:
         candidates = self._candidate_routes(request)
         if not candidates:
             metrics.inc("model_route_rejections_total")
-            raise PermissionError("no model route satisfies the request governance policy")
+            raise AccessDeniedError("no model route satisfies the request governance policy")
         attempt_limit = min(len(candidates), max(1, self.options.fallback_attempts + 1))
         root_request_id = uuid.uuid4().hex
         last_error: Exception | None = None
@@ -636,7 +637,7 @@ class EnterpriseModelGateway:
             self.options.daily_cost_micros,
         ):
             metrics.inc("model_budget_rejections_total")
-            raise PermissionError("model usage budget is exhausted for this repository")
+            raise AccessDeniedError("model usage budget is exhausted for this repository")
         actual_input = 0
         actual_output = 0
         cost = 0

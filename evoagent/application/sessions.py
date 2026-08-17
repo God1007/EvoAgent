@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..codegraph import build_graph
+from ..errors import ClientInputError
 from ..metrics import metrics
 from ..ports import SessionApplicationStorePort
 from ..session import classify_findings, continuity_summary, open_snapshot
@@ -63,7 +64,7 @@ class SessionUseCases:
     ) -> dict[str, Any]:
         timeline = self.store.get_session_timeline(session_id, tenant_id)
         if timeline is None:
-            raise ValueError("session not found")
+            raise ClientInputError("session not found")
         self.store.resolve_session_input(session_id)
         self.store.audit(
             tenant_id or timeline.get("tenant_id", "default"),
@@ -76,16 +77,16 @@ class SessionUseCases:
 
     def analyze_impact(self, sources: dict[str, Any], changed_paths: list[Any]) -> dict[str, Any]:
         if not isinstance(sources, dict) or not isinstance(changed_paths, list):
-            raise ValueError("'files' object and 'changed' list are required")
+            raise ClientInputError("'files' object and 'changed' list are required")
         normalized = {
             path: value
             for path, value in sources.items()
             if isinstance(path, str) and isinstance(value, str)
         }
         if len(normalized) > 5000:
-            raise ValueError("too many files to analyse in a single request")
+            raise ClientInputError("too many files to analyse in a single request")
         total = sum(len(value.encode("utf-8")) for value in normalized.values())
         if total > self.max_diff_bytes * 10:
-            raise ValueError("source payload exceeds the maximum analysable size")
+            raise ClientInputError("source payload exceeds the maximum analysable size")
         graph = build_graph(normalized)
         return graph.impact_of([path for path in changed_paths if isinstance(path, str)])

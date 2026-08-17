@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..errors import ClientInputError
 from ..metrics import metrics
 from ..ports import ModelUsageStorePort
 
@@ -24,11 +25,11 @@ class ModelUsageUseCases:
         error: str = "",
     ) -> dict[str, Any]:
         if not tenant_id or not actor:
-            raise ValueError("model usage reconciliation requires tenant and actor")
+            raise ClientInputError("model usage reconciliation requires tenant and actor")
         if not request_id or len(request_id) > 128:
-            raise ValueError("model usage request_id must contain 1 to 128 characters")
+            raise ClientInputError("model usage request_id must contain 1 to 128 characters")
         if status not in {"success", "failed"}:
-            raise ValueError("model usage status must be success or failed")
+            raise ClientInputError("model usage status must be success or failed")
         values = {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -36,9 +37,11 @@ class ModelUsageUseCases:
         }
         for name, value in values.items():
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                raise ValueError("%s must be a non-negative integer" % name)
+                raise ClientInputError("%s must be a non-negative integer" % name)
         if not isinstance(error, str) or len(error) > 2000:
-            raise ValueError("model usage reconciliation error must be at most 2000 characters")
+            raise ClientInputError(
+                "model usage reconciliation error must be at most 2000 characters"
+            )
         reconciled = self.store.reconcile_model_usage(
             tenant_id,
             actor,

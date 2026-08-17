@@ -89,7 +89,8 @@ jobs:
           "$wheel_env/bin/evoagent-recover-queue" --help >/dev/null
           "$wheel_env/bin/evoagent-eval-labels" --help >/dev/null
           "$wheel_env/bin/python" -c "from evoagent.review_extensions import ReviewerContribution"
-          "$wheel_env/bin/evoagent-migrate" | grep -q '"schema_version": 8'
+          "$wheel_env/bin/evoagent-migrate" | "$wheel_env/bin/python" -c \
+            "import json,sys; from evoagent.migrations import CURRENT_SCHEMA_VERSION; d=json.load(sys.stdin); assert d['schema_version'] == CURRENT_SCHEMA_VERSION"
           kill -TERM "$wheel_pid"
           wait "$wheel_pid"
           trap - EXIT
@@ -213,7 +214,7 @@ jobs:
           EVOAGENT_DATABASE_URL: ${{ env.EVOAGENT_TEST_POSTGRES_URL }}
         run: |
           python -m evoagent.migrate | tee migration.json
-          python -c "import json; d=json.load(open('migration.json')); assert d == {'backend':'postgresql','schema_version':8,'status':'migrated'}"
+          python -c "import json; from evoagent.migrations import CURRENT_SCHEMA_VERSION; d=json.load(open('migration.json')); assert d == {'backend':'postgresql','schema_version':CURRENT_SCHEMA_VERSION,'status':'migrated'}"
       - name: Run adapter contracts and restart fault tests
         run: |
           python -m pytest -q \

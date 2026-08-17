@@ -1,9 +1,12 @@
 import http.client
+import io
 import json
 import os
+import re
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
 from http.server import ThreadingHTTPServer
 
 from evoagent.api import ApiHandler
@@ -152,6 +155,108 @@ class AdmissionControlTests(unittest.TestCase):
         ready = json.loads(ready_response.read())
         self.assertEqual(200, ready_response.status)
         self.assertEqual(CURRENT_SCHEMA_VERSION, ready["checks"]["schema_version"])
+
+    def test_request_identity_and_security_headers_cover_every_response(self):
+        host, port = self._serve(self._settings())
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        self.addCleanup(conn.close)
+
+        conn.request("GET", "/health", headers={"X-Request-ID": "gateway-request.42"})
+        accepted = conn.getresponse()
+        accepted.read()
+        self.assertEqual("gateway-request.42", accepted.getheader("X-Request-ID"))
+        self.assertEqual("nosniff", accepted.getheader("X-Content-Type-Options"))
+        self.assertEqual("DENY", accepted.getheader("X-Frame-Options"))
+        self.assertEqual("same-origin", accepted.getheader("Referrer-Policy"))
+        self.assertIn("camera=()", accepted.getheader("Permissions-Policy", ""))
+        self.assertNotIn("Python", accepted.getheader("Server", ""))
+
+        conn.request("GET", "/health", headers={"X-Request-ID": "invalid request id"})
+        replaced = conn.getresponse()
+        replaced.read()
+        generated = replaced.getheader("X-Request-ID", "")
+        self.assertNotEqual("invalid request id", generated)
+        self.assertRegex(generated, re.compile(r"^[0-9a-f]{32}$"))
+
+    def test_internal_error_is_correlated_without_leaking_exception_or_query(self):
+        host, port = self._serve(self._settings())
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        self.addCleanup(conn.close)
+
+        def fail_inventory():
+            raise RuntimeError("password=provider-secret-value")
+
+        self.service.plugin_status = fail_inventory
+        output = io.StringIO()
+        with redirect_stdout(output):
+            conn.request(
+                "GET",
+                "/v1/plugins?access_token=query-secret-value",
+                headers={"X-Request-ID": "edge-error-17"},
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read())
+
+        logs = output.getvalue()
+        self.assertEqual(500, response.status)
+        self.assertEqual("edge-error-17", response.getheader("X-Request-ID"))
+        self.assertEqual({"error": "internal server error", "request_id": "edge-error-17"}, payload)
+        self.assertNotIn("provider-secret-value", json.dumps(payload))
+        self.assertNotIn("provider-secret-value", logs)
+        self.assertNotIn("query-secret-value", logs)
+        self.assertIn('"event": "http_internal_error"', logs)
+        self.assertIn('"error_type": "builtins.RuntimeError"', logs)
+        self.assertIn('"path": "/v1/plugins"', logs)
+
+    def test_post_internal_error_uses_the_same_safe_boundary(self):
+        host, port = self._serve(self._settings())
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        self.addCleanup(conn.close)
+
+        def fail_reconciliation(*_args):
+            # Built-in ValueError is not assumed to be public-safe. Only the
+            # explicit ClientInputError marker may cross the HTTP boundary.
+            raise ValueError("postgresql://admin:database-secret@db/reviews")
+
+        self.service.reconcile_model_usage = fail_reconciliation
+        body = json.dumps(
+            {
+                "request_id": "provider-request",
+                "status": "success",
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "cost_micros": 1,
+            }
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            conn.request(
+                "POST",
+                "/v1/model-usage/reconcile",
+                body=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Request-ID": "post-error-18",
+                },
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read())
+
+        self.assertEqual(500, response.status)
+        self.assertEqual({"error": "internal server error", "request_id": "post-error-18"}, payload)
+        self.assertNotIn("database-secret", output.getvalue())
+
+    def test_list_limit_is_bounded_and_returns_a_reviewed_client_error(self):
+        host, port = self._serve(self._settings())
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        self.addCleanup(conn.close)
+
+        conn.request("GET", "/api/tasks?limit=1001")
+        response = conn.getresponse()
+        payload = json.loads(response.read())
+
+        self.assertEqual(400, response.status)
+        self.assertEqual({"error": "limit must be an integer between 1 and 1000"}, payload)
 
     def test_repository_policy_api_versions_and_reads_tenant_policy(self):
         host, port = self._serve(self._settings())

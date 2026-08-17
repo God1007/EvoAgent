@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from ..errors import AccessDeniedError, ClientInputError
 from ..metrics import metrics
 from ..models import TaskState, TraceEvent
 from ..policy import RepositoryPolicy, RepositoryPolicyResolver
@@ -75,12 +76,14 @@ class ReviewUseCases:
 
     def validate(self, repository: str, diff: str) -> None:
         if not repository or len(repository) > 250:
-            raise ValueError("repository is required and must be at most 250 characters")
+            raise ClientInputError("repository is required and must be at most 250 characters")
         size = len(diff.encode("utf-8"))
         if size == 0:
-            raise ValueError("diff is required")
+            raise ClientInputError("diff is required")
         if size > self.options.max_diff_bytes:
-            raise ValueError("diff exceeds maximum size of %d bytes" % self.options.max_diff_bytes)
+            raise ClientInputError(
+                "diff exceeds maximum size of %d bytes" % self.options.max_diff_bytes
+            )
 
     def authorize_review(self, tenant_id: str, repository: str, diff: str) -> RepositoryPolicy:
         self.validate(repository, diff)
@@ -99,7 +102,7 @@ class ReviewUseCases:
     def authorize_repository(self, tenant_id: str, repository: str) -> RepositoryPolicy:
         policy = self.policies.resolve(tenant_id, repository)
         if not policy.enabled:
-            raise PermissionError("repository is not authorized for this tenant")
+            raise AccessDeniedError("repository is not authorized for this tenant")
         return policy
 
     def create_task(
@@ -266,7 +269,7 @@ class ReviewUseCases:
         )
         current_policy = self.policies.resolve(tenant_id, repository)
         if not current_policy.enabled:
-            raise PermissionError("repository was disabled after this task was accepted")
+            raise AccessDeniedError("repository was disabled after this task was accepted")
         diff = self.store.get_task_payload(task_id)
         fetched_diff = False
         if diff is None and payload.get("diff_url"):
@@ -469,9 +472,9 @@ class ReviewUseCases:
         tenant_id: str | None = None,
     ) -> dict[str, Any]:
         if not self.store.get(task_id, tenant_id):
-            raise ValueError("task not found")
+            raise ClientInputError("task not found")
         if category not in {"false_positive", "missed_issue", "bad_fix", "accepted"}:
-            raise ValueError("unsupported feedback category")
+            raise ClientInputError("unsupported feedback category")
         self.store.record_failure_case(task_id, category, {"finding": finding, "note": note[:2000]})
         metrics.inc("feedback_total")
         return {"recorded": True, "category": category}
@@ -479,11 +482,11 @@ class ReviewUseCases:
     def resume_task(self, task_id: str, tenant_id: str | None = None) -> dict[str, Any]:
         task = self.store.get(task_id, tenant_id)
         if not task:
-            raise ValueError("task not found")
+            raise ClientInputError("task not found")
         if task["state"] == "SUCCESS":
             return {"task_id": task_id, "state": "SUCCESS", "report": task["report"]}
         if self.store.get_task_payload(task_id) is None:
-            raise ValueError("task payload is no longer available")
+            raise ClientInputError("task payload is no longer available")
         self.queue().submit(
             {
                 "task_id": task_id,

@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .diff_parser import parse_unified_diff
+from .errors import ClientInputError
 from .ports import EvolutionStorePort
 from .reviewer import Reviewer
 from .store import utc_now
@@ -258,37 +259,43 @@ class EvolutionEngine:
     @staticmethod
     def validate_case(name: str, diff: str, expected: list, split: str = "validation") -> None:
         if not name or len(name) > 120:
-            raise ValueError("evaluation case name is required and must be at most 120 characters")
+            raise ClientInputError(
+                "evaluation case name is required and must be at most 120 characters"
+            )
         if split not in {"train", "validation", "holdout"}:
-            raise ValueError("evaluation split must be train, validation or holdout")
+            raise ClientInputError("evaluation split must be train, validation or holdout")
         if len(diff.encode("utf-8")) > 1024 * 1024:
-            raise ValueError("evaluation case diff must be at most 1 MiB")
+            raise ClientInputError("evaluation case diff must be at most 1 MiB")
         parsed = parse_unified_diff(diff)
         if not parsed.added_lines:
-            raise ValueError("evaluation case must contain a valid unified diff with added lines")
+            raise ClientInputError(
+                "evaluation case must contain a valid unified diff with added lines"
+            )
         valid_locations = {(line.path, line.line) for line in parsed.added_lines}
         if not isinstance(expected, list):
-            raise ValueError("expected_findings must be an array")
+            raise ClientInputError("expected_findings must be an array")
         if len(expected) > 100:
-            raise ValueError("expected_findings must contain at most 100 items")
+            raise ClientInputError("expected_findings must contain at most 100 items")
         seen = set()
         for item in expected:
             if not isinstance(item, dict):
-                raise ValueError("each expected finding must be an object")
+                raise ClientInputError("each expected finding must be an object")
             try:
                 location = (str(item.get("path", "")), int(item.get("line", 0)))
             except (TypeError, ValueError) as exc:
-                raise ValueError("expected finding line must be an integer") from exc
+                raise ClientInputError("expected finding line must be an integer") from exc
             if location not in valid_locations:
-                raise ValueError("expected finding must point to an added line: %s:%s" % location)
+                raise ClientInputError(
+                    "expected finding must point to an added line: %s:%s" % location
+                )
             if str(item.get("min_severity", "low")).lower() not in SEVERITY_RANK:
-                raise ValueError("invalid min_severity")
+                raise ClientInputError("invalid min_severity")
             rule_id = str(item.get("rule_id", "")).strip()
             if "rule_id" in item and (not rule_id or len(rule_id) > 80):
-                raise ValueError("rule_id must be non-empty and at most 80 characters")
+                raise ClientInputError("rule_id must be non-empty and at most 80 characters")
             identity = location + (rule_id,)
             if identity in seen:
-                raise ValueError("duplicate expected finding: %s:%s:%s" % identity)
+                raise ClientInputError("duplicate expected finding: %s:%s:%s" % identity)
             seen.add(identity)
 
     def add_evaluation_case(
@@ -349,7 +356,7 @@ class EvolutionEngine:
     ) -> dict[str, Any]:
         skill_name = skill_name.strip()
         if not skill_name or len(skill_name) > 120:
-            raise ValueError("skill_name is required and must be at most 120 characters")
+            raise ClientInputError("skill_name is required and must be at most 120 characters")
         with self._lock:
             return self._propose(skill_name, prompt, regression_score)
 

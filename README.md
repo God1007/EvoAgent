@@ -48,6 +48,7 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **可插拔微内核** | Store、Queue、Model Gateway、Proof Executor、Reviewer、Review Engine、代码托管、可观测性和 FixRule 通过稳定 Capability 组合，支持依赖校验、启动回滚、内容寻址的分层 Profile 与作用域覆盖 |
 | **模型治理网关** | 任务级租户/仓库上下文、凭据脱敏、HTTPS/出口主机限制、结构化输出门禁、Token/成本预算与元数据用量账本 |
 | **生产治理** | JWT、RBAC、多租户、仓库隔离、事务 Outbox、审计日志、灰度发布、影子流量、告警与死信队列 |
+| **安全 HTTP 边界** | 全响应请求关联 ID、无内部细节的统一 500、过滤 query/异常原文的结构化日志与一致安全响应头 |
 | **可观测性** | 任务 Trace、Agent 消息、Prometheus 指标和 OpenTelemetry Trace |
 | **SLO 与告警** | 版本化 30 天 SLO、错误预算、快/慢燃烧率告警、Queue/Outbox 新鲜度、Grafana Dashboard 与处置 Runbook |
 | **灾备证据** | SQLite/PostgreSQL 执行隔离恢复与 RPO/RTO 校验，并可从 PostgreSQL/Outbox 向全新 Redis 离线重建未完成任务 |
@@ -679,6 +680,10 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 
 ## API 概览
 
+所有响应都会返回 `X-Request-ID`。调用方可传入 1–64 位字母、数字、点、下划线或
+连字符组成的请求 ID；非法或缺失时服务会生成随机 ID。意外的服务端异常只返回通用
+错误与该 ID，运维人员通过结构化日志关联排查，不会向客户端暴露异常、密钥或堆栈。
+
 ### 审查与任务
 
 | 方法 | 路径 | 说明 |
@@ -972,6 +977,7 @@ output/evaluation/evaluation-report.md
 - LLM 密钥、GitHub Token 和认证密钥只从环境变量读取；
 - 对外部传入的 GitHub URL（如 Webhook 中的 `diff_url`）强制 HTTPS 与 GitHub 域名白名单校验，跨域名重定向会剥离 Authorization，并对响应大小设上限，避免 Token 外泄与内存放大；
 - Webhook Secret 与登录 Secret 用途不同，不能混用；
+- 所有 HTTP 响应携带经过约束的请求关联 ID；访问日志不记录 query，意外 500 不向调用方或边界日志复制异常原文；
 - 动态 Skill 不获得宿主权限，并运行在受限进程中；
 - 自动修复不写入原 PR Head，只创建独立分支和 Draft PR；
 - 生产 Proof Runner 可独立部署；API 仅访问精确白名单 HTTPS 地址，签名验证失败、重放、超时或容量不足均只能产生“不确定”，不能升级证据等级；

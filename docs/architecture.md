@@ -8,7 +8,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 
 | Layer | Module | Responsibility |
 | --- | --- | --- |
-| Intake | `evoagent/api.py` | HTTP API, static web console, `/webhooks/github`, `/health`, `/metrics` |
+| Intake | `evoagent/api.py`, `errors.py` | HTTP API, static web console, bounded query admission, explicit client-safe errors, correlated 5xx boundary, `/webhooks/github`, `/health`, `/metrics` |
 | Composition | `evoagent/plugins.py` | Trusted plugin manifests, capability registry, scopes, events, dependency graph, lifecycle rollback |
 | Composition | `evoagent/capabilities.py` | Stable typed capability definitions for providers and consumers |
 | Domain boundary | `evoagent/ports.py` | Focused Store, Queue, CodeHost, Model Gateway, and Proof Executor behavioral contracts |
@@ -53,6 +53,7 @@ process startup
   → resolve ReviewService capabilities
 
 change (webhook | REST | console)
+  → HTTP edge (validate/generate request id → admission → safe error envelope)
   → WebhookUseCases | ReviewUseCases
       webhook: delivery + session turn + task + outbox in one transaction
       REST: task + Diff + outbox in one transaction
@@ -165,6 +166,9 @@ See [`plugin-system.md`](plugin-system.md) and
 The full analysis lives in [`threat-model.md`](threat-model.md). Key boundaries:
 
 - **PR content is untrusted input** — never treated as instructions.
+- **HTTP metadata and failures are untrusted** — request IDs are correlation
+  labels only; access logs omit query strings and unexpected 5xx responses never
+  expose exception messages.
 - **Untrusted code execution** only happens in the verifier, and only when a
   test command is configured (container isolation recommended; host fallback is
   for trusted repositories only).

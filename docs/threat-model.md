@@ -44,6 +44,7 @@ the mitigations that exist in the codebase today, plus known residual risks.
 | T12 | Source/API-key leakage through model traffic or errors | Gateway redacts common assignment/Bearer/private-key forms before transport, strips configured credentials from upstream errors, validates exact route host + HTTPS, caps response size/tokens, stores route secrets only via environment references, and persists metadata/hash rather than prompts or responses | Pattern redaction is not a complete DLP system; DNS/network policy and provider retention remain deployment responsibilities |
 | T13 | Forged, replayed, redirected, or altered remote proof | Canonical request/input/evidence hashes, bidirectional HMAC-SHA256, UUID/timestamp replay gate, exact host allowlist, HTTPS outside loopback, disabled redirects/proxies, and bounded bodies | Replay state is process-local; HMAC rotation has no dual-key overlap yet |
 | T14 | Proof evidence deletion or mutation | Optional fail-closed content-addressed artifacts never overwrite existing content; signed responses expose input/evidence hashes | Local filesystem is not WORM and needs backup; regulated retention requires object lock |
+| T15 | Internal exception or query-secret disclosure at the public HTTP edge | One GET/POST exception boundary returns a generic correlated 500; only explicit client-safe error classes may expose 4xx messages; Proof Executor exceptions expose type but not message; structured edge logs include normalized path and bounded exception type but omit query strings, exception messages, and tracebacks; all responses carry a validated/generated `X-Request-ID` | Reviewed 4xx and sandbox command output remain visible to authorized callers; downstream component telemetry must enforce its own redaction and access control |
 
 ## 4. Untrusted-execution policy
 
@@ -58,6 +59,9 @@ the mitigations that exist in the codebase today, plus known residual risks.
 - No GitHub token, LLM key, or host environment is injected into the verifier.
 - Plugin Profile and child Scope provide composition/lifecycle isolation only;
   they are not security sandboxes.
+- `X-Request-ID` is an untrusted correlation value, never an authorization,
+  tenancy, idempotency, or audit identity. A production ingress may replace it
+  when globally unique identifiers are required.
 
 ## 5. Known residual risks (honest boundaries)
 

@@ -29,6 +29,7 @@ import tempfile
 from enum import IntEnum
 from typing import Any
 
+from .errors import ClientInputError
 from .ports import ProofExecutorPort
 from .verifier import RepairVerifier
 
@@ -182,10 +183,16 @@ class ProofRunner:
         try:
             outcome = self.executor.execute(files, command)
         except Exception as exc:
+            error_type = "%s.%s" % (type(exc).__module__, type(exc).__qualname__)
             outcome = {
                 "passed": False,
                 "status": "error",
-                "checks": [{"name": "proof-executor", "detail": str(exc)[:2000]}],
+                "checks": [
+                    {
+                        "name": "proof-executor",
+                        "detail": "proof executor failed (%s)" % error_type[:160],
+                    }
+                ],
             }
         detail = ""
         for check in outcome.get("checks", []):
@@ -213,10 +220,10 @@ def _materialize(files: dict[str, str], root: str) -> None:
     root = os.path.abspath(root)
     for rel, content in files.items():
         if not isinstance(rel, str) or not isinstance(content, str):
-            raise ValueError("proof file set must be a mapping of str paths to str content")
+            raise ClientInputError("proof file set must be a mapping of str paths to str content")
         target = os.path.normpath(os.path.join(root, rel))
         if target != root and not target.startswith(root + os.sep):
-            raise ValueError("unsafe path in proof file set: %s" % rel)
+            raise ClientInputError("unsafe path in proof file set: %s" % rel)
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(content)

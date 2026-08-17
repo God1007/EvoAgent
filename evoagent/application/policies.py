@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from ..errors import ClientInputError
 from ..policy import RepositoryPolicy, RepositoryPolicyResolver
 from ..ports import RepositoryPolicyStorePort
 
@@ -38,10 +39,13 @@ class PolicyUseCases:
         policy: dict[str, Any],
         actor: str,
     ) -> dict[str, Any]:
-        parsed = RepositoryPolicy.from_dict(policy)
+        try:
+            parsed = RepositoryPolicy.from_dict(policy)
+        except ValueError as exc:
+            raise ClientInputError(str(exc)) from None
         unknown_rules = set(parsed.allowed_fix_rules).difference(self.available_fix_rules())
         if unknown_rules:
-            raise ValueError(
+            raise ClientInputError(
                 "repository policy references unavailable fix rules: %s"
                 % ", ".join(sorted(unknown_rules))
             )

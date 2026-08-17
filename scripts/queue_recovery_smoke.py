@@ -5,10 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any
-
-import redis
 
 from evoagent.outbox import OutboxDispatcher
 from evoagent.postgres_store import PostgresTaskStore
@@ -74,10 +73,16 @@ def verify_publication(task_id: str, report_path: Path) -> dict[str, Any]:
     store = _store()
     queue = None
     drained = False
+    delivered = threading.Event()
+    published = 0
+
+    def record_delivery(payload: dict[str, Any]) -> None:
+        if payload.get("task_id") == task_id:
+            delivered.set()
+
     try:
-        queue = TaskQueue(lambda _payload: None, workers=1, redis_url=redis_url)
+        queue = TaskQueue(record_delivery, workers=1, redis_url=redis_url)
         dispatcher = OutboxDispatcher(store, queue, batch_size=500, autostart=False)
-        published = 0
         for _ in range(100):
             count = dispatcher.dispatch_once()
             published += count
@@ -85,6 +90,7 @@ def verify_publication(task_id: str, report_path: Path) -> dict[str, Any]:
                 break
         if published < int(report["staging"]["staged"]):
             raise RuntimeError("not every staged recovery intent was published")
+        delivery_observed = delivered.wait(10)
     finally:
         try:
             if queue is not None:
@@ -93,17 +99,8 @@ def verify_publication(task_id: str, report_path: Path) -> dict[str, Any]:
             store.close()
     if not drained:
         raise RuntimeError("queue workers did not drain during the recovery probe")
-
-    client = redis.Redis.from_url(redis_url, decode_responses=True)
-    try:
-        task_ids = {
-            json.loads(fields["envelope"])["payload"]["task_id"]
-            for _entry_id, fields in client.xrange(TaskQueue.STREAM)
-        }
-    finally:
-        client.close()
-    if task_id not in task_ids:
-        raise RuntimeError("restaged recovery task did not reach Redis Streams")
+    if not delivery_observed:
+        raise RuntimeError("restaged recovery task did not reach a Redis worker")
     return {"status": "published", "task_id": task_id, "published": published}
 
 

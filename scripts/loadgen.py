@@ -92,6 +92,11 @@ def _weighted_plan(mix: list) -> list:
     return plan
 
 
+def _warmup_scenario(scenario: str) -> str:
+    """Warm stateful intake tests without creating a measured-work backlog."""
+    return "steady" if scenario == "intake" else scenario
+
+
 class _Worker(threading.Thread):
     def __init__(
         self,
@@ -286,7 +291,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.warmup > 0:
         generate(
             args.base_url,
-            args.scenario,
+            _warmup_scenario(args.scenario),
             args.warmup,
             args.rate,
             args.concurrency,

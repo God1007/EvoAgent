@@ -29,6 +29,12 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(3, paths.count("/a"))
         self.assertEqual(1, paths.count("/b"))
 
+    def test_intake_warmup_does_not_enqueue_background_work(self):
+        self.assertEqual("steady", loadgen._warmup_scenario("intake"))
+
+    def test_read_only_warmup_preserves_the_selected_scenario(self):
+        self.assertEqual("stress-ramp", loadgen._warmup_scenario("stress-ramp"))
+
 
 class SummarizeTests(unittest.TestCase):
     def test_summary_computes_rates_and_percentiles(self):

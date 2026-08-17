@@ -208,6 +208,34 @@ class AdvancedFeatureTests(unittest.TestCase):
             }
         ).validate_evolution()
 
+    def test_cluster_queue_requires_a_canonical_namespace_and_database_zero(self):
+        configured = settings(self.path)
+        invalid = (
+            {"queue_namespace": "prod"},
+            {"redis_url": "redis://127.0.0.1:6379/0", "queue_redis_cluster": True},
+            {
+                "redis_url": "redis://127.0.0.1:6379/0",
+                "queue_namespace": "bad/name",
+            },
+            {
+                "redis_url": "redis://127.0.0.1:6379/2",
+                "queue_namespace": "prod",
+                "queue_redis_cluster": True,
+            },
+        )
+        for changes in invalid:
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "QUEUE|CLUSTER"):
+                configured.__class__(**{**configured.__dict__, **changes}).validate_evolution()
+
+        configured.__class__(
+            **{
+                **configured.__dict__,
+                "redis_url": "redis://127.0.0.1:6379/0",
+                "queue_namespace": "prod-eu1",
+                "queue_redis_cluster": True,
+            }
+        ).validate_evolution()
+
     def test_feedback_candidate_is_deferred_without_a_model(self):
         store = TaskStore(self.path)
         store.create("task", "org/repo", 1, {"source": "test"})

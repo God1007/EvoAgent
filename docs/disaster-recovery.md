@@ -131,14 +131,21 @@ Recommended cadence:
 
 ### Reconstruct incomplete work into a clean Redis
 
-Keep every application pod, Outbox dispatcher, and worker stopped. Use a new,
-dedicated Redis logical database; the command refuses a non-empty target and
-requires TLS outside loopback. Generate one UUID and retain it for dry-run and
+Keep every application pod, Outbox dispatcher, and worker stopped. For the
+legacy v1 layout, use a new dedicated Redis logical database; the command
+refuses a non-empty target. For v2 standalone/Cluster, configure a fresh stable
+`EVOAGENT_QUEUE_NAMESPACE`; the command reserves only that namespace and rejects
+an existing protocol, stream, DLQ, or fairness key while allowing unrelated
+namespaces on the same cluster. Cluster mode requires database 0. Both modes
+require TLS outside loopback. Generate one UUID and retain it for dry-run and
 apply:
 
 ```bash
 export EVOAGENT_DATABASE_URL='postgresql://.../restored_evoagent'
 export EVOAGENT_REDIS_URL='rediss://.../0'
+# For Redis Cluster also set both values before dry-run and apply:
+# export EVOAGENT_REDIS_CLUSTER=true
+# export EVOAGENT_QUEUE_NAMESPACE='prod-eu1-recovery-20260817'
 recovery_id="$(python -c 'import uuid; print(uuid.uuid4())')"
 
 evoagent-recover-queue \
@@ -154,7 +161,9 @@ evoagent-recover-queue \
   --apply
 ```
 
-The plan selects only `PENDING`, `PLANNING`, `EXECUTING`, or `REVIEWING` tasks
+The report binds its Redis topology evidence (`redis_cluster`, queue namespace,
+and keyspace version) to the reviewed procedure. The plan selects only
+`PENDING`, `PLANNING`, `EXECUTING`, or `REVIEWING` tasks
 without a cancellation request. It retains an existing Outbox payload (including
 GitHub delivery/session metadata), or reconstructs the minimal payload when the
 stored Diff exists. Apply reserves `evoagent:recovery:epoch` atomically in Redis,
@@ -176,7 +185,8 @@ publications. A reused recovery UUID is accepted only for the same reserved
 target before queue activity starts; a new target requires a new UUID.
 
 Queue reconstruction is executable and CI exercises it against real PostgreSQL
-plus an empty Redis logical database. Automated cross-region
+plus an empty Redis logical database, and separately proves reservation against
+a real three-primary Cluster namespace. Automated cross-region
 provisioning/routing and a timed regional exercise remain follow-ups, so this is
 still not a claim of complete regional DR.
 
@@ -191,4 +201,5 @@ still not a claim of complete regional DR.
 - Keep failed manifests and tool logs, but never paste connection strings or
   database artifacts into tickets.
 - If queue reconstruction reports a non-empty Redis target, do not flush it.
-  Verify the target URL and provision a new logical database instead.
+  Verify the target URL and provision a new logical database (v1) or choose a
+  new reviewed namespace (v2) instead.

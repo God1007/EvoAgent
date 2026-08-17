@@ -2,8 +2,15 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
-from evoagent.task_queue import PermanentTaskError, TaskQueue, load_tenant_fair_policy
+from evoagent.task_queue import (
+    PermanentTaskError,
+    TaskQueue,
+    build_queue_keyspace,
+    load_tenant_fair_policy,
+    validate_redis_cluster_url,
+)
 
 
 def _wait(predicate, timeout=5.0):
@@ -52,6 +59,60 @@ class TaskQueueBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires EVOAGENT_REDIS_URL"):
             TaskQueue(lambda _payload: None, workers=1, fair_scheduling=True)
 
+    def test_namespaced_keyspace_is_bounded_and_uses_one_cluster_slot(self):
+        from redis.cluster import key_slot
+
+        keyspace = build_queue_keyspace("prod-eu1")
+        keys = (*keyspace.fixed_keys, keyspace.recovery_marker, keyspace.dedup_prefix + "task")
+        self.assertEqual(2, keyspace.version)
+        self.assertEqual("prod-eu1", keyspace.namespace)
+        self.assertEqual(1, len({key_slot(key.encode()) for key in keys}))
+        self.assertTrue(all("{review:prod-eu1}" in key for key in keys))
+        self.assertIs(build_queue_keyspace(), build_queue_keyspace())
+
+        for invalid in (" space", "brace{", "slash/name", "x" * 49):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                build_queue_keyspace(invalid)
+
+    def test_cluster_mode_requires_a_namespace_and_database_zero(self):
+        with self.assertRaisesRegex(ValueError, "requires EVOAGENT_REDIS_URL"):
+            TaskQueue(lambda _payload: None, redis_cluster=True, namespace="prod")
+        with self.assertRaisesRegex(ValueError, "requires EVOAGENT_QUEUE_NAMESPACE"):
+            TaskQueue(
+                lambda _payload: None,
+                redis_url="redis://127.0.0.1:6379/0",
+                redis_cluster=True,
+            )
+        for url in ("redis://127.0.0.1:6379/1", "redis://127.0.0.1:6379?db=2"):
+            with self.subTest(url=url), self.assertRaisesRegex(ValueError, "logical database"):
+                validate_redis_cluster_url(url)
+
+    def test_cluster_mode_selects_topology_aware_client(self):
+        with mock.patch(
+            "redis.RedisCluster.from_url",
+            side_effect=RuntimeError("cluster fixture unavailable"),
+        ) as connect:
+            with self.assertRaisesRegex(RuntimeError, "fixture unavailable"):
+                TaskQueue(
+                    lambda _payload: None,
+                    redis_url="redis://127.0.0.1:7000/0",
+                    redis_cluster=True,
+                    namespace="prod",
+                )
+        connect.assert_called_once()
+
+    def test_v2_protocol_manifest_rejects_orphan_or_unknown_keyspace(self):
+        queue = object.__new__(TaskQueue)
+        queue._keyspace = build_queue_keyspace("prod")
+        queue._redis = mock.Mock()
+        for result in (-1, 0):
+            with self.subTest(result=result):
+                queue._redis.eval.return_value = result
+                with self.assertRaisesRegex(RuntimeError, "incompatible protocol"):
+                    queue._ensure_keyspace_protocol()
+        queue._redis.eval.return_value = 2
+        queue._ensure_keyspace_protocol()
+
     def test_memory_backend_is_named_and_reports_non_durable(self):
         queue = TaskQueue(lambda _payload: None, workers=1)
         try:
@@ -63,6 +124,9 @@ class TaskQueueBackendTests(unittest.TestCase):
             self.assertEqual(0, queue.fair_waiting_tenants())
             self.assertTrue(queue.health()["healthy"])
             self.assertFalse(queue.health()["lease_heartbeat_running"])
+            self.assertFalse(queue.redis_cluster)
+            self.assertEqual("", queue.queue_namespace)
+            self.assertEqual(1, queue.keyspace_version)
         finally:
             queue.close()
 

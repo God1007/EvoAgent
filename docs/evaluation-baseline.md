@@ -8,7 +8,7 @@ Reproducible snapshot of the end-to-end evaluation harness. Regenerate with
 
 | Field | Value |
 | --- | --- |
-| EvoAgent version | 0.29.0 |
+| EvoAgent version | 0.30.0 |
 | Python | 3.12 |
 | Dependencies | pinned via `requirements.lock` (hash-locked) |
 | Dataset | `evaluation_data/pr_diff_100.jsonl` |

@@ -72,11 +72,10 @@ large contiguous burst requires moving skipped stream entries to the tail, so
 Redis command volume can rise; durable tenant admission should remain enabled
 to bound that burst and the deferral ratio is operationally visible.
 
-The atomic decision currently assumes one logical Redis primary, optionally
-backed by replicas or managed failover. Its stream and scheduler keys are not
-co-located with Redis Cluster hash tags, so sharded Redis Cluster is outside the
-supported topology. Cluster-aware key placement or a different coordination
-design remains future work.
+The v1 key layout assumes one logical Redis primary, optionally backed by
+replicas or managed failover. ADR 0028 later adds an opt-in v2 namespace that
+co-locates the stream and scheduler keys in one Redis Cluster slot; it preserves
+this decision rather than sharding one tenant scheduler across slots.
 
 Deployment is two-stage: first every publisher/consumer must run v0.29 code
 with marking disabled, then configuration may enable it. v0.29 disabled workers

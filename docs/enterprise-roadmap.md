@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.29.0)
+## Current maturity (v0.30.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -14,7 +14,7 @@ It is an execution plan, not a marketing checklist.
 | Review extensibility | Implemented advanced baseline | Multi-provider `review.reviewer` contributions feed the unchanged Engine; Dynamic Skill reload is transactional and content-addressed, with optional mandatory container execution |
 | Repair extensibility | Implemented | Independent `fix.rule` providers; verifier and publication gates remain centralized |
 | Local durability | Development only | SQLite + memory queue is explicitly non-durable |
-| Production persistence | Implemented advanced baseline | PostgreSQL + Redis Streams, migration CLI, Outbox, ACK/lease/DLQ, isolated backup/restore, queue reconstruction, and mandatory real-service CI; managed PITR remains pending |
+| Production persistence | Implemented advanced baseline | PostgreSQL + standalone/Cluster Redis Streams, versioned same-slot queue namespaces, migration CLI, Outbox, ACK/lease/DLQ, isolated backup/restore, namespace-scoped queue reconstruction, and mandatory real-service CI; managed PITR remains pending |
 | Graceful lifecycle | Implemented | Readiness drain plus bounded queue drain before Store/plugin shutdown |
 | Multi-tenancy/governance | Implemented advanced baseline | JWT, RBAC, tenant/repository authorization, audit, canary/shadow/rollback, database-atomic cross-replica tenant review admission, and opt-in Redis weighted tenant turns with content-addressed policy plus retry/reclaim accounting; runtime-cost-aware shares remain pending |
 | Model governance | Implemented advanced baseline | Replaceable gateway, scoped policy routing/residency, deterministic weighted active routes, bounded fallback, isolated candidate shadows, GitOps promotion gates with offline evidence, shared hard capacity leases/rate windows, read-only capacity weight recommendations, per-route breakers, redaction, egress/output limits, total/shadow atomic budgets, metadata-only ledgers, and conservative crash reconciliation; automatic capacity inference remains pending |
@@ -23,7 +23,7 @@ It is an execution plan, not a marketing checklist.
 | HTTP edge security | Implemented advanced baseline | Validated/generated request correlation, explicit client-safe 4xx types, bounded list reads, generic 5xx envelopes, query-free structured access logs, consistent hardening headers, no interpreter-version disclosure, and spoof-resistant trusted-proxy client identity for admission/logging |
 | Operational failure security | Implemented baseline | Allowlisted message-free failure summaries, stable code-location references, persistence-adapter enforcement, legacy-data migration, and exception-message-free OpenTelemetry/plugin/proof paths |
 | Quality evidence | Governance baseline implemented | Reproducible synthetic regression plus blind dual-annotation/adjudication compiler, rights/content/split/evidence audit, per-language/CWE/rule slices, and confidence calibration; production gate remains blocked until a real approved corpus is supplied |
-| HA/DR operational proof | Implemented recovery baseline | SQLite/PostgreSQL isolated restore validates schema/content/application/RPO/RTO; an offline audited epoch reconstructs incomplete PostgreSQL/Outbox intent only into empty Redis and is proven against real CI services; managed PITR and regional routing exercise remain pending |
+| HA/DR operational proof | Implemented recovery baseline | SQLite/PostgreSQL isolated restore validates schema/content/application/RPO/RTO; an offline audited epoch reconstructs incomplete PostgreSQL/Outbox intent only into an empty Redis database or Cluster namespace and is proven against real CI services; managed PITR and regional routing exercise remain pending |
 | Operational data lifecycle | Implemented baseline | Opt-in bounded retention removes eligible terminal Trace history and superseded session snapshots while preserving recovery/continuity anchors and durable deletion markers; native partitioning, managed lifecycle, and long-soak evidence remain pending |
 
 ## Phase 2 — Ports, persistence, and integration proof
@@ -373,10 +373,20 @@ long-running handlers from being falsely reclaimed, while legacy unmarked
 envelopes remain compatible for a two-stage rollout. Tenant-authorized inspection, fixed metrics,
 health, dashboard, churn alert and runbook complete the operator path. The
 mechanism allocates starts rather than CPU seconds, model cost, or completion
-latency, and currently targets one logical Redis primary rather than sharded
-Redis Cluster; production-shaped cost-aware scheduling and cluster-aware key
-placement remain pending. See
+latency; production-shaped cost-aware scheduling remains pending. See
 [`ADR 0027`](adr/0027-weighted-tenant-fair-redis-dispatch.md).
+
+The v0.30 increment closes the Redis Cluster keyspace compatibility boundary.
+A bounded non-sensitive namespace selects v2 keys whose shared hash tag keeps
+Stream, dedupe, fairness, protocol, ACK, and recovery operations in one slot.
+The topology-aware client retains the existing delivery semantics; a canonical
+manifest rejects unknown protocol generations before consumer-group creation.
+Legacy v1 keys remain the default for staged rollout. Health and fixed gauges,
+a mixed-version alert, namespace-aware recovery, drain/cutover runbook, and a
+mandatory real three-primary Cluster CI fixture prove the integration. One queue
+still occupies one slot, so regional failover and production-shaped hot-slot
+soak evidence remain pending. See
+[`ADR 0028`](adr/0028-versioned-redis-cluster-keyspace.md).
 
 Implemented database recovery baseline: `evoagent-dr` performs SQLite online
 backup/restore or a PostgreSQL exported-snapshot `pg_dump` followed by

@@ -150,6 +150,14 @@ See [`plugin-system.md`](plugin-system.md) and
   long but live handler is not falsely reclaimed; a crashed process stops
   renewal and remains recoverable after the lease. `/ready` checks Redis,
   worker, and heartbeat liveness.
+- **Redis keyspace topology** defaults to the compatible v1 standalone layout.
+  A validated v2 namespace gives every Stream, dedupe, fairness, protocol, and
+  recovery key one `{review:<namespace>}` hash tag. The topology-aware Cluster
+  client can therefore preserve the same Lua/transaction invariants without
+  `CROSSSLOT`; a canonical manifest makes unknown protocol generations fail
+  before group creation. Namespaces isolate environments, not tenants, and one
+  queue intentionally remains local to one slot. See
+  [`ADR 0028`](adr/0028-versioned-redis-cluster-keyspace.md).
 - **Tenant-fair dispatch** is an opt-in Redis coordination layer over the same
   stream. A content-addressed policy assigns bounded integer weights; new
   envelopes carry a hashed tenant key and policy snapshot. Atomic grant/defer

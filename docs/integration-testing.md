@@ -3,7 +3,7 @@
 The ordinary test suite is deterministic and works without infrastructure. The
 CI `external-integration` job is a separate mandatory boundary suite: skipped
 external tests become active because the job always provisions PostgreSQL 16,
-Redis 7, and Docker.
+standalone Redis 7, a three-primary Redis 7 Cluster, and Docker.
 
 ## What the matrix proves
 
@@ -16,13 +16,14 @@ Redis 7, and Docker.
 | Redis consumption | A process dies after `XREADGROUP`; another consumer reclaims after the lease |
 | Redis tenant fairness | Uniform and weighted tenant backlogs rotate handler starts through atomic cross-replica scheduler state; retries and reclaimed admissions leave no waiting/index leak |
 | Redis live lease | A handler that runs beyond the static reclaim lease renews its pending idle time and is not executed concurrently by another consumer |
+| Redis Cluster | A real three-primary Redis 7 cluster proves topology discovery, same-slot atomic publish/dedupe/ACK, weighted turns, live lease renewal, incompatible protocol rejection, and namespace-scoped recovery |
 | Redis recovery | A disconnected client socket reconnects without permanently losing its worker |
 | Redis DLQ | Permanent failure survives queue restart and explicit replay succeeds |
 | GitHub transport | Auth/version headers, retry response, JSON body, and PATCH upsert cross a real HTTP socket |
 | Verifier | Real Docker run has no network, read-only root, bounded resources, no ambient host secret, and timeout cleanup |
 | Remote Proof Runner | Signed loopback HTTP reaches a real netless job container and returns content-addressed input/evidence attestations without leaking an ambient secret |
 | PostgreSQL recovery | One exported MVCC snapshot is dumped, restored only into a generated database, compared table-by-table, exercised through the Store adapter, and removed within RPO/RTO |
-| Queue reconstruction | A previously published incomplete task is planned, audited, restaged, and published through the production Outbox/TaskQueue path only after reserving an empty Redis logical database |
+| Queue reconstruction | A previously published incomplete task is planned, audited, restaged, and published through the production Outbox/TaskQueue path only after reserving an empty Redis logical database or v2 Cluster namespace |
 | Evaluation evidence | Answer-free cases, blind dual annotations, independent adjudication, packet hashes, provenance sidecar, slice metrics, and fail-closed tamper cases run in the normal quality suite |
 | Distribution | The installed wheel serves packaged web assets and contains the bundled Skill |
 | Production image | `/ready` sees Postgres, Redis workers, lease heartbeat, enabled fair scheduling, schema and Outbox; async review reaches `SUCCESS`; SIGTERM exits cleanly |

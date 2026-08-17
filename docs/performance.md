@@ -150,7 +150,12 @@ python scripts/microbench.py --json micro.json
   process owns its own pool), so keep it under the server's `max_connections`.
   SQLite is single-writer and intended for single-node/dev.
 - **Queue**: use Redis Streams (`EVOAGENT_REDIS_URL`) in production for durable,
-  crash-safe delivery; the in-process queue is non-durable.
+  crash-safe delivery; the in-process queue is non-durable. A v2
+  `EVOAGENT_QUEUE_NAMESPACE` co-locates the complete queue in one hash slot and
+  enables the topology-aware Cluster client. This provides environment
+  isolation and node routing, not automatic throughput striping: one hot queue
+  can still saturate its owning master, so measure per-node CPU, command latency,
+  network, memory, and slot migration during the production-shaped soak.
 - **Metrics topology**: the built-in registry is process-local. Run one web
   worker per production pod and scale pods horizontally so each Prometheus
   scrape is complete; `SO_REUSEPORT` multi-worker mode is a load-test/dev option,

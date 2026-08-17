@@ -300,6 +300,8 @@ class AdmissionControlTests(unittest.TestCase):
         self.assertEqual(CURRENT_SCHEMA_VERSION, ready["checks"]["schema_version"])
         self.assertFalse(ready["checks"]["queue"]["fair_scheduling"])
         self.assertEqual("uniform-v1", ready["checks"]["queue"]["fair_policy_id"])
+        self.assertFalse(ready["checks"]["queue"]["redis_cluster"])
+        self.assertEqual(1, ready["checks"]["queue"]["keyspace_version"])
 
     def test_request_identity_and_security_headers_cover_every_response(self):
         host, port = self._serve(self._settings())

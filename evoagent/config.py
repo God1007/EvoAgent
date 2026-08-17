@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import urllib.parse
 from dataclasses import dataclass
 from ipaddress import ip_network
 from typing import Any
@@ -9,6 +10,7 @@ SOURCE_SKILLS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."
 INSTALLED_SKILLS_DIR = os.path.join(sys.prefix, "share", "evoagent", "skills")
 DEFAULT_SKILLS_DIR = SOURCE_SKILLS_DIR if os.path.isdir(SOURCE_SKILLS_DIR) else INSTALLED_SKILLS_DIR
 _PROOF_KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_QUEUE_NAMESPACE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$")
 
 
 def _int(name: str, default: int) -> int:
@@ -100,6 +102,8 @@ class Settings:
     queue_shutdown_timeout_seconds: int = 30
     queue_fair_scheduling: bool = False
     queue_tenant_weights_file: str = ""
+    queue_redis_cluster: bool = False
+    queue_namespace: str = ""
     skill_timeout_seconds: int = 30
     skill_memory_mb: int = 256
     skill_sandbox: bool = True
@@ -286,6 +290,19 @@ class Settings:
             raise ValueError("EVOAGENT_TENANT_CAPACITY_RETRY_SECONDS must be between 1 and 3600")
         if self.queue_fair_scheduling and not self.redis_url:
             raise ValueError("EVOAGENT_QUEUE_FAIR_SCHEDULING requires EVOAGENT_REDIS_URL")
+        if self.queue_namespace and not self.redis_url:
+            raise ValueError("EVOAGENT_QUEUE_NAMESPACE requires EVOAGENT_REDIS_URL")
+        if self.queue_namespace and not _QUEUE_NAMESPACE.fullmatch(self.queue_namespace):
+            raise ValueError("EVOAGENT_QUEUE_NAMESPACE is not a canonical queue namespace")
+        if self.queue_redis_cluster and not self.queue_namespace:
+            raise ValueError("EVOAGENT_REDIS_CLUSTER requires EVOAGENT_QUEUE_NAMESPACE")
+        if self.queue_redis_cluster:
+            parsed_redis = urllib.parse.urlsplit(self.redis_url)
+            query_database = urllib.parse.parse_qs(parsed_redis.query, keep_blank_values=True).get(
+                "db", ["0"]
+            )
+            if parsed_redis.path.removeprefix("/") not in {"", "0"} or query_database != ["0"]:
+                raise ValueError("EVOAGENT_REDIS_CLUSTER cannot select a logical database")
         if (
             (self.llm_daily_cost_micros > 0 or self.llm_shadow_daily_cost_micros > 0)
             and self.llm_input_cost_micros_per_million == 0
@@ -404,6 +421,8 @@ class Settings:
             ),
             queue_fair_scheduling=_bool("EVOAGENT_QUEUE_FAIR_SCHEDULING", False),
             queue_tenant_weights_file=os.getenv("EVOAGENT_QUEUE_TENANT_WEIGHTS_FILE", ""),
+            queue_redis_cluster=_bool("EVOAGENT_REDIS_CLUSTER", False),
+            queue_namespace=os.getenv("EVOAGENT_QUEUE_NAMESPACE", ""),
             skill_timeout_seconds=_int("EVOAGENT_SKILL_TIMEOUT_SECONDS", 30),
             skill_memory_mb=_int("EVOAGENT_SKILL_MEMORY_MB", 256),
             skill_sandbox=_bool("EVOAGENT_SKILL_SANDBOX", True),

@@ -89,6 +89,8 @@ class DefaultQueueFactory:
             on_dead_letter,
             fair_scheduling=self.settings.queue_fair_scheduling,
             tenant_weights_file=self.settings.queue_tenant_weights_file,
+            redis_cluster=self.settings.queue_redis_cluster,
+            namespace=self.settings.queue_namespace,
         )
 
 

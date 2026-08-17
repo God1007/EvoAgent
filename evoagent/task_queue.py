@@ -31,6 +31,7 @@ import socket
 import threading
 import time
 import tomllib
+import urllib.parse
 import uuid
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -44,6 +45,92 @@ from .metrics import metrics
 _TENANT_KEY = re.compile(r"^[0-9a-f]{64}$")
 _POLICY_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _POLICY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_QUEUE_NAMESPACE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$")
+
+
+@dataclass(frozen=True)
+class QueueKeyspace:
+    """All Redis keys owned by one queue protocol generation."""
+
+    version: int
+    namespace: str
+    slot_tag: str
+    stream: str
+    dlq: str
+    dedup_prefix: str
+    fair_waiting: str
+    fair_entries: str
+    fair_admitted: str
+    fair_last_tenant: str
+    fair_streak: str
+    protocol: str
+    recovery_marker: str
+
+    @property
+    def fixed_keys(self) -> tuple[str, ...]:
+        return (
+            self.stream,
+            self.dlq,
+            self.fair_waiting,
+            self.fair_entries,
+            self.fair_admitted,
+            self.fair_last_tenant,
+            self.fair_streak,
+            self.protocol,
+        )
+
+
+LEGACY_QUEUE_KEYSPACE = QueueKeyspace(
+    version=1,
+    namespace="",
+    slot_tag="",
+    stream="evoagent:review:stream",
+    dlq="evoagent:review:dlq",
+    dedup_prefix="evoagent:review:dedup:",
+    fair_waiting="evoagent:review:fair:waiting",
+    fair_entries="evoagent:review:fair:entries",
+    fair_admitted="evoagent:review:fair:admitted",
+    fair_last_tenant="evoagent:review:fair:last-tenant",
+    fair_streak="evoagent:review:fair:streak",
+    protocol="",
+    recovery_marker="evoagent:recovery:epoch",
+)
+
+
+def build_queue_keyspace(namespace: str = "") -> QueueKeyspace:
+    """Build the legacy layout or a Redis-Cluster-safe v2 namespace."""
+    if not namespace:
+        return LEGACY_QUEUE_KEYSPACE
+    if not _QUEUE_NAMESPACE.fullmatch(namespace):
+        raise ValueError(
+            "EVOAGENT_QUEUE_NAMESPACE must be 1-48 letters, digits, dots, dashes, or underscores"
+        )
+    slot_tag = "review:%s" % namespace
+    root = "evoagent:{%s}" % slot_tag
+    return QueueKeyspace(
+        version=2,
+        namespace=namespace,
+        slot_tag=slot_tag,
+        stream=root + ":stream",
+        dlq=root + ":dlq",
+        dedup_prefix=root + ":dedup:",
+        fair_waiting=root + ":fair:waiting",
+        fair_entries=root + ":fair:entries",
+        fair_admitted=root + ":fair:admitted",
+        fair_last_tenant=root + ":fair:last-tenant",
+        fair_streak=root + ":fair:streak",
+        protocol=root + ":protocol",
+        recovery_marker=root + ":recovery:epoch",
+    )
+
+
+def validate_redis_cluster_url(url: str) -> None:
+    parsed = urllib.parse.urlsplit(url)
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    path_database = parsed.path.removeprefix("/")
+    query_database = query.get("db", ["0"])
+    if path_database not in {"", "0"} or query_database != ["0"]:
+        raise ValueError("Redis Cluster queue URLs cannot select a logical database other than 0")
 
 
 @dataclass(frozen=True)
@@ -135,16 +222,17 @@ class PermanentTaskError(RuntimeError):
 
 
 class TaskQueue:
-    STREAM = "evoagent:review:stream"
-    DLQ = "evoagent:review:dlq"
-    DEDUP = "evoagent:review:dedup:"
+    STREAM = LEGACY_QUEUE_KEYSPACE.stream
+    DLQ = LEGACY_QUEUE_KEYSPACE.dlq
+    DEDUP = LEGACY_QUEUE_KEYSPACE.dedup_prefix
     DEDUP_TTL_SECONDS = 7 * 24 * 60 * 60
     GROUP = "evoagent-workers"
-    FAIR_WAITING = "evoagent:review:fair:waiting"
-    FAIR_ENTRIES = "evoagent:review:fair:entries"
-    FAIR_ADMITTED = "evoagent:review:fair:admitted"
-    FAIR_LAST_TENANT = "evoagent:review:fair:last-tenant"
-    FAIR_STREAK = "evoagent:review:fair:streak"
+    FAIR_WAITING = LEGACY_QUEUE_KEYSPACE.fair_waiting
+    FAIR_ENTRIES = LEGACY_QUEUE_KEYSPACE.fair_entries
+    FAIR_ADMITTED = LEGACY_QUEUE_KEYSPACE.fair_admitted
+    FAIR_LAST_TENANT = LEGACY_QUEUE_KEYSPACE.fair_last_tenant
+    FAIR_STREAK = LEGACY_QUEUE_KEYSPACE.fair_streak
+    PROTOCOL_VERSION = 1
 
     def __init__(
         self,
@@ -158,9 +246,29 @@ class TaskQueue:
         backoff_cap: float = 10.0,
         fair_scheduling: bool = False,
         tenant_weights_file: str = "",
+        redis_cluster: bool = False,
+        namespace: str = "",
     ):
         if fair_scheduling and not redis_url:
             raise ValueError("tenant-fair scheduling requires EVOAGENT_REDIS_URL")
+        if namespace and not redis_url:
+            raise ValueError("EVOAGENT_QUEUE_NAMESPACE requires EVOAGENT_REDIS_URL")
+        if redis_cluster and not redis_url:
+            raise ValueError("Redis Cluster queue mode requires EVOAGENT_REDIS_URL")
+        if redis_cluster and not namespace:
+            raise ValueError("Redis Cluster queue mode requires EVOAGENT_QUEUE_NAMESPACE")
+        if redis_cluster:
+            validate_redis_cluster_url(redis_url)
+        self._keyspace = build_queue_keyspace(namespace)
+        self._redis_cluster = bool(redis_cluster)
+        self.STREAM = self._keyspace.stream
+        self.DLQ = self._keyspace.dlq
+        self.DEDUP = self._keyspace.dedup_prefix
+        self.FAIR_WAITING = self._keyspace.fair_waiting
+        self.FAIR_ENTRIES = self._keyspace.fair_entries
+        self.FAIR_ADMITTED = self._keyspace.fair_admitted
+        self.FAIR_LAST_TENANT = self._keyspace.fair_last_tenant
+        self.FAIR_STREAK = self._keyspace.fair_streak
         self._fair_policy = load_tenant_fair_policy(tenant_weights_file)
         self._fair_scheduling = bool(fair_scheduling)
         self.handler = handler
@@ -195,19 +303,29 @@ class TaskQueue:
                 import redis
             except ImportError as exc:
                 raise RuntimeError("Redis mode requires: pip install redis") from exc
-            self._redis = redis.Redis.from_url(
-                redis_url,
-                decode_responses=True,
-                socket_connect_timeout=5,
-                socket_timeout=max(2, min(lease_seconds, 5)),
-                health_check_interval=30,
-            )
-            self._redis.ping()
+            client_type = redis.RedisCluster if self._redis_cluster else redis.Redis
             try:
-                self._redis.xgroup_create(self.STREAM, self.GROUP, id="0", mkstream=True)
-            except redis.ResponseError as exc:
-                if "BUSYGROUP" not in str(exc):
-                    raise
+                self._redis = client_type.from_url(
+                    redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=5,
+                    socket_timeout=max(2, min(lease_seconds, 5)),
+                    health_check_interval=30,
+                )
+                self._redis.ping()
+                if self._keyspace.protocol:
+                    self._ensure_keyspace_protocol()
+                try:
+                    self._redis.xgroup_create(self.STREAM, self.GROUP, id="0", mkstream=True)
+                except redis.ResponseError as exc:
+                    if "BUSYGROUP" not in str(exc):
+                        raise
+            except Exception:
+                if self._redis is not None:
+                    self._redis.close()
+                self._redis = None
+                self._executor.shutdown(wait=False, cancel_futures=True)
+                raise
             for _ in range(workers):
                 self._redis_workers.append(self._executor.submit(self._redis_worker))
             self._redis_heartbeat = threading.Thread(
@@ -219,6 +337,8 @@ class TaskQueue:
 
     @property
     def backend(self) -> str:
+        if self._redis_cluster and self._redis:
+            return "redis-cluster-streams"
         return "redis-streams" if self._redis else "memory-ephemeral"
 
     @property
@@ -236,6 +356,49 @@ class TaskQueue:
 
     def tenant_weight(self, tenant_id: str) -> int:
         return self._fair_policy.weight(tenant_id)
+
+    @property
+    def redis_cluster(self) -> bool:
+        return self._redis_cluster
+
+    @property
+    def queue_namespace(self) -> str:
+        return self._keyspace.namespace
+
+    @property
+    def keyspace_version(self) -> int:
+        return self._keyspace.version
+
+    def _ensure_keyspace_protocol(self) -> None:
+        expected = json.dumps(
+            {
+                "protocol_version": self.PROTOCOL_VERSION,
+                "keyspace_version": self._keyspace.version,
+                "namespace": self._keyspace.namespace,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        guarded_keys = tuple(
+            key for key in self._keyspace.fixed_keys if key != self._keyspace.protocol
+        )
+        result = int(
+            self._redis.eval(
+                "local current=redis.call('GET',KEYS[1]); "
+                "if not current then "
+                "for index=2,#KEYS do "
+                "if redis.call('EXISTS',KEYS[index]) == 1 then return -1 end end; "
+                "redis.call('SET',KEYS[1],ARGV[1]); return 1 end; "
+                "if current == ARGV[1] then return 2 end; return 0",
+                1 + len(guarded_keys),
+                self._keyspace.protocol,
+                *guarded_keys,
+                expected,
+            )
+        )
+        if result not in {1, 2}:
+            raise RuntimeError("Redis queue namespace has an incompatible protocol manifest")
 
     def submit(self, payload: dict[str, Any], message_id: str = "") -> str:
         with self._lifecycle_lock:
@@ -724,6 +887,9 @@ class TaskQueue:
                 "fair_policy_id": self._fair_policy.policy_id,
                 "fair_waiting_tenants": 0,
                 "lease_heartbeat_running": False,
+                "redis_cluster": False,
+                "queue_namespace": "",
+                "keyspace_version": 1,
             }
         running = sum(not worker.done() for worker in self._redis_workers)
         dependency_ok = False
@@ -756,6 +922,9 @@ class TaskQueue:
             "fair_policy_id": self._fair_policy.policy_id,
             "fair_waiting_tenants": fair_waiting,
             "lease_heartbeat_running": heartbeat_running,
+            "redis_cluster": self._redis_cluster,
+            "queue_namespace": self._keyspace.namespace,
+            "keyspace_version": self._keyspace.version,
         }
 
     def drain(self, timeout_seconds: float = 0.0) -> bool:

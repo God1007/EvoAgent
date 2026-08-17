@@ -13,6 +13,7 @@ from evoagent.models import TaskState, TraceEvent
 from evoagent.ports import (
     ApplicationStorePort,
     CodeHostPort,
+    QueueTopologyPort,
     TaskQueuePort,
     TenantFairQueuePort,
 )
@@ -47,6 +48,7 @@ class PortSurfaceTests(unittest.TestCase):
         try:
             self.assertIsInstance(queue, TaskQueuePort)
             self.assertIsInstance(queue, TenantFairQueuePort)
+            self.assertIsInstance(queue, QueueTopologyPort)
         finally:
             queue.close()
 
@@ -84,6 +86,7 @@ class PortSurfaceTests(unittest.TestCase):
         legacy = LegacyQueueProvider()
         self.assertIsInstance(legacy, TaskQueuePort)
         self.assertNotIsInstance(legacy, TenantFairQueuePort)
+        self.assertNotIsInstance(legacy, QueueTopologyPort)
 
 
 class _StoreBehaviorContract:

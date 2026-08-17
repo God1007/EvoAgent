@@ -27,7 +27,8 @@ to inherit an EvoAgent implementation class.
 | `SessionApplicationStorePort` | PR continuity and source impact | SQLite/PostgreSQL store facet |
 | `RepairApplicationStorePort` | idempotent repair publication | SQLite/PostgreSQL store facet |
 | `WebhookApplicationStorePort` | atomic delivery/session/task/outbox intake | SQLite/PostgreSQL store facet |
-| `TaskQueuePort` / `QueueFactoryPort` | asynchronous review delivery | memory executor, Redis Streams |
+| `TaskQueuePort` / `QueueFactoryPort` | asynchronous review delivery | memory executor, standalone/Cluster Redis Streams |
+| `TenantFairQueuePort` / `QueueTopologyPort` | optional scheduling and deployment telemetry | built-in queue; legacy providers remain compatible with neutral metrics |
 | `CodeHostPort` | diff intake, comment delivery, repair PR | GitHub |
 
 `ApplicationStorePort` is the composition-root capability. Lower-level modules
@@ -52,6 +53,7 @@ backend contracts are enabled with:
 ```bash
 export EVOAGENT_TEST_POSTGRES_URL=postgresql://evoagent:evoagent@localhost:5432/evoagent
 export EVOAGENT_TEST_REDIS_URL=redis://localhost:6379/0
+export EVOAGENT_TEST_REDIS_CLUSTER_URL=redis://localhost:7000/0
 pytest -q tests/test_adapter_contracts.py
 pytest -q tests/test_external_integrations.py
 ```
@@ -62,8 +64,9 @@ PostgreSQL adapter closes its connection pool after each contract test.
 
 The mandatory GitHub Actions matrix supplies both URLs on every pull request.
 It additionally proves real pool timeout/replacement, Redis connection recovery,
-consumer-process lease reclaim, durable DLQ replay, and acknowledged Stream
-cleanup. See `integration-testing.md` for the full boundary map.
+consumer-process lease reclaim, durable DLQ replay, acknowledged Stream cleanup,
+and a real three-primary Cluster with same-slot v2 keys. See
+`integration-testing.md` for the full boundary map.
 
 The initial contract extraction found a concrete parity defect: PostgreSQL did
 not implement the shadow-observation/automatic-promotion behavior already

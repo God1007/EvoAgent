@@ -222,6 +222,41 @@ jobs:
             tests/test_adapter_contracts.py \
             tests/test_external_integrations.py \
             tests/test_github_http_fixture.py
+      - name: Start a three-primary Redis Cluster
+        run: |
+          docker run -d --name evoagent-redis-cluster \
+            -p 7000:7000 -p 7001:7001 -p 7002:7002 \
+            -p 17000:17000 -p 17001:17001 -p 17002:17002 \
+            redis:7-alpine sh -ec '
+              redis-server --port 7000 --bind 0.0.0.0 --protected-mode no --appendonly no --cluster-enabled yes --cluster-config-file /tmp/nodes-7000.conf --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7000 --cluster-announce-bus-port 17000 &
+              redis-server --port 7001 --bind 0.0.0.0 --protected-mode no --appendonly no --cluster-enabled yes --cluster-config-file /tmp/nodes-7001.conf --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7001 --cluster-announce-bus-port 17001 &
+              redis-server --port 7002 --bind 0.0.0.0 --protected-mode no --appendonly no --cluster-enabled yes --cluster-config-file /tmp/nodes-7002.conf --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7002 --cluster-announce-bus-port 17002 &
+              wait'
+          for attempt in $(seq 1 30); do
+            if docker exec evoagent-redis-cluster redis-cli -p 7000 ping >/dev/null 2>&1 && \
+               docker exec evoagent-redis-cluster redis-cli -p 7001 ping >/dev/null 2>&1 && \
+               docker exec evoagent-redis-cluster redis-cli -p 7002 ping >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              docker logs evoagent-redis-cluster
+              exit 1
+            fi
+            sleep 1
+          done
+          docker exec evoagent-redis-cluster redis-cli --cluster create \
+            127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 \
+            --cluster-replicas 0 --cluster-yes
+          docker exec evoagent-redis-cluster redis-cli -p 7000 cluster info | grep -q 'cluster_state:ok'
+      - name: Run Redis Cluster queue and recovery contracts
+        env:
+          EVOAGENT_TEST_REDIS_CLUSTER_URL: redis://127.0.0.1:7000/0
+        run: |
+          python -m pytest -q \
+            tests/test_external_integrations.py::RedisClusterQueueIntegrationTests
+      - name: Stop the Redis Cluster fixture
+        if: always()
+        run: docker rm -f evoagent-redis-cluster >/dev/null 2>&1 || true
       - name: Prove backup and isolated restore integrity
         env:
           EVOAGENT_DATABASE_URL: ${{ env.EVOAGENT_TEST_POSTGRES_URL }}
@@ -258,6 +293,7 @@ jobs:
             -e EVOAGENT_AUTH_REQUIRED=false \
             -e EVOAGENT_DATABASE_URL="${EVOAGENT_TEST_POSTGRES_URL}" \
             -e EVOAGENT_REDIS_URL="${EVOAGENT_TEST_REDIS_URL}" \
+            -e EVOAGENT_QUEUE_NAMESPACE=ci-full-stack \
             -e EVOAGENT_QUEUE_FAIR_SCHEDULING=true \
             -e EVOAGENT_SKILLS_DIR=/app/skills \
             evoagent:ci
@@ -273,7 +309,7 @@ jobs:
             fi
             sleep 1
           done
-          python -c "import json; from evoagent.migrations import CURRENT_SCHEMA_VERSION; d=json.load(open('ready.json')); q=d['checks']['queue']; assert d['status']=='ready'; assert d['queue_backend']=='redis-streams'; assert d['checks']['schema_version']==CURRENT_SCHEMA_VERSION; assert q['healthy'] and q['fair_scheduling'] and q['lease_heartbeat_running']"
+          python -c "import json; from evoagent.migrations import CURRENT_SCHEMA_VERSION; d=json.load(open('ready.json')); q=d['checks']['queue']; assert d['status']=='ready'; assert d['queue_backend']=='redis-streams'; assert d['checks']['schema_version']==CURRENT_SCHEMA_VERSION; assert q['healthy'] and q['fair_scheduling'] and q['lease_heartbeat_running']; assert q['keyspace_version']==2 and q['queue_namespace']=='ci-full-stack' and not q['redis_cluster']"
           curl -fsS -X POST 'http://127.0.0.1:18080/v1/reviews?async=true' \
             -H 'Content-Type: application/json' \
             -d '{"repository":"ci/full-stack","pull_request":17,"diff":"diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n+value = 1\n+print(value)"}' \

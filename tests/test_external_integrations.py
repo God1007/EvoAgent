@@ -14,10 +14,12 @@ import uuid
 from evoagent.postgres_store import PostgresTaskStore
 from evoagent.proof_artifacts import S3ObjectLockArtifactStore
 from evoagent.proof_remote import RedisProofReplayStore
+from evoagent.recovery import RedisRecoveryTarget
 from evoagent.task_queue import PermanentTaskError, TaskQueue, load_tenant_fair_policy
 
 POSTGRES_URL = os.getenv("EVOAGENT_TEST_POSTGRES_URL", "")
 REDIS_URL = os.getenv("EVOAGENT_TEST_REDIS_URL", "")
+REDIS_CLUSTER_URL = os.getenv("EVOAGENT_TEST_REDIS_CLUSTER_URL", "")
 S3_OBJECT_LOCK_BUCKET = os.getenv("EVOAGENT_TEST_S3_OBJECT_LOCK_BUCKET", "")
 S3_REGION = os.getenv("EVOAGENT_TEST_S3_REGION", "")
 
@@ -491,6 +493,135 @@ class RedisRuntimeIntegrationTests(unittest.TestCase):
                 self.redis.delete(*keys)
             first.close()
             second.close()
+
+
+@unittest.skipUnless(
+    REDIS_CLUSTER_URL,
+    "EVOAGENT_TEST_REDIS_CLUSTER_URL is not configured",
+)
+class RedisClusterQueueIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        import redis
+
+        self.namespace = "test-" + uuid.uuid4().hex[:16]
+        self.redis = redis.RedisCluster.from_url(REDIS_CLUSTER_URL, decode_responses=True)
+        self.redis.ping()
+
+    def tearDown(self):
+        pattern = "evoagent:{review:%s}:*" % self.namespace
+        keys = list(self.redis.scan_iter(match=pattern, count=1000))
+        if keys:
+            self.redis.delete(*keys)
+        self.redis.close()
+
+    def queue(self, handler, **kwargs):
+        return TaskQueue(
+            handler,
+            workers=1,
+            redis_url=REDIS_CLUSTER_URL,
+            redis_cluster=True,
+            namespace=self.namespace,
+            **kwargs,
+        )
+
+    def test_cluster_queue_routes_atomic_delivery_and_dedupe_to_one_slot(self):
+        delivered: list[str] = []
+        queue = self.queue(lambda payload: delivered.append(payload["message_id"]))
+        try:
+            queue.submit({"message_id": "one"}, "same-id")
+            self.assertTrue(_wait(lambda: delivered == ["one"]))
+            queue.submit({"message_id": "duplicate"}, "same-id")
+            self.assertFalse(_wait(lambda: len(delivered) > 1, 0.5))
+            self.assertTrue(_wait(lambda: queue.depth() == 0))
+            health = queue.health()
+            self.assertTrue(health["healthy"], health)
+            self.assertEqual("redis-cluster-streams", health["backend"])
+            self.assertTrue(health["redis_cluster"])
+            self.assertEqual(self.namespace, health["queue_namespace"])
+            self.assertEqual(2, health["keyspace_version"])
+            self.assertIsNotNone(self.redis.get(queue._keyspace.protocol))
+        finally:
+            queue.close(3)
+
+    def test_cluster_queue_preserves_weighted_tenant_turns(self):
+        first_started = threading.Event()
+        release_first = threading.Event()
+        delivered: list[str] = []
+
+        def handler(payload):
+            delivered.append(payload["message_id"])
+            if len(delivered) == 1:
+                first_started.set()
+                release_first.wait(5)
+
+        queue = self.queue(handler, fair_scheduling=True)
+        try:
+            queue.submit({"message_id": "a1", "tenant_id": "tenant-a"}, "a1")
+            self.assertTrue(first_started.wait(5))
+            queue.submit({"message_id": "a2", "tenant_id": "tenant-a"}, "a2")
+            queue.submit({"message_id": "a3", "tenant_id": "tenant-a"}, "a3")
+            queue.submit({"message_id": "b1", "tenant_id": "tenant-b"}, "b1")
+            release_first.set()
+            self.assertTrue(_wait(lambda: len(delivered) == 4), delivered)
+            self.assertEqual(["a1", "b1", "a2", "a3"], delivered)
+        finally:
+            release_first.set()
+            queue.close(3)
+
+    def test_cluster_live_delivery_heartbeat_prevents_false_reclaim(self):
+        started = threading.Event()
+        release = threading.Event()
+        deliveries = 0
+        delivery_lock = threading.Lock()
+
+        def handler(_payload):
+            nonlocal deliveries
+            with delivery_lock:
+                deliveries += 1
+            started.set()
+            release.wait(5)
+
+        first = self.queue(handler, lease_seconds=1, fair_scheduling=True)
+        second = self.queue(handler, lease_seconds=1, fair_scheduling=True)
+        try:
+            first.submit({"message_id": "slow", "tenant_id": "tenant-a"}, "slow")
+            self.assertTrue(started.wait(5))
+            time.sleep(2.2)
+            self.assertEqual(1, deliveries)
+            release.set()
+            self.assertTrue(_wait(lambda: first.depth() == 0))
+        finally:
+            release.set()
+            first.close(3)
+            second.close(3)
+
+    def test_cluster_protocol_and_recovery_namespaces_fail_closed(self):
+        queue = self.queue(lambda _payload: None)
+        protocol_key = queue._keyspace.protocol
+        queue.close(3)
+        self.redis.delete(protocol_key)
+        with self.assertRaisesRegex(RuntimeError, "incompatible protocol"):
+            self.queue(lambda _payload: None)
+        self.redis.set(protocol_key, '{"protocol_version":999}')
+        with self.assertRaisesRegex(RuntimeError, "incompatible protocol"):
+            self.queue(lambda _payload: None)
+
+        recovery_namespace = "recovery-" + uuid.uuid4().hex[:16]
+        target = RedisRecoveryTarget(
+            REDIS_CLUSTER_URL,
+            redis_cluster=True,
+            namespace=recovery_namespace,
+        )
+        try:
+            self.assertEqual("empty", target.inspect("reviewed-marker"))
+            self.assertEqual("reserved", target.reserve("reviewed-marker"))
+            self.assertEqual("reserved", target.inspect("reviewed-marker"))
+        finally:
+            recovery_pattern = "evoagent:{review:%s}:*" % recovery_namespace
+            recovery_keys = list(self.redis.scan_iter(match=recovery_pattern, count=1000))
+            target.close()
+            if recovery_keys:
+                self.redis.delete(*recovery_keys)
 
 
 @unittest.skipUnless(

@@ -724,6 +724,20 @@ class TenantFairQueuePort(Protocol):
     def fair_waiting_tenants(self) -> int: ...
 
 
+@runtime_checkable
+class QueueTopologyPort(Protocol):
+    """Optional Redis deployment metadata without expanding TaskQueuePort."""
+
+    @property
+    def redis_cluster(self) -> bool: ...
+
+    @property
+    def queue_namespace(self) -> str: ...
+
+    @property
+    def keyspace_version(self) -> int: ...
+
+
 class QueueFactoryPort(Protocol):
     def create(
         self,

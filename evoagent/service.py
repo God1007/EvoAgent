@@ -40,7 +40,7 @@ from .github import GitHubAppAuthenticator, GitHubClient
 from .metrics import metrics
 from .outbox import OutboxDispatcher
 from .plugins import Plugin, PluginProfile, PluginRuntime
-from .ports import CodeHostPort, TenantFairQueuePort
+from .ports import CodeHostPort, QueueTopologyPort, TenantFairQueuePort
 from .retention import RetentionManager, RetentionOptions
 from .review_engine import ReviewEngine
 from .reviewer import GatewayReviewer
@@ -257,6 +257,22 @@ class ReviewService:
                 float(self.queue.fair_waiting_tenants())
                 if isinstance(self.queue, TenantFairQueuePort)
                 else 0.0
+            ),
+        )
+        metrics.register_gauge_source(
+            "queue_redis_cluster_enabled",
+            lambda: (
+                1.0
+                if isinstance(self.queue, QueueTopologyPort) and self.queue.redis_cluster
+                else 0.0
+            ),
+        )
+        metrics.register_gauge_source(
+            "queue_keyspace_version",
+            lambda: (
+                float(self.queue.keyspace_version)
+                if isinstance(self.queue, QueueTopologyPort)
+                else 1.0
             ),
         )
         self._readiness_lock = threading.Lock()

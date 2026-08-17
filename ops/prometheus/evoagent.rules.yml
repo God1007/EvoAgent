@@ -174,3 +174,12 @@ groups:
         annotations:
           summary: Tenant-fair scheduling is spending over half of decisions deferring burst traffic
           runbook: docs/operations.md#tenant-fair-scheduling
+
+      - alert: EvoAgentQueueKeyspaceVersionMixed
+        expr: count(count_values("keyspace_version", evoagent_queue_keyspace_version)) > 1
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: Serving EvoAgent replicas expose different Redis queue keyspace versions
+          runbook: docs/operations.md#redis-cluster-queue

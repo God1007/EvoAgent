@@ -268,6 +268,53 @@ the tenant-fair scheduler below is enabled, Redis workers still dequeue admitted
 work in stream order. Per-tenant details stay behind tenant authorization rather
 than becoming Prometheus labels.
 
+## Redis cluster queue
+
+The default empty `EVOAGENT_QUEUE_NAMESPACE` preserves the v1 single-node keys
+used through v0.29. Set a stable, non-sensitive namespace such as `prod-eu1` to
+select the v2 layout. Every stream, DLQ, dedupe, fairness, protocol, and recovery
+key then contains the same `{review:<namespace>}` hash tag. This both isolates
+environments and lets every Lua/transaction boundary execute in one Redis
+Cluster slot. Set `EVOAGENT_REDIS_CLUSTER=true` only with a v2 namespace and a
+Redis URL using logical database 0. All advertised cluster node addresses must
+be reachable from every application pod; use `rediss://` and the managed
+service's authenticated CA configuration outside a trusted private network.
+
+The first v2 process atomically creates a canonical protocol manifest inside the
+namespace. Later processes compare it before creating the consumer group and
+fail startup on an unknown protocol/keyspace version. A Stream/DLQ/fairness key
+without a manifest is treated as an incompatible orphan rather than adopted;
+only a recovery Epoch may legitimately precede first startup. `/ready` exposes
+`redis_cluster`, `queue_namespace`, and `keyspace_version`; Prometheus exports
+fixed gauges without turning the namespace into a label.
+`EvoAgentQueueKeyspaceVersionMixed` means replicas behind one scrape scope do
+not agree: stop the rollout, determine which deployment still serves v1, and do
+not move or delete Redis keys manually.
+
+Changing the namespace is a queue cutover, not an in-place rename:
+
+1. deploy v0.30 to every publisher/consumer while the namespace remains empty;
+2. stop intake and Outbox publication, then drain stream, pending entries,
+   retries, DLQ decisions, and fairness indexes in the old keyspace;
+3. configure one reviewed namespace on every replica and start a canary against
+   standalone Redis first; verify protocol version 1, keyspace version 2, and an
+   end-to-end Outbox delivery;
+4. to move from standalone Redis to Redis Cluster, repeat the freeze/drain,
+   switch the URL and cluster flag together, and verify all cluster slots are
+   covered before reopening traffic;
+5. roll back only after draining the currently active namespace. A pre-v0.30
+   binary ignores the namespace and must never run concurrently with v2.
+
+Use a different namespace for each environment. Sharing a namespace shares the
+stream, consumer group, dedupe decisions, fairness state, and recovery epoch.
+Redis Cluster improves sharding and managed availability but does not by itself
+prove regional failover: run the queue reconstruction procedure against a fresh
+namespace after restoring PostgreSQL. The v2 recovery reservation checks only
+the target namespace, so unrelated cluster workloads do not make the target
+appear non-empty; an existing protocol/stream/DLQ/fairness key still fails
+closed. Dedupe entries are created atomically with the stream, so an occupied
+stream is the recovery guard for their dynamic key family.
+
 ## Tenant fair scheduling
 
 `EVOAGENT_QUEUE_FAIR_SCHEDULING=true` enables weighted round-robin dispatch on
@@ -278,12 +325,13 @@ content-addressed policy digest. Redis Lua atomically grants up to that tenant's
 weight in one turn or moves the entry to the stream tail while another tenant is
 waiting. Raw tenant identifiers never enter scheduler keys or Prometheus labels.
 
-The scheduler currently requires a single logical Redis primary (with optional
-replicas/failover) because one Lua decision touches the stream and several
-scheduler keys atomically. Redis Cluster sharding is not supported: these keys
-do not share a cluster hash slot. Keep the queue and scheduler keys in the same
-non-clustered Redis service, and test the managed-service failover mode before
-enabling fairness in production.
+On the legacy v1 layout the scheduler requires a single logical Redis primary.
+The v2 namespace places its stream and scheduler indexes in one cluster slot, so
+the same Lua decision is supported through the Redis Cluster client. This is
+intentional per-queue slot locality: a namespace can move between cluster nodes,
+but one review queue is not striped across all masters. Use separate namespaces
+only for truly independent environments, not to shard tenants and bypass global
+fairness.
 
 The optional `EVOAGENT_QUEUE_TENANT_WEIGHTS_FILE` is bounded v1 TOML:
 

@@ -40,7 +40,7 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **PR 会话连续性** | 同一 PR 多次 push 归入同一会话，跨轮次跟踪问题的新增/仍存在/已修复/移动，稳定 Marker 评论原地更新 |
 | **代码影响面图谱** | 基于 `ast` 的 Python 符号/调用/导入图，回答「改了这些文件，哪些符号在影响半径内」 |
 | **可执行证据阶梯** | 可插拔 Proof Runner 以「补丁前失败、补丁后通过」将判断升级为 L1–L4；生产可用双向签名的独立 Runner 隔离不可信执行 |
-| **双运行模式** | 本地使用 SQLite + 进程内队列；生产环境切换 PostgreSQL + Redis Streams |
+| **双运行模式** | 本地使用 SQLite + 进程内队列；生产环境切换 PostgreSQL + 单节点或 Cluster Redis Streams |
 | **GitHub 自动化** | 支持 PR Webhook、幂等投递、Diff 拉取、评论 upsert 和独立修复 PR |
 | **保守型自动修复** | 仅处理可确定转换的规则，在新分支生成原子提交，并经过编译与可选测试门禁 |
 | **受控能力演进** | 从误报、漏报和坏修复中生成候选 Prompt，通过 Validation/Holdout 回放门禁后才允许激活 |
@@ -50,6 +50,7 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **生产治理** | JWT、RBAC、多租户、仓库隔离、事务 Outbox、审计日志、灰度发布、影子流量、告警与死信队列 |
 | **租户容量隔离** | 数据库原子协调的跨副本租户审查槽位，覆盖异步重试、离线恢复与恢复代际，过载返回可重试的 429，抑制单租户无限占用持久任务容量 |
 | **租户公平调度** | Redis Streams 上可选的跨副本加权轮转；内容寻址策略、匿名租户键、原子延后/准入索引、在途租约心跳与崩溃接管在保留 ACK、重试和 DLQ 语义的同时避免连续突发长期垄断 Worker |
+| **Redis Cluster 队列** | 版本化命名空间把 Stream、去重、公平索引与恢复 Epoch 固定到同一 Hash Slot；协议清单拒绝不兼容实例，真实三主分片 CI 验证原子语义 |
 | **安全 HTTP 边界** | 全响应请求关联 ID、无内部细节的统一 500、过滤 query/异常原文的结构化日志、一致安全响应头，以及默认不信任转发头的可信代理链客户端身份解析 |
 | **无消息故障契约** | Task/Trace/Checkpoint、Agent、Queue/DLQ、Outbox/Effect、Readiness、插件与遥测只记录异常类型和稳定故障引用，不落异常原文 |
 | **可观测性** | 任务 Trace、Agent 消息、固定基数的模型成本/容量/修复/反馈 Prometheus 指标和 OpenTelemetry Trace |
@@ -526,7 +527,7 @@ curl -X POST 'http://127.0.0.1:8080/v1/skills/reload'
 | 组件 | 本地模式 | 生产模式 |
 | --- | --- | --- |
 | 数据库 | SQLite | PostgreSQL 16 |
-| 任务队列 | 进程内线程队列 | Redis Streams |
+| 任务队列 | 进程内线程队列 | Redis Streams / Redis Cluster Streams |
 | Worker | 当前进程 | 多 Worker、ACK、租约和过期任务回收 |
 | 失败处理 | 任务记录 | 指数退避、最大尝试次数、死信队列和重放 |
 | 登录 | 默认关闭 | JWT + RBAC + Tenant 隔离 |
@@ -535,7 +536,7 @@ curl -X POST 'http://127.0.0.1:8080/v1/skills/reload'
 如果未配置 `EVOAGENT_DATABASE_URL` 和 `EVOAGENT_REDIS_URL`，系统会自动使用本地模式。
 
 > [!IMPORTANT]
-> 死信队列、指数退避重试与重放的**持久化保证仅在 `redis-streams` 队列下成立**。本地进程内队列（`/health` 中 `queue` 为 `memory-ephemeral`、`queue_durable` 为 `false`）是非持久的：进程退出会丢失待处理、执行中、待重试与死信任务，仅适用于单进程开发环境。配置了 PostgreSQL 却未配置 Redis 时，服务会在启动时打印非持久告警。
+> 死信队列、指数退避重试与重放的**持久化保证仅在 Redis Streams 队列下成立**。本地进程内队列（`/health` 中 `queue` 为 `memory-ephemeral`、`queue_durable` 为 `false`）是非持久的：进程退出会丢失待处理、执行中、待重试与死信任务，仅适用于单进程开发环境。配置了 PostgreSQL 却未配置 Redis 时，服务会在启动时打印非持久告警。
 
 ## 生产部署
 
@@ -641,8 +642,10 @@ evoagent-dr --backend postgresql \
 到普通 CI Artifact；生产加密、对象锁和演练流程见
 [`docs/disaster-recovery.md`](docs/disaster-recovery.md)。
 
-区域故障后应保持应用和 Worker 停止，先对全新空 Redis 执行 dry-run，再使用同一恢复
-UUID `--apply`；工具会拒绝活动 Redis、终态任务、取消任务和缺失恢复载荷的隐式放行：
+区域故障后应保持应用和 Worker 停止，先对全新空 Redis v1 数据库或空 v2 命名空间执行
+dry-run，再使用同一恢复 UUID `--apply`；工具会拒绝活动队列、终态任务、取消任务和缺失
+恢复载荷的隐式放行。Cluster 模式需同时设置 `EVOAGENT_REDIS_CLUSTER=true` 和新的
+`EVOAGENT_QUEUE_NAMESPACE`：
 
 ```bash
 recovery_id="$(python -c 'import uuid; print(uuid.uuid4())')"
@@ -817,6 +820,8 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `EVOAGENT_MAX_STEPS` | `8` | 单任务最大状态步数 |
 | `EVOAGENT_TIMEOUT_SECONDS` | `120` | 审查任务超时 |
 | `EVOAGENT_QUEUE_SHUTDOWN_TIMEOUT_SECONDS` | `30` | 关闭存储前等待队列在途任务完成的最长秒数 |
+| `EVOAGENT_QUEUE_NAMESPACE` | 空 | 稳定、非敏感的 v2 队列命名空间；隔离环境并将所有原子键放入同一 Cluster Hash Slot |
+| `EVOAGENT_REDIS_CLUSTER` | `false` | 使用拓扑感知 Redis Cluster 客户端；要求命名空间且只能使用逻辑数据库 0 |
 | `EVOAGENT_QUEUE_FAIR_SCHEDULING` | `false` | 是否对 Redis 新消息启用跨副本加权租户轮转；Memory 后端不支持 |
 | `EVOAGENT_QUEUE_TENANT_WEIGHTS_FILE` | 空 | [v1 权重 TOML](examples/tenant-queue-weights.toml)；稳定策略 ID，默认/单租户权重范围 1–100，内容摘要随消息快照 |
 | `EVOAGENT_OUTBOX_MAX_ATTEMPTS` | `20` | Outbox 发布进入 dead 前的最大尝试次数 |
@@ -938,7 +943,7 @@ make check
 
 当前整体行覆盖率约 85%，其中 `fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
 
-GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16 与 Redis 7，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、加权租户轮转、长任务租约心跳、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离、远程 Proof Runner 的签名 HTTP → 禁网容器全链路、PostgreSQL 隔离备份恢复、空 Redis 任务重建，以及生产镜像的 `/ready` → Outbox → Redis → Worker 流程。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；后续架构决策记录在 [`docs/adr/`](docs/adr/)，模型治理见 [`ADR 0007`](docs/adr/0007-governed-model-gateway.md)，远程证据边界见 [`ADR 0009`](docs/adr/0009-authenticated-remote-proof-runner.md)，数据库恢复边界见 [`ADR 0011`](docs/adr/0011-isolated-database-recovery-drills.md) 与 [`ADR 0012`](docs/adr/0012-offline-queue-reconstruction.md)，独立评测证据见 [`ADR 0013`](docs/adr/0013-independent-evaluation-evidence.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
+GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16、Redis 7 与三主 Redis Cluster，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、同槽原子去重、加权租户轮转、长任务租约心跳、命名空间恢复、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离、远程 Proof Runner 的签名 HTTP → 禁网容器全链路、PostgreSQL 隔离备份恢复、空 Redis 任务重建，以及生产镜像的 `/ready` → Outbox → Redis → Worker 流程。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；后续架构决策记录在 [`docs/adr/`](docs/adr/)，模型治理见 [`ADR 0007`](docs/adr/0007-governed-model-gateway.md)，远程证据边界见 [`ADR 0009`](docs/adr/0009-authenticated-remote-proof-runner.md)，数据库恢复边界见 [`ADR 0011`](docs/adr/0011-isolated-database-recovery-drills.md) 与 [`ADR 0012`](docs/adr/0012-offline-queue-reconstruction.md)，Redis Cluster 键空间见 [`ADR 0028`](docs/adr/0028-versioned-redis-cluster-keyspace.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
 
 更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，仓库策略见 [`docs/repository-policies.md`](docs/repository-policies.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)，SLO 告警与处置见 [`docs/operations.md`](docs/operations.md)，数据库灾备见 [`docs/disaster-recovery.md`](docs/disaster-recovery.md)，性能压测方法与可复现基线见 [`docs/performance.md`](docs/performance.md) 与 [`docs/performance-baseline.md`](docs/performance-baseline.md)。
 

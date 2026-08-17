@@ -1,9 +1,11 @@
 """Real persistence and object-store tests enabled by explicit environments."""
 
+import hashlib
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -12,7 +14,7 @@ import uuid
 from evoagent.postgres_store import PostgresTaskStore
 from evoagent.proof_artifacts import S3ObjectLockArtifactStore
 from evoagent.proof_remote import RedisProofReplayStore
-from evoagent.task_queue import PermanentTaskError, TaskQueue
+from evoagent.task_queue import PermanentTaskError, TaskQueue, load_tenant_fair_policy
 
 POSTGRES_URL = os.getenv("EVOAGENT_TEST_POSTGRES_URL", "")
 REDIS_URL = os.getenv("EVOAGENT_TEST_REDIS_URL", "")
@@ -94,17 +96,129 @@ class RedisRuntimeIntegrationTests(unittest.TestCase):
         import redis
 
         self.redis = redis.Redis.from_url(REDIS_URL, decode_responses=True)
-        self.redis.delete(TaskQueue.STREAM, TaskQueue.DLQ)
+        self._clear_queue_state()
         dedupe_keys = list(self.redis.scan_iter(TaskQueue.DEDUP + "*", count=1000))
         if dedupe_keys:
             self.redis.delete(*dedupe_keys)
 
     def tearDown(self):
-        self.redis.delete(TaskQueue.STREAM, TaskQueue.DLQ)
+        self._clear_queue_state()
         dedupe_keys = list(self.redis.scan_iter(TaskQueue.DEDUP + "*", count=1000))
         if dedupe_keys:
             self.redis.delete(*dedupe_keys)
         self.redis.close()
+
+    def _clear_queue_state(self):
+        self.redis.delete(
+            TaskQueue.STREAM,
+            TaskQueue.DLQ,
+            TaskQueue.FAIR_WAITING,
+            TaskQueue.FAIR_ENTRIES,
+            TaskQueue.FAIR_ADMITTED,
+            TaskQueue.FAIR_LAST_TENANT,
+            TaskQueue.FAIR_STREAK,
+        )
+
+    def test_tenant_fair_scheduler_interleaves_backlogged_tenants(self):
+        first_started = threading.Event()
+        release_first = threading.Event()
+        delivered: list[str] = []
+
+        def handler(payload):
+            delivered.append(payload["message_id"])
+            if len(delivered) == 1:
+                first_started.set()
+                release_first.wait(5)
+
+        queue = TaskQueue(
+            handler,
+            workers=1,
+            redis_url=REDIS_URL,
+            fair_scheduling=True,
+        )
+        try:
+            queue.submit({"message_id": "a1", "tenant_id": "tenant-a"}, "a1")
+            self.assertTrue(first_started.wait(5))
+            queue.submit({"message_id": "a2", "tenant_id": "tenant-a"}, "a2")
+            queue.submit({"message_id": "a3", "tenant_id": "tenant-a"}, "a3")
+            queue.submit({"message_id": "b1", "tenant_id": "tenant-b"}, "b1")
+            queue.submit({"message_id": "b2", "tenant_id": "tenant-b"}, "b2")
+            release_first.set()
+
+            self.assertTrue(_wait(lambda: len(delivered) == 5), delivered)
+            self.assertEqual(["a1", "b1", "a2", "b2", "a3"], delivered)
+            self.assertEqual(0, queue.fair_waiting_tenants())
+            self.assertEqual("uniform-v1", queue.health()["fair_policy_id"])
+        finally:
+            release_first.set()
+            queue.close(3)
+
+    def test_tenant_fair_scheduler_honors_versioned_weights(self):
+        first_started = threading.Event()
+        release_first = threading.Event()
+        delivered: list[str] = []
+
+        def handler(payload):
+            delivered.append(payload["message_id"])
+            if len(delivered) == 1:
+                first_started.set()
+                release_first.wait(5)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml") as policy:
+            policy.write(
+                'version = 1\nid = "priority-v1"\ndefault_weight = 1\n[tenants]\n"tenant-a" = 2\n'
+            )
+            policy.flush()
+            queue = TaskQueue(
+                handler,
+                workers=1,
+                redis_url=REDIS_URL,
+                fair_scheduling=True,
+                tenant_weights_file=policy.name,
+            )
+            try:
+                self.assertEqual(2, queue.tenant_weight("tenant-a"))
+                queue.submit({"message_id": "a1", "tenant_id": "tenant-a"}, "a1")
+                self.assertTrue(first_started.wait(5))
+                queue.submit({"message_id": "a2", "tenant_id": "tenant-a"}, "a2")
+                queue.submit({"message_id": "a3", "tenant_id": "tenant-a"}, "a3")
+                queue.submit({"message_id": "b1", "tenant_id": "tenant-b"}, "b1")
+                release_first.set()
+
+                self.assertTrue(_wait(lambda: len(delivered) == 4), delivered)
+                self.assertEqual(["a1", "a2", "b1", "a3"], delivered)
+            finally:
+                release_first.set()
+                queue.close(3)
+
+    def test_tenant_fair_retry_requeues_without_leaking_scheduler_state(self):
+        calls = 0
+        delivered = threading.Event()
+
+        def handler(_payload):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("transient fixture failure")
+            delivered.set()
+
+        queue = TaskQueue(
+            handler,
+            workers=1,
+            redis_url=REDIS_URL,
+            max_attempts=2,
+            fair_scheduling=True,
+        )
+        try:
+            queue.submit({"message_id": "retry", "tenant_id": "tenant-a"}, "retry")
+            self.assertTrue(delivered.wait(5))
+            self.assertTrue(_wait(lambda: queue.depth() == 0))
+            self.assertEqual(2, calls)
+            self.assertEqual(0, self.redis.hlen(TaskQueue.FAIR_WAITING))
+            self.assertEqual(0, self.redis.hlen(TaskQueue.FAIR_ENTRIES))
+            self.assertEqual(0, self.redis.hlen(TaskQueue.FAIR_ADMITTED))
+        finally:
+            queue.close(3)
 
     def test_submission_dedupe_survives_queue_process_restart(self):
         message_id = "dedupe-" + uuid.uuid4().hex
@@ -169,6 +283,163 @@ class RedisRuntimeIntegrationTests(unittest.TestCase):
             self.assertTrue(_wait(lambda: queue.depth() == 0))
         finally:
             queue.close(3)
+
+    def test_fair_entry_reclaim_preserves_single_scheduler_accounting(self):
+        self.redis.xgroup_create(TaskQueue.STREAM, TaskQueue.GROUP, id="0", mkstream=True)
+        message_id = "fair-crash-" + uuid.uuid4().hex
+        tenant_key = hashlib.sha256(b"tenant-a").hexdigest()
+        envelope = json.dumps(
+            {
+                "message_id": message_id,
+                "attempt": 0,
+                "payload": {"message_id": message_id, "tenant_id": "tenant-a"},
+                "submitted_at": time.time(),
+                "fair": {
+                    "tenant_key": tenant_key,
+                    "weight": 1,
+                    "policy_sha256": load_tenant_fair_policy().sha256,
+                },
+            }
+        )
+        redis_id = self.redis.xadd(TaskQueue.STREAM, {"envelope": envelope})
+        self.redis.hincrby(TaskQueue.FAIR_WAITING, tenant_key, 1)
+        self.redis.hset(TaskQueue.FAIR_ENTRIES, redis_id, tenant_key)
+        script = (
+            "import redis,sys; r=redis.Redis.from_url(sys.argv[1],decode_responses=True); "
+            "rows=r.xreadgroup(sys.argv[2],'crashed-fair-process',{sys.argv[3]:'>'},count=1); "
+            "assert rows; r.close()"
+        )
+        crashed = subprocess.run(
+            [sys.executable, "-c", script, REDIS_URL, TaskQueue.GROUP, TaskQueue.STREAM],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(0, crashed.returncode, crashed.stderr)
+        time.sleep(1.1)
+
+        delivered = threading.Event()
+        queue = TaskQueue(
+            lambda payload: delivered.set() if payload["message_id"] == message_id else None,
+            workers=1,
+            redis_url=REDIS_URL,
+            lease_seconds=1,
+            fair_scheduling=True,
+        )
+        try:
+            self.assertTrue(delivered.wait(5))
+            self.assertTrue(_wait(lambda: queue.depth() == 0))
+            self.assertEqual(0, self.redis.hlen(TaskQueue.FAIR_WAITING))
+            self.assertEqual(0, self.redis.hlen(TaskQueue.FAIR_ENTRIES))
+            self.assertEqual(0, self.redis.hlen(TaskQueue.FAIR_ADMITTED))
+        finally:
+            queue.close(3)
+
+    def test_fair_marker_without_scheduler_index_fails_closed(self):
+        tenant_key = hashlib.sha256(b"tenant-a").hexdigest()
+        envelope = json.dumps(
+            {
+                "message_id": "missing-index",
+                "attempt": 0,
+                "payload": {"message_id": "missing-index", "tenant_id": "tenant-a"},
+                "submitted_at": time.time(),
+                "fair": {
+                    "tenant_key": tenant_key,
+                    "weight": 1,
+                    "policy_sha256": load_tenant_fair_policy().sha256,
+                },
+            }
+        )
+        self.redis.xadd(TaskQueue.STREAM, {"envelope": envelope})
+        delivered = threading.Event()
+        queue = TaskQueue(
+            lambda _payload: delivered.set(),
+            workers=1,
+            redis_url=REDIS_URL,
+            fair_scheduling=True,
+        )
+        try:
+            self.assertTrue(_wait(lambda: queue.dead_letter_depth() == 1))
+            self.assertFalse(delivered.is_set())
+            self.assertEqual(0, queue.depth())
+        finally:
+            queue.close(3)
+
+    def test_reclaimed_fair_marker_must_match_admitted_tenant(self):
+        tenant_key = hashlib.sha256(b"tenant-a").hexdigest()
+        envelope = json.dumps(
+            {
+                "message_id": "admitted-mismatch",
+                "attempt": 0,
+                "payload": {"message_id": "admitted-mismatch", "tenant_id": "tenant-a"},
+                "submitted_at": time.time(),
+                "fair": {
+                    "tenant_key": tenant_key,
+                    "weight": 1,
+                    "policy_sha256": load_tenant_fair_policy().sha256,
+                },
+            }
+        )
+        redis_id = self.redis.xadd(TaskQueue.STREAM, {"envelope": envelope})
+        self.redis.hset(TaskQueue.FAIR_ADMITTED, redis_id, hashlib.sha256(b"tenant-b").hexdigest())
+        delivered = threading.Event()
+        queue = TaskQueue(
+            lambda _payload: delivered.set(),
+            workers=1,
+            redis_url=REDIS_URL,
+            fair_scheduling=True,
+        )
+        try:
+            self.assertTrue(_wait(lambda: queue.dead_letter_depth() == 1))
+            self.assertFalse(delivered.is_set())
+            self.assertEqual(0, queue.depth())
+            self.assertEqual(0, self.redis.hlen(TaskQueue.FAIR_ADMITTED))
+        finally:
+            queue.close(3)
+
+    def test_active_delivery_heartbeat_prevents_false_lease_reclaim(self):
+        started = threading.Event()
+        release = threading.Event()
+        duplicate = threading.Event()
+        deliveries = 0
+        delivery_lock = threading.Lock()
+
+        def slow_handler(_payload):
+            nonlocal deliveries
+            with delivery_lock:
+                deliveries += 1
+                if deliveries > 1:
+                    duplicate.set()
+            started.set()
+            release.wait(5)
+
+        first = TaskQueue(
+            slow_handler,
+            workers=1,
+            redis_url=REDIS_URL,
+            lease_seconds=1,
+            fair_scheduling=True,
+        )
+        second = TaskQueue(
+            slow_handler,
+            workers=1,
+            redis_url=REDIS_URL,
+            lease_seconds=1,
+            fair_scheduling=True,
+        )
+        try:
+            first.submit({"message_id": "slow", "tenant_id": "tenant-a"}, "slow")
+            self.assertTrue(started.wait(5))
+            self.assertFalse(duplicate.wait(2.2))
+            self.assertEqual(1, deliveries)
+            self.assertTrue(first.health()["lease_heartbeat_running"])
+            release.set()
+            self.assertTrue(_wait(lambda: first.depth() == 0))
+        finally:
+            release.set()
+            first.close(3)
+            second.close(3)
 
     def test_dlq_replay_survives_queue_restart(self):
         message_id = "dlq-" + uuid.uuid4().hex

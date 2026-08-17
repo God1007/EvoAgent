@@ -1,8 +1,9 @@
+import tempfile
 import threading
 import time
 import unittest
 
-from evoagent.task_queue import PermanentTaskError, TaskQueue
+from evoagent.task_queue import PermanentTaskError, TaskQueue, load_tenant_fair_policy
 
 
 def _wait(predicate, timeout=5.0):
@@ -15,12 +16,53 @@ def _wait(predicate, timeout=5.0):
 
 
 class TaskQueueBackendTests(unittest.TestCase):
+    def test_tenant_fair_policy_is_bounded_and_content_addressed(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".toml") as handle:
+            handle.write(
+                'version = 1\nid = "priority-v1"\ndefault_weight = 2\n[tenants]\n"tenant-a" = 4\n'
+            )
+            handle.flush()
+            policy = load_tenant_fair_policy(handle.name)
+
+        self.assertEqual(4, policy.weight("tenant-a"))
+        self.assertEqual(2, policy.weight("tenant-b"))
+        self.assertEqual("priority-v1", policy.policy_id)
+        self.assertRegex(policy.sha256, r"^[0-9a-f]{64}$")
+        self.assertEqual(load_tenant_fair_policy().sha256, load_tenant_fair_policy().sha256)
+
+    def test_tenant_fair_policy_rejects_unsafe_or_invalid_documents(self):
+        invalid = (
+            "version = 2\n",
+            "version = 1\n",
+            'version = 1\nid = "valid-v1"\ndefault_weight = 0\n',
+            'version = 1\nid = "valid-v1"\nunknown = true\n',
+            'version = 1\nid = "bad id"\n',
+            'version = 1\nid = "valid-v1"\n[tenants]\n" tenant" = 2\n',
+            'version = 1\nid = "valid-v1"\n[tenants]\n"tenant" = true\n',
+        )
+        for document in invalid:
+            with self.subTest(document=document):
+                with tempfile.NamedTemporaryFile("w", suffix=".toml") as handle:
+                    handle.write(document)
+                    handle.flush()
+                    with self.assertRaises(ValueError):
+                        load_tenant_fair_policy(handle.name)
+
+    def test_fair_scheduling_requires_redis(self):
+        with self.assertRaisesRegex(ValueError, "requires EVOAGENT_REDIS_URL"):
+            TaskQueue(lambda _payload: None, workers=1, fair_scheduling=True)
+
     def test_memory_backend_is_named_and_reports_non_durable(self):
         queue = TaskQueue(lambda _payload: None, workers=1)
         try:
             self.assertEqual("memory-ephemeral", queue.backend)
             self.assertFalse(queue.durable)
+            self.assertFalse(queue.fair_scheduling)
+            self.assertEqual(1, queue.tenant_weight("tenant"))
+            self.assertEqual("uniform-v1", queue.fair_policy_id)
+            self.assertEqual(0, queue.fair_waiting_tenants())
             self.assertTrue(queue.health()["healthy"])
+            self.assertFalse(queue.health()["lease_heartbeat_running"])
         finally:
             queue.close()
 

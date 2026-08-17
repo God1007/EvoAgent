@@ -1,0 +1,9 @@
+version = 1
+id = "service-tiers-v1"
+default_weight = 1
+
+# Stable tenant identifiers only. Weight is an integer from 1 to 100 and
+# controls how many dispatch starts a tenant may receive in one scheduler turn.
+[tenants]
+"default" = 1
+"priority-tenant" = 2

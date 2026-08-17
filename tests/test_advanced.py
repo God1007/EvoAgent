@@ -193,6 +193,21 @@ class AdvancedFeatureTests(unittest.TestCase):
             ):
                 configured.__class__(**{**configured.__dict__, **changes}).validate_evolution()
 
+    def test_tenant_fair_queue_requires_durable_redis(self):
+        configured = settings(self.path)
+        with self.assertRaisesRegex(ValueError, "QUEUE_FAIR_SCHEDULING requires"):
+            configured.__class__(
+                **{**configured.__dict__, "queue_fair_scheduling": True}
+            ).validate_evolution()
+
+        configured.__class__(
+            **{
+                **configured.__dict__,
+                "redis_url": "redis://127.0.0.1:6379/0",
+                "queue_fair_scheduling": True,
+            }
+        ).validate_evolution()
+
     def test_feedback_candidate_is_deferred_without_a_model(self):
         store = TaskStore(self.path)
         store.create("task", "org/repo", 1, {"source": "test"})

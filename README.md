@@ -49,6 +49,7 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **模型治理网关** | 任务级租户/仓库上下文、凭据脱敏、HTTPS/出口主机限制、结构化输出门禁、Token/成本预算与元数据用量账本 |
 | **生产治理** | JWT、RBAC、多租户、仓库隔离、事务 Outbox、审计日志、灰度发布、影子流量、告警与死信队列 |
 | **租户容量隔离** | 数据库原子协调的跨副本租户审查槽位，覆盖异步重试、离线恢复与恢复代际，过载返回可重试的 429，抑制单租户无限占用持久任务容量 |
+| **租户公平调度** | Redis Streams 上可选的跨副本加权轮转；内容寻址策略、匿名租户键、原子延后/准入索引、在途租约心跳与崩溃接管在保留 ACK、重试和 DLQ 语义的同时避免连续突发长期垄断 Worker |
 | **安全 HTTP 边界** | 全响应请求关联 ID、无内部细节的统一 500、过滤 query/异常原文的结构化日志、一致安全响应头，以及默认不信任转发头的可信代理链客户端身份解析 |
 | **无消息故障契约** | Task/Trace/Checkpoint、Agent、Queue/DLQ、Outbox/Effect、Readiness、插件与遥测只记录异常类型和稳定故障引用，不落异常原文 |
 | **可观测性** | 任务 Trace、Agent 消息、固定基数的模型成本/容量/修复/反馈 Prometheus 指标和 OpenTelemetry Trace |
@@ -794,7 +795,7 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `POST` | `/v1/model-usage/reconcile` | 按供应商账单原子结算超时的模型用量预占并写入审计 |
 | `GET` | `/api/model-routes/promotion` | 按租户/仓库查询候选路由只读晋级门禁 |
 | `GET` | `/api/model-routes/capacity` | 查询路由容量、熔断状态和只读权重建议；共享池精确计数脱敏 |
-| `GET` | `/api/tenant-review-capacity` | 管理员查询当前租户的审查槽位、上限、饱和状态与最老占用时间 |
+| `GET` | `/api/tenant-review-capacity` | 管理员查询当前租户的审查槽位、上限、饱和状态、最老占用时间及队列权重/策略摘要 |
 
 `POST /v1/reviews` 的 Diff 默认最大为 1 MiB；单任务默认最多 8 步、120 秒。可通过 `.env.example` 中的环境变量调整。
 
@@ -816,6 +817,8 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `EVOAGENT_MAX_STEPS` | `8` | 单任务最大状态步数 |
 | `EVOAGENT_TIMEOUT_SECONDS` | `120` | 审查任务超时 |
 | `EVOAGENT_QUEUE_SHUTDOWN_TIMEOUT_SECONDS` | `30` | 关闭存储前等待队列在途任务完成的最长秒数 |
+| `EVOAGENT_QUEUE_FAIR_SCHEDULING` | `false` | 是否对 Redis 新消息启用跨副本加权租户轮转；Memory 后端不支持 |
+| `EVOAGENT_QUEUE_TENANT_WEIGHTS_FILE` | 空 | [v1 权重 TOML](examples/tenant-queue-weights.toml)；稳定策略 ID，默认/单租户权重范围 1–100，内容摘要随消息快照 |
 | `EVOAGENT_OUTBOX_MAX_ATTEMPTS` | `20` | Outbox 发布进入 dead 前的最大尝试次数 |
 | `EVOAGENT_OUTBOX_LEASE_SECONDS` | `30` | Outbox Dispatcher 的消息所有权租约秒数 |
 | `EVOAGENT_PLUGIN_PROFILE` | 空 | Trusted Plugin TOML Profile 路径 |
@@ -935,7 +938,7 @@ make check
 
 当前整体行覆盖率约 85%，其中 `fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
 
-GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16 与 Redis 7，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离、远程 Proof Runner 的签名 HTTP → 禁网容器全链路、PostgreSQL 隔离备份恢复、空 Redis 任务重建，以及生产镜像的 `/ready` → Outbox → Redis → Worker 流程。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；后续架构决策记录在 [`docs/adr/`](docs/adr/)，模型治理见 [`ADR 0007`](docs/adr/0007-governed-model-gateway.md)，远程证据边界见 [`ADR 0009`](docs/adr/0009-authenticated-remote-proof-runner.md)，数据库恢复边界见 [`ADR 0011`](docs/adr/0011-isolated-database-recovery-drills.md) 与 [`ADR 0012`](docs/adr/0012-offline-queue-reconstruction.md)，独立评测证据见 [`ADR 0013`](docs/adr/0013-independent-evaluation-evidence.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
+GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16 与 Redis 7，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、加权租户轮转、长任务租约心跳、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离、远程 Proof Runner 的签名 HTTP → 禁网容器全链路、PostgreSQL 隔离备份恢复、空 Redis 任务重建，以及生产镜像的 `/ready` → Outbox → Redis → Worker 流程。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；后续架构决策记录在 [`docs/adr/`](docs/adr/)，模型治理见 [`ADR 0007`](docs/adr/0007-governed-model-gateway.md)，远程证据边界见 [`ADR 0009`](docs/adr/0009-authenticated-remote-proof-runner.md)，数据库恢复边界见 [`ADR 0011`](docs/adr/0011-isolated-database-recovery-drills.md) 与 [`ADR 0012`](docs/adr/0012-offline-queue-reconstruction.md)，独立评测证据见 [`ADR 0013`](docs/adr/0013-independent-evaluation-evidence.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
 
 更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，仓库策略见 [`docs/repository-policies.md`](docs/repository-policies.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)，SLO 告警与处置见 [`docs/operations.md`](docs/operations.md)，数据库灾备见 [`docs/disaster-recovery.md`](docs/disaster-recovery.md)，性能压测方法与可复现基线见 [`docs/performance.md`](docs/performance.md) 与 [`docs/performance-baseline.md`](docs/performance-baseline.md)。
 
@@ -945,7 +948,7 @@ GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强
 
 - **多核 HTTP 扩展**：`EVOAGENT_WEB_WORKERS` 通过 `SO_REUSEPORT` 派生多个 worker 进程，master 监督进程负责崩溃重启（带退避与风暴上限）与 `SIGTERM` 优雅摘流（`/ready` 转 503 → 等待在途请求 → 到期 `SIGKILL` 兜底）。
 - **过载保护（背压）**：按客户端的令牌桶限流 + 重端点的有界并发闸门，过载时返回 `429`/`503` + `Retry-After` 而非雪崩。默认只信 socket peer；配置 `EVOAGENT_TRUSTED_PROXY_CIDRS` 后才从右向左验证 `X-Forwarded-For` 代理链，避免伪造地址绕过限流。
-- **租户噪声隔离**：PostgreSQL/SQLite 在任务与 Outbox 同一事务内原子占用租户槽位；异步失败在重试与离线队列恢复期间保留槽位，成功、取消或最终死信才释放。该硬上限限制持久待办占用，但不等同于加权公平调度。
+- **租户噪声隔离**：PostgreSQL/SQLite 在任务与 Outbox 同一事务内原子占用租户槽位；异步失败在重试与离线队列恢复期间保留槽位，成功、取消或最终死信才释放。生产 Redis 可进一步启用内容寻址的加权租户轮转，限制持久占用并公平分配任务启动机会。
 - **依赖韧性**：GitHub / LLM 出站调用包裹熔断器（closed/open/half-open + 退避抖动），仅对连接/超时类传输故障计数，上游宕机时快速失败而非占满线程。
 - **连接池**：Postgres 使用核心依赖 `psycopg_pool` 的有界连接池；池大小、可用连接和等待请求经 `/metrics` 暴露，真实耗尽/恢复行为由 CI 门禁验证。
 - **历史保留**：可选的状态感知维护器分批清理过期运行历史，不删除活跃任务、每个任务的最后事件、会话最新完成快照或乱序完成仍需读取的连续性锚点。

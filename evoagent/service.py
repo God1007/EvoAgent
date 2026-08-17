@@ -40,7 +40,7 @@ from .github import GitHubAppAuthenticator, GitHubClient
 from .metrics import metrics
 from .outbox import OutboxDispatcher
 from .plugins import Plugin, PluginProfile, PluginRuntime
-from .ports import CodeHostPort
+from .ports import CodeHostPort, TenantFairQueuePort
 from .retention import RetentionManager, RetentionOptions
 from .review_engine import ReviewEngine
 from .reviewer import GatewayReviewer
@@ -242,6 +242,22 @@ class ReviewService:
         metrics.register_gauge_source(
             "review_admission_slots_active",
             lambda: float(self.store.tenant_review_admission_stats()["active"]),
+        )
+        metrics.register_gauge_source(
+            "queue_fair_scheduling_enabled",
+            lambda: (
+                1.0
+                if isinstance(self.queue, TenantFairQueuePort) and self.queue.fair_scheduling
+                else 0.0
+            ),
+        )
+        metrics.register_gauge_source(
+            "queue_fair_waiting_tenants",
+            lambda: (
+                float(self.queue.fair_waiting_tenants())
+                if isinstance(self.queue, TenantFairQueuePort)
+                else 0.0
+            ),
         )
         self._readiness_lock = threading.Lock()
         self._readiness_cache: tuple[float, tuple[bool, dict[str, Any]]] | None = None

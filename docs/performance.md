@@ -47,7 +47,10 @@ scenarios (see `SCENARIOS` in [`scripts/loadgen.py`](../scripts/loadgen.py)):
 - **Noisy-neighbor intake**: one tenant drives its durable outstanding-review
   limit while another continues admitting work. Assert atomic cross-replica
   occupancy, bounded 429 + `Retry-After`, release after success/cancel/DLQ, and
-  no cross-tenant rejection.
+  no cross-tenant rejection. With Redis fairness enabled, additionally assert
+  weighted dispatch-start ratios, bounded tail deferrals, retry/reclaim
+  accounting, heartbeat protection for work exceeding the reclaim lease, and
+  latency for the non-bursting tenant.
 - **CPU-heavy**: `/v1/codegraph/impact` on large source sets.
 - **Sandboxed**: `/v1/proofs` (container-isolated; excluded from the default
   latency SLO, measured for saturation and correctness only).
@@ -134,8 +137,10 @@ python scripts/microbench.py --json micro.json
 - **Tenant durable capacity**: `EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS` bounds each
   tenant's outstanding review intents across database-sharing replicas. Slots
   survive async retries and offline reconstruction, preventing unlimited
-  durable backlog growth. This admission bound is not a weighted-fair worker
-  scheduler and should be sized from end-to-end completion capacity.
+  durable backlog growth. The Redis-only fair scheduler can then rotate handler
+  starts by bounded v1 tenant weights across replicas. It does not equalize task
+  duration or model cost, and both controls should be sized from end-to-end
+  completion capacity.
 - **Resilience**: outbound GitHub and LLM calls are wrapped in a circuit breaker
   with exponential backoff + jitter, so an upstream outage fails fast instead of
   exhausting workers.
@@ -161,5 +166,5 @@ python scripts/microbench.py --json micro.json
 - microVM isolation (Firecracker/Kata) as an alternative `proof.executor`
   provider for hostile public multi-tenancy.
 - A dedicated concurrency guard for `/webhooks/github` `synchronize` fan-out.
-- Weighted-fair tenant dequeue/worker shares and a production-shaped
-  multi-tenant soak; the current uniform admission limit bounds occupancy only.
+- Runtime-cost-aware tenant shares and a production-shaped multi-tenant soak;
+  the current weighted scheduler governs dispatch starts, not CPU/model time.

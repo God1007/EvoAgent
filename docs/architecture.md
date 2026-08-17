@@ -11,12 +11,12 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Intake | `evoagent/api.py`, `backpressure.py`, `errors.py` | HTTP API, spoof-resistant trusted-proxy identity, bounded admission, explicit client-safe errors, correlated 5xx boundary, `/webhooks/github`, `/health`, `/metrics` |
 | Composition | `evoagent/plugins.py` | Trusted plugin manifests, capability registry, scopes, events, dependency graph, lifecycle rollback |
 | Composition | `evoagent/capabilities.py` | Stable typed capability definitions for providers and consumers |
-| Domain boundary | `evoagent/ports.py` | Focused Store, Queue, CodeHost, Model Gateway, Proof Executor, Proof Replay Store, and Proof Artifact Store behavioral contracts |
+| Domain boundary | `evoagent/ports.py` | Focused Store, stable Queue plus optional tenant-fair Queue, CodeHost, Model Gateway, Proof Executor, Proof Replay Store, and Proof Artifact Store behavioral contracts |
 | Composition | `evoagent/bootstrap.py` | Replaceable built-in provider catalog and transactional application startup |
 | Application | `evoagent/application/` | Focused Review, Webhook, Session, Repair, Policy, and Model Usage use cases |
 | Composition facade | `evoagent/service.py` | Capability wiring, lifecycle/health, canary/shadow runtime selection, API compatibility |
 | Runtime | `evoagent/harness.py` | LangGraph state machine, budget, retry, checkpoint/resume |
-| Runtime | `evoagent/task_queue.py` | In-process queue or Redis Streams (ACK, lease, DLQ, replay) |
+| Runtime | `evoagent/task_queue.py` | In-process queue or Redis Streams (ACK, lease, DLQ, replay, content-addressed weighted tenant turns) |
 | Runtime | `evoagent/outbox.py` | Store-to-queue transactional publication, leases, retry and recovery |
 | Review | `evoagent/review_extensions.py`, `review_engine.py`, `agents.py` | Stable reviewer-contribution seam, replaceable engine, and default multi-agent collaboration protocol |
 | Review | `evoagent/reviewer.py` | Local deterministic rules + governed gateway reviewer + composite |
@@ -60,7 +60,7 @@ change (webhook | REST | console)
       webhook: delivery + admission + session turn + task + outbox in one transaction
       REST: admission + task + Diff + outbox in one transaction
   → OutboxDispatcher                        # lease + idempotent publication
-  → TaskQueue                               # in-process or Redis Streams
+  → TaskQueue                               # memory or Redis Streams; optional weighted tenant turn before handler start
   → ReviewHarness.run                       # LangGraph nodes, checkpoint each step
       parse → plan → specialists (security, reliability, llm, skills)
             llm → ModelGateway (scope → weighted active route → redact → reserve → call/fallback → validate → account → isolated shadow)
@@ -146,7 +146,18 @@ See [`plugin-system.md`](plugin-system.md) and
   `queue_durable: false`) and is for single-process development only.
   Redis workers reconnect after transient transport failures; acknowledged
   entries are atomically ACKed and deleted so memory and operational depth do
-  not grow forever. `/ready` checks both Redis reachability and worker liveness.
+  not grow forever. A separate heartbeat renews every active pending entry so a
+  long but live handler is not falsely reclaimed; a crashed process stops
+  renewal and remains recoverable after the lease. `/ready` checks Redis,
+  worker, and heartbeat liveness.
+- **Tenant-fair dispatch** is an opt-in Redis coordination layer over the same
+  stream. A content-addressed policy assigns bounded integer weights; new
+  envelopes carry a hashed tenant key and policy snapshot. Atomic grant/defer
+  scripts preserve weighted turns across replicas, and separate waiting versus
+  admitted indexes make retry and `XAUTOCLAIM` crash recovery single-accounted.
+  Legacy unmarked messages remain consumable during a two-stage rollout. The
+  mechanism equalizes dispatch starts, not review runtime or model cost. See
+  [`ADR 0027`](adr/0027-weighted-tenant-fair-redis-dispatch.md).
 - **Durable acceptance** uses a transactional outbox. A committed task and its
   queue intent cannot diverge; dispatch leases and message-key dedupe recover
   the publish/ack crash window. See
@@ -161,7 +172,7 @@ See [`plugin-system.md`](plugin-system.md) and
   failures retain their slot through retry/recovery, terminal disposition
   releases it, and resume advances a generation so stale delivery callbacks
   cannot release new work. The uniform cap bounds noisy-neighbor occupancy but
-  does not promise weighted-fair dequeue order. See
+  does not by itself promise weighted-fair dequeue order. See
   [`ADR 0026`](adr/0026-durable-tenant-review-admission.md).
 - **Operational-history retention** is opt-in and delegates deletion safety to
   the Store transaction. It prunes only old terminal-task Trace events and old

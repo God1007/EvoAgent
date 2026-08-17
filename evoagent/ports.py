@@ -709,6 +709,21 @@ class TaskQueuePort(Protocol):
     def close(self, drain_timeout_seconds: float = 0.0) -> bool: ...
 
 
+@runtime_checkable
+class TenantFairQueuePort(Protocol):
+    """Optional scheduling telemetry/policy surface for compatible queues."""
+
+    @property
+    def fair_scheduling(self) -> bool: ...
+
+    @property
+    def fair_policy_id(self) -> str: ...
+
+    def tenant_weight(self, tenant_id: str) -> int: ...
+
+    def fair_waiting_tenants(self) -> int: ...
+
+
 class QueueFactoryPort(Protocol):
     def create(
         self,

@@ -175,6 +175,29 @@
       ],
       "title": "Global active review admissions",
       "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 62},
+      "id": 16,
+      "targets": [
+        {"expr": "evoagent:ratio:queue_fair_deferrals_15m", "refId": "A"}
+      ],
+      "title": "Tenant-fair scheduler deferral ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "fieldConfig": {"defaults": {"unit": "short"}},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 62},
+      "id": 17,
+      "targets": [
+        {"expr": "max(evoagent_queue_fair_waiting_tenants)", "legendFormat": "waiting tenants", "refId": "A"},
+        {"expr": "sum(increase(evoagent_queue_lease_heartbeat_failures_total[10m]))", "legendFormat": "lease heartbeat failures", "refId": "B"}
+      ],
+      "title": "Tenant-fair scheduler waiting tenants",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

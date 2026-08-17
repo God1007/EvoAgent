@@ -26,6 +26,7 @@ from ..ports import (
     ReviewApplicationStorePort,
     ReviewReleasePort,
     TaskQueuePort,
+    TenantFairQueuePort,
 )
 from ..report import to_markdown
 from ..store import utc_now
@@ -566,6 +567,8 @@ class ReviewUseCases:
         stats = self.store.tenant_review_admission_stats(tenant_id)
         limit = self.options.tenant_max_active_reviews
         active = int(stats["active"])
+        queue = self.queue()
+        fair_queue = queue if isinstance(queue, TenantFairQueuePort) else None
         return {
             "tenant_id": tenant_id,
             "enabled": limit > 0,
@@ -574,6 +577,9 @@ class ReviewUseCases:
             "available": max(0, limit - active) if limit else None,
             "saturated": bool(limit and active >= limit),
             "oldest_acquired_at": stats["oldest_acquired_at"],
+            "queue_fair_scheduling": bool(fair_queue and fair_queue.fair_scheduling),
+            "queue_weight": fair_queue.tenant_weight(tenant_id) if fair_queue else 1,
+            "queue_policy_id": fair_queue.fair_policy_id if fair_queue else None,
         }
 
     def cancel_task(self, task_id: str, tenant_id: str | None = None) -> bool:

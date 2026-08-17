@@ -84,6 +84,7 @@ jobs:
           test -f "$wheel_env/share/evoagent/ops/slo.toml"
           test -f "$wheel_env/share/evoagent/ops/prometheus/evoagent.rules.yml"
           test -f "$wheel_env/share/evoagent/ops/grafana/evoagent-overview.json"
+          test -f "$wheel_env/share/evoagent/examples/tenant-queue-weights.toml"
           "$wheel_env/bin/evoagent-slo" --help >/dev/null
           "$wheel_env/bin/evoagent-dr" --help >/dev/null
           "$wheel_env/bin/evoagent-recover-queue" --help >/dev/null
@@ -257,6 +258,7 @@ jobs:
             -e EVOAGENT_AUTH_REQUIRED=false \
             -e EVOAGENT_DATABASE_URL="${EVOAGENT_TEST_POSTGRES_URL}" \
             -e EVOAGENT_REDIS_URL="${EVOAGENT_TEST_REDIS_URL}" \
+            -e EVOAGENT_QUEUE_FAIR_SCHEDULING=true \
             -e EVOAGENT_SKILLS_DIR=/app/skills \
             evoagent:ci
       - name: Prove readiness and end-to-end outbox delivery
@@ -271,7 +273,7 @@ jobs:
             fi
             sleep 1
           done
-          python -c "import json; from evoagent.migrations import CURRENT_SCHEMA_VERSION; d=json.load(open('ready.json')); assert d['status']=='ready'; assert d['queue_backend']=='redis-streams'; assert d['checks']['schema_version']==CURRENT_SCHEMA_VERSION; assert d['checks']['queue']['healthy']"
+          python -c "import json; from evoagent.migrations import CURRENT_SCHEMA_VERSION; d=json.load(open('ready.json')); q=d['checks']['queue']; assert d['status']=='ready'; assert d['queue_backend']=='redis-streams'; assert d['checks']['schema_version']==CURRENT_SCHEMA_VERSION; assert q['healthy'] and q['fair_scheduling'] and q['lease_heartbeat_running']"
           curl -fsS -X POST 'http://127.0.0.1:18080/v1/reviews?async=true' \
             -H 'Content-Type: application/json' \
             -d '{"repository":"ci/full-stack","pull_request":17,"diff":"diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n+value = 1\n+print(value)"}' \

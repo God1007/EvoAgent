@@ -119,6 +119,9 @@ class AdmissionControlTests(unittest.TestCase):
         self.assertEqual(200, capacity_response.status)
         self.assertEqual(1, capacity["active_reviews"])
         self.assertTrue(capacity["saturated"])
+        self.assertFalse(capacity["queue_fair_scheduling"])
+        self.assertEqual(1, capacity["queue_weight"])
+        self.assertEqual("uniform-v1", capacity["queue_policy_id"])
 
     def test_trusted_proxy_clients_receive_independent_rate_limit_buckets(self):
         host, port = self._serve(
@@ -295,6 +298,8 @@ class AdmissionControlTests(unittest.TestCase):
         ready = json.loads(ready_response.read())
         self.assertEqual(200, ready_response.status)
         self.assertEqual(CURRENT_SCHEMA_VERSION, ready["checks"]["schema_version"])
+        self.assertFalse(ready["checks"]["queue"]["fair_scheduling"])
+        self.assertEqual("uniform-v1", ready["checks"]["queue"]["fair_policy_id"])
 
     def test_request_identity_and_security_headers_cover_every_response(self):
         host, port = self._serve(self._settings())

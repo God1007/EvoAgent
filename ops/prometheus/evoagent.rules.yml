@@ -18,6 +18,8 @@ groups:
         expr: ((sum(increase(evoagent_feedback_false_positive_total[24h])) or vector(0)) + (sum(increase(evoagent_feedback_missed_issue_total[24h])) or vector(0)) + (sum(increase(evoagent_feedback_bad_fix_total[24h])) or vector(0))) / clamp_min(sum(increase(evoagent_feedback_total[24h])), 1)
       - record: evoagent:ratio:tenant_review_capacity_rejected_15m
         expr: (sum(increase(evoagent_review_admission_rejections_total[15m])) or vector(0)) / clamp_min((sum(increase(evoagent_review_admissions_total[15m])) or vector(0)) + (sum(increase(evoagent_review_admission_rejections_total[15m])) or vector(0)), 1)
+      - record: evoagent:ratio:queue_fair_deferrals_15m
+        expr: (sum(increase(evoagent_queue_fair_deferrals_total[15m])) or vector(0)) / clamp_min((sum(increase(evoagent_queue_fair_grants_total[15m])) or vector(0)) + (sum(increase(evoagent_queue_fair_deferrals_total[15m])) or vector(0)), 1)
 
   - name: evoagent-slo-alerts
     rules:
@@ -63,6 +65,15 @@ groups:
           severity: page
         annotations:
           summary: The oldest review queue item is over 60 seconds old
+          runbook: docs/operations.md#queue-or-outbox-stale
+
+      - alert: EvoAgentQueueLeaseHeartbeatFailing
+        expr: sum(increase(evoagent_queue_lease_heartbeat_failures_total[10m])) > 2
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: Active Redis deliveries are not renewing their consumer lease
           runbook: docs/operations.md#queue-or-outbox-stale
 
       - alert: EvoAgentOutboxStale
@@ -154,3 +165,12 @@ groups:
         annotations:
           summary: Tenant review admission is rejecting a sustained share of requests
           runbook: docs/operations.md#tenant-review-capacity
+
+      - alert: EvoAgentTenantFairnessChurnHigh
+        expr: evoagent:ratio:queue_fair_deferrals_15m > 0.5 and sum(increase(evoagent_queue_fair_deferrals_total[15m])) > 100
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: Tenant-fair scheduling is spending over half of decisions deferring burst traffic
+          runbook: docs/operations.md#tenant-fair-scheduling

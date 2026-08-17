@@ -87,6 +87,8 @@ class DefaultQueueFactory:
             self.settings.queue_max_attempts,
             self.settings.queue_lease_seconds,
             on_dead_letter,
+            fair_scheduling=self.settings.queue_fair_scheduling,
+            tenant_weights_file=self.settings.queue_tenant_weights_file,
         )
 
 

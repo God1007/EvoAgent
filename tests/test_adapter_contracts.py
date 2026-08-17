@@ -10,7 +10,12 @@ from evoagent.errors import TenantReviewCapacityError
 from evoagent.github import GitHubClient
 from evoagent.migrations import CURRENT_SCHEMA_VERSION
 from evoagent.models import TaskState, TraceEvent
-from evoagent.ports import ApplicationStorePort, CodeHostPort, TaskQueuePort
+from evoagent.ports import (
+    ApplicationStorePort,
+    CodeHostPort,
+    TaskQueuePort,
+    TenantFairQueuePort,
+)
 from evoagent.postgres_store import PostgresTaskStore
 from evoagent.store import TaskStore, utc_now
 from evoagent.task_queue import TaskQueue
@@ -36,6 +41,49 @@ class PortSurfaceTests(unittest.TestCase):
             self.assertIsInstance(queue, TaskQueuePort)
         finally:
             queue.close()
+
+    def test_fair_scheduling_is_an_optional_queue_port(self):
+        queue = TaskQueue(lambda _payload: None, workers=1)
+        try:
+            self.assertIsInstance(queue, TaskQueuePort)
+            self.assertIsInstance(queue, TenantFairQueuePort)
+        finally:
+            queue.close()
+
+        class LegacyQueueProvider:
+            backend = "legacy"
+            durable = True
+
+            def submit(self, _payload, message_id=""):
+                return message_id
+
+            def dead_letters(self, _limit=100):
+                return []
+
+            def replay_dead_letter(self, _message_id):
+                return False
+
+            def depth(self):
+                return 0
+
+            def oldest_age_seconds(self):
+                return 0.0
+
+            def dead_letter_depth(self):
+                return 0
+
+            def health(self):
+                return {"healthy": True}
+
+            def drain(self, _timeout_seconds=0.0):
+                return True
+
+            def close(self, _drain_timeout_seconds=0.0):
+                return True
+
+        legacy = LegacyQueueProvider()
+        self.assertIsInstance(legacy, TaskQueuePort)
+        self.assertNotIsInstance(legacy, TenantFairQueuePort)
 
 
 class _StoreBehaviorContract:
@@ -1128,6 +1176,7 @@ class _QueueBehaviorContract:
     redis_url = ""
     expected_backend = ""
     expected_durable = False
+    expected_heartbeat = False
 
     def test_delivery_and_shutdown_contract(self):
         received: list[str] = []
@@ -1147,6 +1196,10 @@ class _QueueBehaviorContract:
             health = queue.health()
             self.assertTrue(health["healthy"], health)
             self.assertEqual(self.expected_backend, health["backend"])
+            self.assertEqual(
+                self.expected_heartbeat,
+                health["lease_heartbeat_running"],
+            )
             self.assertEqual(
                 message_id,
                 queue.submit({"message_id": message_id}, message_id=message_id),
@@ -1176,6 +1229,7 @@ class RedisQueueContractTests(_QueueBehaviorContract, unittest.TestCase):
     redis_url = os.getenv("EVOAGENT_TEST_REDIS_URL", "")
     expected_backend = "redis-streams"
     expected_durable = True
+    expected_heartbeat = True
 
 
 if __name__ == "__main__":

@@ -136,6 +136,11 @@ not copy them into general task or readiness records.
 - **Queue stale:** inspect Redis health, worker count, task duration, and lease
   reclaim. Scale workers only if downstream GitHub/model/DB capacity can absorb
   them.
+- **Lease heartbeat failure:** every live Redis handler periodically resets its
+  pending-entry idle time. Check readiness `lease_heartbeat_running`, Redis
+  latency/timeouts, and `queue_lease_heartbeat_failures_total`. Do not increase
+  the reclaim threshold to hide a broken heartbeat; restore Redis connectivity
+  so only a truly lost process becomes eligible for `XAUTOCLAIM`.
 - **Regional reconstruction:** a `FAILED` async task with an active durable
   admission is still retry-managed and is included in an offline recovery plan;
   a synchronous failed task whose slot was released remains terminal.
@@ -258,10 +263,77 @@ commit the final `CANCELLED` state and release the slot. Do not edit
 the limit only through reviewed deployment configuration after checking worker,
 database, model, and GitHub capacity.
 
-This control bounds durable occupancy; it is not weighted-fair queue scheduling.
-A tenant at its limit cannot add more work, but Redis workers may still dequeue
-already-admitted work in stream order. Per-tenant details stay behind tenant
-authorization rather than becoming Prometheus labels.
+This control alone bounds durable occupancy; it does not order workers. Unless
+the tenant-fair scheduler below is enabled, Redis workers still dequeue admitted
+work in stream order. Per-tenant details stay behind tenant authorization rather
+than becoming Prometheus labels.
+
+## Tenant fair scheduling
+
+`EVOAGENT_QUEUE_FAIR_SCHEDULING=true` enables weighted round-robin dispatch on
+the production Redis Streams backend. It does not change Outbox publication,
+consumer-group ACK, retry/DLQ, or lease-reclaim durability. Every new envelope
+receives a SHA-256 tenant key, an integer weight from 1 to 100, and the
+content-addressed policy digest. Redis Lua atomically grants up to that tenant's
+weight in one turn or moves the entry to the stream tail while another tenant is
+waiting. Raw tenant identifiers never enter scheduler keys or Prometheus labels.
+
+The scheduler currently requires a single logical Redis primary (with optional
+replicas/failover) because one Lua decision touches the stream and several
+scheduler keys atomically. Redis Cluster sharding is not supported: these keys
+do not share a cluster hash slot. Keep the queue and scheduler keys in the same
+non-clustered Redis service, and test the managed-service failover mode before
+enabling fairness in production.
+
+The optional `EVOAGENT_QUEUE_TENANT_WEIGHTS_FILE` is bounded v1 TOML:
+
+```toml
+version = 1
+id = "service-tiers-v1"
+default_weight = 1
+
+[tenants]
+"standard-tenant" = 1
+"priority-tenant" = 2
+```
+
+Use a non-sensitive stable `id` for rollout comparison and the smallest weights
+that express the service tier. A weight controls
+dispatch starts, not CPU seconds or model cost: a tenant whose reviews run much
+longer can still consume more worker time. The tenant-authorized
+`/api/tenant-review-capacity` response exposes only that tenant's effective
+weight and the non-sensitive policy ID. Health exposes the ID, configured mode,
+and aggregate waiting-tenant count. The content SHA-256 remains inside the
+trusted Redis envelope as execution evidence rather than becoming a public
+cross-tenant configuration fingerprint.
+
+Roll out in two stages. First deploy v0.29 or newer to every queue publisher and
+consumer with fairness disabled. Only after all old workers are gone may the
+flag be enabled through reviewed configuration; v0.29 workers that are not yet
+enabled still recognize and coordinate marked envelopes during the configuration
+rollout. Legacy unmarked backlog remains compatible and drains in original
+stream order. Before rolling back to a pre-v0.29 binary, disable new marking and
+wait until the Redis stream, pending set, `fair_waiting_tenants`, and fairness
+entry/admission hashes are empty. Do not delete scheduler hashes to force a
+rollback: that can bypass turns or strand accounting.
+
+An admitted entry moves from the waiting hash to an admission hash before its
+handler starts. A dedicated live-delivery heartbeat resets its Redis pending
+idle time, preventing a legitimate task longer than the static lease from being
+claimed concurrently. If the process actually crashes, the heartbeat stops and
+`XAUTOCLAIM` recognizes the retained admission without decrementing the tenant
+twice. A transient failure publishes a newly tracked retry before ACKing the old
+entry; final DLQ uses the existing task admission generation rules. Invalid
+marker/index correspondence fails closed to DLQ instead of bypassing fairness.
+
+Investigate `EvoAgentTenantFairnessChurnHigh` with
+`evoagent:ratio:queue_fair_deferrals_15m`, queue age/depth, waiting tenants,
+worker concurrency, admission saturation, and the current policy ID. A high
+ratio normally means one tenant placed a long contiguous burst ahead of other
+tenants, requiring bounded tail moves to restore turns. Keep the per-tenant
+durable admission limit enabled to bound that work. If queue age also breaches,
+reduce intake or add proven downstream capacity; raising weights merely moves
+latency between tenants. Never add tenant IDs as metric labels.
 
 ## History retention
 

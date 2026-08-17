@@ -76,6 +76,7 @@ evoagent = ["py.typed"]
 "share/evoagent/ops" = ["ops/slo.toml"]
 "share/evoagent/ops/prometheus" = ["ops/prometheus/evoagent.rules.yml"]
 "share/evoagent/ops/grafana" = ["ops/grafana/evoagent-overview.json"]
+"share/evoagent/examples" = ["examples/tenant-queue-weights.toml"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

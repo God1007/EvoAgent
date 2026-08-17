@@ -14,6 +14,8 @@ Redis 7, and Docker.
 | PostgreSQL pool | Checkout timeout is bounded; a server-terminated connection is replaced |
 | Redis publication | Stable message IDs deduplicate across queue object/process restart |
 | Redis consumption | A process dies after `XREADGROUP`; another consumer reclaims after the lease |
+| Redis tenant fairness | Uniform and weighted tenant backlogs rotate handler starts through atomic cross-replica scheduler state; retries and reclaimed admissions leave no waiting/index leak |
+| Redis live lease | A handler that runs beyond the static reclaim lease renews its pending idle time and is not executed concurrently by another consumer |
 | Redis recovery | A disconnected client socket reconnects without permanently losing its worker |
 | Redis DLQ | Permanent failure survives queue restart and explicit replay succeeds |
 | GitHub transport | Auth/version headers, retry response, JSON body, and PATCH upsert cross a real HTTP socket |
@@ -23,7 +25,7 @@ Redis 7, and Docker.
 | Queue reconstruction | A previously published incomplete task is planned, audited, restaged, and published through the production Outbox/TaskQueue path only after reserving an empty Redis logical database |
 | Evaluation evidence | Answer-free cases, blind dual annotations, independent adjudication, packet hashes, provenance sidecar, slice metrics, and fail-closed tamper cases run in the normal quality suite |
 | Distribution | The installed wheel serves packaged web assets and contains the bundled Skill |
-| Production image | `/ready` sees Postgres, Redis workers, schema and Outbox; async review reaches `SUCCESS`; SIGTERM exits cleanly |
+| Production image | `/ready` sees Postgres, Redis workers, lease heartbeat, enabled fair scheduling, schema and Outbox; async review reaches `SUCCESS`; SIGTERM exits cleanly |
 
 ## Local reproduction
 

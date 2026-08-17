@@ -98,6 +98,8 @@ class Settings:
     queue_max_attempts: int = 3
     queue_lease_seconds: int = 60
     queue_shutdown_timeout_seconds: int = 30
+    queue_fair_scheduling: bool = False
+    queue_tenant_weights_file: str = ""
     skill_timeout_seconds: int = 30
     skill_memory_mb: int = 256
     skill_sandbox: bool = True
@@ -282,6 +284,8 @@ class Settings:
             raise ValueError("EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS must be between 0 and 1000000")
         if not 1 <= self.tenant_capacity_retry_seconds <= 3600:
             raise ValueError("EVOAGENT_TENANT_CAPACITY_RETRY_SECONDS must be between 1 and 3600")
+        if self.queue_fair_scheduling and not self.redis_url:
+            raise ValueError("EVOAGENT_QUEUE_FAIR_SCHEDULING requires EVOAGENT_REDIS_URL")
         if (
             (self.llm_daily_cost_micros > 0 or self.llm_shadow_daily_cost_micros > 0)
             and self.llm_input_cost_micros_per_million == 0
@@ -398,6 +402,8 @@ class Settings:
             queue_shutdown_timeout_seconds=_non_negative_int(
                 "EVOAGENT_QUEUE_SHUTDOWN_TIMEOUT_SECONDS", 30
             ),
+            queue_fair_scheduling=_bool("EVOAGENT_QUEUE_FAIR_SCHEDULING", False),
+            queue_tenant_weights_file=os.getenv("EVOAGENT_QUEUE_TENANT_WEIGHTS_FILE", ""),
             skill_timeout_seconds=_int("EVOAGENT_SKILL_TIMEOUT_SECONDS", 30),
             skill_memory_mb=_int("EVOAGENT_SKILL_MEMORY_MB", 256),
             skill_sandbox=_bool("EVOAGENT_SKILL_SANDBOX", True),

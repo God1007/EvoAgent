@@ -93,6 +93,7 @@ class Settings:
     skill_sandbox: bool = True
     skill_signing_key: str = ""
     skill_container_image: str = ""
+    skill_require_container: bool = False
     repair_test_command: str = ""
     repair_verify_timeout_seconds: int = 120
     repair_container_image: str = ""
@@ -316,6 +317,7 @@ class Settings:
             skill_sandbox=_bool("EVOAGENT_SKILL_SANDBOX", True),
             skill_signing_key=os.getenv("EVOAGENT_SKILL_SIGNING_KEY", ""),
             skill_container_image=os.getenv("EVOAGENT_SKILL_CONTAINER_IMAGE", ""),
+            skill_require_container=_bool("EVOAGENT_SKILL_REQUIRE_CONTAINER", False),
             repair_test_command=os.getenv("EVOAGENT_REPAIR_TEST_COMMAND", ""),
             repair_verify_timeout_seconds=_int("EVOAGENT_REPAIR_VERIFY_TIMEOUT_SECONDS", 120),
             repair_container_image=os.getenv("EVOAGENT_REPAIR_CONTAINER_IMAGE", ""),

@@ -5,9 +5,18 @@ import unittest
 from unittest import mock
 
 from evoagent.bootstrap import build_application_runtime
-from evoagent.capabilities import FIX_RULE, GITHUB_CLIENT, MODEL_GATEWAY, PROOF_EXECUTOR, STORE
+from evoagent.capabilities import (
+    FIX_RULE,
+    GITHUB_CLIENT,
+    MODEL_GATEWAY,
+    PROOF_EXECUTOR,
+    REVIEWER,
+    STORE,
+)
 from evoagent.config import Settings
+from evoagent.diff_parser import parse_unified_diff
 from evoagent.fix_rules import RuleMutation
+from evoagent.models import Finding, Severity
 from evoagent.plugins import (
     CapabilityKey,
     PluginActivationError,
@@ -21,6 +30,8 @@ from evoagent.plugins import (
     RuntimeState,
     discover_plugins,
 )
+from evoagent.review_extensions import ReviewerContribution
+from evoagent.reviewer import Reviewer
 from evoagent.service import ReviewService
 
 
@@ -337,6 +348,84 @@ class ApplicationCompositionTests(unittest.TestCase):
         self.assertEqual("running", status["state"])
         self.assertGreaterEqual(len(status["plugins"]), 10)
         self.assertIsNotNone(runtime.require(STORE))
+        self.assertEqual(
+            ["evoagent.reviewer.security", "evoagent.reviewer.reliability"],
+            status["capabilities"][REVIEWER.name],
+        )
+
+    def test_reviewer_plugin_contributes_without_replacing_the_review_engine(self):
+        class CompanyReviewer(Reviewer):
+            name = "company-reviewer"
+
+            def review(self, _diff, parsed):
+                line = parsed.added_lines[0]
+                return [
+                    Finding(
+                        "COMPANY-RULE",
+                        Severity.HIGH,
+                        "Company invariant",
+                        "The change violates a company invariant.",
+                        line.path,
+                        line.line,
+                        line.content,
+                        "Use the approved wrapper.",
+                        "Add a policy regression test.",
+                        0.95,
+                    )
+                ]
+
+        plugin = ProviderPlugin(
+            PluginManifest(
+                "company.reviewer.policy",
+                "1.0.0",
+                (REVIEWER.name,),
+                priority=30,
+            ),
+            REVIEWER,
+            lambda _context: ReviewerContribution(
+                "company-policy-review",
+                CompanyReviewer(),
+                description="Company policy reviewer",
+                source="company.reviewer.policy",
+            ),
+        )
+        service = ReviewService(_settings(self.path), plugins=[plugin])
+        self.addCleanup(service.close)
+        diff = "--- a/app.py\n+++ b/app.py\n@@ -0,0 +1 @@\n+approved_call()\n"
+
+        findings = service.reviewer.review(diff, parse_unified_diff(diff))
+
+        self.assertIn("COMPANY-RULE", {item.rule_id for item in findings})
+        inventory = {item["name"]: item for item in service.registry.list()}
+        self.assertEqual("company.reviewer.policy", inventory["company-policy-review"]["source"])
+
+    def test_profile_can_remove_one_reviewer_provider_without_engine_changes(self):
+        profile = PluginProfile(disabled=frozenset({"evoagent.reviewer.security"}))
+        service = ReviewService(_settings(self.path), plugin_profile=profile)
+        self.addCleanup(service.close)
+        names = {item["name"] for item in service.registry.list()}
+
+        self.assertNotIn("security-review", names)
+        self.assertIn("reliability-review", names)
+
+    def test_duplicate_reviewer_contribution_ids_fail_transactionally(self):
+        class DuplicateReviewer(Reviewer):
+            name = "duplicate-reviewer"
+
+            def review(self, _diff, _parsed):
+                return []
+
+        plugin = ProviderPlugin(
+            PluginManifest("company.reviewer.collision", "1.0.0", (REVIEWER.name,)),
+            REVIEWER,
+            lambda _context: ReviewerContribution(
+                "security-review",
+                DuplicateReviewer(),
+            ),
+        )
+
+        with self.assertRaisesRegex(PluginActivationError, "duplicate reviewer contribution"):
+            ReviewService(_settings(self.path), plugins=[plugin])
 
     def test_service_can_replace_a_builtin_provider_by_stable_plugin_id(self):
         fake_github = object()

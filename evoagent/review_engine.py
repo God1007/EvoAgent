@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from .agents import FilteredAgent, MultiAgentCoordinator
+from collections.abc import Sequence
+
+from .agents import MultiAgentCoordinator
 from .config import Settings
 from .harness import ReviewHarness
 from .model_gateway import ModelGovernanceContext
 from .observability import Observability
 from .ports import ModelGatewayPort, ReviewWorkflowStorePort
-from .reviewer import GatewayReviewer, LocalRuleReviewer, Reviewer
+from .review_extensions import ReviewerContribution
+from .reviewer import GatewayReviewer, Reviewer
 from .skills import SkillRegistry
 
 
@@ -21,6 +24,7 @@ class ReviewEngine:
         store: ReviewWorkflowStorePort,
         observability: Observability,
         model_gateway: ModelGatewayPort,
+        reviewer_contributions: Sequence[ReviewerContribution],
     ):
         self.settings = settings
         self.store = store
@@ -34,20 +38,24 @@ class ReviewEngine:
             settings.skill_memory_mb,
             settings.skill_signing_key,
             settings.skill_container_image,
+            settings.skill_require_container,
         )
-        local = LocalRuleReviewer()
-        self.registry.register(
-            "security-review",
-            FilteredAgent("security-agent", local, ("SEC-",)),
-            "1.0.0",
-            "Security, injection and secret detection",
+        contribution_ids = [item.contribution_id for item in reviewer_contributions]
+        duplicates = sorted(
+            contribution_id
+            for contribution_id in set(contribution_ids)
+            if contribution_ids.count(contribution_id) > 1
         )
-        self.registry.register(
-            "reliability-review",
-            FilteredAgent("reliability-agent", local, ("REL-",)),
-            "1.0.0",
-            "Reliability and observability review",
-        )
+        if duplicates:
+            raise ValueError("duplicate reviewer contribution ids: %s" % ", ".join(duplicates))
+        for contribution in reviewer_contributions:
+            self.registry.register(
+                contribution.contribution_id,
+                contribution.reviewer,
+                contribution.version,
+                contribution.description,
+                contribution.source,
+            )
         self.reviewer: Reviewer
         self.harness: ReviewHarness
         self.reload()

@@ -88,6 +88,7 @@ jobs:
           "$wheel_env/bin/evoagent-dr" --help >/dev/null
           "$wheel_env/bin/evoagent-recover-queue" --help >/dev/null
           "$wheel_env/bin/evoagent-eval-labels" --help >/dev/null
+          "$wheel_env/bin/python" -c "from evoagent.review_extensions import ReviewerContribution"
           "$wheel_env/bin/evoagent-migrate" | grep -q '"schema_version": 8'
           kill -TERM "$wheel_pid"
           wait "$wheel_pid"

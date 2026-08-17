@@ -18,10 +18,10 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Runtime | `evoagent/harness.py` | LangGraph state machine, budget, retry, checkpoint/resume |
 | Runtime | `evoagent/task_queue.py` | In-process queue or Redis Streams (ACK, lease, DLQ, replay) |
 | Runtime | `evoagent/outbox.py` | Store-to-queue transactional publication, leases, retry and recovery |
-| Review | `evoagent/review_engine.py`, `agents.py` | Replaceable review engine and default multi-agent collaboration protocol |
+| Review | `evoagent/review_extensions.py`, `review_engine.py`, `agents.py` | Stable reviewer-contribution seam, replaceable engine, and default multi-agent collaboration protocol |
 | Review | `evoagent/reviewer.py` | Local deterministic rules + governed gateway reviewer + composite |
 | Model gateway | `evoagent/model_gateway.py` | Secret redaction, egress/output limits, budget reservation, and usage accounting |
-| Review | `evoagent/skills.py` | Dynamic skill registry, manifest/hash/signature checks, sandboxed execution |
+| Review | `evoagent/skills.py`, `skill_runner.py` | Transactional dynamic-skill snapshots, manifest/hash/signature checks, bounded sandboxed execution |
 | Delivery | `evoagent/fix_rules.py`, `fixer.py` | Pluggable deterministic transforms plus verified auto-repair on a dedicated branch |
 | Delivery | `evoagent/verifier.py` | Compile/test gates with container or host isolation |
 | Evidence | `evoagent/proof.py`, `proof_remote.py` | L1–L4 grading plus authenticated local/remote execution and attestations |

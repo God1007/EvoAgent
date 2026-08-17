@@ -19,6 +19,7 @@ from .ports import (
     QueueFactoryPort,
 )
 from .review_engine import ReviewEngine
+from .review_extensions import ReviewerContribution
 from .rollout import ReleaseManager
 
 SETTINGS = CapabilityKey[Settings]("settings")
@@ -31,6 +32,7 @@ MODEL_GATEWAY = CapabilityKey[ModelGatewayPort]("model.gateway")
 PROOF_EXECUTOR = CapabilityKey[ProofExecutorPort]("proof.executor")
 GITHUB_CLIENT = CapabilityKey[CodeHostPort]("codehost.github")
 REVIEW_ENGINE = CapabilityKey[ReviewEngine]("review.engine")
+REVIEWER = CapabilityKey[ReviewerContribution]("review.reviewer", multiple=True)
 FIX_RULE = CapabilityKey[FixRule]("fix.rule", multiple=True)
 FIXER = CapabilityKey[SafeFixer]("fixer")
 AUTH = CapabilityKey[AuthManager]("auth")

@@ -4,7 +4,7 @@ EvoAgent 有两种扩展机制，二者不能混用：
 
 | 机制 | 适用能力 | 运行位置 | 信任等级 |
 | --- | --- | --- | --- |
-| Trusted Plugin | Store、Queue、LLM、Review Engine、代码托管、可观测性、FixRule | 服务主进程 | 运维方审核并安装的可信代码 |
+| Trusted Plugin | Store、Queue、LLM、Reviewer、Review Engine、代码托管、可观测性、FixRule | 服务主进程 | 运维方审核并安装的可信代码 |
 | Dynamic Skill | 第三方代码审查规则 | 受限子进程或容器 | 不可信代码，不获得主进程凭据 |
 
 Trusted Plugin 负责企业部署所需的可替换基础设施；Dynamic Skill 负责在安全边界外扩展审查能力。
@@ -62,6 +62,7 @@ manifest = PluginManifest(
 | `model.gateway` | `evoagent.model-gateway` | 模型路由、脱敏、配额与用量账本 |
 | `proof.executor` | `evoagent.proof-executor` | 容器化本地或签名远程证据执行 |
 | `codehost.github` | `evoagent.codehost.github` | GitHub Adapter |
+| `review.reviewer` | `evoagent.reviewer.security`、`evoagent.reviewer.reliability` | 可组合 Reviewer contribution（多 Provider） |
 | `review.engine` | `evoagent.review-engine` | Reviewer Graph 与 Harness |
 | `fix.rule` | `evoagent.fix-rule.*` | 可组合确定性修复规则 |
 | `fixer` | `evoagent.fixer` | 修复计划、验证和发布 |
@@ -76,7 +77,48 @@ Capability 负责“选择哪个 Provider”，`evoagent.ports` 中的 Protocol 
 “Provider 必须遵守什么行为合同”。Store、Queue、CodeHost 替换实现必须运行
 [`adapter-contracts.md`](adapter-contracts.md) 中的共享契约测试，不能只满足同名方法。
 
-## 3. 添加可插拔 FixRule
+## 3. 添加可插拔 Reviewer
+
+Reviewer 扩展分成三个角色：`ReviewerContribution` 定义稳定合同，可信插件提供
+`review.reviewer`，默认 `ReviewEngine` 收集所有启用 Provider。新增审查器不需要替换
+Engine，也不能与已有 contribution ID 冲突：
+
+```python
+from evoagent.capabilities import REVIEWER
+from evoagent.plugins import PluginManifest, ProviderPlugin
+from evoagent.review_extensions import ReviewerContribution
+from evoagent.reviewer import Reviewer
+
+
+class CompanyPolicyReviewer(Reviewer):
+    name = "company-policy-agent"
+
+    def review(self, diff, parsed):
+        return []  # 返回经过新增行位置约束的 Finding
+
+
+def create_plugin():
+    return ProviderPlugin(
+        PluginManifest(
+            plugin_id="company.reviewer.policy",
+            version="1.0.0",
+            provides=(REVIEWER.name,),
+            priority=30,
+        ),
+        REVIEWER,
+        lambda _context: ReviewerContribution(
+            "company-policy-review",
+            CompanyPolicyReviewer(),
+            source="company.reviewer.policy",
+        ),
+    )
+```
+
+Profile 可以独立关闭 `evoagent.reviewer.security` 或
+`evoagent.reviewer.reliability`。不可信审查代码不能使用这个主进程 seam，必须走
+Dynamic Skill。
+
+## 4. 添加可插拔 FixRule
 
 下面的插件把目标行中的整数 `0` 改为 `1`，仅用于展示协议：
 
@@ -131,7 +173,7 @@ export EVOAGENT_PLUGIN_ALLOWLIST=company.fix-rule.replace-zero
 
 同一个 `fix.rule` 可以有多个 Provider。`SafeFixer` 会在启动时收集所有启用规则，拒绝重复 Rule ID，并继续统一执行编译、测试和独立修复 PR 门禁。
 
-## 4. 订阅生命周期事件
+## 5. 订阅生命周期事件
 
 Observer 不参与主流程决策，异常会被隔离并计入 `plugin_event_failures_total`：
 
@@ -169,7 +211,7 @@ class AuditPlugin:
 
 事件不会携带原始 Diff、Token 或 LLM API Key。需要改变业务结果的 Policy Hook 尚未开放，以免插件绕过任务状态和验证不变量。
 
-## 5. Profile
+## 6. Profile
 
 ```toml
 [profile]
@@ -191,7 +233,7 @@ export EVOAGENT_PLUGIN_PROFILE=/etc/evoagent/production.toml
 
 插件通过 `context.config` 读取自己的配置。配置中不能保存密钥；密钥仍应来自 Secret Manager 注入的环境变量。
 
-## 6. Provider 替换和 Scope
+## 7. Provider 替换和 Scope
 
 传入与内置插件相同的稳定 Plugin ID，即可替换默认实现。例如自定义 Store Provider 使用 `evoagent.store`，同时提供 `STORE` Capability。替换发生在候选运行图启动前，不会同时启动两份相同 ID 的 Provider。
 
@@ -206,7 +248,25 @@ global
 
 子 Scope 优先解析本地 Provider，不存在时继承父 Scope。关闭子 Scope 只释放本层资源。Scope 不是权限或进程隔离边界；不可信代码仍必须使用 Dynamic Skill 或 Verifier 容器。
 
-## 7. 上线检查
+## 8. Dynamic Skill 的事务加载边界
+
+Dynamic Skill reload 先在内存中完整校验候选集合，再一次性替换旧集合。任何 Manifest、
+哈希、签名、路径或命名冲突都会保留上一版运行集合；从目录删除的 Skill 会在成功 reload
+后退役。执行器使用 reload 时捕获的、按 SHA-256 绑定的源码快照，而不是再次读取可变路径，
+从而关闭“校验后替换文件”的竞态。stdout/stderr、源码、时间、内存和文件句柄均有上限，
+文件写入、网络、子进程和危险 OS 操作会被拒绝。
+
+本地受限子进程是开发模式的纵深防御，不等于内核级隔离。企业环境应设置：
+
+```bash
+export EVOAGENT_SKILL_REQUIRE_CONTAINER=true
+export EVOAGENT_SKILL_CONTAINER_IMAGE='registry.example/evoagent-skill-runner@sha256:...'
+```
+
+这样存在 Dynamic Skill 但未配置独立容器镜像时，服务会 fail-closed。可信 Plugin 仍在
+主进程运行，因此必须使用 allowlist、固定版本和制品哈希。
+
+## 9. 上线检查
 
 - 插件包版本和哈希已锁定；
 - Plugin ID 已加入 `EVOAGENT_PLUGIN_ALLOWLIST`；
@@ -216,4 +276,6 @@ global
 - 事件载荷不包含源码和密钥；
 - `/health` 中 `plugin_runtime=running` 且 Profile 正确；
 - 新 FixRule 同时包含肯定样本、拒绝修复样本和编译验证。
+- 新 Reviewer 使用唯一 contribution ID，且可通过 Profile 单独启停。
+- Dynamic Skill reload 失败时旧快照仍可用，生产环境要求固定摘要的容器镜像。
 - 新 Store、Queue 或 CodeHost Provider 已满足对应 Port，并通过共享行为契约。

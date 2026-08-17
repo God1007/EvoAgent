@@ -44,8 +44,8 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **GitHub 自动化** | 支持 PR Webhook、幂等投递、Diff 拉取、评论 upsert 和独立修复 PR |
 | **保守型自动修复** | 仅处理可确定转换的规则，在新分支生成原子提交，并经过编译与可选测试门禁 |
 | **受控能力演进** | 从误报、漏报和坏修复中生成候选 Prompt，通过 Validation/Holdout 回放门禁后才允许激活 |
-| **动态 Skills** | 基于 manifest 加载自定义审查器，支持哈希/签名校验、超时、内存限制和隔离进程 |
-| **可插拔微内核** | Store、Queue、Model Gateway、Proof Executor、Review Engine、代码托管、可观测性和 FixRule 通过稳定 Capability 组合，支持依赖校验、启动回滚、Profile 与作用域覆盖 |
+| **动态 Skills** | 基于 manifest 事务加载内容寻址的审查器快照，支持哈希/签名、输出/时间/内存上限、隔离进程及生产强制容器 |
+| **可插拔微内核** | Store、Queue、Model Gateway、Proof Executor、Reviewer、Review Engine、代码托管、可观测性和 FixRule 通过稳定 Capability 组合，支持依赖校验、启动回滚、Profile 与作用域覆盖 |
 | **模型治理网关** | 任务级租户/仓库上下文、凭据脱敏、HTTPS/出口主机限制、结构化输出门禁、Token/成本预算与元数据用量账本 |
 | **生产治理** | JWT、RBAC、多租户、仓库隔离、事务 Outbox、审计日志、灰度发布、影子流量、告警与死信队列 |
 | **可观测性** | 任务 Trace、Agent 消息、Prometheus 指标和 OpenTelemetry Trace |
@@ -269,8 +269,10 @@ curl 'http://127.0.0.1:8080/v1/tasks/<task-id>/report'
 单参数 `yaml.load(...)` 或显式 `secure=False` 时，才分别替换为
 `yaml.safe_load(...)` 和 `secure=True`；自定义 Loader、额外参数等不确定形态会拒绝自动修复。
 
-以上五种确定性修复均实现为独立 `fix.rule` Provider，可以通过 TOML
-Profile 单独禁用，也可以由可信插件新增规则，而无需修改 `SafeFixer`。
+安全与可靠性审查器也已实现为独立 `review.reviewer` Provider；企业插件可以新增
+Reviewer、调整优先级或通过 TOML Profile 禁用一个内置 Reviewer，而无需替换
+`ReviewEngine`。以上五种确定性修复均实现为独立 `fix.rule` Provider，同样可以独立
+启停或扩展，而无需修改 `SafeFixer`。
 插件协议、生命周期、信任边界和开发示例见
 [`docs/plugin-system.md`](docs/plugin-system.md)。
 
@@ -812,6 +814,8 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `EVOAGENT_PROOF_RUNNER_ALLOWED_HOSTS` | 空 | Runner 精确主机白名单（启用远程执行时必填） |
 | `EVOAGENT_PROOF_REQUIRE_REMOTE` | `false` | 是否要求远程 Runner 完整配置，否则启动失败 |
 | `EVOAGENT_SKILL_SANDBOX` | `true` | 动态 Skill 是否运行在沙箱中 |
+| `EVOAGENT_SKILL_CONTAINER_IMAGE` | 空 | Dynamic Skill 的独立容器镜像（生产建议固定 digest） |
+| `EVOAGENT_SKILL_REQUIRE_CONTAINER` | `false` | 存在 Dynamic Skill 时是否强制要求容器，否则启动失败 |
 | `EVOAGENT_OTEL_ENDPOINT` | 空 | OTLP HTTP Exporter 地址 |
 | `EVOAGENT_PROMETHEUS_URL` | `http://127.0.0.1:9090` | `evoagent-slo` 查询地址（非服务进程配置） |
 
@@ -829,7 +833,10 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 │   ├── outbox.py                 # 事务发布、租约重试与故障恢复
 │   ├── capabilities.py           # 稳定类型化 Capability 定义
 │   ├── bootstrap.py              # 默认 Provider Catalog 与应用组装
+│   ├── review_extensions.py      # Reviewer Contribution 稳定能力合同
 │   ├── review_engine.py          # 可替换 Reviewer Graph 与 Harness 组装
+│   ├── skills.py                 # Dynamic Skill 候选快照与事务 reload
+│   ├── skill_runner.py           # 有界、无权限的 Skill 子进程协议
 │   ├── model_gateway.py          # 模型脱敏、出口、预算、输出与用量治理
 │   ├── proof.py                  # L1–L4 证据阶梯与执行器端口消费
 │   ├── proof_remote.py           # 双向签名远程执行协议与独立 Runner

@@ -42,6 +42,9 @@ EvoAgent adopts a small trusted plugin runtime with these contracts:
 8. Deterministic repair rules are multi-valued `fix.rule` capabilities. Each rule
    is independently replaceable or disableable while `SafeFixer` continues to
    own compilation/test verification and publication safety.
+9. Reviewer contributors are multi-valued `review.reviewer` capabilities consumed
+   by the unchanged engine; the snapshot and trust-boundary details are extended
+   by [`ADR 0014`](0014-capability-seams-and-snapshotted-skills.md).
 
 The stable plugin API is `evoagent.plugin/v1`. Capability definitions live in
 `evoagent/capabilities.py`; the default provider catalog and composition root live
@@ -70,7 +73,7 @@ credentials.
 
 ## Consequences
 
-- New storage, queue, model, code-host, workflow, telemetry, and repair-rule
+- New storage, queue, model, code-host, reviewer, workflow, telemetry, and repair-rule
   providers can be integrated without editing `ReviewService`.
 - Startup failures no longer leave a partially assembled service or leaked pool.
 - The `/health` response exposes the active profile and plugin runtime state.

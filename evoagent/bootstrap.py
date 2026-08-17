@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from .agents import FilteredAgent
 from .auth import AuthManager
 from .capabilities import (
     ALERTS,
@@ -22,6 +23,7 @@ from .capabilities import (
     RELEASES,
     REPOSITORY_POLICY,
     REVIEW_ENGINE,
+    REVIEWER,
     SETTINGS,
     STORE,
 )
@@ -62,6 +64,8 @@ from .postgres_store import create_store
 from .proof import LocalProofExecutor
 from .proof_remote import RemoteProofExecutor
 from .review_engine import ReviewEngine
+from .review_extensions import ReviewerContribution
+from .reviewer import LocalRuleReviewer
 from .rollout import ReleaseManager
 from .task_queue import TaskQueue
 from .verifier import RepairVerifier
@@ -186,14 +190,41 @@ def default_plugins(settings: Settings) -> list[Plugin]:
             "GitHub code-host adapter",
         ),
         _provider(
+            "evoagent.reviewer.security",
+            REVIEWER,
+            (),
+            lambda _context: ReviewerContribution(
+                "security-review",
+                FilteredAgent("security-agent", LocalRuleReviewer(), ("SEC-",)),
+                description="Security, injection and secret detection",
+                source="evoagent.reviewer.security",
+            ),
+            "Built-in deterministic security reviewer contribution",
+            priority=20,
+        ),
+        _provider(
+            "evoagent.reviewer.reliability",
+            REVIEWER,
+            (),
+            lambda _context: ReviewerContribution(
+                "reliability-review",
+                FilteredAgent("reliability-agent", LocalRuleReviewer(), ("REL-",)),
+                description="Reliability and observability review",
+                source="evoagent.reviewer.reliability",
+            ),
+            "Built-in deterministic reliability reviewer contribution",
+            priority=10,
+        ),
+        _provider(
             "evoagent.review-engine",
             REVIEW_ENGINE,
-            (SETTINGS, STORE, OBSERVABILITY, MODEL_GATEWAY),
+            (SETTINGS, STORE, OBSERVABILITY, MODEL_GATEWAY, REVIEWER),
             lambda context: ReviewEngine(
                 context.require(SETTINGS),
                 context.require(STORE),
                 context.require(OBSERVABILITY),
                 context.require(MODEL_GATEWAY),
+                context.all(REVIEWER),
             ),
             "Default multi-agent review workflow",
         ),
@@ -291,6 +322,7 @@ def _provider(
     factory: Callable[[PluginContext], Any],
     description: str,
     close: Callable[[Any], None] | None = None,
+    priority: int = 0,
 ) -> ProviderPlugin[Any]:
     return ProviderPlugin(
         PluginManifest(
@@ -298,6 +330,7 @@ def _provider(
             version="1.0.0",
             provides=(capability.name,),
             requires=tuple(item.name for item in requires),
+            priority=priority,
             description=description,
         ),
         capability,

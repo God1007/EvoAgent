@@ -134,6 +134,38 @@ class AdmissionControlTests(unittest.TestCase):
         self.assertEqual(4096, fetched["policy"]["max_diff_bytes"])
         self.assertEqual([1], [item["version"] for item in fetched["history"]])
 
+    def test_model_usage_api_is_tenant_scoped_operational_metadata(self):
+        host, port = self._serve(self._settings())
+        request_id = "model-request-1"
+        self.service.store.reserve_model_usage(
+            {
+                "request_id": request_id,
+                "tenant_id": "default",
+                "repository": "org/repo",
+                "task_id": "task-1",
+                "purpose": "review",
+                "provider": "test",
+                "model": "model-a",
+                "reserved_tokens": 20,
+                "reserved_cost_micros": 4,
+                "redactions": 1,
+                "request_sha256": "a" * 64,
+                "created_at": "2026-08-17T00:00:00+00:00",
+            },
+            "2026-08-17T00:00:00+00:00",
+        )
+        self.service.store.complete_model_usage(request_id, "success", 10, 3, 2)
+
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        self.addCleanup(conn.close)
+        conn.request("GET", "/api/model-usage?repository=org%2Frepo")
+        response = conn.getresponse()
+        payload = json.loads(response.read())
+
+        self.assertEqual(200, response.status)
+        self.assertEqual([request_id], [item["request_id"] for item in payload["usage"]])
+        self.assertNotIn("messages", payload["usage"][0])
+
     def test_rejected_requests_are_counted_in_metrics(self):
         host, port = self._serve(self._settings(rate_limit_rps=1, rate_limit_burst=1))
         conn = http.client.HTTPConnection(host, port, timeout=5)

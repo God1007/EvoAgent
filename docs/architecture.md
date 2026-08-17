@@ -11,7 +11,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Intake | `evoagent/api.py` | HTTP API, static web console, `/webhooks/github`, `/health`, `/metrics` |
 | Composition | `evoagent/plugins.py` | Trusted plugin manifests, capability registry, scopes, events, dependency graph, lifecycle rollback |
 | Composition | `evoagent/capabilities.py` | Stable typed capability definitions for providers and consumers |
-| Domain boundary | `evoagent/ports.py` | Focused Store, Queue, and CodeHost behavioral contracts |
+| Domain boundary | `evoagent/ports.py` | Focused Store, Queue, CodeHost, and Model Gateway behavioral contracts |
 | Composition | `evoagent/bootstrap.py` | Replaceable built-in provider catalog and transactional application startup |
 | Application | `evoagent/application/` | Focused Review, Webhook, Session, Repair, and Policy use cases |
 | Composition facade | `evoagent/service.py` | Capability wiring, lifecycle/health, canary/shadow runtime selection, API compatibility |
@@ -19,7 +19,8 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Runtime | `evoagent/task_queue.py` | In-process queue or Redis Streams (ACK, lease, DLQ, replay) |
 | Runtime | `evoagent/outbox.py` | Store-to-queue transactional publication, leases, retry and recovery |
 | Review | `evoagent/review_engine.py`, `agents.py` | Replaceable review engine and default multi-agent collaboration protocol |
-| Review | `evoagent/reviewer.py` | Local deterministic rules + OpenAI-compatible reviewer + composite |
+| Review | `evoagent/reviewer.py` | Local deterministic rules + governed gateway reviewer + composite |
+| Model gateway | `evoagent/model_gateway.py` | Secret redaction, egress/output limits, budget reservation, and usage accounting |
 | Review | `evoagent/skills.py` | Dynamic skill registry, manifest/hash/signature checks, sandboxed execution |
 | Delivery | `evoagent/fix_rules.py`, `fixer.py` | Pluggable deterministic transforms plus verified auto-repair on a dedicated branch |
 | Delivery | `evoagent/verifier.py` | Compile/test gates with container or host isolation |
@@ -51,6 +52,7 @@ change (webhook | REST | console)
   → TaskQueue                               # in-process or Redis Streams
   → ReviewHarness.run                       # LangGraph nodes, checkpoint each step
       parse → plan → specialists (security, reliability, llm, skills)
+            llm → ModelGateway (scope → redact → reserve → call → validate → account)
             → evidence gate (critic, test) → synthesize → verify
   → ReviewReport (findings with stable fingerprints)
   → delivery: report + optional PR comment upsert + optional verified fix PR
@@ -81,9 +83,9 @@ before the remaining infrastructure is forced closed.
 
 The default graph exposes stable capabilities for settings, store,
 observability, GitHub/LLM circuit breakers, GitHub delivery, the review engine,
-repair rules, the verified fixer, authentication, release governance, alerting,
-evolution, and the queue factory. `ReviewService` consumes these contracts and
-does not instantiate their implementations directly.
+the model gateway, repair rules, the verified fixer, authentication, release
+governance, alerting, evolution, and the queue factory. `ReviewService` consumes
+these contracts and does not instantiate their implementations directly.
 
 Capability keys select providers; domain Ports constrain provider behavior.
 Lower-level modules depend on focused Store facets rather than the complete
@@ -142,6 +144,10 @@ The full analysis lives in [`threat-model.md`](threat-model.md). Key boundaries:
   for trusted repositories only).
 - **Outbound GitHub requests** are restricted to an HTTPS host allowlist with
   redirect token-stripping and response-size caps.
+- **Outbound model requests** pass through a tenant/repository-aware gateway;
+  likely credentials are redacted, the configured DNS host and HTTPS scheme are
+  checked, responses are size/token bounded, and raw prompts/responses are not
+  persisted in the usage ledger.
 - **Dynamic skills** run in a restricted subprocess with no host credentials.
 - **Trusted plugins** run in the main process and must be pinned, reviewed, and
   explicitly allowlisted. Plugin Scope is not a sandbox.
@@ -149,8 +155,8 @@ The full analysis lives in [`threat-model.md`](threat-model.md). Key boundaries:
 ## 6. Extension points
 
 - **New detection rule**: add to `LocalRuleReviewer.RULES` or ship a sandboxed Dynamic Skill.
-- **New reviewer/model**: implement the `Reviewer` interface; compose via
-  `CompositeReviewer`.
+- **New reviewer/model route**: replace the `model.gateway` capability or use
+  `GatewayReviewer`; model credentials stay outside reviewer/domain objects.
 - **New skill**: drop a manifest + entrypoint under `skills/<name>/`; see the
   README "自定义 Skill" section.
 - **New deterministic repair**: implement `FixRule` and provide the multi-valued

@@ -384,6 +384,40 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ON repository_policy_versions(tenant_id,repository,version DESC)",
         ),
     ),
+    Migration(
+        6,
+        "model-gateway-usage-ledger",
+        (
+            """CREATE TABLE IF NOT EXISTS model_usage (
+                request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                repository TEXT NOT NULL, task_id TEXT, purpose TEXT NOT NULL,
+                provider TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL,
+                reserved_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                reserved_cost_micros INTEGER NOT NULL DEFAULT 0,
+                cost_micros INTEGER NOT NULL DEFAULT 0, redactions INTEGER NOT NULL DEFAULT 0,
+                request_sha256 TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL,
+                completed_at TEXT)""",
+            "CREATE INDEX IF NOT EXISTS idx_model_usage_budget "
+            "ON model_usage(tenant_id,repository,created_at,status)",
+            "CREATE INDEX IF NOT EXISTS idx_model_usage_task ON model_usage(task_id,created_at)",
+        ),
+        (
+            """CREATE TABLE IF NOT EXISTS model_usage (
+                request_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,
+                repository TEXT NOT NULL, task_id TEXT, purpose TEXT NOT NULL,
+                provider TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL,
+                reserved_tokens BIGINT NOT NULL, input_tokens BIGINT NOT NULL DEFAULT 0,
+                output_tokens BIGINT NOT NULL DEFAULT 0,
+                reserved_cost_micros BIGINT NOT NULL DEFAULT 0,
+                cost_micros BIGINT NOT NULL DEFAULT 0, redactions INTEGER NOT NULL DEFAULT 0,
+                request_sha256 TEXT NOT NULL, error TEXT, created_at TIMESTAMPTZ NOT NULL,
+                completed_at TIMESTAMPTZ)""",
+            "CREATE INDEX IF NOT EXISTS idx_model_usage_budget "
+            "ON model_usage(tenant_id,repository,created_at,status)",
+            "CREATE INDEX IF NOT EXISTS idx_model_usage_task ON model_usage(task_id,created_at)",
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1].version

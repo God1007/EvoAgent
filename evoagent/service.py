@@ -23,6 +23,7 @@ from .capabilities import (
     GITHUB_BREAKER,
     GITHUB_CLIENT,
     LLM_BREAKER,
+    MODEL_GATEWAY,
     OBSERVABILITY,
     QUEUE_FACTORY,
     RELEASES,
@@ -38,7 +39,7 @@ from .outbox import OutboxDispatcher
 from .plugins import Plugin, PluginProfile, PluginRuntime
 from .ports import CodeHostPort
 from .review_engine import ReviewEngine
-from .reviewer import OpenAICompatibleReviewer
+from .reviewer import GatewayReviewer
 
 
 class ReviewService:
@@ -60,6 +61,7 @@ class ReviewService:
         try:
             self.github_breaker = self.plugin_runtime.require(GITHUB_BREAKER)
             self.llm_breaker = self.plugin_runtime.require(LLM_BREAKER)
+            self.model_gateway = self.plugin_runtime.require(MODEL_GATEWAY)
             self.store = self.plugin_runtime.require(STORE)
             self.policies = self.plugin_runtime.require(REPOSITORY_POLICY)
             self.observability = self.plugin_runtime.require(OBSERVABILITY)
@@ -316,7 +318,7 @@ class ReviewService:
             "queue_backend": self.queue.backend,
         }
 
-    def _build_llm_reviewer(self, prompt: str = "") -> OpenAICompatibleReviewer:
+    def _build_llm_reviewer(self, prompt: str = "") -> GatewayReviewer:
         return self.review_engine.build_llm_reviewer(prompt)
 
     def _candidate_reviewer(self, tenant_id: str):
@@ -355,7 +357,7 @@ class ReviewService:
                     [
                         item
                         for item in self.registry.reviewers()
-                        if not isinstance(item, OpenAICompatibleReviewer)
+                        if not isinstance(item, GatewayReviewer)
                     ]
                     + [candidate]
                 )
@@ -390,7 +392,7 @@ class ReviewService:
         }
         try:
             parsed = parse_unified_diff(diff)
-            findings = candidate.review(diff, parsed)
+            findings = candidate.review_with_context(task_id, diff, parsed)
             candidate_result: dict[str, object] = {
                 "finding_keys": sorted(item.fingerprint() for item in findings)
             }

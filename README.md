@@ -45,7 +45,8 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **保守型自动修复** | 仅处理可确定转换的规则，在新分支生成原子提交，并经过编译与可选测试门禁 |
 | **受控能力演进** | 从误报、漏报和坏修复中生成候选 Prompt，通过 Validation/Holdout 回放门禁后才允许激活 |
 | **动态 Skills** | 基于 manifest 加载自定义审查器，支持哈希/签名校验、超时、内存限制和隔离进程 |
-| **可插拔微内核** | Store、Queue、Review Engine、代码托管、可观测性和 FixRule 通过稳定 Capability 组合，支持依赖校验、启动回滚、Profile 与作用域覆盖 |
+| **可插拔微内核** | Store、Queue、Model Gateway、Review Engine、代码托管、可观测性和 FixRule 通过稳定 Capability 组合，支持依赖校验、启动回滚、Profile 与作用域覆盖 |
+| **模型治理网关** | 任务级租户/仓库上下文、凭据脱敏、HTTPS/出口主机限制、结构化输出门禁、Token/成本预算与元数据用量账本 |
 | **生产治理** | JWT、RBAC、多租户、仓库隔离、事务 Outbox、审计日志、灰度发布、影子流量、告警与死信队列 |
 | **可观测性** | 任务 Trace、Agent 消息、Prometheus 指标和 OpenTelemetry Trace |
 | **Web 控制台** | 提供运行总览、发起审查、任务中心、Skill 管理、演进实验室和 GitHub 配置页面 |
@@ -272,7 +273,10 @@ Profile 单独禁用，也可以由可信插件新增规则，而无需修改 `S
 
 ## 接入大模型
 
-EvoAgent 使用 OpenAI Chat Completions 兼容协议。无论使用哪个模型，输出都必须符合结构化 JSON Schema，并且发现位置必须属于 Diff 新增行。
+EvoAgent 使用 OpenAI Chat Completions 兼容协议。生产评审统一经过可替换的
+`model.gateway`，而不是由 Reviewer 直接持有端点和密钥。网关在调用前脱敏常见
+凭据并按租户/仓库原子预占当日预算，调用后校验 JSON 对象、输出 Token 上限并
+记账；原始 Prompt 和响应不会写入用量账本。发现位置仍必须属于 Diff 新增行。
 
 ### DeepSeek
 
@@ -310,7 +314,10 @@ export EVOAGENT_LLM_MODEL='<model-name>'
 python -m evoagent
 ```
 
-密钥只从环境变量读取，不要提交到代码仓库。
+密钥只从环境变量读取，不要提交到代码仓库。生产环境建议显式配置
+`EVOAGENT_LLM_ALLOWED_HOSTS`；它只接受精确 DNS 主机名。Token/成本上限和计价
+变量见 [`.env.example`](.env.example)，详细语义与当前单路由边界见
+[`docs/model-gateway.md`](docs/model-gateway.md)。
 
 ## 接入 GitHub
 
@@ -719,6 +726,7 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `POST` | `/v1/queue/dead-letters/replay` | 重放指定死信任务 |
 | `GET` | `/api/outbox` | 按状态查询事务 Outbox 消息 |
 | `POST` | `/v1/outbox/replay` | 审计并重放指定 Outbox 死消息 |
+| `GET` | `/api/model-usage` | 管理员按当前租户/可选仓库查询模型用量元数据 |
 
 `POST /v1/reviews` 的 Diff 默认最大为 1 MiB；单任务默认最多 8 步、120 秒。可通过 `.env.example` 中的环境变量调整。
 
@@ -740,6 +748,11 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `EVOAGENT_PLUGIN_DISCOVERY` | `false` | 是否发现已安装的可信插件 Entry Point |
 | `EVOAGENT_PLUGIN_ALLOWLIST` | 空 | 允许加载的可信 Plugin ID，逗号分隔 |
 | `EVOAGENT_LLM_PROVIDER` | `local` | `local`、`deepseek`、`openrouter-free` 或 `custom` |
+| `EVOAGENT_LLM_ALLOWED_HOSTS` | 当前路由主机 | 模型出口精确 DNS 主机 allowlist，逗号分隔 |
+| `EVOAGENT_LLM_MAX_INPUT_TOKENS` | `120000` | 单请求估算输入 Token 上限 |
+| `EVOAGENT_LLM_MAX_OUTPUT_TOKENS` | `4096` | 单请求最大输出 Token |
+| `EVOAGENT_LLM_DAILY_TOKEN_BUDGET` | `0` | 每租户/仓库/UTC 日 Token 预算；0 为关闭 |
+| `EVOAGENT_LLM_DAILY_COST_MICROS` | `0` | 每租户/仓库/UTC 日成本预算（微单位）；0 为关闭 |
 | `EVOAGENT_DATABASE_URL` | 空 | PostgreSQL URL；为空时使用 SQLite |
 | `EVOAGENT_REDIS_URL` | 空 | Redis URL；为空时使用进程内队列 |
 | `EVOAGENT_ASYNC_WORKERS` | `2` | 异步 Worker 数量 |
@@ -764,6 +777,7 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 │   ├── capabilities.py           # 稳定类型化 Capability 定义
 │   ├── bootstrap.py              # 默认 Provider Catalog 与应用组装
 │   ├── review_engine.py          # 可替换 Reviewer Graph 与 Harness 组装
+│   ├── model_gateway.py          # 模型脱敏、出口、预算、输出与用量治理
 │   ├── harness.py                # LangGraph、状态机与 Checkpoint
 │   ├── agents.py                 # 多 Agent 协作协议
 │   ├── reviewer.py               # 本地规则与 OpenAI-compatible Reviewer
@@ -811,7 +825,7 @@ make check
 
 当前整体行覆盖率约 87%，其中 `fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
 
-GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16 与 Redis 7，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离，以及生产镜像的 `/ready` → Outbox → Redis → Worker 全链路。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；质量门禁、可信插件微内核、数据库迁移、事务 Outbox、仓库策略与应用用例边界分别记录在 [`ADR 0001`](docs/adr/0001-engineering-quality-gates.md)、[`ADR 0002`](docs/adr/0002-trusted-plugin-microkernel.md)、[`ADR 0003`](docs/adr/0003-versioned-forward-only-migrations.md)、[`ADR 0004`](docs/adr/0004-transactional-outbox.md)、[`ADR 0005`](docs/adr/0005-versioned-repository-policy.md) 和 [`ADR 0006`](docs/adr/0006-use-case-boundaries-and-atomic-webhook-intake.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
+GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16 与 Redis 7，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离，以及生产镜像的 `/ready` → Outbox → Redis → Worker 全链路。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；后续架构决策记录在 [`docs/adr/`](docs/adr/)，模型治理见 [`ADR 0007`](docs/adr/0007-governed-model-gateway.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
 
 更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，仓库策略见 [`docs/repository-policies.md`](docs/repository-policies.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)，性能 SLO、压测方法与可复现基线见 [`docs/performance.md`](docs/performance.md) 与 [`docs/performance-baseline.md`](docs/performance-baseline.md)。
 

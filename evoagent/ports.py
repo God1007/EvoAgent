@@ -11,9 +11,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from .models import ReviewReport, TraceEvent
+
+if TYPE_CHECKING:
+    from .model_gateway import ModelRequest, ModelResponse
 
 
 class ReviewExecutionStorePort(Protocol):
@@ -343,6 +346,40 @@ class OutboxStorePort(Protocol):
     def requeue_outbox(self, message_id: str) -> bool: ...
 
 
+class ModelUsageStorePort(Protocol):
+    def reserve_model_usage(
+        self,
+        record: dict[str, Any],
+        period_start: str,
+        token_budget: int = 0,
+        cost_budget_micros: int = 0,
+    ) -> bool: ...
+
+    def complete_model_usage(
+        self,
+        request_id: str,
+        status: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_micros: int,
+        error: str = "",
+    ) -> bool: ...
+
+    def list_model_usage(
+        self, tenant_id: str, repository: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]: ...
+
+
+@runtime_checkable
+class ModelGatewayPort(Protocol):
+    @property
+    def configured(self) -> bool: ...
+
+    def route_info(self) -> dict[str, Any]: ...
+
+    def complete(self, request: ModelRequest) -> ModelResponse: ...
+
+
 class ServiceStorePort(Protocol):
     def ping(self) -> None: ...
 
@@ -479,6 +516,7 @@ class ApplicationStorePort(
     AlertStorePort,
     RepositoryPolicyStorePort,
     OutboxStorePort,
+    ModelUsageStorePort,
     ServiceStorePort,
     Protocol,
 ):

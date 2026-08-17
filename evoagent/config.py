@@ -64,6 +64,13 @@ class Settings:
     openrouter_api_key: str = ""
     openrouter_site_url: str = ""
     openrouter_app_name: str = "EvoAgent"
+    llm_allowed_hosts: tuple[str, ...] = ()
+    llm_max_input_tokens: int = 120000
+    llm_max_output_tokens: int = 4096
+    llm_daily_token_budget: int = 0
+    llm_daily_cost_micros: int = 0
+    llm_input_cost_micros_per_million: int = 0
+    llm_output_cost_micros_per_million: int = 0
     eval_max_cases: int = 5
     eval_min_cases: int = 3
     eval_min_improvement: float = 0.01
@@ -213,6 +220,14 @@ class Settings:
             raise ValueError(
                 "EVOAGENT_PLUGIN_ALLOWLIST is required when trusted plugin discovery is enabled"
             )
+        if (
+            self.llm_daily_cost_micros > 0
+            and self.llm_input_cost_micros_per_million == 0
+            and self.llm_output_cost_micros_per_million == 0
+        ):
+            raise ValueError(
+                "model input or output pricing is required when the daily cost budget is enabled"
+            )
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -244,6 +259,17 @@ class Settings:
             openrouter_api_key=os.getenv("EVOAGENT_OPENROUTER_API_KEY", ""),
             openrouter_site_url=os.getenv("EVOAGENT_OPENROUTER_SITE_URL", ""),
             openrouter_app_name=os.getenv("EVOAGENT_OPENROUTER_APP_NAME", "EvoAgent"),
+            llm_allowed_hosts=_csv("EVOAGENT_LLM_ALLOWED_HOSTS"),
+            llm_max_input_tokens=_int("EVOAGENT_LLM_MAX_INPUT_TOKENS", 120000),
+            llm_max_output_tokens=_int("EVOAGENT_LLM_MAX_OUTPUT_TOKENS", 4096),
+            llm_daily_token_budget=_non_negative_int("EVOAGENT_LLM_DAILY_TOKEN_BUDGET", 0),
+            llm_daily_cost_micros=_non_negative_int("EVOAGENT_LLM_DAILY_COST_MICROS", 0),
+            llm_input_cost_micros_per_million=_non_negative_int(
+                "EVOAGENT_LLM_INPUT_COST_MICROS_PER_MILLION", 0
+            ),
+            llm_output_cost_micros_per_million=_non_negative_int(
+                "EVOAGENT_LLM_OUTPUT_COST_MICROS_PER_MILLION", 0
+            ),
             eval_max_cases=_int("EVOAGENT_EVAL_MAX_CASES", 5),
             eval_min_cases=_int("EVOAGENT_EVAL_MIN_CASES", 3),
             eval_min_improvement=float(os.getenv("EVOAGENT_EVAL_MIN_IMPROVEMENT", "0.01")),

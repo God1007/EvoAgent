@@ -351,6 +351,95 @@ class _StoreBehaviorContract:
             )
         )
 
+    def test_model_usage_budget_reservation_contract(self):
+        tenant_id = self.unique("model-tenant")
+        repository = "acme/" + self.unique("model-repository")
+
+        def record(request_id: str, tokens: int, cost: int) -> dict:
+            return {
+                "request_id": request_id,
+                "tenant_id": tenant_id,
+                "repository": repository,
+                "task_id": None,
+                "purpose": "review",
+                "provider": "contract",
+                "model": "model-a",
+                "reserved_tokens": tokens,
+                "reserved_cost_micros": cost,
+                "redactions": 1,
+                "request_sha256": "a" * 64,
+                "created_at": utc_now(),
+            }
+
+        first = self.unique("model-request")
+        second = self.unique("model-request")
+        period_start = "2000-01-01T00:00:00+00:00"
+        self.assertTrue(
+            self.store.reserve_model_usage(record(first, 60, 60), period_start, 100, 100)
+        )
+        self.assertFalse(
+            self.store.reserve_model_usage(record(second, 50, 50), period_start, 100, 100)
+        )
+        self.assertTrue(self.store.complete_model_usage(first, "success", 10, 10, 20))
+        self.assertTrue(
+            self.store.reserve_model_usage(record(second, 50, 50), period_start, 100, 100)
+        )
+        self.assertTrue(self.store.complete_model_usage(second, "failed", 0, 0, 0, "boom"))
+
+        usage = self.store.list_model_usage(tenant_id, repository, 10)
+        self.assertEqual({first, second}, {item["request_id"] for item in usage})
+        self.assertEqual({"success", "failed"}, {item["status"] for item in usage})
+
+    def test_concurrent_model_budget_reservations_cannot_overspend(self):
+        tenant_id = self.unique("concurrent-model-tenant")
+        repository = "acme/" + self.unique("concurrent-model-repository")
+        period_start = "2000-01-01T00:00:00+00:00"
+        barrier = threading.Barrier(2)
+        results: list[bool] = []
+        errors: list[Exception] = []
+
+        def reserve(request_id: str) -> None:
+            try:
+                barrier.wait(timeout=5)
+                results.append(
+                    self.store.reserve_model_usage(
+                        {
+                            "request_id": request_id,
+                            "tenant_id": tenant_id,
+                            "repository": repository,
+                            "task_id": None,
+                            "purpose": "review",
+                            "provider": "contract",
+                            "model": "model-a",
+                            "reserved_tokens": 60,
+                            "reserved_cost_micros": 60,
+                            "redactions": 0,
+                            "request_sha256": "b" * 64,
+                            "created_at": utc_now(),
+                        },
+                        period_start,
+                        100,
+                        100,
+                    )
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        workers = [
+            threading.Thread(target=reserve, args=(self.unique("concurrent-model-request"),))
+            for _ in range(2)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=10)
+
+        self.assertEqual([], errors)
+        self.assertEqual([False, True], sorted(results))
+        usage = self.store.list_model_usage(tenant_id, repository, 10)
+        self.assertEqual(1, len(usage))
+        self.assertEqual("reserved", usage[0]["status"])
+
 
 class SQLiteStoreContractTests(_StoreBehaviorContract, unittest.TestCase):
     def setUp(self):

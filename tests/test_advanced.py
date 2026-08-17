@@ -108,6 +108,12 @@ class AdvancedFeatureTests(unittest.TestCase):
         )
         self.assertTrue(str(free.resolved_llm()["model"]).endswith(":free"))
 
+    def test_cost_budget_requires_pricing_to_avoid_false_enforcement(self):
+        configured = settings(self.path)
+        configured = configured.__class__(**{**configured.__dict__, "llm_daily_cost_micros": 1000})
+        with self.assertRaisesRegex(ValueError, "pricing is required"):
+            configured.validate_evolution()
+
     def test_feedback_candidate_is_deferred_without_a_model(self):
         store = TaskStore(self.path)
         store.create("task", "org/repo", 1, {"source": "test"})

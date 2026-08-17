@@ -15,6 +15,7 @@ from .capabilities import (
     GITHUB_BREAKER,
     GITHUB_CLIENT,
     LLM_BREAKER,
+    MODEL_GATEWAY,
     OBSERVABILITY,
     QUEUE_FACTORY,
     RELEASES,
@@ -36,6 +37,12 @@ from .fix_rules import (
 )
 from .fixer import SafeFixer
 from .github import GitHubClient
+from .model_gateway import (
+    EnterpriseModelGateway,
+    ModelGatewayOptions,
+    ModelRoute,
+    OpenAICompatibleModelProvider,
+)
 from .observability import AlertManager, Observability
 from .plugins import (
     CapabilityKey,
@@ -144,6 +151,13 @@ def default_plugins(settings: Settings) -> list[Plugin]:
             "Versioned tenant and repository execution policy",
         ),
         _provider(
+            "evoagent.model-gateway",
+            MODEL_GATEWAY,
+            (SETTINGS, STORE, LLM_BREAKER),
+            _model_gateway,
+            "Governed model routing, redaction, budget, and usage ledger",
+        ),
+        _provider(
             "evoagent.observability",
             OBSERVABILITY,
             (SETTINGS,),
@@ -163,12 +177,12 @@ def default_plugins(settings: Settings) -> list[Plugin]:
         _provider(
             "evoagent.review-engine",
             REVIEW_ENGINE,
-            (SETTINGS, STORE, OBSERVABILITY, LLM_BREAKER),
+            (SETTINGS, STORE, OBSERVABILITY, MODEL_GATEWAY),
             lambda context: ReviewEngine(
                 context.require(SETTINGS),
                 context.require(STORE),
                 context.require(OBSERVABILITY),
-                context.require(LLM_BREAKER),
+                context.require(MODEL_GATEWAY),
             ),
             "Default multi-agent review workflow",
         ),
@@ -304,6 +318,41 @@ def _store(context: PluginContext) -> ApplicationStorePort:
 def _observability(context: PluginContext) -> Observability:
     settings = context.require(SETTINGS)
     return Observability(settings.otel_service_name, settings.otel_endpoint)
+
+
+def _model_gateway(context: PluginContext) -> EnterpriseModelGateway:
+    settings = context.require(SETTINGS)
+    config = settings.resolved_llm()
+    route = (
+        ModelRoute(
+            provider=str(config["provider"]),
+            model=str(config["model"]),
+            base_url=str(config["base_url"]),
+            api_key=str(config["api_key"]),
+            headers=dict(config.get("headers") or {}),
+            input_cost_micros_per_million=settings.llm_input_cost_micros_per_million,
+            output_cost_micros_per_million=settings.llm_output_cost_micros_per_million,
+        )
+        if config
+        else None
+    )
+    provider = OpenAICompatibleModelProvider(
+        settings.llm_allowed_hosts,
+        settings.timeout_seconds,
+        breaker=context.require(LLM_BREAKER),
+    )
+    return EnterpriseModelGateway(
+        context.require(STORE),
+        route,
+        provider,
+        ModelGatewayOptions(
+            allowed_hosts=settings.llm_allowed_hosts,
+            max_input_tokens=settings.llm_max_input_tokens,
+            max_output_tokens=settings.llm_max_output_tokens,
+            daily_token_budget=settings.llm_daily_token_budget,
+            daily_cost_micros=settings.llm_daily_cost_micros,
+        ),
+    )
 
 
 def _fixer(settings: Settings, rules: list[FixRule]) -> SafeFixer:

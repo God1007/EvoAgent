@@ -35,9 +35,12 @@ rejected before persistence.
 | `auto_fix` | Repair publication |
 | `allowed_fix_rules` | Findings eligible for deterministic repair |
 
-Token/cost budgets and data-residency routing are intentionally not represented
-as enforced policy yet. They require the model gateway in roadmap phase 4;
-storing unenforced fields would create a false governance claim.
+Token/cost budgets are now enforced by the model gateway per tenant/repository
+and UTC day from operator configuration. They are deliberately not duplicated
+inside the versioned policy document yet: per-repository overrides and
+data-residency/multi-route selection require the next routing-policy increment.
+The current `allowed_llm_providers` and `allowed_llm_models` admission rules still
+bind each accepted task to the configured route.
 
 ## Version and execution semantics
 

@@ -221,6 +221,97 @@ class TaskStore:
             )
         return cursor.rowcount > 0
 
+    def reserve_model_usage(
+        self,
+        record: dict[str, Any],
+        period_start: str,
+        token_budget: int = 0,
+        cost_budget_micros: int = 0,
+    ) -> bool:
+        """Atomically enforce one repository's period budget and reserve capacity."""
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            used = conn.execute(
+                "SELECT COALESCE(SUM(CASE WHEN status='reserved' THEN reserved_tokens "
+                "ELSE input_tokens+output_tokens END),0) AS tokens,"
+                "COALESCE(SUM(CASE WHEN status='reserved' THEN reserved_cost_micros "
+                "ELSE cost_micros END),0) AS cost FROM model_usage "
+                "WHERE tenant_id=? AND repository=? AND created_at>=? "
+                "AND status IN ('reserved','success','failed')",
+                (record["tenant_id"], record["repository"], period_start),
+            ).fetchone()
+            if (
+                token_budget > 0
+                and int(used["tokens"]) + int(record["reserved_tokens"]) > token_budget
+            ):
+                return False
+            if (
+                cost_budget_micros > 0
+                and int(used["cost"]) + int(record["reserved_cost_micros"]) > cost_budget_micros
+            ):
+                return False
+            conn.execute(
+                "INSERT INTO model_usage(request_id,tenant_id,repository,task_id,purpose,"
+                "provider,model,status,reserved_tokens,reserved_cost_micros,redactions,"
+                "request_sha256,created_at) VALUES (?,?,?,?,?,?,?,'reserved',?,?,?,?,?)",
+                (
+                    record["request_id"],
+                    record["tenant_id"],
+                    record["repository"],
+                    record.get("task_id"),
+                    record["purpose"],
+                    record["provider"],
+                    record["model"],
+                    record["reserved_tokens"],
+                    record.get("reserved_cost_micros", 0),
+                    record.get("redactions", 0),
+                    record["request_sha256"],
+                    record.get("created_at") or utc_now(),
+                ),
+            )
+        return True
+
+    def complete_model_usage(
+        self,
+        request_id: str,
+        status: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_micros: int,
+        error: str = "",
+    ) -> bool:
+        if status not in {"success", "failed"}:
+            raise ValueError("model usage status must be success or failed")
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE model_usage SET status=?,input_tokens=?,output_tokens=?,cost_micros=?,"
+                "error=?,completed_at=? WHERE request_id=? AND status='reserved'",
+                (
+                    status,
+                    max(0, input_tokens),
+                    max(0, output_tokens),
+                    max(0, cost_micros),
+                    error[:2000] or None,
+                    utc_now(),
+                    request_id,
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def list_model_usage(
+        self, tenant_id: str, repository: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM model_usage WHERE tenant_id=?"
+        params: list[Any] = [tenant_id]
+        if repository is not None:
+            query += " AND repository=?"
+            params.append(repository)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, min(limit, 1000)))
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
     def claim_effect(self, effect_key: str, owner: str, lease_seconds: float) -> dict[str, Any]:
         now = utc_now()
         lease_until = utc_after(lease_seconds)

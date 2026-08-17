@@ -5,7 +5,7 @@ import unittest
 from unittest import mock
 
 from evoagent.bootstrap import build_application_runtime
-from evoagent.capabilities import FIX_RULE, GITHUB_CLIENT, STORE
+from evoagent.capabilities import FIX_RULE, GITHUB_CLIENT, MODEL_GATEWAY, STORE
 from evoagent.config import Settings
 from evoagent.fix_rules import RuleMutation
 from evoagent.plugins import (
@@ -354,6 +354,34 @@ class ApplicationCompositionTests(unittest.TestCase):
 
         self.assertIs(fake_github, service.github)
         self.assertEqual("running", service.plugin_status()["state"])
+
+    def test_service_can_replace_the_model_gateway_provider(self):
+        class FakeGateway:
+            configured = False
+
+            @staticmethod
+            def route_info():
+                return {}
+
+            @staticmethod
+            def complete(_request):
+                raise AssertionError("disabled fake gateway must not be called")
+
+        gateway = FakeGateway()
+        replacement = ProviderPlugin(
+            PluginManifest(
+                "evoagent.model-gateway",
+                "2.0.0",
+                (MODEL_GATEWAY.name,),
+            ),
+            MODEL_GATEWAY,
+            lambda _context: gateway,
+        )
+        service = ReviewService(_settings(self.path), plugins=[replacement])
+        self.addCleanup(service.close)
+
+        self.assertIs(gateway, service.model_gateway)
+        self.assertEqual({}, service.llm_config)
 
     def test_service_publishes_sanitized_lifecycle_events(self):
         events = []

@@ -365,13 +365,17 @@ class MultiAgentCoordinator(Reviewer):
     def _specialist_node(self, state: CollaborationState) -> dict[str, Any]:
         findings: list[Finding] = []
         failures = []
+
+        def invoke(agent: Reviewer) -> list[Finding]:
+            contextual = getattr(agent, "review_with_context", None)
+            if contextual:
+                return contextual(state.get("task_id", ""), state["diff"], state["parsed"])
+            return agent.review(state["diff"], state["parsed"])
+
         with ThreadPoolExecutor(
             max_workers=min(self.max_workers, max(1, len(self.agents)))
         ) as pool:
-            futures = {
-                pool.submit(agent.review, state["diff"], state["parsed"]): agent
-                for agent in self.agents
-            }
+            futures = {pool.submit(invoke, agent): agent for agent in self.agents}
             for future in as_completed(futures):
                 agent = futures[future]
                 try:

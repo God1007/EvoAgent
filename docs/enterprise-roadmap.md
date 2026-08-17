@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.8.0)
+## Current maturity (v0.9.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -17,6 +17,7 @@ It is an execution plan, not a marketing checklist.
 | Production persistence | Implemented baseline | PostgreSQL + Redis Streams, migration CLI, Outbox, ACK/lease/DLQ, and mandatory real-service CI; backup/restore drill remains pending |
 | Graceful lifecycle | Implemented | Readiness drain plus bounded queue drain before Store/plugin shutdown |
 | Multi-tenancy/governance | Implemented baseline | JWT, RBAC, tenant/repository authorization, audit, canary/shadow/rollback |
+| Model governance | Implemented baseline | Replaceable gateway, scope propagation, redaction, exact-host egress control, structured output, atomic daily budgets, metadata-only usage ledger; fallback routing remains pending |
 | Strong untrusted execution | Partial | Container isolation exists; host fallback is not a strong boundary; microVM/remote runner pending |
 | Quality evidence | Synthetic benchmark only | 100-case controlled corpus; production activation gate remains blocked without independent labels |
 | HA/DR operational proof | Pending | No documented backup/restore drill, regional failover, or sustained production SLO evidence |
@@ -159,12 +160,29 @@ contracts, and
 
 ## Phase 4 — Model gateway and execution isolation
 
-### Model gateway
+### Model gateway — governed single-route baseline implemented
 
 - provider routing, fallback, retry budget, and per-model circuit breakers;
 - request/token/cost accounting by tenant and repository;
 - structured-output validation, redaction, data-retention policy, and egress allowlist;
 - offline/shadow evaluation before route changes.
+
+Implemented evidence: production reviewers receive `ModelGatewayPort` rather
+than endpoint credentials; task context is propagated into parallel specialists;
+schema version 6 records metadata-only usage; estimated input plus maximum output
+is atomically reserved per tenant/repository/UTC day; concurrent overspend is
+covered by the shared SQLite/PostgreSQL contract; success reconciles to actual
+usage; output-gate failures retain known billed usage while transport failures
+without usage release the reservation. The built-in transport
+enforces HTTPS/exact hosts, input/output/response caps, JSON-object output, and
+credential redaction in both prompts and errors. `/api/model-usage` is an
+admin-only tenant-scoped operational view, and the complete gateway is
+replaceable through `evoagent.model-gateway`.
+
+Still pending before this item is complete: declarative multi-route policy,
+provider/region fallback with a bounded retry budget, per-route circuit breakers,
+and promotion gates that shadow candidate routes before activation. The current
+single route is intentionally described as a baseline rather than HA routing.
 
 ### Remote proof runner
 

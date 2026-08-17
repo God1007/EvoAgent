@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from .agents import FilteredAgent, MultiAgentCoordinator
-from .circuit_breaker import CircuitBreaker
 from .config import Settings
 from .harness import ReviewHarness
 from .observability import Observability
-from .ports import ReviewWorkflowStorePort
-from .reviewer import LocalRuleReviewer, OpenAICompatibleReviewer, Reviewer
+from .ports import ModelGatewayPort, ReviewWorkflowStorePort
+from .reviewer import GatewayReviewer, LocalRuleReviewer, Reviewer
 from .skills import SkillRegistry
 
 
@@ -20,13 +19,13 @@ class ReviewEngine:
         settings: Settings,
         store: ReviewWorkflowStorePort,
         observability: Observability,
-        llm_breaker: CircuitBreaker,
+        model_gateway: ModelGatewayPort,
     ):
         self.settings = settings
         self.store = store
         self.observability = observability
-        self.llm_breaker = llm_breaker
-        self.llm_config = settings.resolved_llm()
+        self.model_gateway = model_gateway
+        self.llm_config = model_gateway.route_info()
         self.registry = SkillRegistry(
             settings.skills_dir,
             settings.skill_sandbox,
@@ -54,21 +53,18 @@ class ReviewEngine:
 
     @property
     def llm_available(self) -> bool:
-        return bool(self.llm_config)
+        return self.model_gateway.configured
 
-    def build_llm_reviewer(self, prompt: str = "") -> OpenAICompatibleReviewer:
-        if not self.llm_config:
+    def build_llm_reviewer(self, prompt: str = "") -> GatewayReviewer:
+        if not self.model_gateway.configured:
             raise RuntimeError("no LLM provider is configured")
-        return OpenAICompatibleReviewer(
-            str(self.llm_config["base_url"]),
-            str(self.llm_config["api_key"]),
-            str(self.llm_config["model"]),
-            self.settings.timeout_seconds,
-            system_prompt=prompt,
-            provider=str(self.llm_config["provider"]),
-            extra_headers=dict(self.llm_config.get("headers") or {}),
-            breaker=self.llm_breaker,
-        )
+        return GatewayReviewer(self.model_gateway, self._task_context, prompt)
+
+    def _task_context(self, task_id: str) -> tuple[str, str]:
+        task = self.store.get(task_id) if task_id else None
+        if not task:
+            raise ValueError("model review task context is unavailable")
+        return str(task.get("tenant_id") or "default"), str(task["repository"])
 
     def build_coordinator(self, reviewers: list[Reviewer]) -> MultiAgentCoordinator:
         return MultiAgentCoordinator(reviewers, store=self.store)
@@ -83,7 +79,7 @@ class ReviewEngine:
         )
 
     def reload(self) -> list[dict]:
-        if self.llm_config:
+        if self.model_gateway.configured:
             active = self.store.get_active_skill_version("llm-review")
             self.registry.register(
                 "llm-review",

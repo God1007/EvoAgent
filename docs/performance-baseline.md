@@ -115,8 +115,9 @@ backend is still outstanding.
 
 ## 5. Overload / backpressure
 
-Proves the service **sheds** load instead of collapsing. The rate limiter keys
-on client IP, so from localhost all requests share one bucket. Probe paths
+Proves the service **sheds** load instead of collapsing. This baseline does not
+configure trusted proxy CIDRs, so the limiter uses the localhost socket peer and
+all requests share one bucket. Probe paths
 (`/health`, `/ready`, `/metrics`) bypass the limiter by design.
 
 ### 5a. Rate-limit shedding (`429` + `Retry-After`)

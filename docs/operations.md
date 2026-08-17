@@ -38,6 +38,25 @@ shared `SO_REUSEPORT` socket cannot aggregate several local worker processes.
 Prometheus should attach deployment/cluster/region labels at scrape time and
 aggregate across pods in queries.
 
+## Trusted proxy client identity
+
+`X-Forwarded-For` is ignored by default. Set `EVOAGENT_TRUSTED_PROXY_CIDRS` only
+to the canonical CIDRs of proxies that can connect directly to EvoAgent. The
+resolver starts at the kernel-supplied socket peer, consumes the chain from
+right to left while each current hop is trusted, and stops at the first
+untrusted address. An attacker-controlled prefix farther left is never used for
+rate limiting or access logs. Empty hops, hostnames, addresses with ports, more
+than 32 hops, or more than 4096 header bytes fail closed to the socket peer.
+
+During ingress rollout, send two test requests with different client addresses
+through the real proxy and confirm `client_source=forwarded`, the expected
+`client`/`peer`, and independent rate-limit buckets. Direct requests with the
+same headers must produce `client_source=ignored`. Alert or investigate growth
+in `http_forwarded_invalid_total`; compare the proxy's append/overwrite policy
+without logging the raw header. Never configure `0.0.0.0/0` or `::/0`—startup
+rejects both—and do not copy an entire cloud public range when only private
+ingress addresses can reach the service.
+
 ## Availability fast burn
 
 This alert means the 99.9% monthly error budget is being consumed at more than

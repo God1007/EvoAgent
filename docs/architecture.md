@@ -8,7 +8,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 
 | Layer | Module | Responsibility |
 | --- | --- | --- |
-| Intake | `evoagent/api.py`, `errors.py` | HTTP API, static web console, bounded query admission, explicit client-safe errors, correlated 5xx boundary, `/webhooks/github`, `/health`, `/metrics` |
+| Intake | `evoagent/api.py`, `backpressure.py`, `errors.py` | HTTP API, spoof-resistant trusted-proxy identity, bounded admission, explicit client-safe errors, correlated 5xx boundary, `/webhooks/github`, `/health`, `/metrics` |
 | Composition | `evoagent/plugins.py` | Trusted plugin manifests, capability registry, scopes, events, dependency graph, lifecycle rollback |
 | Composition | `evoagent/capabilities.py` | Stable typed capability definitions for providers and consumers |
 | Domain boundary | `evoagent/ports.py` | Focused Store, Queue, CodeHost, Model Gateway, Proof Executor, Proof Replay Store, and Proof Artifact Store behavioral contracts |
@@ -53,7 +53,7 @@ process startup
   → resolve ReviewService capabilities
 
 change (webhook | REST | console)
-  → HTTP edge (validate/generate request id → admission → safe error envelope)
+  → HTTP edge (resolve trusted proxy chain → request id → admission → safe error envelope)
   → WebhookUseCases | ReviewUseCases
       webhook: delivery + session turn + task + outbox in one transaction
       REST: task + Diff + outbox in one transaction
@@ -167,8 +167,10 @@ The full analysis lives in [`threat-model.md`](threat-model.md). Key boundaries:
 
 - **PR content is untrusted input** — never treated as instructions.
 - **HTTP metadata and failures are untrusted** — request IDs are correlation
-  labels only; access logs omit query strings and unexpected 5xx responses never
-  expose exception messages.
+  labels only. Forwarded client addresses are ignored unless the direct peer is
+  in an explicit trusted CIDR, then the chain is consumed right-to-left only to
+  the first untrusted hop. Access logs omit raw forwarding/query values and
+  unexpected 5xx responses never expose exception messages.
 - **Operational exception messages are untrusted data** — task failures,
   checkpoints, agent failures, Queue/DLQ, Outbox/effect records, readiness,
   plugin lifecycle failures, proof launch failures, and OpenTelemetry spans use

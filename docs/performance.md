@@ -120,9 +120,13 @@ python scripts/microbench.py --json micro.json
   Graceful drain flips `/ready` to 503 (LB stops routing) and lets in-flight
   HTTP requests finish; in-flight async queue work is only recovered with the
   durable Redis backend (the in-memory queue loses it on exit).
-- **Backpressure**: a global + per-tenant token-bucket rate limiter and a
+- **Backpressure**: a per-client token-bucket rate limiter and a
   bounded-concurrency gate for heavy endpoints shed load with `429`/`503` +
-  `Retry-After` instead of collapsing.
+  `Retry-After` instead of collapsing. The client key is the socket peer unless
+  that peer matches `EVOAGENT_TRUSTED_PROXY_CIDRS`; only then is the bounded
+  `X-Forwarded-For` chain consumed from right to left. Invalid or attacker-added
+  prefixes fail closed to a previously verified hop rather than creating a new
+  bucket.
 - **Resilience**: outbound GitHub and LLM calls are wrapped in a circuit breaker
   with exponential backoff + jitter, so an upstream outage fails fast instead of
   exhausting workers.
@@ -145,6 +149,4 @@ python scripts/microbench.py --json micro.json
   `session_findings` (both grow unbounded today).
 - microVM isolation (Firecracker/Kata) as an alternative `proof.executor`
   provider for hostile public multi-tenancy.
-- Trusted-proxy `X-Forwarded-For` parsing for the rate limiter (today it keys on
-  the socket peer, so behind a proxy all clients share one bucket) and a
-  dedicated concurrency guard for `/webhooks/github` `synchronize` fan-out.
+- A dedicated concurrency guard for `/webhooks/github` `synchronize` fan-out.

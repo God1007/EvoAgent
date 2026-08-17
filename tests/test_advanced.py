@@ -138,6 +138,22 @@ class AdvancedFeatureTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "CAPACITY_LEASE_SECONDS must exceed"):
             configured.validate_evolution()
 
+    def test_trusted_proxy_networks_must_be_bounded_canonical_cidrs(self):
+        configured = settings(self.path)
+        for cidrs in (
+            ("0.0.0.0/0",),
+            ("10.0.0.1/8",),
+            ("127.0.0.1",),
+            ("not-a-network",),
+        ):
+            with (
+                self.subTest(cidrs=cidrs),
+                self.assertRaisesRegex(ValueError, "EVOAGENT_TRUSTED_PROXY_CIDRS"),
+            ):
+                configured.__class__(
+                    **{**configured.__dict__, "trusted_proxy_cidrs": cidrs}
+                ).validate_evolution()
+
     def test_model_capacity_window_retention_is_bounded(self):
         configured = settings(self.path)
         configured = configured.__class__(

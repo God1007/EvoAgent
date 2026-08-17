@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.25.0)
+## Current maturity (v0.26.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -20,7 +20,7 @@ It is an execution plan, not a marketing checklist.
 | Model governance | Implemented advanced baseline | Replaceable gateway, scoped policy routing/residency, deterministic weighted active routes, bounded fallback, isolated candidate shadows, GitOps promotion gates with offline evidence, shared hard capacity leases/rate windows, read-only capacity weight recommendations, per-route breakers, redaction, egress/output limits, total/shadow atomic budgets, metadata-only ledgers, and conservative crash reconciliation; automatic capacity inference remains pending |
 | Strong untrusted execution | Implemented advanced baseline | Replaceable remote Proof Runner, mutually authenticated evidence manifests, container-only jobs, cross-replica Redis nonce claims, dual-key rotation, and pluggable local/S3 Object Lock artifacts; a microVM executor and provider-backed compliance drill remain pending |
 | Service-level operations | Implemented advanced baseline | Fixed-cardinality availability/latency/success SLIs plus model economics, capacity saturation, repair outcomes, and feedback trends; versioned 30-day SLO catalog, multi-window burn/quality alerts, queue/Outbox age, DLQ depth, dashboard, runbooks, and hardened Prometheus evaluator |
-| HTTP edge security | Implemented baseline | Validated/generated request correlation, explicit client-safe 4xx types, bounded list reads, generic 5xx envelopes, query-free structured access logs, consistent hardening headers, and no interpreter-version disclosure |
+| HTTP edge security | Implemented advanced baseline | Validated/generated request correlation, explicit client-safe 4xx types, bounded list reads, generic 5xx envelopes, query-free structured access logs, consistent hardening headers, no interpreter-version disclosure, and spoof-resistant trusted-proxy client identity for admission/logging |
 | Operational failure security | Implemented baseline | Allowlisted message-free failure summaries, stable code-location references, persistence-adapter enforcement, legacy-data migration, and exception-message-free OpenTelemetry/plugin/proof paths |
 | Quality evidence | Governance baseline implemented | Reproducible synthetic regression plus blind dual-annotation/adjudication compiler, rights/content/split/evidence audit, per-language/CWE/rule slices, and confidence calibration; production gate remains blocked until a real approved corpus is supplied |
 | HA/DR operational proof | Implemented recovery baseline | SQLite/PostgreSQL isolated restore validates schema/content/application/RPO/RTO; an offline audited epoch reconstructs incomplete PostgreSQL/Outbox intent only into empty Redis and is proven against real CI services; managed PITR and regional routing exercise remain pending |
@@ -326,6 +326,15 @@ feedback trend. Alerts require minimum volumes, dashboards expose each signal,
 and runbooks explicitly prevent sparse feedback from being treated as unbiased
 accuracy evidence. Tenant/repository/route values never become metric labels.
 See [`ADR 0023`](adr/0023-fixed-cardinality-quality-economics.md).
+
+The v0.26 increment closes the reverse-proxy admission identity gap. Forwarded
+addresses are default-deny and become authoritative only when the direct socket
+peer belongs to one of at most 64 explicit canonical CIDRs. A bounded literal-IP
+chain is walked from right to left and stops at the first untrusted hop, so an
+attacker cannot prepend a new rate-limit identity. Malformed chains fall back to
+the socket peer, raw forwarding values never enter logs or metric labels, and
+fixed counters distinguish accepted, ignored, and invalid forwarding metadata.
+See [`ADR 0024`](adr/0024-trusted-proxy-client-identity.md).
 
 Implemented database recovery baseline: `evoagent-dr` performs SQLite online
 backup/restore or a PostgreSQL exported-snapshot `pg_dump` followed by

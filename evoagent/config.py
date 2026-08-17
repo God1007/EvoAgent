@@ -2,6 +2,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from ipaddress import ip_network
 from typing import Any
 
 SOURCE_SKILLS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "skills"))
@@ -132,6 +133,7 @@ class Settings:
     web_workers: int = 1
     rate_limit_rps: int = 0
     rate_limit_burst: int = 0
+    trusted_proxy_cidrs: tuple[str, ...] = ()
     max_inflight_heavy: int = 0
     breaker_failure_threshold: int = 5
     breaker_reset_seconds: int = 30
@@ -242,6 +244,23 @@ class Settings:
             raise ValueError(
                 "EVOAGENT_PLUGIN_ALLOWLIST is required when trusted plugin discovery is enabled"
             )
+        if len(self.trusted_proxy_cidrs) > 64:
+            raise ValueError("EVOAGENT_TRUSTED_PROXY_CIDRS accepts at most 64 networks")
+        normalized_proxy_cidrs = []
+        for value in self.trusted_proxy_cidrs:
+            try:
+                network = ip_network(value, strict=True)
+            except ValueError as exc:
+                raise ValueError("EVOAGENT_TRUSTED_PROXY_CIDRS contains an invalid CIDR") from exc
+            if value != str(network):
+                raise ValueError(
+                    "EVOAGENT_TRUSTED_PROXY_CIDRS entries must use canonical CIDR notation"
+                )
+            if network.prefixlen == 0:
+                raise ValueError("EVOAGENT_TRUSTED_PROXY_CIDRS cannot trust the entire internet")
+            normalized_proxy_cidrs.append(str(network))
+        if len(normalized_proxy_cidrs) != len(set(normalized_proxy_cidrs)):
+            raise ValueError("EVOAGENT_TRUSTED_PROXY_CIDRS contains duplicate networks")
         if (
             (self.llm_daily_cost_micros > 0 or self.llm_shadow_daily_cost_micros > 0)
             and self.llm_input_cost_micros_per_million == 0
@@ -401,6 +420,7 @@ class Settings:
             web_workers=_int("EVOAGENT_WEB_WORKERS", 1),
             rate_limit_rps=_non_negative_int("EVOAGENT_RATE_LIMIT_RPS", 0),
             rate_limit_burst=_non_negative_int("EVOAGENT_RATE_LIMIT_BURST", 0),
+            trusted_proxy_cidrs=_csv("EVOAGENT_TRUSTED_PROXY_CIDRS"),
             max_inflight_heavy=_non_negative_int("EVOAGENT_MAX_INFLIGHT_HEAVY", 0),
             breaker_failure_threshold=_int("EVOAGENT_BREAKER_FAILURE_THRESHOLD", 5),
             breaker_reset_seconds=_int("EVOAGENT_BREAKER_RESET_SECONDS", 30),

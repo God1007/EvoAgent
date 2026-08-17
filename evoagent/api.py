@@ -17,6 +17,7 @@ from typing import Any
 
 from . import __version__
 from .auth import Principal
+from .backpressure import ClientIdentity
 from .config import Settings
 from .errors import AccessDeniedError, ClientInputError, safe_exception_fields
 from .github import verify_signature
@@ -50,6 +51,7 @@ DRAINING = threading.Event()
 class ApiHandler(BaseHTTPRequestHandler):
     service: ReviewService
     settings: Settings
+    _client_identity_cache: ClientIdentity | None = None
     server_version = "EvoAgent/%s" % __version__
     sys_version = ""
 
@@ -98,17 +100,37 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._structured_log("http_handler_message", level="warning")
 
     def _structured_log(self, event: str, **fields: Any) -> None:
-        client = self.client_address[0] if self.client_address else "unknown"
+        identity = self._client_identity_value()
         record = {
             "timestamp": datetime.now(UTC).isoformat(),
             "event": event,
             "request_id": self._request_id_value(),
             "method": getattr(self, "command", ""),
             "path": self._safe_request_path(),
-            "client": client,
+            "client": identity.address,
+            "peer": identity.peer,
+            "client_source": identity.source,
+            "forwarded_hops": identity.forwarded_hops,
             **fields,
         }
         print(json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True)
+
+    def _client_identity_value(self) -> ClientIdentity:
+        cached = getattr(self, "_client_identity_cache", None)
+        if isinstance(cached, ClientIdentity):
+            return cached
+        peer = self.client_address[0] if self.client_address else "unknown"
+        headers = getattr(self, "headers", None)
+        forwarded_values = headers.get_all("X-Forwarded-For", []) if headers is not None else []
+        identity = self.service.client_identity_resolver.resolve(peer, ",".join(forwarded_values))
+        self._client_identity_cache = identity
+        if identity.source == "forwarded":
+            metrics.inc("http_forwarded_client_total")
+        elif identity.source == "ignored":
+            metrics.inc("http_forwarded_ignored_total")
+        elif identity.source == "invalid":
+            metrics.inc("http_forwarded_invalid_total")
+        return identity
 
     def _request_id_value(self) -> str:
         cached = getattr(self, "_request_id_cache", "")
@@ -258,6 +280,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _dispatch(self, method: str, handler) -> None:
         """Establish one request identity and one safe exception boundary."""
         self._request_id_cache = ""
+        self._client_identity_cache = None
         self._response_started = False
         self._metric_counted = False
         self._metric_response_recorded = False
@@ -293,7 +316,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         if request_class != "probe":
             metrics.inc("http_nonprobe_requests_total")
         if path not in PROBE_PATHS:
-            client = self.client_address[0] if self.client_address else "unknown"
+            client = self._client_identity_value().address
             allowed, retry_after = self.service.rate_limiter.check(client)
             if not allowed:
                 self._reject(429, retry_after, "rate limit exceeded")

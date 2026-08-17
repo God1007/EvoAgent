@@ -12,6 +12,7 @@ from unittest import mock
 
 from evoagent.api import ApiHandler
 from evoagent.config import Settings
+from evoagent.metrics import Metrics
 from evoagent.migrations import CURRENT_SCHEMA_VERSION
 from evoagent.service import ReviewService
 
@@ -71,6 +72,95 @@ class AdmissionControlTests(unittest.TestCase):
         second.read()
         self.assertEqual(429, second.status)
         self.assertIsNotNone(second.getheader("Retry-After"))
+
+    def test_trusted_proxy_clients_receive_independent_rate_limit_buckets(self):
+        host, port = self._serve(
+            self._settings(
+                rate_limit_rps=1,
+                rate_limit_burst=1,
+                trusted_proxy_cidrs=("127.0.0.1/32",),
+            )
+        )
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        self.addCleanup(conn.close)
+
+        statuses = []
+        for client in ("198.51.100.10", "198.51.100.11", "198.51.100.10"):
+            conn.request("GET", self._TASK, headers={"X-Forwarded-For": client})
+            response = conn.getresponse()
+            response.read()
+            statuses.append(response.status)
+
+        self.assertEqual([404, 404, 429], statuses)
+
+    def test_untrusted_socket_peer_cannot_rotate_forwarded_rate_limit_keys(self):
+        host, port = self._serve(
+            self._settings(
+                rate_limit_rps=1,
+                rate_limit_burst=1,
+                trusted_proxy_cidrs=("10.0.0.0/8",),
+            )
+        )
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        self.addCleanup(conn.close)
+
+        statuses = []
+        for client in ("198.51.100.10", "198.51.100.11"):
+            conn.request("GET", self._TASK, headers={"X-Forwarded-For": client})
+            response = conn.getresponse()
+            response.read()
+            statuses.append(response.status)
+
+        self.assertEqual([404, 429], statuses)
+
+    def test_access_log_records_resolved_client_without_untrusted_left_prefix(self):
+        host, port = self._serve(self._settings(trusted_proxy_cidrs=("127.0.0.1/32", "10.0.0.0/8")))
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        self.addCleanup(conn.close)
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            conn.request(
+                "GET",
+                "/health",
+                headers={"X-Forwarded-For": "203.0.113.99, 198.51.100.20, 10.0.0.7"},
+            )
+            response = conn.getresponse()
+            response.read()
+
+        logs = output.getvalue()
+        self.assertEqual(200, response.status)
+        self.assertIn('"client": "198.51.100.20"', logs)
+        self.assertIn('"peer": "127.0.0.1"', logs)
+        self.assertIn('"client_source": "forwarded"', logs)
+        self.assertIn('"forwarded_hops": 2', logs)
+        self.assertNotIn("203.0.113.99", logs)
+
+    def test_invalid_forwarded_chain_falls_back_to_peer_and_is_counted(self):
+        host, port = self._serve(
+            self._settings(
+                rate_limit_rps=1,
+                rate_limit_burst=1,
+                trusted_proxy_cidrs=("127.0.0.1/32",),
+            )
+        )
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        self.addCleanup(conn.close)
+        captured = Metrics()
+
+        with mock.patch("evoagent.api.metrics", captured):
+            statuses = []
+            for invalid in ("proxy.internal", "198.51.100.8:443"):
+                conn.request("GET", self._TASK, headers={"X-Forwarded-For": invalid})
+                response = conn.getresponse()
+                response.read()
+                statuses.append(response.status)
+
+        self.assertEqual([404, 429], statuses)
+        self.assertIn(
+            "evoagent_http_forwarded_invalid_total 2.0",
+            captured.prometheus(),
+        )
 
     def test_model_usage_reconciliation_http_boundary_is_state_guarded(self):
         host, port = self._serve(self._settings())

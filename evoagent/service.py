@@ -14,7 +14,7 @@ from .application import (
     WebhookOptions,
     WebhookUseCases,
 )
-from .backpressure import ConcurrencyLimiter, RateLimiter
+from .backpressure import ConcurrencyLimiter, RateLimiter, TrustedProxyResolver
 from .bootstrap import build_application_runtime
 from .capabilities import (
     ALERTS,
@@ -191,6 +191,7 @@ class ReviewService:
             settings.rate_limit_rps,
             settings.rate_limit_burst or settings.rate_limit_rps,
         )
+        self.client_identity_resolver = TrustedProxyResolver(settings.trusted_proxy_cidrs)
         self.heavy_gate = ConcurrencyLimiter(settings.max_inflight_heavy)
         metrics.register_gauge_source("heavy_in_flight", self.heavy_gate.in_flight)
         metrics.register_gauge_source("breaker_github_state", self.github_breaker.state_code)

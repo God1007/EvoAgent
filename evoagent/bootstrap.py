@@ -452,6 +452,7 @@ def _proof_executor(context: PluginContext) -> ProofExecutorPort:
             max_request_bytes=settings.proof_runner_max_request_bytes,
             max_response_bytes=settings.proof_runner_max_response_bytes,
             replay_window_seconds=settings.proof_runner_replay_window_seconds,
+            signing_key_id=settings.proof_runner_signing_key_id,
         )
     return LocalProofExecutor(
         lambda command: RepairVerifier(

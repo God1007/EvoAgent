@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from dataclasses import dataclass
 from typing import Any
@@ -6,6 +7,7 @@ from typing import Any
 SOURCE_SKILLS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "skills"))
 INSTALLED_SKILLS_DIR = os.path.join(sys.prefix, "share", "evoagent", "skills")
 DEFAULT_SKILLS_DIR = SOURCE_SKILLS_DIR if os.path.isdir(SOURCE_SKILLS_DIR) else INSTALLED_SKILLS_DIR
+_PROOF_KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 def _int(name: str, default: int) -> int:
@@ -105,6 +107,7 @@ class Settings:
     repair_max_output_bytes: int = 16000
     proof_runner_url: str = ""
     proof_runner_signing_key: str = ""
+    proof_runner_signing_key_id: str = "default"
     proof_runner_allowed_hosts: tuple[str, ...] = ()
     proof_runner_timeout_seconds: int = 150
     proof_runner_max_request_bytes: int = 12 * 1024 * 1024
@@ -253,6 +256,8 @@ class Settings:
         if self.proof_runner_url:
             if len(self.proof_runner_signing_key.encode("utf-8")) < 32:
                 raise ValueError("EVOAGENT_PROOF_RUNNER_SIGNING_KEY must contain at least 32 bytes")
+            if not _PROOF_KEY_ID.fullmatch(self.proof_runner_signing_key_id):
+                raise ValueError("EVOAGENT_PROOF_RUNNER_SIGNING_KEY_ID is invalid")
             if not self.proof_runner_allowed_hosts:
                 raise ValueError(
                     "EVOAGENT_PROOF_RUNNER_ALLOWED_HOSTS is required for remote proof execution"
@@ -335,6 +340,9 @@ class Settings:
             repair_max_output_bytes=_int("EVOAGENT_REPAIR_MAX_OUTPUT_BYTES", 16000),
             proof_runner_url=os.getenv("EVOAGENT_PROOF_RUNNER_URL", "").rstrip("/"),
             proof_runner_signing_key=os.getenv("EVOAGENT_PROOF_RUNNER_SIGNING_KEY", ""),
+            proof_runner_signing_key_id=os.getenv(
+                "EVOAGENT_PROOF_RUNNER_SIGNING_KEY_ID", "default"
+            ),
             proof_runner_allowed_hosts=_csv("EVOAGENT_PROOF_RUNNER_ALLOWED_HOSTS"),
             proof_runner_timeout_seconds=_int("EVOAGENT_PROOF_RUNNER_TIMEOUT_SECONDS", 150),
             proof_runner_max_request_bytes=_int(

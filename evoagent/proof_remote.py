@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import signal
 import ssl
 import tempfile
@@ -23,11 +24,11 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .ports import ProofExecutorPort
+from .ports import ProofExecutorPort, ProofReplayStorePort
 from .proof import LocalProofExecutor
 from .verifier import RepairVerifier
 
@@ -38,7 +39,9 @@ HEADER_ISSUED_AT = "X-EvoAgent-Issued-At"
 HEADER_BODY_SHA256 = "X-EvoAgent-Body-SHA256"
 HEADER_SIGNATURE = "X-EvoAgent-Signature"
 HEADER_INPUT_SHA256 = "X-EvoAgent-Input-SHA256"
+HEADER_KEY_ID = "X-EvoAgent-Key-Id"
 _ALLOWED_OUTCOMES = frozenset({"passed", "failed", "timeout", "error", "skipped"})
+_KEY_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 class ProofProtocolError(RuntimeError):
@@ -91,6 +94,13 @@ def _validated_secret(value: str | bytes) -> bytes:
     return secret
 
 
+def _validated_key_id(value: str) -> str:
+    key_id = str(value).strip()
+    if not _KEY_ID.fullmatch(key_id):
+        raise ValueError("proof runner signing key id is invalid")
+    return key_id
+
+
 def _header(headers: Mapping[str, str], name: str) -> str:
     expected = name.lower()
     for key, value in headers.items():
@@ -127,6 +137,108 @@ def _validate_timestamp(value: str, now: int, max_age_seconds: int) -> str:
 
 def _input_document(files: dict[str, str], command: str) -> dict[str, Any]:
     return {"command": command, "files": files}
+
+
+class InMemoryProofReplayStore:
+    """Bounded single-process replay adapter retained for local development."""
+
+    backend = "memory"
+
+    def __init__(
+        self,
+        max_entries: int = 100_000,
+        clock: Any = time.time,
+    ):
+        if max_entries <= 0:
+            raise ValueError("proof replay entry limit must be positive")
+        self.max_entries = max_entries
+        self._clock = clock
+        self._seen: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def claim(self, request_id: str, expires_at: int) -> bool:
+        now = int(self._clock())
+        with self._lock:
+            self._seen = {key: expiry for key, expiry in self._seen.items() if expiry > now}
+            if request_id in self._seen:
+                return False
+            if len(self._seen) >= self.max_entries:
+                raise ProofRunnerUnavailableError("proof replay guard capacity is exhausted")
+            self._seen[request_id] = max(now + 1, int(expires_at))
+        return True
+
+    def health(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        return None
+
+
+class RedisProofReplayStore:
+    """Cross-replica nonce adapter using Redis atomic SET NX with expiry."""
+
+    backend = "redis"
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        prefix: str = "evoagent:proof-replay:v1",
+        client: Any | None = None,
+        clock: Any = time.time,
+    ):
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in {"redis", "rediss"} or not parsed.hostname:
+            raise ValueError("proof replay Redis URL must use redis:// or rediss://")
+        if (
+            not prefix
+            or len(prefix) > 160
+            or any(
+                character
+                not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789:._-"
+                for character in prefix
+            )
+        ):
+            raise ValueError("proof replay Redis prefix is invalid")
+        if client is None:
+            try:
+                import redis
+            except ImportError as exc:  # pragma: no cover - declared runtime dependency
+                raise RuntimeError("Redis proof replay mode requires the redis package") from exc
+            client = redis.Redis.from_url(
+                url,
+                socket_connect_timeout=3,
+                socket_timeout=3,
+                health_check_interval=30,
+                decode_responses=True,
+            )
+        self._client = client
+        self._prefix = prefix
+        self._clock = clock
+
+    def claim(self, request_id: str, expires_at: int) -> bool:
+        ttl = max(1, int(expires_at) - int(self._clock()))
+        try:
+            claimed = self._client.set(
+                "%s:%s" % (self._prefix, request_id),
+                "1",
+                nx=True,
+                ex=ttl,
+            )
+        except Exception as exc:
+            raise ProofRunnerUnavailableError("proof replay store is unavailable") from exc
+        return bool(claimed)
+
+    def health(self) -> bool:
+        try:
+            return bool(self._client.ping())
+        except Exception:
+            return False
+
+    def close(self) -> None:
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            close()
 
 
 class ContentAddressedArtifactStore:
@@ -201,11 +313,13 @@ class RemoteProofExecutor:
         max_request_bytes: int = 10 * 1024 * 1024,
         max_response_bytes: int = 128 * 1024,
         replay_window_seconds: int = 300,
+        signing_key_id: str = "default",
         opener: Any | None = None,
         clock: Any = time.time,
     ):
         self.endpoint = self._validate_endpoint(endpoint, allowed_hosts)
         self._secret = _validated_secret(signing_key)
+        self.signing_key_id = _validated_key_id(signing_key_id)
         self.timeout_seconds = timeout_seconds
         self.max_request_bytes = max_request_bytes
         self.max_response_bytes = max_response_bytes
@@ -246,6 +360,7 @@ class RemoteProofExecutor:
             "version": PROTOCOL_VERSION,
             "request_id": request_id,
             "issued_at": int(issued_at),
+            "key_id": self.signing_key_id,
             "input_sha256": input_sha256,
             "files": files,
             "command": command,
@@ -273,6 +388,7 @@ class RemoteProofExecutor:
                 HEADER_ISSUED_AT: issued_at,
                 HEADER_BODY_SHA256: body_sha256,
                 HEADER_INPUT_SHA256: input_sha256,
+                HEADER_KEY_ID: self.signing_key_id,
                 HEADER_SIGNATURE: signature,
             },
         )
@@ -297,17 +413,24 @@ class RemoteProofExecutor:
 
     def health(self) -> dict[str, Any]:
         parsed = urllib.parse.urlsplit(self.endpoint)
-        url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/healthz", "", ""))
+        url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "/readyz", "", ""))
         request = urllib.request.Request(url, method="GET")
         try:
             with self._opener.open(request, timeout=min(self.timeout_seconds, 3)) as response:
                 status = int(getattr(response, "status", 200))
                 body = response.read(1025)
             document = json.loads(body) if len(body) <= 1024 else {}
-            healthy = status == 200 and document == {"status": "ok"}
+            healthy = status == 200 and document.get("status") == "ready"
         except Exception:
             healthy = False
-        return {"healthy": healthy, "mode": "remote", "endpoint_host": parsed.hostname or ""}
+            document = {}
+        return {
+            "healthy": healthy,
+            "mode": "remote",
+            "endpoint_host": parsed.hostname or "",
+            "replay_backend": str(document.get("replay_backend", "unknown")),
+            "signing_key_id": self.signing_key_id,
+        }
 
     def _read_bounded(self, response: Any) -> bytes:
         length = response.headers.get("Content-Length")
@@ -348,6 +471,13 @@ class RemoteProofExecutor:
         )
         if not hmac.compare_digest(claimed_input_sha, input_sha256):
             raise ProofProtocolError("proof runner response input digest mismatch")
+        response_key_id = _header(headers, HEADER_KEY_ID) or "default"
+        try:
+            response_key_id = _validated_key_id(response_key_id)
+        except ValueError as exc:
+            raise ProofProtocolError("proof runner response key id is invalid") from exc
+        if not hmac.compare_digest(response_key_id, self.signing_key_id):
+            raise ProofProtocolError("proof runner response key id mismatch")
         expected = _sign(
             self._secret,
             "response",
@@ -368,6 +498,9 @@ class RemoteProofExecutor:
             raise ProofProtocolError("proof runner response body request id mismatch")
         if document.get("input_sha256") != input_sha256:
             raise ProofProtocolError("proof runner response body input digest mismatch")
+        document_key_id = document.get("key_id", "default")
+        if document_key_id != self.signing_key_id:
+            raise ProofProtocolError("proof runner response body key id mismatch")
         outcome = document.get("outcome")
         if not isinstance(outcome, dict):
             raise ProofProtocolError("proof runner response has no outcome")
@@ -390,6 +523,7 @@ class RemoteProofExecutor:
         verified = dict(outcome)
         verified["attestation"] = {
             "request_id": request_id,
+            "key_id": self.signing_key_id,
             "input_sha256": input_sha256,
             "evidence_sha256": evidence_sha,
             "artifacts": artifacts,
@@ -431,6 +565,8 @@ class ProofRunnerServer:
         executor: ProofExecutorPort,
         signing_key: str | bytes,
         *,
+        signing_key_id: str = "default",
+        verification_keys: Mapping[str, str | bytes] | None = None,
         max_request_bytes: int = 10 * 1024 * 1024,
         max_response_bytes: int = 128 * 1024,
         replay_window_seconds: int = 300,
@@ -440,10 +576,20 @@ class ProofRunnerServer:
         max_concurrency: int = 2,
         artifact_store: ContentAddressedArtifactStore | None = None,
         require_artifacts: bool = False,
+        replay_store: ProofReplayStorePort | None = None,
         clock: Any = time.time,
     ):
         self.executor = executor
-        self._secret = _validated_secret(signing_key)
+        self.signing_key_id = _validated_key_id(signing_key_id)
+        self._signing_keys = {self.signing_key_id: _validated_secret(signing_key)}
+        additional_keys = verification_keys or {}
+        if len(additional_keys) > 1:
+            raise ValueError("proof runner accepts at most one previous signing key")
+        for key_id, secret in additional_keys.items():
+            validated_id = _validated_key_id(key_id)
+            if validated_id in self._signing_keys:
+                raise ValueError("proof runner signing key ids must be unique")
+            self._signing_keys[validated_id] = _validated_secret(secret)
         if max_request_bytes < 1024 or max_response_bytes < 1024:
             raise ValueError("proof runner byte limits must be at least 1024")
         self.max_request_bytes = max_request_bytes
@@ -457,8 +603,10 @@ class ProofRunnerServer:
         if require_artifacts and artifact_store is None:
             raise ValueError("required proof artifact storage is not configured")
         self._clock = clock
-        self._seen: dict[str, int] = {}
-        self._seen_lock = threading.Lock()
+        self.replay_store = replay_store or InMemoryProofReplayStore(
+            max_replay_entries,
+            clock,
+        )
         self._slots = threading.BoundedSemaphore(max_concurrency)
 
     def execute(self, body: bytes, headers: Mapping[str, str]) -> SignedProofResponse:
@@ -475,8 +623,16 @@ class ProofRunnerServer:
         )
         if not hmac.compare_digest(body_sha, sha256_hex(body)):
             raise ProofProtocolError("proof request body digest mismatch")
+        provided_key_id = _header(headers, HEADER_KEY_ID)
+        try:
+            key_id = _validated_key_id(provided_key_id or "default")
+        except ValueError as exc:
+            raise ProofProtocolError("proof request signature is invalid") from exc
+        secret = self._signing_keys.get(key_id)
+        if secret is None:
+            raise ProofProtocolError("proof request signature is invalid")
         expected = _sign(
-            self._secret,
+            secret,
             "request",
             request_id,
             issued_at,
@@ -485,8 +641,15 @@ class ProofRunnerServer:
         )
         if not hmac.compare_digest(_header(headers, HEADER_SIGNATURE), expected):
             raise ProofProtocolError("proof request signature is invalid")
-        self._claim_request(request_id, now)
-        document, files, command = self._validate_document(body, request_id, issued_at, input_sha)
+        self._claim_request(request_id, int(issued_at), now)
+        document, files, command = self._validate_document(
+            body,
+            request_id,
+            issued_at,
+            input_sha,
+            key_id,
+            allow_legacy_key_id=not provided_key_id,
+        )
         input_bytes = canonical_json(_input_document(files, command))
         input_artifact = self._store_artifact("inputs", input_bytes)
         if not self._slots.acquire(blocking=False):
@@ -511,15 +674,23 @@ class ProofRunnerServer:
         response_document = {
             "version": PROTOCOL_VERSION,
             "request_id": document["request_id"],
+            "key_id": key_id,
             "input_sha256": input_sha,
             "evidence_sha256": sha256_hex(evidence_bytes),
             "outcome": outcome,
             "artifacts": artifacts,
         }
-        return self._signed_response(response_document, request_id, input_sha)
+        return self._signed_response(response_document, request_id, input_sha, key_id, secret)
 
     def _validate_document(
-        self, body: bytes, request_id: str, issued_at: str, input_sha: str
+        self,
+        body: bytes,
+        request_id: str,
+        issued_at: str,
+        input_sha: str,
+        key_id: str,
+        *,
+        allow_legacy_key_id: bool,
     ) -> tuple[dict[str, Any], dict[str, str], str]:
         try:
             document = json.loads(body)
@@ -529,6 +700,11 @@ class ProofRunnerServer:
             raise ProofProtocolError("unsupported proof request version")
         if document.get("request_id") != request_id or str(document.get("issued_at")) != issued_at:
             raise ProofProtocolError("proof request metadata mismatch")
+        document_key_id = document.get("key_id")
+        if document_key_id is None and allow_legacy_key_id:
+            document_key_id = "default"
+        if document_key_id != key_id:
+            raise ProofProtocolError("proof request key id mismatch")
         if document.get("input_sha256") != input_sha:
             raise ProofProtocolError("proof request input digest mismatch")
         files = document.get("files")
@@ -551,17 +727,16 @@ class ProofRunnerServer:
             raise ProofProtocolError("proof request canonical input digest mismatch")
         return document, typed_files, command
 
-    def _claim_request(self, request_id: str, now: int) -> None:
-        cutoff = now - self.replay_window_seconds
-        with self._seen_lock:
-            self._seen = {
-                key: timestamp for key, timestamp in self._seen.items() if timestamp >= cutoff
-            }
-            if request_id in self._seen:
-                raise ProofProtocolError("proof request replay detected")
-            if len(self._seen) >= self.max_replay_entries:
-                raise ProofRunnerUnavailableError("proof replay guard capacity is exhausted")
-            self._seen[request_id] = now
+    def _claim_request(self, request_id: str, issued_at: int, now: int) -> None:
+        expires_at = max(now + 1, issued_at + self.replay_window_seconds + 1)
+        try:
+            claimed = self.replay_store.claim(request_id, expires_at)
+        except ProofRunnerUnavailableError:
+            raise
+        except Exception as exc:
+            raise ProofRunnerUnavailableError("proof replay store is unavailable") from exc
+        if not claimed:
+            raise ProofProtocolError("proof request replay detected")
 
     def _store_artifact(self, namespace: str, content: bytes) -> str:
         if self.artifact_store is None:
@@ -576,7 +751,12 @@ class ProofRunnerServer:
             return ""
 
     def _signed_response(
-        self, document: dict[str, Any], request_id: str, input_sha: str
+        self,
+        document: dict[str, Any],
+        request_id: str,
+        input_sha: str,
+        key_id: str,
+        secret: bytes,
     ) -> SignedProofResponse:
         body = canonical_json(document)
         if len(body) > self.max_response_bytes:
@@ -584,6 +764,7 @@ class ProofRunnerServer:
             document = {
                 "version": PROTOCOL_VERSION,
                 "request_id": request_id,
+                "key_id": key_id,
                 "input_sha256": input_sha,
                 "evidence_sha256": sha256_hex(canonical_json(outcome)),
                 "outcome": outcome,
@@ -601,8 +782,9 @@ class ProofRunnerServer:
                 HEADER_ISSUED_AT: issued_at,
                 HEADER_BODY_SHA256: body_sha,
                 HEADER_INPUT_SHA256: input_sha,
+                HEADER_KEY_ID: key_id,
                 HEADER_SIGNATURE: _sign(
-                    self._secret,
+                    secret,
                     "response",
                     request_id,
                     issued_at,
@@ -611,6 +793,20 @@ class ProofRunnerServer:
                 ),
             },
         )
+
+    def readiness(self) -> dict[str, Any]:
+        try:
+            ready = bool(self.replay_store.health())
+        except Exception:
+            ready = False
+        return {
+            "status": "ready" if ready else "not-ready",
+            "replay_backend": self.replay_store.backend,
+            "signing_key_ids": len(self._signing_keys),
+        }
+
+    def close(self) -> None:
+        self.replay_store.close()
 
 
 def _error_outcome(detail: str) -> dict[str, Any]:
@@ -626,8 +822,13 @@ def _error_outcome(detail: str) -> dict[str, Any]:
 class ProofRunnerSettings:
     host: str
     port: int
-    signing_key: str
+    signing_key: str = field(repr=False)
     container_image: str
+    signing_key_id: str = "default"
+    previous_signing_key_id: str = ""
+    previous_signing_key: str = field(default="", repr=False)
+    replay_redis_url: str = field(default="", repr=False)
+    require_shared_replay: bool = False
     timeout_seconds: int = 120
     memory_mb: int = 1024
     pids_limit: int = 256
@@ -661,6 +862,12 @@ class ProofRunnerSettings:
             port=integer("PORT", 8091),
             signing_key=os.getenv(prefix + "SIGNING_KEY", ""),
             container_image=os.getenv(prefix + "CONTAINER_IMAGE", ""),
+            signing_key_id=os.getenv(prefix + "SIGNING_KEY_ID", "default"),
+            previous_signing_key_id=os.getenv(prefix + "PREVIOUS_SIGNING_KEY_ID", ""),
+            previous_signing_key=os.getenv(prefix + "PREVIOUS_SIGNING_KEY", ""),
+            replay_redis_url=os.getenv(prefix + "REPLAY_REDIS_URL", ""),
+            require_shared_replay=os.getenv(prefix + "REQUIRE_SHARED_REPLAY", "false").lower()
+            in {"1", "true", "yes", "on"},
             timeout_seconds=integer("TIMEOUT_SECONDS", 120),
             memory_mb=integer("MEMORY_MB", 1024),
             pids_limit=integer("PIDS_LIMIT", 256),
@@ -685,6 +892,20 @@ class ProofRunnerSettings:
 
     def validate(self) -> None:
         _validated_secret(self.signing_key)
+        _validated_key_id(self.signing_key_id)
+        if bool(self.previous_signing_key_id) != bool(self.previous_signing_key):
+            raise ValueError(
+                "proof runner previous signing key id and key must be configured together"
+            )
+        if self.previous_signing_key_id:
+            _validated_key_id(self.previous_signing_key_id)
+            _validated_secret(self.previous_signing_key)
+            if self.previous_signing_key_id == self.signing_key_id:
+                raise ValueError("proof runner current and previous signing key ids must differ")
+        if self.require_shared_replay and not self.replay_redis_url:
+            raise ValueError(
+                "EVOAGENT_PROOF_RUNNER_REPLAY_REDIS_URL is required when shared replay is mandatory"
+            )
         if not self.container_image:
             raise ValueError("EVOAGENT_PROOF_RUNNER_CONTAINER_IMAGE is required")
         if self.cpus <= 0:
@@ -713,9 +934,21 @@ def build_runner_service(settings: ProofRunnerSettings) -> ProofRunnerServer:
     artifacts = (
         ContentAddressedArtifactStore(settings.artifact_dir) if settings.artifact_dir else None
     )
+    replay_store: ProofReplayStorePort = (
+        RedisProofReplayStore(settings.replay_redis_url)
+        if settings.replay_redis_url
+        else InMemoryProofReplayStore(settings.max_replay_entries)
+    )
+    verification_keys = (
+        {settings.previous_signing_key_id: settings.previous_signing_key}
+        if settings.previous_signing_key_id
+        else {}
+    )
     return ProofRunnerServer(
         executor,
         settings.signing_key,
+        signing_key_id=settings.signing_key_id,
+        verification_keys=verification_keys,
         max_request_bytes=settings.max_request_bytes,
         max_response_bytes=settings.max_response_bytes,
         replay_window_seconds=settings.replay_window_seconds,
@@ -725,6 +958,7 @@ def build_runner_service(settings: ProofRunnerSettings) -> ProofRunnerServer:
         max_concurrency=settings.max_concurrency,
         artifact_store=artifacts,
         require_artifacts=settings.require_artifacts,
+        replay_store=replay_store,
     )
 
 
@@ -734,11 +968,17 @@ def _handler(service: ProofRunnerServer, max_request_bytes: int):
         sys_version = ""
 
         def do_GET(self) -> None:
-            if self.path != "/healthz":
+            if self.path == "/healthz":
+                document = {"status": "ok"}
+                status = 200
+            elif self.path == "/readyz":
+                document = service.readiness()
+                status = 200 if document["status"] == "ready" else 503
+            else:
                 self.send_error(404)
                 return
-            payload = b'{"status":"ok"}'
-            self.send_response(200)
+            payload = canonical_json(document)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
@@ -831,6 +1071,7 @@ def run() -> None:
         pass
     finally:
         server.server_close()
+        service.close()
         for signal_number, previous in previous_handlers.items():
             signal.signal(signal_number, previous)
 

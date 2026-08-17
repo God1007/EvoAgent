@@ -11,7 +11,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Intake | `evoagent/api.py`, `errors.py` | HTTP API, static web console, bounded query admission, explicit client-safe errors, correlated 5xx boundary, `/webhooks/github`, `/health`, `/metrics` |
 | Composition | `evoagent/plugins.py` | Trusted plugin manifests, capability registry, scopes, events, dependency graph, lifecycle rollback |
 | Composition | `evoagent/capabilities.py` | Stable typed capability definitions for providers and consumers |
-| Domain boundary | `evoagent/ports.py` | Focused Store, Queue, CodeHost, Model Gateway, and Proof Executor behavioral contracts |
+| Domain boundary | `evoagent/ports.py` | Focused Store, Queue, CodeHost, Model Gateway, Proof Executor, and Proof Replay Store behavioral contracts |
 | Composition | `evoagent/bootstrap.py` | Replaceable built-in provider catalog and transactional application startup |
 | Application | `evoagent/application/` | Focused Review, Webhook, Session, Repair, Policy, and Model Usage use cases |
 | Composition facade | `evoagent/service.py` | Capability wiring, lifecycle/health, canary/shadow runtime selection, API compatibility |
@@ -181,6 +181,8 @@ The full analysis lives in [`threat-model.md`](threat-model.md). Key boundaries:
 - **Production proof execution** can cross an authenticated remote boundary.
   The response is bound to request/input/evidence hashes; the remote process
   starts container-only jobs with no application credentials or network.
+  Production replicas atomically claim nonces in shared Redis and support one
+  previous HMAC key during a body-bound, fail-closed rotation window.
 - **Outbound GitHub requests** are restricted to an HTTPS host allowlist with
   redirect token-stripping and response-size caps.
 - **Outbound model requests** pass through a tenant/repository-aware gateway;

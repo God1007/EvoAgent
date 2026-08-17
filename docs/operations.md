@@ -150,6 +150,13 @@ must never be reclassified as failed reproductions. Follow
 [`remote-proof-runner.md`](remote-proof-runner.md) for isolation, key rotation,
 artifact retention, and replica limits.
 
+For more than one Runner replica, require shared replay and alert when
+`/readyz` is not ready. A replay Redis outage is not a reason to bypass nonce
+claims or switch to memory; stop proof traffic and retain L1 uncertainty. During
+HMAC rotation, verify all Runners accept current+previous IDs before switching
+clients, wait for the request/replay drain, then remove the previous key. Never
+reuse a retired key ID for different key material.
+
 ## Release checklist
 
 1. Ruff, mypy, unit/contract tests, dependency audit, wheel build pass.

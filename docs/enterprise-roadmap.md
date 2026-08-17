@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.20.0)
+## Current maturity (v0.21.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -18,7 +18,7 @@ It is an execution plan, not a marketing checklist.
 | Graceful lifecycle | Implemented | Readiness drain plus bounded queue drain before Store/plugin shutdown |
 | Multi-tenancy/governance | Implemented baseline | JWT, RBAC, tenant/repository authorization, audit, canary/shadow/rollback |
 | Model governance | Implemented advanced baseline | Replaceable gateway, scoped policy routing/residency, bounded fallback, per-route breakers, redaction, egress/output limits, atomic budgets, correlated metadata-only ledger, and conservative crash reconciliation; route shadow promotion remains pending |
-| Strong untrusted execution | Implemented baseline | Replaceable remote Proof Runner, mutually authenticated evidence manifests, container-only jobs, replay/size/capacity gates, and content-addressed artifacts; microVM and distributed replay store remain pending |
+| Strong untrusted execution | Implemented advanced baseline | Replaceable remote Proof Runner, mutually authenticated evidence manifests, container-only jobs, cross-replica Redis nonce claims, dual-key rotation, replay/size/capacity gates, and content-addressed artifacts; microVM and WORM retention remain pending |
 | Service-level operations | Implemented baseline | Fixed-cardinality availability/latency/success SLIs, versioned 30-day SLO catalog, multi-window burn alerts, queue/Outbox age, DLQ depth, dashboard, runbooks, and hardened Prometheus evaluator |
 | HTTP edge security | Implemented baseline | Validated/generated request correlation, explicit client-safe 4xx types, bounded list reads, generic 5xx envelopes, query-free structured access logs, consistent hardening headers, and no interpreter-version disclosure |
 | Operational failure security | Implemented baseline | Allowlisted message-free failure summaries, stable code-location references, persistence-adapter enforcement, legacy-data migration, and exception-message-free OpenTelemetry/plugin/proof paths |
@@ -227,9 +227,18 @@ uncertainty according to the ladder. Unit attack tests cover tampering, expiry,
 replay, allowlists, artifact immutability, and failure mapping; mandatory Docker
 CI exercises the complete HTTP → signature → runner → netless container path.
 
-Still pending for hostile public multi-tenancy: a microVM executor, shared
-multi-replica replay/nonce storage, dual-key rotation, and object-lock/WORM
-retention. See [`ADR 0009`](adr/0009-authenticated-remote-proof-runner.md).
+The v0.21 increment extracts `ProofReplayStorePort`: local development keeps a
+bounded memory adapter, while production replicas atomically claim UUID nonces
+through Redis `SET NX` + TTL. Runner `/readyz` fails with the shared dependency,
+and an outage returns 503 before execution. Body-bound key IDs plus exactly one
+previous verification key provide a documented rolling rotation with no
+unsigned/downgrade window; responses use the request-selected key. Real Redis
+CI proves cross-adapter atomicity and TTL.
+
+Still pending for hostile public multi-tenancy: a microVM executor and
+object-lock/WORM retention. See
+[`ADR 0009`](adr/0009-authenticated-remote-proof-runner.md) and
+[`ADR 0019`](adr/0019-shared-proof-replay-and-key-rotation.md).
 
 ## Phase 5 — SLO, operations, and disaster recovery
 

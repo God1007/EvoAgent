@@ -823,6 +823,9 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `EVOAGENT_REPAIR_TEST_COMMAND` | 空 | 自动修复后运行的仓库测试命令 |
 | `EVOAGENT_PROOF_RUNNER_URL` | 空 | 独立 Proof Runner `/v1/execute` 地址；非回环必须 HTTPS |
 | `EVOAGENT_PROOF_RUNNER_ALLOWED_HOSTS` | 空 | Runner 精确主机白名单（启用远程执行时必填） |
+| `EVOAGENT_PROOF_RUNNER_SIGNING_KEY_ID` | `default` | 当前 HMAC 密钥的非敏感版本 ID，写入签名证明 |
+| `EVOAGENT_PROOF_RUNNER_REPLAY_REDIS_URL` | 空 | Runner 多副本共享 nonce 存储；生产横向扩容时配置 |
+| `EVOAGENT_PROOF_RUNNER_REQUIRE_SHARED_REPLAY` | `false` | 是否禁止 Runner 使用进程内防重放存储 |
 | `EVOAGENT_PROOF_REQUIRE_REMOTE` | `false` | 是否要求远程 Runner 完整配置，否则启动失败 |
 | `EVOAGENT_SKILL_SANDBOX` | `true` | 动态 Skill 是否运行在沙箱中 |
 | `EVOAGENT_SKILL_CONTAINER_IMAGE` | 空 | Dynamic Skill 的独立容器镜像（生产建议固定 digest） |

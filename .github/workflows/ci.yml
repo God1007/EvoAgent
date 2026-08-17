@@ -271,7 +271,7 @@ jobs:
             fi
             sleep 1
           done
-          python -c "import json; d=json.load(open('ready.json')); assert d['status']=='ready'; assert d['queue_backend']=='redis-streams'; assert d['checks']['schema_version']==8; assert d['checks']['queue']['healthy']"
+          python -c "import json; from evoagent.migrations import CURRENT_SCHEMA_VERSION; d=json.load(open('ready.json')); assert d['status']=='ready'; assert d['queue_backend']=='redis-streams'; assert d['checks']['schema_version']==CURRENT_SCHEMA_VERSION; assert d['checks']['queue']['healthy']"
           curl -fsS -X POST 'http://127.0.0.1:18080/v1/reviews?async=true' \
             -H 'Content-Type: application/json' \
             -d '{"repository":"ci/full-stack","pull_request":17,"diff":"diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n+value = 1\n+print(value)"}' \

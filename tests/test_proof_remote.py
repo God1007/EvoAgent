@@ -9,17 +9,50 @@ from unittest import mock
 from evoagent.config import Settings
 from evoagent.proof import EvidenceLevel, ProofRunner
 from evoagent.proof_remote import (
+    HEADER_BODY_SHA256,
+    HEADER_INPUT_SHA256,
+    HEADER_ISSUED_AT,
+    HEADER_KEY_ID,
+    HEADER_REQUEST_ID,
+    HEADER_SIGNATURE,
     BoundedThreadingHTTPServer,
     ContentAddressedArtifactStore,
     ProofProtocolError,
     ProofRunnerServer,
     ProofRunnerSettings,
+    ProofRunnerUnavailableError,
+    RedisProofReplayStore,
     RemoteProofExecutor,
     _handler,
+    _sign,
     canonical_json,
+    sha256_hex,
 )
 
 SECRET = "proof-test-signing-secret-at-least-32-bytes"
+NEXT_SECRET = "next-proof-signing-secret-at-least-32-bytes"
+
+
+class FakeRedis:
+    def __init__(self):
+        self.values = {}
+        self.available = True
+
+    def set(self, key, value, nx=False, ex=None):
+        if not self.available:
+            raise ConnectionError("redis unavailable")
+        if nx and key in self.values:
+            return False
+        self.values[key] = (value, ex)
+        return True
+
+    def ping(self):
+        if not self.available:
+            raise ConnectionError("redis unavailable")
+        return True
+
+    def close(self):
+        return None
 
 
 def _outcome(status="passed"):
@@ -155,6 +188,162 @@ class RemoteProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ProofProtocolError, "replay detected"):
             self.server.execute(request.data, dict(request.header_items()))
         self.assertEqual(1, len(self.executor.calls))
+
+    def test_shared_redis_replay_store_rejects_replay_on_a_second_replica(self):
+        redis = FakeRedis()
+        first = ProofRunnerServer(
+            self.executor,
+            SECRET,
+            replay_store=RedisProofReplayStore(
+                "redis://127.0.0.1/0", client=redis, clock=lambda: 1000
+            ),
+            clock=lambda: 1000,
+        )
+        second = ProofRunnerServer(
+            self.executor,
+            SECRET,
+            replay_store=RedisProofReplayStore(
+                "redis://127.0.0.1/0", client=redis, clock=lambda: 1000
+            ),
+            clock=lambda: 1000,
+        )
+        opener = LoopbackOpener(first)
+        self._client(opener).execute({"app.py": "x = 1\n"}, "pytest -q")
+        request = opener.last_request
+
+        with self.assertRaisesRegex(ProofProtocolError, "replay detected"):
+            second.execute(request.data, dict(request.header_items()))
+        self.assertEqual(1, len(self.executor.calls))
+
+    def test_replay_store_outage_fails_closed_before_execution_and_readiness(self):
+        redis = FakeRedis()
+        redis.available = False
+        server = ProofRunnerServer(
+            self.executor,
+            SECRET,
+            replay_store=RedisProofReplayStore(
+                "redis://127.0.0.1/0", client=redis, clock=lambda: 1000
+            ),
+            clock=lambda: 1000,
+        )
+        client = self._client(LoopbackOpener(server))
+
+        with self.assertRaisesRegex(ProofRunnerUnavailableError, "replay store"):
+            client.execute({"app.py": "x = 1\n"}, "pytest -q")
+        self.assertEqual([], self.executor.calls)
+        self.assertEqual(
+            {"status": "not-ready", "replay_backend": "redis", "signing_key_ids": 1},
+            server.readiness(),
+        )
+
+    def test_current_and_previous_signing_keys_overlap_without_downgrade(self):
+        server = ProofRunnerServer(
+            self.executor,
+            NEXT_SECRET,
+            signing_key_id="2026-09",
+            verification_keys={"2026-08": SECRET},
+            clock=lambda: 1000,
+        )
+        previous = RemoteProofExecutor(
+            "http://127.0.0.1:8091/v1/execute",
+            SECRET,
+            ("127.0.0.1",),
+            signing_key_id="2026-08",
+            opener=LoopbackOpener(server),
+            clock=lambda: 1000,
+        )
+        current = RemoteProofExecutor(
+            "http://127.0.0.1:8091/v1/execute",
+            NEXT_SECRET,
+            ("127.0.0.1",),
+            signing_key_id="2026-09",
+            opener=LoopbackOpener(server),
+            clock=lambda: 1000,
+        )
+
+        self.assertEqual(
+            "2026-08", previous.execute({"old.py": "x=1\n"}, "test")["attestation"]["key_id"]
+        )
+        self.assertEqual(
+            "2026-09", current.execute({"new.py": "x=2\n"}, "test")["attestation"]["key_id"]
+        )
+        retired = ProofRunnerServer(
+            self.executor,
+            NEXT_SECRET,
+            signing_key_id="2026-09",
+            clock=lambda: 1000,
+        )
+        rejected = RemoteProofExecutor(
+            "http://127.0.0.1:8091/v1/execute",
+            SECRET,
+            ("127.0.0.1",),
+            signing_key_id="2026-08",
+            opener=LoopbackOpener(retired),
+            clock=lambda: 1000,
+        )
+        with self.assertRaisesRegex(ProofProtocolError, "signature is invalid"):
+            rejected.execute({"old.py": "x=1\n"}, "test")
+
+    def test_legacy_request_without_key_id_can_only_select_literal_default(self):
+        def legacy_request(body, headers):
+            document = json.loads(body)
+            document.pop("key_id")
+            body = canonical_json(document)
+            replaced_headers = {
+                HEADER_KEY_ID.lower(),
+                HEADER_BODY_SHA256.lower(),
+                HEADER_SIGNATURE.lower(),
+            }
+            headers = {
+                key: value for key, value in headers.items() if key.lower() not in replaced_headers
+            }
+
+            def header(name):
+                return next(value for key, value in headers.items() if key.lower() == name.lower())
+
+            body_sha = sha256_hex(body)
+            headers[HEADER_BODY_SHA256] = body_sha
+            headers[HEADER_SIGNATURE] = _sign(
+                SECRET.encode("utf-8"),
+                "request",
+                header(HEADER_REQUEST_ID),
+                header(HEADER_ISSUED_AT),
+                body_sha,
+                header(HEADER_INPUT_SHA256),
+            )
+            return body, headers
+
+        overlap = ProofRunnerServer(
+            self.executor,
+            NEXT_SECRET,
+            signing_key_id="2026-09",
+            verification_keys={"default": SECRET},
+            clock=lambda: 1000,
+        )
+        result = self._client(LoopbackOpener(overlap, mutate_request=legacy_request)).execute(
+            {"old.py": "x=1\n"}, "test"
+        )
+        self.assertEqual("default", result["attestation"]["key_id"])
+
+        named_only = ProofRunnerServer(
+            self.executor,
+            NEXT_SECRET,
+            signing_key_id="2026-09",
+            clock=lambda: 1000,
+        )
+        with self.assertRaisesRegex(ProofProtocolError, "signature is invalid"):
+            self._client(LoopbackOpener(named_only, mutate_request=legacy_request)).execute(
+                {"old.py": "x=1\n"}, "test"
+            )
+
+    def test_response_key_id_tampering_is_rejected(self):
+        def tamper(body, headers):
+            headers[HEADER_KEY_ID] = "attacker-key"
+            return body, headers
+
+        client = self._client(LoopbackOpener(self.server, mutate_response=tamper))
+        with self.assertRaisesRegex(ProofProtocolError, "key id mismatch"):
+            client.execute({"app.py": "x = 1\n"}, "pytest -q")
 
     def test_replay_guard_memory_is_bounded(self):
         server = ProofRunnerServer(self.executor, SECRET, max_replay_entries=1, clock=lambda: 1000)
@@ -320,6 +509,11 @@ class RunnerDeploymentTests(unittest.TestCase):
             os.environ,
             {
                 "EVOAGENT_PROOF_RUNNER_SIGNING_KEY": SECRET,
+                "EVOAGENT_PROOF_RUNNER_SIGNING_KEY_ID": "2026-09",
+                "EVOAGENT_PROOF_RUNNER_PREVIOUS_SIGNING_KEY_ID": "2026-08",
+                "EVOAGENT_PROOF_RUNNER_PREVIOUS_SIGNING_KEY": NEXT_SECRET,
+                "EVOAGENT_PROOF_RUNNER_REPLAY_REDIS_URL": "redis://replay:secret@redis/0",
+                "EVOAGENT_PROOF_RUNNER_REQUIRE_SHARED_REPLAY": "true",
                 "EVOAGENT_PROOF_RUNNER_CONTAINER_IMAGE": "python:3.12-slim",
                 "EVOAGENT_GITHUB_TOKEN": "must-not-be-read",
             },
@@ -328,6 +522,11 @@ class RunnerDeploymentTests(unittest.TestCase):
             settings = ProofRunnerSettings.from_env()
         self.assertEqual("127.0.0.1", settings.host)
         self.assertEqual("python:3.12-slim", settings.container_image)
+        self.assertEqual("2026-09", settings.signing_key_id)
+        self.assertTrue(settings.require_shared_replay)
+        self.assertNotIn(SECRET, repr(settings))
+        self.assertNotIn(NEXT_SECRET, repr(settings))
+        self.assertNotIn("redis:secret", repr(settings))
         self.assertFalse(hasattr(settings, "github_token"))
 
     def test_application_settings_fail_closed_for_partial_remote_configuration(self):
@@ -357,6 +556,16 @@ class RunnerDeploymentTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "URL is required"):
             no_endpoint.validate_evolution()
+        invalid_key_id = Settings(
+            **{
+                **base.__dict__,
+                "proof_runner_signing_key": SECRET,
+                "proof_runner_allowed_hosts": ("proof.example",),
+                "proof_runner_signing_key_id": "bad key id",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "KEY_ID"):
+            invalid_key_id.validate_evolution()
 
     def test_runner_requires_container_and_strong_key(self):
         with self.assertRaisesRegex(ValueError, "CONTAINER_IMAGE"):
@@ -381,6 +590,28 @@ class RunnerDeploymentTests(unittest.TestCase):
                 port=8091,
                 signing_key=SECRET,
                 container_image="python:3.12-slim",
+            ).validate()
+
+    def test_shared_replay_and_rotation_configuration_fail_closed(self):
+        base = {
+            "host": "127.0.0.1",
+            "port": 8091,
+            "signing_key": SECRET,
+            "container_image": "python:3.12-slim",
+        }
+        with self.assertRaisesRegex(ValueError, "REPLAY_REDIS_URL"):
+            ProofRunnerSettings(**base, require_shared_replay=True).validate()
+        with self.assertRaisesRegex(ValueError, "configured together"):
+            ProofRunnerSettings(
+                **base,
+                previous_signing_key_id="2026-08",
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "must differ"):
+            ProofRunnerSettings(
+                **base,
+                signing_key_id="same",
+                previous_signing_key_id="same",
+                previous_signing_key=NEXT_SECRET,
             ).validate()
 
     def test_actual_loopback_http_transport(self):

@@ -416,6 +416,20 @@ class ProofExecutorPort(Protocol):
     def health(self) -> dict[str, Any]: ...
 
 
+@runtime_checkable
+class ProofReplayStorePort(Protocol):
+    """Atomic nonce claims shared by one or more Proof Runner replicas."""
+
+    @property
+    def backend(self) -> str: ...
+
+    def claim(self, request_id: str, expires_at: int) -> bool: ...
+
+    def health(self) -> bool: ...
+
+    def close(self) -> None: ...
+
+
 class ServiceStorePort(Protocol):
     def ping(self) -> None: ...
 

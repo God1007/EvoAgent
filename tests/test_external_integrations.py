@@ -10,6 +10,7 @@ import unittest
 import uuid
 
 from evoagent.postgres_store import PostgresTaskStore
+from evoagent.proof_remote import RedisProofReplayStore
 from evoagent.task_queue import PermanentTaskError, TaskQueue
 
 POSTGRES_URL = os.getenv("EVOAGENT_TEST_POSTGRES_URL", "")
@@ -197,6 +198,25 @@ class RedisRuntimeIntegrationTests(unittest.TestCase):
             self.assertTrue(queue.health()["healthy"])
         finally:
             queue.close(3)
+
+    def test_proof_replay_claim_is_atomic_across_runner_adapters(self):
+        prefix = "evoagent:test-proof-replay:%s" % uuid.uuid4().hex
+        first = RedisProofReplayStore(REDIS_URL, prefix=prefix)
+        second = RedisProofReplayStore(REDIS_URL, prefix=prefix)
+        request_id = str(uuid.uuid4())
+        try:
+            self.assertTrue(first.claim(request_id, int(time.time()) + 30))
+            self.assertFalse(second.claim(request_id, int(time.time()) + 30))
+            self.assertTrue(first.health())
+            keys = list(self.redis.scan_iter(prefix + ":*"))
+            self.assertEqual(1, len(keys))
+            self.assertGreater(self.redis.ttl(keys[0]), 0)
+        finally:
+            keys = list(self.redis.scan_iter(prefix + ":*"))
+            if keys:
+                self.redis.delete(*keys)
+            first.close()
+            second.close()
 
 
 if __name__ == "__main__":

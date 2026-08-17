@@ -44,10 +44,12 @@ produce L2, and only a signed passing patched result can produce L3/L4.
   remote provider is configured.
 - The runner must live in a dedicated trust domain with no application secrets;
   giving it a shared production Docker socket would weaken that isolation.
-- HMAC key rotation currently requires an orchestrated rollout; dual-key
-  rotation is not yet implemented.
-- The replay cache is process-local. Multi-replica deployments need a shared
-  nonce store or sticky routing until that contract is added.
+- Key IDs are bound inside request/response bodies. A Runner can accept exactly
+  one previous key during a coordinated overlap and signs each response with
+  the request-selected key; named-key clients fail closed against old Runners.
+- Replay protection is a Port. Local mode uses a bounded process cache;
+  production replicas use Redis atomic `SET NX` + TTL and expose dependency
+  readiness separately from liveness.
 - Filesystem content addressing detects mutation but is not object-lock/WORM.
   Regulated retention should replace `proof.executor` or extend the runner with
   an immutable object-store adapter.

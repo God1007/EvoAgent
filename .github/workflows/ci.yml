@@ -73,6 +73,7 @@ jobs:
           test -f "$wheel_env/share/evoagent/ops/prometheus/evoagent.rules.yml"
           test -f "$wheel_env/share/evoagent/ops/grafana/evoagent-overview.json"
           "$wheel_env/bin/evoagent-slo" --help >/dev/null
+          "$wheel_env/bin/evoagent-dr" --help >/dev/null
           "$wheel_env/bin/evoagent-migrate" | grep -q '"schema_version": 7'
           kill -TERM "$wheel_pid"
           wait "$wheel_pid"
@@ -186,6 +187,12 @@ jobs:
         run: |
           python -m pip install --require-hashes -r requirements-dev.lock
           python -m pip install --no-deps -e .
+      - name: Install PostgreSQL backup and restore tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-client
+          pg_dump --version
+          pg_restore --version
       - name: Run the real migration entry point
         env:
           EVOAGENT_DATABASE_URL: ${{ env.EVOAGENT_TEST_POSTGRES_URL }}
@@ -198,6 +205,28 @@ jobs:
             tests/test_adapter_contracts.py \
             tests/test_external_integrations.py \
             tests/test_github_http_fixture.py
+      - name: Prove backup and isolated restore integrity
+        env:
+          EVOAGENT_DATABASE_URL: ${{ env.EVOAGENT_TEST_POSTGRES_URL }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/evoagent-dr"
+          python -m evoagent.dr \
+            --backend postgresql \
+            --output-dir "${RUNNER_TEMP}/evoagent-dr" \
+            --max-rpo-seconds 300 \
+            --max-rto-seconds 300 > recovery-report.json
+          cat recovery-report.json
+          python -c "import json; d=json.load(open('recovery-report.json')); assert d['status']=='pass'; assert d['integrity']['source_fingerprint']==d['integrity']['restored_fingerprint']; assert d['cleanup']['restored_database_removed']"
+      - name: Retain non-sensitive recovery evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: database-recovery-evidence
+          path: |
+            recovery-report.json
+            ${{ runner.temp }}/evoagent-dr/*.manifest.json
+          if-no-files-found: warn
+          retention-days: 14
       - name: Build the production image
         run: docker build -t evoagent:ci .
       - name: Run the real container verifier boundary tests

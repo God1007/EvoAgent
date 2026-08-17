@@ -121,8 +121,10 @@ artifact retention, and replica limits.
 5. Canary health and error budget are observed before widening traffic.
 6. Rollback artifact, previous image digest, and migration compatibility are
    recorded.
-7. Backup restore drill and recovery report are within the declared RPO/RTO.
+7. `evoagent-dr` restored into a disposable database, content fingerprints
+   matched, cleanup succeeded, and the report is within declared RPO/RTO.
 
-The automated backup/restore drill and its evidence format remain the next
-milestone; until that drill exists and runs against a disposable restored
-database, enterprise disaster-recovery readiness remains incomplete.
+The complete procedure and evidence contract are in the
+[disaster-recovery runbook](disaster-recovery.md). Database recoverability is
+automated; Redis rehydration, regional failover, and a production-shaped soak
+remain required before claiming full service disaster-recovery readiness.

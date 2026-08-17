@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.12.0)
+## Current maturity (v0.13.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -21,7 +21,7 @@ It is an execution plan, not a marketing checklist.
 | Strong untrusted execution | Implemented baseline | Replaceable remote Proof Runner, mutually authenticated evidence manifests, container-only jobs, replay/size/capacity gates, and content-addressed artifacts; microVM and distributed replay store remain pending |
 | Service-level operations | Implemented baseline | Fixed-cardinality availability/latency/success SLIs, versioned 30-day SLO catalog, multi-window burn alerts, queue/Outbox age, DLQ depth, dashboard, runbooks, and hardened Prometheus evaluator |
 | Quality evidence | Synthetic benchmark only | 100-case controlled corpus; production activation gate remains blocked without independent labels |
-| HA/DR operational proof | Pending | No documented backup/restore drill, regional failover, or sustained production SLO evidence |
+| HA/DR operational proof | Implemented database baseline | SQLite online restore and PostgreSQL exported-snapshot `pg_dump`/isolated `pg_restore` validate checksummed schema, bounded-memory table fingerprints, Store read/write smoke, cleanup, and RPO/RTO evidence; Redis rehydration and regional failover remain pending |
 
 ## Phase 2 — Ports, persistence, and integration proof
 
@@ -247,9 +247,19 @@ fast/slow budget burn and dependency backlog alerts, and the packaged Grafana
 dashboard links to actionable runbooks. CI validates the rules with `promtool`
 and verifies all operational assets in the wheel.
 
-Still pending in this phase: an automated PostgreSQL backup/restore integrity
-drill, declared RPO/RTO evidence, regional failover exercise, and a sustained
-production-shaped soak. SLO instrumentation is not a claim of DR readiness.
+Implemented database recovery baseline: `evoagent-dr` performs SQLite online
+backup/restore or a PostgreSQL exported-snapshot `pg_dump` followed by
+`pg_restore` into a strictly generated disposable database. A pass requires
+checksummed migration history, schema metadata, per-table counts and
+bounded-memory content fingerprints, Store read/write smoke, target cleanup,
+artifact SHA-256, and explicit RPO/RTO gates. CI runs the real PostgreSQL path
+and retains only the non-row-data evidence manifests. See
+[`ADR 0011`](adr/0011-isolated-database-recovery-drills.md).
+
+Still pending in this phase: reconciliation of incomplete work after a regional
+Redis loss, managed PITR/object-lock integration, a separate-region failover
+exercise, and a sustained production-shaped soak. A same-cluster database drill
+is not a claim of full service DR readiness.
 
 ## Phase 6 — Independent quality evidence
 

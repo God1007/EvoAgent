@@ -19,6 +19,7 @@ Redis 7, and Docker.
 | GitHub transport | Auth/version headers, retry response, JSON body, and PATCH upsert cross a real HTTP socket |
 | Verifier | Real Docker run has no network, read-only root, bounded resources, no ambient host secret, and timeout cleanup |
 | Remote Proof Runner | Signed loopback HTTP reaches a real netless job container and returns content-addressed input/evidence attestations without leaking an ambient secret |
+| PostgreSQL recovery | One exported MVCC snapshot is dumped, restored only into a generated database, compared table-by-table, exercised through the Store adapter, and removed within RPO/RTO |
 | Distribution | The installed wheel serves packaged web assets and contains the bundled Skill |
 | Production image | `/ready` sees Postgres, Redis workers, schema and Outbox; async review reaches `SUCCESS`; SIGTERM exits cleanly |
 
@@ -39,12 +40,20 @@ python -m pytest -q \
   tests/test_external_integrations.py \
   tests/test_github_http_fixture.py
 
+export EVOAGENT_DATABASE_URL="$EVOAGENT_TEST_POSTGRES_URL"
+evoagent-dr --backend postgresql \
+  --output-dir /tmp/evoagent-recovery \
+  --max-rpo-seconds 300 \
+  --max-rto-seconds 300
+
 docker build -t evoagent:integration .
 EVOAGENT_TEST_CONTAINER_IMAGE=evoagent:integration \
   python -m pytest -q tests/test_container_integration.py
 ```
 
-The workflow itself is the executable source of truth for image startup and the
+The recovery command requires PostgreSQL client tools and a disposable database
+role with `CREATEDB`; it never restores into the named source database. The
+workflow itself is the executable source of truth for image startup and the
 full-stack Outbox path. A local machine without Docker/PostgreSQL/Redis can still
 run `make check`; its report must retain the explicit external-test skips rather
 than being represented as production-backend evidence.

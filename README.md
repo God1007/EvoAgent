@@ -50,6 +50,7 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **生产治理** | JWT、RBAC、多租户、仓库隔离、事务 Outbox、审计日志、灰度发布、影子流量、告警与死信队列 |
 | **可观测性** | 任务 Trace、Agent 消息、Prometheus 指标和 OpenTelemetry Trace |
 | **SLO 与告警** | 版本化 30 天 SLO、错误预算、快/慢燃烧率告警、Queue/Outbox 新鲜度、Grafana Dashboard 与处置 Runbook |
+| **灾备证据** | SQLite 在线快照与 PostgreSQL MVCC `pg_dump` 均执行隔离恢复，校验迁移、Schema、逐表内容指纹、应用读写及 RPO/RTO |
 | **Web 控制台** | 提供运行总览、发起审查、任务中心、Skill 管理、演进实验室和 GitHub 配置页面 |
 
 ## 工作原理
@@ -606,6 +607,23 @@ curl http://127.0.0.1:8080/health
 }
 ```
 
+### 4. 隔离恢复演练
+
+在带有 `pg_dump` / `pg_restore` 的独立运维 Job 中执行，不要给常驻服务容器授予建库权限：
+
+```bash
+export EVOAGENT_DATABASE_URL='postgresql://...'
+evoagent-dr --backend postgresql \
+  --output-dir /var/lib/evoagent/recovery \
+  --max-rpo-seconds 3600 \
+  --max-rto-seconds 900
+```
+
+工具只会恢复到内部生成的 `evoagent_drill_<uuid>` 数据库，并在逐表内容指纹、迁移
+校验和、应用读写及 RPO/RTO 全部通过后删除临时库、输出 JSON 证据。数据备份不会上传
+到普通 CI Artifact；生产加密、对象锁和演练流程见
+[`docs/disaster-recovery.md`](docs/disaster-recovery.md)。
+
 ## 登录与 API 鉴权
 
 启用 `EVOAGENT_AUTH_REQUIRED=true` 后，业务 API 需要 Bearer Token：
@@ -796,6 +814,7 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 │   ├── proof.py                  # L1–L4 证据阶梯与执行器端口消费
 │   ├── proof_remote.py           # 双向签名远程执行协议与独立 Runner
 │   ├── slo.py                    # 版本化 SLO 与 Prometheus 评估 CLI
+│   ├── dr.py                     # 隔离备份恢复演练与 RPO/RTO 证据
 │   ├── harness.py                # LangGraph、状态机与 Checkpoint
 │   ├── agents.py                 # 多 Agent 协作协议
 │   ├── reviewer.py               # 本地规则与 OpenAI-compatible Reviewer
@@ -844,9 +863,9 @@ make check
 
 当前整体行覆盖率约 87%，其中 `fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
 
-GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16 与 Redis 7，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离、远程 Proof Runner 的签名 HTTP → 禁网容器全链路，以及生产镜像的 `/ready` → Outbox → Redis → Worker 流程。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；后续架构决策记录在 [`docs/adr/`](docs/adr/)，模型治理见 [`ADR 0007`](docs/adr/0007-governed-model-gateway.md)，远程证据边界见 [`ADR 0009`](docs/adr/0009-authenticated-remote-proof-runner.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
+GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16 与 Redis 7，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离、远程 Proof Runner 的签名 HTTP → 禁网容器全链路、PostgreSQL 隔离备份恢复，以及生产镜像的 `/ready` → Outbox → Redis → Worker 流程。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；后续架构决策记录在 [`docs/adr/`](docs/adr/)，模型治理见 [`ADR 0007`](docs/adr/0007-governed-model-gateway.md)，远程证据边界见 [`ADR 0009`](docs/adr/0009-authenticated-remote-proof-runner.md)，数据库恢复边界见 [`ADR 0011`](docs/adr/0011-isolated-database-recovery-drills.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
 
-更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，仓库策略见 [`docs/repository-policies.md`](docs/repository-policies.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)，SLO 告警与处置见 [`docs/operations.md`](docs/operations.md)，性能压测方法与可复现基线见 [`docs/performance.md`](docs/performance.md) 与 [`docs/performance-baseline.md`](docs/performance-baseline.md)。
+更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，仓库策略见 [`docs/repository-policies.md`](docs/repository-policies.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)，SLO 告警与处置见 [`docs/operations.md`](docs/operations.md)，数据库灾备见 [`docs/disaster-recovery.md`](docs/disaster-recovery.md)，性能压测方法与可复现基线见 [`docs/performance.md`](docs/performance.md) 与 [`docs/performance-baseline.md`](docs/performance-baseline.md)。
 
 ## 生产级性能与压测
 

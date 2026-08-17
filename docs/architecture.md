@@ -34,6 +34,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Cross-cutting | `evoagent/auth.py` | JWT, RBAC, tenant isolation |
 | Cross-cutting | `evoagent/observability.py`, `metrics.py` | Trace, Prometheus metrics, OpenTelemetry |
 | Operations | `evoagent/slo.py`, `ops/` | Versioned SLO evaluation, Prometheus alerts, and Grafana dashboard |
+| Operations | `evoagent/dr.py` | Isolated SQLite/PostgreSQL restore drills and RPO/RTO evidence |
 | Model | `evoagent/models.py` | `Finding`, `Severity`, `ReviewReport`, stable fingerprints |
 | Adapters | `evoagent/github.py`, `diff_parser.py` | Hardened GitHub client, unified-diff parsing |
 
@@ -112,6 +113,11 @@ See [`plugin-system.md`](plugin-system.md) and
   migrations and refuses a database created by a newer application. See
   [`database-migrations.md`](database-migrations.md) and
   [`ADR 0003`](adr/0003-versioned-forward-only-migrations.md).
+- **Recovery proof** uses SQLite online backup or a PostgreSQL exported MVCC
+  snapshot plus `pg_dump`, always restores into a disposable target, compares
+  schema/content fingerprints, exercises the Store adapter, and emits versioned
+  RPO/RTO evidence. See [`disaster-recovery.md`](disaster-recovery.md) and
+  [`ADR 0011`](adr/0011-isolated-database-recovery-drills.md).
 - **Queue durability** depends on the backend. `redis-streams` provides ACK,
   consumer leases, dead-letter queue, and replay. The in-process
   `memory-ephemeral` backend is **not** durable (`/health` reports

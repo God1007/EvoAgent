@@ -23,6 +23,10 @@ to inherit an EvoAgent implementation class.
 | `ReleaseStorePort` | canary, shadow, promotion, rollback | SQLite/PostgreSQL store facet |
 | `AlertStorePort` | operational alert evaluation | SQLite/PostgreSQL store facet |
 | `OutboxStorePort` | durable queue publication and recovery | SQLite/PostgreSQL store facet |
+| `ReviewApplicationStorePort` | review task lifecycle and external-effect receipts | SQLite/PostgreSQL store facet |
+| `SessionApplicationStorePort` | PR continuity and source impact | SQLite/PostgreSQL store facet |
+| `RepairApplicationStorePort` | idempotent repair publication | SQLite/PostgreSQL store facet |
+| `WebhookApplicationStorePort` | atomic delivery/session/task/outbox intake | SQLite/PostgreSQL store facet |
 | `TaskQueuePort` / `QueueFactoryPort` | asynchronous review delivery | memory executor, Redis Streams |
 | `CodeHostPort` | diff intake, comment delivery, repair PR | GitHub |
 
@@ -39,7 +43,8 @@ tables because its constructor accepts `ReviewExecutionStorePort`.
    external service;
 2. one behavior suite is inherited by each adapter backend, proving task,
    checkpoint, session, identity, webhook, audit, shadow-release, delivery,
-   health, shutdown, Outbox, and effect-receipt semantics.
+   health, shutdown, Outbox, and effect-receipt semantics. Webhook contracts
+   include concurrent duplicate admission and injected transaction rollback.
 
 SQLite and the memory queue always run in the local test suite. Production
 backend contracts are enabled with:

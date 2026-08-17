@@ -618,6 +618,10 @@ Provider/Model、Diff 大小、GitHub 评论和确定性 FixRule。每次变更�
 审计日志，任务接收时固化策略快照，紧急禁用仍会阻止未执行任务。字段、兼容规则与
 API 示例见 [`docs/repository-policies.md`](docs/repository-policies.md)。
 
+GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在同一个
+数据库事务中提交；并发重复 delivery 只绑定一个任务，任一步失败都会整体回滚，避免
+“Webhook 已接收但任务不存在”的悬挂状态。
+
 ## API 概览
 
 ### 审查与任务
@@ -751,7 +755,8 @@ API 示例见 [`docs/repository-policies.md`](docs/repository-policies.md)。
 .
 ├── evoagent/
 │   ├── api.py                    # HTTP API 与静态控制台
-│   ├── service.py                # 业务用例编排与 Capability 消费
+│   ├── application/              # Review/Webhook/Session/Repair/Policy 用例层
+│   ├── service.py                # Capability 组装、生命周期与兼容门面
 │   ├── plugins.py                # 插件依赖图、生命周期、Scope 与事件总线
 │   ├── ports.py                  # Store / Queue / CodeHost 领域端口
 │   ├── migrations.py             # 带校验和与兼容门禁的数据库迁移历史
@@ -804,9 +809,9 @@ make check
 - 锁定依赖漏洞审计；
 - sdist / wheel 构建验证。
 
-当前整体行覆盖率约 86%，其中 `reviewer`、`fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
+当前整体行覆盖率约 87%，其中 `fixer`、`verifier`、`report`、`github` 等核心模块均在 90% 以上；覆盖率门禁维持 70%，为边界适配器保留合理裕度。
 
-GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16 与 Redis 7，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离，以及生产镜像的 `/ready` → Outbox → Redis → Worker 全链路。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；质量门禁、可信插件微内核、数据库迁移、事务 Outbox 与仓库策略分别记录在 [`ADR 0001`](docs/adr/0001-engineering-quality-gates.md)、[`ADR 0002`](docs/adr/0002-trusted-plugin-microkernel.md)、[`ADR 0003`](docs/adr/0003-versioned-forward-only-migrations.md)、[`ADR 0004`](docs/adr/0004-transactional-outbox.md) 和 [`ADR 0005`](docs/adr/0005-versioned-repository-policy.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
+GitHub 额外执行 Gitleaks、CodeQL、依赖审计、Docker 构建冒烟和强制外部适配器矩阵。后者会启动真实 PostgreSQL 16 与 Redis 7，验证迁移、共享 Store/Queue 契约、连接池耗尽与重连、Redis 断连恢复、跨进程租约接管、DLQ 重放、GitHub HTTP 线协议、Verifier 容器隔离，以及生产镜像的 `/ready` → Outbox → Redis → Worker 全链路。复现方式见 [`docs/integration-testing.md`](docs/integration-testing.md)。一期所有修复、增强、设计取舍和验证证据汇总在 [`docs/phase-1-engineering-quality-upgrade.md`](docs/phase-1-engineering-quality-upgrade.md)；质量门禁、可信插件微内核、数据库迁移、事务 Outbox、仓库策略与应用用例边界分别记录在 [`ADR 0001`](docs/adr/0001-engineering-quality-gates.md)、[`ADR 0002`](docs/adr/0002-trusted-plugin-microkernel.md)、[`ADR 0003`](docs/adr/0003-versioned-forward-only-migrations.md)、[`ADR 0004`](docs/adr/0004-transactional-outbox.md)、[`ADR 0005`](docs/adr/0005-versioned-repository-policy.md) 和 [`ADR 0006`](docs/adr/0006-use-case-boundaries-and-atomic-webhook-intake.md)。贡献要求和安全报告流程分别见 [`CONTRIBUTING.md`](CONTRIBUTING.md) 与 [`SECURITY.md`](SECURITY.md)。
 
 更多工程文档：系统架构见 [`docs/architecture.md`](docs/architecture.md)，仓库策略见 [`docs/repository-policies.md`](docs/repository-policies.md)，威胁模型与信任边界见 [`docs/threat-model.md`](docs/threat-model.md)，评测口径与可复现基线见 [`docs/evaluation.md`](docs/evaluation.md) 与 [`docs/evaluation-baseline.md`](docs/evaluation-baseline.md)，性能 SLO、压测方法与可复现基线见 [`docs/performance.md`](docs/performance.md) 与 [`docs/performance-baseline.md`](docs/performance-baseline.md)。
 

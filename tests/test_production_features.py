@@ -4,6 +4,7 @@ import time
 import unittest
 
 from evoagent.auth import AuthManager
+from evoagent.config import Settings
 from evoagent.harness import ReviewHarness
 from evoagent.reviewer import LocalRuleReviewer
 from evoagent.rollout import ReleaseManager
@@ -99,8 +100,23 @@ class ProductionFeatureTests(unittest.TestCase):
 
     def test_dead_letter_marks_pending_task_failed(self):
         self.store.create("dead", "org/repo", 1, {}, "tenant")
-        service = ReviewService.__new__(ReviewService)
-        service.store = self.store
+        service = ReviewService(
+            Settings(
+                host="127.0.0.1",
+                port=8080,
+                db_path=self.path,
+                max_diff_bytes=10_000,
+                max_steps=8,
+                timeout_seconds=10,
+                llm_base_url="",
+                llm_api_key="",
+                llm_model="",
+                github_webhook_secret="",
+                github_token="",
+                auto_post_review=False,
+            )
+        )
+        self.addCleanup(service.close)
 
         service._on_dead_letter({"task_id": "dead", "tenant_id": "tenant"}, "boom")
 

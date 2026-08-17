@@ -4,12 +4,13 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.7.0)
+## Current maturity (v0.8.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
 | Reproducible engineering | Implemented | Hash locks, Ruff, mypy, tests, coverage gate, package build, dependency audit |
 | Application composition | Implemented | Trusted plugin graph, typed capabilities, Profile, Scope, rollback, reverse shutdown |
+| Application boundaries | Implemented baseline | Focused Review/Webhook/Session/Repair/Policy use cases behind a compatible facade; evolution is an independent capability |
 | Review extensibility | Implemented | Reviewer interface, sandboxed Dynamic Skills, replaceable `review.engine` |
 | Repair extensibility | Implemented | Independent `fix.rule` providers; verifier and publication gates remain centralized |
 | Local durability | Development only | SQLite + memory queue is explicitly non-durable |
@@ -109,32 +110,52 @@ the single-process unit coverage denominator until its entire broad Store
 surface (not only critical contracts) has boundary coverage; the external job
 is nevertheless a required pass/fail merge gate.
 
-## Phase 3 — Application decomposition and policy scopes
+## Phase 3 — Application decomposition and policy scopes — implemented baseline
 
-Split the large `ReviewService` into use-case services while keeping one public
-facade for API compatibility:
+`ReviewService` remains the public API-compatible composition facade, while
+business orchestration is split into independently testable application
+objects:
 
 ```text
 ReviewApplication
   ├── ReviewUseCases
-  ├── PullRequestWebhookUseCases
+  ├── WebhookUseCases
   ├── RepairUseCases
   ├── SessionUseCases
-  └── EvolutionUseCases
+  ├── PolicyUseCases
+  └── EvolutionEngine (independent capability)
 ```
 
-Introduce tenant/repository policy resolution on top of child plugin scopes:
+Implemented repository policy dimensions:
 
 - allowed reviewers and FixRules;
-- LLM/model/data-residency policy;
-- token, concurrency, and cost budgets;
-- auto-fix and publication approval rules.
+- allowed LLM providers and models;
+- repository-specific Diff size;
+- enable/disable, auto-fix, and comment-publication decisions.
+
+The policy is versioned and audited. Accepted tasks retain the exact policy
+snapshot used for admission, while current disable/comment restrictions remain
+emergency kill switches. Cost/token quotas, data residency, redaction, and
+tenant-specific provider credentials intentionally remain in Phase 4 because a
+model gateway is required to enforce them rather than merely store them.
+
+GitHub PR intake was also made one Store unit of work: delivery binding, session
+turn, task, and outbox commit atomically. Duplicate and concurrent deliveries
+resolve to one task; fault injection proves that an exception leaves no partial
+delivery, session, task, or queue intent.
 
 Acceptance:
 
-- each use case has a narrow port set and independent tests;
-- repository policy changes are audited and versioned;
-- one tenant cannot consume another tenant's provider, quota, or event payload.
+- focused application Ports and immutable options pass mypy;
+- direct use-case tests run without HTTP or plugin startup;
+- SQLite/PostgreSQL share duplicate, concurrency, and rollback contracts;
+- repository policy changes are audited, versioned, and tenant scoped;
+- public service/API behavior remains backward compatible.
+
+Evidence: `evoagent/application/`, the focused Protocols in
+`evoagent/ports.py`, `tests/test_application_use_cases.py`, the shared adapter
+contracts, and
+[`ADR 0006`](adr/0006-use-case-boundaries-and-atomic-webhook-intake.md).
 
 ## Phase 4 — Model gateway and execution isolation
 

@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from . import __version__
 from .auth import Principal
 from .config import Settings
 from .github import verify_signature
@@ -46,7 +47,7 @@ DRAINING = threading.Event()
 class ApiHandler(BaseHTTPRequestHandler):
     service: ReviewService
     settings: Settings
-    server_version = "EvoAgent/0.3"
+    server_version = "EvoAgent/%s" % __version__
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print("%s - %s" % (self.address_string(), fmt % args))

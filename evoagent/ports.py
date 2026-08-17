@@ -10,6 +10,7 @@ still verify the surface consumed by the domain.
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from typing import Any, Protocol, runtime_checkable
 
 from .models import ReviewReport, TraceEvent
@@ -176,6 +177,145 @@ class RepositoryPolicyStorePort(Protocol):
     ) -> bool: ...
 
 
+class SessionApplicationStorePort(Protocol):
+    def complete_session_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        task_id: str | None,
+        open_snapshots: list[dict[str, Any]],
+        summary: dict[str, Any],
+        head_sha: str | None = None,
+    ) -> None: ...
+
+    def previous_open_snapshot(self, session_id: str, turn_id: str) -> list[dict[str, Any]]: ...
+
+    def get_session(
+        self, tenant_id: str, repository: str, pull_request: int
+    ) -> dict[str, Any] | None: ...
+
+    def get_session_timeline(
+        self, session_id: str, tenant_id: str | None = None, turn_limit: int = 200
+    ) -> dict[str, Any] | None: ...
+
+    def resolve_session_input(self, session_id: str) -> None: ...
+
+    def audit(
+        self,
+        tenant_id: str,
+        actor: str,
+        action: str,
+        resource: str,
+        detail: dict[str, Any] | None = None,
+    ) -> None: ...
+
+
+class RepairApplicationStorePort(Protocol):
+    def get(self, task_id: str, tenant_id: str | None = None) -> dict[str, Any] | None: ...
+
+    def claim_effect(self, effect_key: str, owner: str, lease_seconds: float) -> dict[str, Any]: ...
+
+    def complete_effect(self, effect_key: str, owner: str, result: dict[str, Any]) -> bool: ...
+
+    def release_effect(self, effect_key: str, owner: str, error: str) -> bool: ...
+
+
+class RepairPublisherPort(Protocol):
+    @property
+    def rule_ids(self) -> tuple[str, ...]: ...
+
+    def create_fix_commits(
+        self,
+        client: CodeHostPort,
+        repository: str,
+        pull_request: int,
+        report: dict[str, Any],
+        operation_key: str = "",
+        allowed_rule_ids: tuple[str, ...] | None = None,
+    ) -> dict[str, Any]: ...
+
+
+class ReviewApplicationStorePort(Protocol):
+    def get(self, task_id: str, tenant_id: str | None = None) -> dict[str, Any] | None: ...
+
+    def create_review_task(
+        self,
+        task_id: str,
+        repository: str,
+        pull_request: int | None,
+        payload: dict[str, Any],
+        tenant_id: str,
+        diff: str | None = None,
+        outbox_payload: dict[str, Any] | None = None,
+    ) -> None: ...
+
+    def save_task_payload(self, task_id: str, diff: str) -> None: ...
+
+    def get_task_payload(self, task_id: str) -> str | None: ...
+
+    def update_task_input(self, task_id: str, updates: dict[str, Any]) -> None: ...
+
+    def request_cancel(self, task_id: str, tenant_id: str | None = None) -> bool: ...
+
+    def fail(self, task_id: str, error: str, event: TraceEvent) -> None: ...
+
+    def create_alert(self, tenant_id: str, alert_key: str, severity: str, message: str) -> None: ...
+
+    def claim_effect(self, effect_key: str, owner: str, lease_seconds: float) -> dict[str, Any]: ...
+
+    def complete_effect(self, effect_key: str, owner: str, result: dict[str, Any]) -> bool: ...
+
+    def release_effect(self, effect_key: str, owner: str, error: str) -> bool: ...
+
+    def record_failure_case(self, task_id: str, category: str, payload: dict[str, Any]) -> None: ...
+
+
+class ReviewReleasePort(Protocol):
+    def assignment(self, tenant_id: str, skill_name: str, key: str) -> dict[str, Any]: ...
+
+    def observe(
+        self, tenant_id: str, skill_name: str, failed: bool, lane: str
+    ) -> dict[str, Any] | None: ...
+
+
+class ReviewAlertPort(Protocol):
+    def evaluate(self, tenant_id: str) -> None: ...
+
+
+class ObservabilityPort(Protocol):
+    def span(self, name: str, trace_id: str, **attributes: Any) -> AbstractContextManager[Any]: ...
+
+
+class WebhookApplicationStorePort(Protocol):
+    def installation_tenant(self, installation_id: int) -> str | None: ...
+
+    def claim_webhook(
+        self,
+        delivery_id: str,
+        tenant_id: str,
+        event_type: str,
+        payload_sha256: str,
+    ) -> bool: ...
+
+    def complete_webhook(self, delivery_id: str, task_id: str | None) -> None: ...
+
+    def get_webhook(self, delivery_id: str) -> dict[str, Any] | None: ...
+
+    def accept_pull_request_webhook(
+        self,
+        delivery_id: str,
+        tenant_id: str,
+        payload_sha256: str,
+        repository: str,
+        pull_request: int,
+        head_sha: str | None,
+        trigger: str,
+        task_id: str,
+        task_payload: dict[str, Any],
+        outbox_payload: dict[str, Any],
+    ) -> dict[str, Any]: ...
+
+
 class OutboxStorePort(Protocol):
     def claim_outbox(
         self,
@@ -270,6 +410,20 @@ class ServiceStorePort(Protocol):
         event_type: str,
         payload_sha256: str,
     ) -> bool: ...
+
+    def accept_pull_request_webhook(
+        self,
+        delivery_id: str,
+        tenant_id: str,
+        payload_sha256: str,
+        repository: str,
+        pull_request: int,
+        head_sha: str | None,
+        trigger: str,
+        task_id: str,
+        task_payload: dict[str, Any],
+        outbox_payload: dict[str, Any],
+    ) -> dict[str, Any]: ...
 
     def complete_webhook(self, delivery_id: str, task_id: str | None) -> None: ...
 

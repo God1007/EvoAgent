@@ -11,6 +11,7 @@ separate dispatcher leases committed rows and publishes them through the active
 ```text
 HTTP/webhook request
   -> Store transaction
+       webhook only: bind delivery + append PR session turn
        insert task
        insert task payload (or deferred-diff metadata)
        insert outbox message with task-id message key
@@ -31,6 +32,8 @@ of recovery and the dispatcher retries with capped exponential delay.
 | Failure point | Recovery behavior |
 | --- | --- |
 | Before Store commit | Task, payload, and outbox all roll back |
+| Webhook failure during intake | Delivery, session turn, task, and outbox all roll back |
+| Concurrent duplicate webhook | Unique delivery id returns the one already-bound task |
 | After commit, before queue publish | Dispatcher/restarted process leases the pending row |
 | After publish, before `published` update | Same message key is submitted again; queue dedupe prevents a second delivery |
 | Dispatcher dies while leasing | Another dispatcher reclaims the row after `lease_until` |

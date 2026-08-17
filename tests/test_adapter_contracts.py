@@ -108,6 +108,159 @@ class _StoreBehaviorContract:
             any(item["resource"] == resource for item in self.store.list_audit("tenant-a", 100))
         )
 
+    def test_pull_request_acceptance_is_one_atomic_idempotent_unit(self):
+        delivery = self.unique("atomic-delivery")
+        task_id = self.unique("atomic-task")
+        repository = "acme/" + self.unique("atomic-repository")
+        task_payload = {"source": "github-webhook", "diff_pending": True}
+        outbox_payload = {
+            "repository": repository,
+            "pull_request": 41,
+            "diff_url": "https://example.invalid/pull.diff",
+            "tenant_id": "tenant-a",
+        }
+
+        accepted = self.store.accept_pull_request_webhook(
+            delivery,
+            "tenant-a",
+            "payload-hash",
+            repository,
+            41,
+            "head-1",
+            "opened",
+            task_id,
+            task_payload,
+            outbox_payload,
+        )
+        duplicate = self.store.accept_pull_request_webhook(
+            delivery,
+            "tenant-a",
+            "payload-hash",
+            repository,
+            41,
+            "head-1",
+            "opened",
+            self.unique("must-not-be-created"),
+            task_payload,
+            outbox_payload,
+        )
+
+        self.assertTrue(accepted["accepted"])
+        self.assertFalse(duplicate["accepted"])
+        self.assertEqual(task_id, duplicate["task_id"])
+        self.assertEqual(task_id, self.store.get_webhook(delivery)["task_id"])
+        task = self.store.get(task_id, "tenant-a")
+        self.assertEqual(accepted["session_id"], task["input"]["session_id"])
+        timeline = self.store.get_session_timeline(accepted["session_id"], "tenant-a")
+        self.assertEqual(1, len(timeline["turns"]))
+        self.assertTrue(
+            any(item["message_key"] == task_id for item in self.store.list_outbox("pending", 100))
+        )
+        with self.assertRaisesRegex(ValueError, "different payload"):
+            self.store.accept_pull_request_webhook(
+                delivery,
+                "tenant-a",
+                "different-hash",
+                repository,
+                41,
+                "head-1",
+                "opened",
+                self.unique("conflict"),
+                task_payload,
+                outbox_payload,
+            )
+
+    def test_pull_request_acceptance_rolls_back_every_record_on_failure(self):
+        delivery = self.unique("rollback-delivery")
+        task_id = self.unique("rollback-task")
+        repository = "acme/" + self.unique("rollback-repository")
+        with self.assertRaises(TypeError):
+            self.store.accept_pull_request_webhook(
+                delivery,
+                "tenant-a",
+                "payload-hash",
+                repository,
+                42,
+                "head-1",
+                "opened",
+                task_id,
+                {"not_json_serializable": object()},
+                {"repository": repository},
+            )
+
+        self.assertIsNone(self.store.get_webhook(delivery))
+        self.assertIsNone(self.store.get(task_id, "tenant-a"))
+        self.assertIsNone(self.store.get_session("tenant-a", repository, 42))
+
+    def test_pull_request_acceptance_recovers_a_legacy_unbound_delivery(self):
+        delivery = self.unique("legacy-unbound-delivery")
+        task_id = self.unique("recovered-task")
+        repository = "acme/" + self.unique("recovered-repository")
+        self.assertTrue(
+            self.store.claim_webhook(delivery, "tenant-a", "pull_request", "payload-hash")
+        )
+
+        recovered = self.store.accept_pull_request_webhook(
+            delivery,
+            "tenant-a",
+            "payload-hash",
+            repository,
+            44,
+            "head-1",
+            "opened",
+            task_id,
+            {"source": "contract", "diff_pending": True},
+            {"repository": repository, "pull_request": 44},
+        )
+
+        self.assertTrue(recovered["accepted"])
+        self.assertEqual(task_id, self.store.get_webhook(delivery)["task_id"])
+        self.assertIsNotNone(self.store.get(task_id, "tenant-a"))
+
+    def test_concurrent_duplicate_delivery_creates_exactly_one_task(self):
+        delivery = self.unique("concurrent-delivery")
+        repository = "acme/" + self.unique("concurrent-repository")
+        barrier = threading.Barrier(2)
+        results: list[dict] = []
+        errors: list[Exception] = []
+
+        def accept(task_id: str) -> None:
+            try:
+                barrier.wait(timeout=5)
+                results.append(
+                    self.store.accept_pull_request_webhook(
+                        delivery,
+                        "tenant-a",
+                        "payload-hash",
+                        repository,
+                        43,
+                        "head-1",
+                        "opened",
+                        task_id,
+                        {"source": "contract", "diff_pending": True},
+                        {"repository": repository, "pull_request": 43},
+                    )
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        workers = [
+            threading.Thread(target=accept, args=(self.unique("candidate-task"),)) for _ in range(2)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=10)
+
+        self.assertEqual([], errors)
+        self.assertEqual(2, len(results))
+        self.assertEqual(1, sum(bool(item["accepted"]) for item in results))
+        task_ids = {item["task_id"] for item in results}
+        self.assertEqual(1, len(task_ids))
+        session = self.store.get_session("tenant-a", repository, 43)
+        timeline = self.store.get_session_timeline(session["id"], "tenant-a")
+        self.assertEqual(1, len(timeline["turns"]))
+
     def test_shadow_release_contract(self):
         skill_name = self.unique("review-skill")
         self.store.save_deployment(

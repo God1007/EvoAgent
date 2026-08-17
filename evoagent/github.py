@@ -11,6 +11,8 @@ import urllib.request
 from datetime import datetime
 from typing import Any, ClassVar
 
+from . import __version__
+
 
 def verify_signature(secret: str, body: bytes, signature: str) -> bool:
     if not secret or not signature.startswith("sha256="):
@@ -96,7 +98,7 @@ class GitHubClient:
     def _headers(self, accept: str = "application/vnd.github+json") -> dict[str, str]:
         headers = {
             "Accept": accept,
-            "User-Agent": "EvoAgent/0.1",
+            "User-Agent": "EvoAgent/%s" % __version__,
             "X-GitHub-Api-Version": "2022-11-28",
         }
         if self.token:
@@ -364,7 +366,7 @@ class GitHubAppAuthenticator:
                 "Authorization": "Bearer " + self.app_jwt(),
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "EvoAgent/0.3",
+                "User-Agent": "EvoAgent/%s" % __version__,
                 "Content-Type": "application/json",
             },
         )

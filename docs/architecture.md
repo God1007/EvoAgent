@@ -13,7 +13,8 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Composition | `evoagent/capabilities.py` | Stable typed capability definitions for providers and consumers |
 | Domain boundary | `evoagent/ports.py` | Focused Store, Queue, and CodeHost behavioral contracts |
 | Composition | `evoagent/bootstrap.py` | Replaceable built-in provider catalog and transactional application startup |
-| Orchestration | `evoagent/service.py` | Consumes composed capabilities, enqueues/processes reviews, GitHub integration |
+| Application | `evoagent/application/` | Focused Review, Webhook, Session, Repair, and Policy use cases |
+| Composition facade | `evoagent/service.py` | Capability wiring, lifecycle/health, canary/shadow runtime selection, API compatibility |
 | Runtime | `evoagent/harness.py` | LangGraph state machine, budget, retry, checkpoint/resume |
 | Runtime | `evoagent/task_queue.py` | In-process queue or Redis Streams (ACK, lease, DLQ, replay) |
 | Runtime | `evoagent/outbox.py` | Store-to-queue transactional publication, leases, retry and recovery |
@@ -43,7 +44,9 @@ process startup
   → resolve ReviewService capabilities
 
 change (webhook | REST | console)
-  → ReviewService.enqueue_review            # atomically persist task + outbox
+  → WebhookUseCases | ReviewUseCases
+      webhook: delivery + session turn + task + outbox in one transaction
+      REST: task + Diff + outbox in one transaction
   → OutboxDispatcher                        # lease + idempotent publication
   → TaskQueue                               # in-process or Redis Streams
   → ReviewHarness.run                       # LangGraph nodes, checkpoint each step
@@ -117,9 +120,12 @@ See [`plugin-system.md`](plugin-system.md) and
   the publish/ack crash window. See
   [`transactional-outbox.md`](transactional-outbox.md) and
   [`ADR 0004`](adr/0004-transactional-outbox.md).
-- **Idempotency**: GitHub webhook delivery id, payload digest, and PR update
-  time prevent invalid replay; comments use stable upsert markers and repair PRs
-  use effect receipts plus deterministic branches.
+- **Atomic webhook intake** binds delivery id + payload digest, PR session turn,
+  task, and outbox in one Store transaction. Concurrent duplicate deliveries
+  return the same task, while injected failures leave no partial records. See
+  [`ADR 0006`](adr/0006-use-case-boundaries-and-atomic-webhook-intake.md).
+- **Idempotent external effects**: comments use stable upsert markers and repair
+  PRs use effect receipts plus deterministic branches.
 - **Repository governance** is resolved through a replaceable capability. The
   accepted task stores a versioned policy snapshot while current disable/comment
   kill switches are checked again at execution. See
@@ -155,6 +161,9 @@ The full analysis lives in [`threat-model.md`](threat-model.md). Key boundaries:
   in its manifest.
 - **New lifecycle observer**: subscribe to sanitized events such as
   `review.completed`; observer failures are isolated from the review path.
+- **New application operation**: add a focused object under
+  `evoagent.application`, declare only the Ports it consumes, test it directly,
+  and expose a compatibility delegate from `ReviewService` when required.
 
 ## 7. Deliberate boundaries
 

@@ -370,40 +370,61 @@ class TaskStore:
         Returns the session/turn ids plus the previous turn's open-finding
         snapshot so the caller can classify the current findings for continuity.
         """
-        now = utc_now()
         with self._lock, self._connect() as conn:
-            # Atomic get-or-create: INSERT OR IGNORE closes the SELECT/INSERT race
-            # so a concurrent opened+synchronize pair cannot create two sessions.
-            new_id = str(uuid.uuid4())
-            cursor = conn.execute(
-                "INSERT OR IGNORE INTO review_sessions(id,tenant_id,repository,pull_request,"
-                "status,latest_head_sha,created_at,updated_at) VALUES (?,?,?,?,'open',?,?,?)",
-                (new_id, tenant_id, repository, pull_request, head_sha, now, now),
+            return self._start_session_turn_in_transaction(
+                conn,
+                tenant_id,
+                repository,
+                pull_request,
+                head_sha,
+                trigger,
+                task_id,
+                utc_now(),
             )
-            is_new = cursor.rowcount > 0
-            row = conn.execute(
-                "SELECT id, latest_head_sha FROM review_sessions "
-                "WHERE tenant_id=? AND repository=? AND pull_request=?",
-                (tenant_id, repository, pull_request),
-            ).fetchone()
-            session_id = row["id"]
-            previous_head = None if is_new else row["latest_head_sha"]
-            sequence = (
-                int(
-                    conn.execute(
-                        "SELECT COALESCE(MAX(sequence),0) AS m FROM session_turns WHERE session_id=?",
-                        (session_id,),
-                    ).fetchone()["m"]
-                )
-                + 1
+
+    def _start_session_turn_in_transaction(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        repository: str,
+        pull_request: int,
+        head_sha: str | None,
+        trigger: str,
+        task_id: str | None,
+        now: str,
+    ) -> dict[str, Any]:
+        # Atomic get-or-create: INSERT OR IGNORE closes the SELECT/INSERT race
+        # so a concurrent opened+synchronize pair cannot create two sessions.
+        new_id = str(uuid.uuid4())
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO review_sessions(id,tenant_id,repository,pull_request,"
+            "status,latest_head_sha,created_at,updated_at) VALUES (?,?,?,?,'open',?,?,?)",
+            (new_id, tenant_id, repository, pull_request, head_sha, now, now),
+        )
+        is_new = cursor.rowcount > 0
+        row = conn.execute(
+            "SELECT id, latest_head_sha FROM review_sessions "
+            "WHERE tenant_id=? AND repository=? AND pull_request=?",
+            (tenant_id, repository, pull_request),
+        ).fetchone()
+        session_id = row["id"]
+        previous_head = None if is_new else row["latest_head_sha"]
+        sequence = (
+            int(
+                conn.execute(
+                    "SELECT COALESCE(MAX(sequence),0) AS m FROM session_turns WHERE session_id=?",
+                    (session_id,),
+                ).fetchone()["m"]
             )
-            turn_id = str(uuid.uuid4())
-            conn.execute(
-                "INSERT INTO session_turns(id,session_id,task_id,head_sha,trigger,sequence,created_at) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (turn_id, session_id, task_id, head_sha, trigger, sequence, now),
-            )
-            previous = self._previous_open_snapshot(conn, session_id, turn_id)
+            + 1
+        )
+        turn_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO session_turns(id,session_id,task_id,head_sha,trigger,sequence,created_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (turn_id, session_id, task_id, head_sha, trigger, sequence, now),
+        )
+        previous = self._previous_open_snapshot(conn, session_id, turn_id)
         return {
             "session_id": session_id,
             "turn_id": turn_id,
@@ -897,6 +918,94 @@ class TaskStore:
                         "delivery id was already used with a different payload"
                     ) from None
                 return False
+
+    def accept_pull_request_webhook(
+        self,
+        delivery_id: str,
+        tenant_id: str,
+        payload_sha256: str,
+        repository: str,
+        pull_request: int,
+        head_sha: str | None,
+        trigger: str,
+        task_id: str,
+        task_payload: dict[str, Any],
+        outbox_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically bind one delivery to its session, task, and queue intent."""
+        if not delivery_id:
+            raise ValueError("X-GitHub-Delivery is required")
+        now = utc_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT payload_sha256,task_id FROM webhook_deliveries WHERE delivery_id=?",
+                (delivery_id,),
+            ).fetchone()
+            if existing:
+                if existing["payload_sha256"] != payload_sha256:
+                    raise ValueError("delivery id was already used with a different payload")
+                if existing["task_id"]:
+                    return {"accepted": False, "task_id": existing["task_id"]}
+            else:
+                conn.execute(
+                    "INSERT INTO webhook_deliveries"
+                    "(delivery_id,tenant_id,event_type,payload_sha256,received_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (delivery_id, tenant_id, "pull_request", payload_sha256, now),
+                )
+            session = self._start_session_turn_in_transaction(
+                conn,
+                tenant_id,
+                repository,
+                pull_request,
+                head_sha,
+                trigger,
+                task_id,
+                now,
+            )
+            session_payload = {
+                "session_id": session["session_id"],
+                "turn_id": session["turn_id"],
+                "head_sha": head_sha,
+            }
+            conn.execute(
+                "INSERT INTO tasks(id,state,repository,pull_request,input_json,report_json,error,"
+                "created_at,updated_at,tenant_id,cancel_requested) "
+                "VALUES (?,?,?,?,?,NULL,NULL,?,?,?,0)",
+                (
+                    task_id,
+                    TaskState.PENDING.value,
+                    repository,
+                    pull_request,
+                    json.dumps({**task_payload, **session_payload}, ensure_ascii=False),
+                    now,
+                    now,
+                    tenant_id,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,"
+                "attempts,available_at,created_at,updated_at) "
+                "VALUES (?,?,?,?,'pending',0,?,?,?)",
+                (
+                    "review:" + task_id,
+                    "review",
+                    task_id,
+                    json.dumps(
+                        {"task_id": task_id, **outbox_payload, **session_payload},
+                        ensure_ascii=False,
+                    ),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                "UPDATE webhook_deliveries SET task_id=? WHERE delivery_id=?",
+                (task_id, delivery_id),
+            )
+        return {"accepted": True, "task_id": task_id, **session}
 
     def complete_webhook(self, delivery_id: str, task_id: str | None) -> None:
         with self._lock, self._connect() as conn:

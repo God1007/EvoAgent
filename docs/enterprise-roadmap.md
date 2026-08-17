@@ -4,12 +4,12 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.16.0)
+## Current maturity (v0.17.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
 | Reproducible engineering | Implemented | Hash locks, Ruff, mypy, tests, coverage gate, package build, dependency audit |
-| Application composition | Implemented | Trusted plugin graph, typed service-definition/provider/consumer seams, Profile, Scope, rollback, and reverse shutdown |
+| Application composition | Implemented | Trusted plugin graph, typed service-definition/provider/consumer seams, bounded content-addressed Profile layers, Scope, rollback, and reverse shutdown |
 | Application boundaries | Implemented baseline | Focused Review/Webhook/Session/Repair/Policy use cases behind a compatible facade; evolution is an independent capability |
 | Review extensibility | Implemented advanced baseline | Multi-provider `review.reviewer` contributions feed the unchanged Engine; Dynamic Skill reload is transactional and content-addressed, with optional mandatory container execution |
 | Repair extensibility | Implemented | Independent `fix.rule` providers; verifier and publication gates remain centralized |

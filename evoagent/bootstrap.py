@@ -102,8 +102,12 @@ def build_application_runtime(
     enabled and their ids are present in the operator allowlist.
     """
 
-    if profile is None and settings.plugin_profile_path:
-        profile = PluginProfile.from_toml(settings.plugin_profile_path)
+    if profile is None:
+        profile_paths = [
+            path for path in (settings.plugin_profile_path, *settings.plugin_profile_layers) if path
+        ]
+        if profile_paths:
+            profile = PluginProfile.from_toml_layers(profile_paths)
     selected_profile = profile or PluginProfile()
     catalog = {plugin.manifest.plugin_id: plugin for plugin in default_plugins(settings)}
     discovered: list[Plugin] = []

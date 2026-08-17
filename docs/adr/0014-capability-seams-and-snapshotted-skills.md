@@ -49,6 +49,7 @@ activations instead of mutable-path execution.
 
 EvoAgent does not adopt unrestricted production HMR or “everything is a plugin.”
 Authentication, policy enforcement, verification, state transitions, and trust
-classification remain privileged invariants. Live graph replacement and
-layered/bundled profile overlays may be added later only through candidate graph
-construction, health checks, and atomic traffic handoff.
+classification remain privileged invariants. Bundle-defined live graph
+replacement may be added later only through candidate graph construction,
+health checks, and atomic traffic handoff. Ordered Profile
+overlays are specified separately by [ADR 0015](0015-layered-plugin-profiles.md).

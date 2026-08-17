@@ -13,7 +13,7 @@ Trusted Plugin 负责企业部署所需的可替换基础设施；Dynamic Skill 
 
 ```mermaid
 flowchart LR
-    Profile["TOML Profile"] --> Catalog["Built-ins + allowlisted entry points"]
+    Profile["Base + ordered Profile layers"] --> Catalog["Built-ins + allowlisted entry points"]
     Catalog --> Validate["Manifest / dependency / cycle validation"]
     Validate --> Start["Topological activation"]
     Start --> Context["Capability registry + event bus"]
@@ -211,7 +211,7 @@ class AuditPlugin:
 
 事件不会携带原始 Diff、Token 或 LLM API Key。需要改变业务结果的 Policy Hook 尚未开放，以免插件绕过任务状态和验证不变量。
 
-## 6. Profile
+## 6. 分层 Profile
 
 ```toml
 [profile]
@@ -228,10 +228,25 @@ timeout_seconds = 3
 启动时设置：
 
 ```bash
-export EVOAGENT_PLUGIN_PROFILE=/etc/evoagent/production.toml
+export EVOAGENT_PLUGIN_PROFILE=/etc/evoagent/base.toml
+export EVOAGENT_PLUGIN_PROFILE_LAYERS=/etc/evoagent/cn.toml,/etc/evoagent/production.toml
 ```
 
-插件通过 `context.config` 读取自己的配置。配置中不能保存密钥；密钥仍应来自 Secret Manager 注入的环境变量。
+基础层最先加载，覆盖层按环境变量中的从左到右顺序加载。合并规则刻意保持简单且
+可预测：
+
+- 后层的 `name`、单插件 `enabled` 和 `disabled` 决策覆盖前层；
+- 后层声明 `[profile].enabled` 时，会重置此前所有启停决策并建立新的 allowlist；
+- 某层显式提供插件 `config` 时，整体替换该插件的旧配置，不执行容易产生歧义的深合并；
+- 最多 16 层，每层不超过 1 MiB；未知字段、重复路径、重复 ID 或类型错误会在任何插件
+  启动前 fail-closed；
+- 运行时深度冻结有效配置，每个插件通过 `context.config` 获得独立副本，不能篡改其他
+  Provider 看到的配置或审计指纹。
+
+`GET /v1/plugins` 返回有序的 `profile_layers`（文件名和内容 SHA-256）以及最终
+`profile_sha256`，但不返回配置值。运维系统可以用这些指纹确认实例是否运行相同配置；
+Profile 中不能保存密钥，密钥仍应由 Secret Manager 注入环境变量。Profile 当前在进程
+启动时构造，不提供生产热更新；变更应走正常灰度发布和回滚。
 
 ## 7. Provider 替换和 Scope
 
@@ -275,6 +290,7 @@ export EVOAGENT_SKILL_CONTAINER_IMAGE='registry.example/evoagent-skill-runner@sh
 - 关闭流程测试验证 Cleanup 幂等；
 - 事件载荷不包含源码和密钥；
 - `/health` 中 `plugin_runtime=running` 且 Profile 正确；
+- `/v1/plugins` 的 Profile 层顺序与 SHA-256 和发布清单一致；
 - 新 FixRule 同时包含肯定样本、拒绝修复样本和编译验证。
 - 新 Reviewer 使用唯一 contribution ID，且可通过 Profile 单独启停。
 - Dynamic Skill reload 失败时旧快照仍可用，生产环境要求固定摘要的容器镜像。

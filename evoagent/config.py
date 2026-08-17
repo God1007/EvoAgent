@@ -130,6 +130,7 @@ class Settings:
     pg_pool_max: int = 10
     pg_pool_timeout: int = 10
     plugin_profile_path: str = ""
+    plugin_profile_layers: tuple[str, ...] = ()
     plugin_discovery: bool = False
     plugin_allowlist: tuple[str, ...] = ()
     outbox_poll_seconds: float = 0.25
@@ -360,6 +361,7 @@ class Settings:
             pg_pool_max=_int("EVOAGENT_PG_POOL_MAX", 10),
             pg_pool_timeout=_int("EVOAGENT_PG_POOL_TIMEOUT", 10),
             plugin_profile_path=os.getenv("EVOAGENT_PLUGIN_PROFILE", ""),
+            plugin_profile_layers=_csv("EVOAGENT_PLUGIN_PROFILE_LAYERS"),
             plugin_discovery=_bool("EVOAGENT_PLUGIN_DISCOVERY", False),
             plugin_allowlist=_csv("EVOAGENT_PLUGIN_ALLOWLIST"),
             outbox_poll_seconds=_positive_float("EVOAGENT_OUTBOX_POLL_SECONDS", 0.25),

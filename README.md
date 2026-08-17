@@ -45,7 +45,7 @@ EvoAgent 接收 GitHub Pull Request 或手动提交的 Unified Diff，只审查�
 | **保守型自动修复** | 仅处理可确定转换的规则，在新分支生成原子提交，并经过编译与可选测试门禁 |
 | **受控能力演进** | 从误报、漏报和坏修复中生成候选 Prompt，通过 Validation/Holdout 回放门禁后才允许激活 |
 | **动态 Skills** | 基于 manifest 事务加载内容寻址的审查器快照，支持哈希/签名、输出/时间/内存上限、隔离进程及生产强制容器 |
-| **可插拔微内核** | Store、Queue、Model Gateway、Proof Executor、Reviewer、Review Engine、代码托管、可观测性和 FixRule 通过稳定 Capability 组合，支持依赖校验、启动回滚、Profile 与作用域覆盖 |
+| **可插拔微内核** | Store、Queue、Model Gateway、Proof Executor、Reviewer、Review Engine、代码托管、可观测性和 FixRule 通过稳定 Capability 组合，支持依赖校验、启动回滚、内容寻址的分层 Profile 与作用域覆盖 |
 | **模型治理网关** | 任务级租户/仓库上下文、凭据脱敏、HTTPS/出口主机限制、结构化输出门禁、Token/成本预算与元数据用量账本 |
 | **生产治理** | JWT、RBAC、多租户、仓库隔离、事务 Outbox、审计日志、灰度发布、影子流量、告警与死信队列 |
 | **可观测性** | 任务 Trace、Agent 消息、Prometheus 指标和 OpenTelemetry Trace |
@@ -273,6 +273,8 @@ curl 'http://127.0.0.1:8080/v1/tasks/<task-id>/report'
 Reviewer、调整优先级或通过 TOML Profile 禁用一个内置 Reviewer，而无需替换
 `ReviewEngine`。以上五种确定性修复均实现为独立 `fix.rule` Provider，同样可以独立
 启停或扩展，而无需修改 `SafeFixer`。
+部署配置可以把基础 Profile、区域和环境覆盖层按顺序组合；最终有效配置与每层文件
+都带 SHA-256 指纹，便于发布审计和回滚比对。
 插件协议、生命周期、信任边界和开发示例见
 [`docs/plugin-system.md`](docs/plugin-system.md)。
 
@@ -794,6 +796,7 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `EVOAGENT_OUTBOX_MAX_ATTEMPTS` | `20` | Outbox 发布进入 dead 前的最大尝试次数 |
 | `EVOAGENT_OUTBOX_LEASE_SECONDS` | `30` | Outbox Dispatcher 的消息所有权租约秒数 |
 | `EVOAGENT_PLUGIN_PROFILE` | 空 | Trusted Plugin TOML Profile 路径 |
+| `EVOAGENT_PLUGIN_PROFILE_LAYERS` | 空 | 在基础 Profile 后依次应用的 TOML 覆盖层路径，逗号分隔 |
 | `EVOAGENT_PLUGIN_DISCOVERY` | `false` | 是否发现已安装的可信插件 Entry Point |
 | `EVOAGENT_PLUGIN_ALLOWLIST` | 空 | 允许加载的可信 Plugin ID，逗号分隔 |
 | `EVOAGENT_LLM_PROVIDER` | `local` | `local`、`deepseek`、`openrouter-free` 或 `custom` |

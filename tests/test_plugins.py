@@ -295,6 +295,143 @@ class PluginRuntimeTests(unittest.TestCase):
         self.assertEqual("0.9", runtime.require(selected))
         self.assertFalse(runtime.capabilities.has(ignored.name))
 
+    def test_profile_layers_apply_last_wins_selection_and_replace_whole_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = os.path.join(directory, "base.toml")
+            overlay = os.path.join(directory, "production.toml")
+            with open(base, "w", encoding="utf-8") as output:
+                output.write(
+                    '[profile]\nname = "base"\ndisabled = ["test.optional"]\n\n'
+                    '[plugins."test.provider".config]\nthreshold = 0.5\nregion = "us"\n'
+                )
+            with open(overlay, "w", encoding="utf-8") as output:
+                output.write(
+                    '[profile]\nname = "production"\n\n'
+                    '[plugins."test.optional"]\nenabled = true\n\n'
+                    '[plugins."test.provider".config]\nthreshold = 0.9\n'
+                )
+
+            profile = PluginProfile.from_toml_layers([base, overlay])
+
+        self.assertEqual("production", profile.name)
+        self.assertTrue(profile.selects("test.optional"))
+        self.assertTrue(profile.selects("test.unmentioned"))
+        self.assertEqual({"threshold": 0.9}, dict(profile.config_for("test.provider")))
+        self.assertEqual(2, len(profile.layers))
+        self.assertTrue(all("@sha256:" in layer for layer in profile.layers))
+        self.assertRegex(profile.fingerprint(), r"^[0-9a-f]{64}$")
+
+    def test_later_enabled_allowlist_resets_earlier_selection_decisions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = os.path.join(directory, "base.toml")
+            overlay = os.path.join(directory, "restricted.toml")
+            with open(base, "w", encoding="utf-8") as output:
+                output.write('[profile]\ndisabled = ["test.a"]\n')
+            with open(overlay, "w", encoding="utf-8") as output:
+                output.write('[profile]\nenabled = ["test.b"]\n')
+
+            profile = PluginProfile.from_toml_layers([base, overlay])
+
+        self.assertFalse(profile.selects("test.a"))
+        self.assertTrue(profile.selects("test.b"))
+        self.assertFalse(profile.selects("test.c"))
+        self.assertNotIn("test.a", profile.disabled)
+
+    def test_profile_fingerprint_is_canonical_and_binds_configuration(self):
+        first = PluginProfile(
+            name="production",
+            plugin_config={"test.provider": {"threshold": 0.9, "routes": ["a", "b"]}},
+        )
+        reordered = PluginProfile(
+            name="production",
+            plugin_config={"test.provider": {"routes": ["a", "b"], "threshold": 0.9}},
+        )
+        changed = PluginProfile(
+            name="production",
+            plugin_config={"test.provider": {"threshold": 0.8, "routes": ["a", "b"]}},
+        )
+
+        self.assertEqual(first.fingerprint(), reordered.fingerprint())
+        self.assertNotEqual(first.fingerprint(), changed.fingerprint())
+
+    def test_unnamed_single_profile_keeps_file_stem_as_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "production.toml")
+            with open(path, "w", encoding="utf-8") as output:
+                output.write('[plugins."test.provider"]\nenabled = true\n')
+
+            profile = PluginProfile.from_toml(path)
+
+        self.assertEqual("production", profile.name)
+
+    def test_profile_layer_schema_is_strict_and_stack_is_bounded(self):
+        handle, path = tempfile.mkstemp(suffix=".toml")
+        os.close(handle)
+        self.addCleanup(os.unlink, path)
+        invalid_documents = (
+            ("[profile]\nunknown = true\n", "unknown fields"),
+            ("unknown = true\n", "unknown top-level fields"),
+            (
+                '[profile]\nenabled = ["test.a"]\ndefault_enabled = false\n',
+                "cannot be used together",
+            ),
+            ('[profile]\nenabled = ["test.a", "test.a"]\n', "must not contain duplicates"),
+            (
+                '[profile]\nenabled = ["test.a"]\ndisabled = ["test.a"]\n',
+                "both enabled and disabled",
+            ),
+            ('[plugins."test.a"]\nunknown = true\n', "unknown fields"),
+            ('[plugins."test.a"]\n', "must declare enabled or config"),
+        )
+        for content, expected in invalid_documents:
+            with self.subTest(expected=expected):
+                with open(path, "w", encoding="utf-8") as output:
+                    output.write(content)
+                with self.assertRaisesRegex(PluginConfigurationError, expected):
+                    PluginProfile.from_toml(path)
+
+        with open(path, "wb") as output:
+            output.write(b"#" * (1024 * 1024 + 1))
+        with self.assertRaisesRegex(PluginConfigurationError, "1 MiB"):
+            PluginProfile.from_toml(path)
+        with self.assertRaisesRegex(PluginConfigurationError, "duplicate paths"):
+            PluginProfile.from_toml_layers([path, path])
+        with self.assertRaisesRegex(PluginConfigurationError, "limited to 16"):
+            PluginProfile.from_toml_layers(["layer-%d.toml" % index for index in range(17)])
+
+    def test_profile_configuration_is_deeply_isolated_from_consumers(self):
+        enabled = {"test.provider"}
+        layers = ["base@sha256:abc"]
+        profile = PluginProfile(
+            enabled=enabled,
+            layers=layers,
+            plugin_config={"test.provider": {"nested": {"region": "us"}, "routes": ("a",)}},
+        )
+        enabled.clear()
+        layers.append("mutated@sha256:def")
+        config = profile.config_for("test.provider")
+        config["nested"]["region"] = "mutated"
+        config["routes"].append("b")
+
+        fresh = profile.config_for("test.provider")
+
+        self.assertEqual("us", fresh["nested"]["region"])
+        self.assertEqual(["a"], fresh["routes"])
+        self.assertEqual(frozenset({"test.provider"}), profile.enabled)
+        self.assertEqual(("base@sha256:abc",), profile.layers)
+        with self.assertRaises(TypeError):
+            profile.plugin_config["test.provider"]["nested"]["region"] = "blocked"
+
+    def test_settings_load_ordered_profile_layers_from_environment(self):
+        with mock.patch.dict(
+            os.environ,
+            {"EVOAGENT_PLUGIN_PROFILE_LAYERS": "region.toml, production.toml"},
+            clear=True,
+        ):
+            settings = Settings.from_env()
+
+        self.assertEqual(("region.toml", "production.toml"), settings.plugin_profile_layers)
+
     def test_profile_rejects_unknown_plugin_references(self):
         profile = PluginProfile(disabled=frozenset({"test.typo"}))
         with self.assertRaisesRegex(PluginConfigurationError, "test.typo"):
@@ -637,6 +774,33 @@ class ApplicationCompositionTests(unittest.TestCase):
 
         self.assertEqual("no-cookie-fix", service.plugin_status()["profile"])
         self.assertNotIn("SEC-INSECURE-COOKIE", service.fixer.rule_ids)
+
+    def test_service_composes_base_profile_and_ordered_environment_layers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = os.path.join(directory, "base.toml")
+            overlay = os.path.join(directory, "production.toml")
+            with open(base, "w", encoding="utf-8") as output:
+                output.write(
+                    '[profile]\nname = "base"\ndisabled = ["evoagent.fix-rule.debug-print"]\n'
+                )
+            with open(overlay, "w", encoding="utf-8") as output:
+                output.write(
+                    '[profile]\nname = "production"\n'
+                    '[plugins."evoagent.fix-rule.debug-print"]\nenabled = true\n'
+                )
+            configured = _settings(
+                self.path,
+                plugin_profile_path=base,
+                plugin_profile_layers=(overlay,),
+            )
+            service = ReviewService(configured)
+            self.addCleanup(service.close)
+
+        status = service.plugin_status()
+        self.assertEqual("production", status["profile"])
+        self.assertEqual(2, len(status["profile_layers"]))
+        self.assertRegex(status["profile_sha256"], r"^[0-9a-f]{64}$")
+        self.assertIn("REL-DEBUG-PRINT", service.fixer.rule_ids)
 
     def test_trusted_discovery_requires_an_allowlist(self):
         with self.assertRaisesRegex(ValueError, "PLUGIN_ALLOWLIST"):

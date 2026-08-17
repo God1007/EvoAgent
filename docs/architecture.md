@@ -72,7 +72,7 @@ continues from the last completed node instead of replaying the whole graph.
 ## 3. Composition and lifecycle
 
 ```text
-PluginProfile
+ordered PluginProfile layers
   → provider catalog
   → dependency graph validation
   → topological activation
@@ -84,6 +84,10 @@ Capability registration, event subscription, and resource ownership are
 reversible effects. A startup error rolls back the complete candidate graph in
 reverse order. Service shutdown first drains/closes the task queue and then
 unwinds the plugin graph, so consumers stop before their dependencies.
+Profile composition is bounded and deterministic: base, region, and environment
+layers apply in order, plugin configuration uses whole-value replacement, and
+the runtime inventory exposes source-content and effective-profile hashes
+without configuration values. Configuration is frozen before provider startup.
 The queue stops accepting submissions and waits up to
 `EVOAGENT_QUEUE_SHUTDOWN_TIMEOUT_SECONDS` for active/already-scheduled work;
 timeouts increment `queue_drain_timeouts_total` and emit `queue.drain-timeout`

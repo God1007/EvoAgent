@@ -7,7 +7,9 @@ queue, model, workflow, delivery, and observability providers.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.metadata
+import json
 import re
 import threading
 import tomllib
@@ -123,10 +125,25 @@ class PluginProfile:
     enabled: frozenset[str] = frozenset()
     disabled: frozenset[str] = frozenset()
     plugin_config: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+    default_enabled: bool | None = None
+    layers: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.name.strip():
+        if not isinstance(self.name, str) or not self.name.strip():
             raise ValueError("plugin profile name must not be empty")
+        if any(not isinstance(plugin_id, str) for plugin_id in self.enabled):
+            raise ValueError("enabled plugin ids must be strings")
+        if any(not isinstance(plugin_id, str) for plugin_id in self.disabled):
+            raise ValueError("disabled plugin ids must be strings")
+        if any(not isinstance(layer, str) or not layer.strip() for layer in self.layers):
+            raise ValueError("plugin profile layer labels must not be empty")
+        object.__setattr__(self, "enabled", frozenset(self.enabled))
+        object.__setattr__(self, "disabled", frozenset(self.disabled))
+        object.__setattr__(self, "layers", tuple(self.layers))
+        if self.default_enabled is None:
+            object.__setattr__(self, "default_enabled", not bool(self.enabled))
+        elif not isinstance(self.default_enabled, bool):
+            raise ValueError("plugin profile default_enabled must be a boolean")
         overlap = self.enabled.intersection(self.disabled)
         if overlap:
             raise ValueError(
@@ -135,61 +152,202 @@ class PluginProfile:
         for plugin_id in self.enabled.union(self.disabled).union(self.plugin_config):
             if not _IDENTIFIER.fullmatch(plugin_id):
                 raise ValueError("invalid plugin id in profile: %s" % plugin_id)
+        copied_config = {}
+        for plugin_id, value in self.plugin_config.items():
+            if not isinstance(value, Mapping):
+                raise ValueError("plugin config must be a mapping: %s" % plugin_id)
+            copied_config[plugin_id] = _freeze_profile_value(value)
+        object.__setattr__(self, "plugin_config", MappingProxyType(copied_config))
 
     def selects(self, plugin_id: str) -> bool:
         if plugin_id in self.disabled:
             return False
-        return not self.enabled or plugin_id in self.enabled
+        if plugin_id in self.enabled:
+            return True
+        return bool(self.default_enabled)
 
     def config_for(self, plugin_id: str) -> Mapping[str, Any]:
-        return MappingProxyType(dict(self.plugin_config.get(plugin_id, {})))
+        value = _thaw_profile_value(self.plugin_config.get(plugin_id, {}))
+        return MappingProxyType(value)
+
+    def fingerprint(self) -> str:
+        """Hash the effective profile without exposing plugin configuration values."""
+        payload = {
+            "name": self.name,
+            "default_enabled": self.default_enabled,
+            "enabled": sorted(self.enabled),
+            "disabled": sorted(self.disabled),
+            "plugin_config": _canonical_profile_value(self.plugin_config),
+            "layers": list(self.layers),
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     @classmethod
     def from_toml(cls, path: str | Path) -> PluginProfile:
-        source = Path(path)
-        try:
-            with source.open("rb") as handle:
-                document = tomllib.load(handle)
-        except (OSError, tomllib.TOMLDecodeError) as exc:
-            raise PluginConfigurationError(
-                "cannot load plugin profile %s: %s" % (source, exc)
-            ) from exc
+        return cls.from_toml_layers([path])
 
-        profile = document.get("profile", {})
-        plugins = document.get("plugins", {})
-        if not isinstance(profile, dict) or not isinstance(plugins, dict):
-            raise PluginConfigurationError("profile and plugins must be TOML tables")
-        enabled = _string_set(profile.get("enabled", []), "profile.enabled")
-        disabled = _string_set(profile.get("disabled", []), "profile.disabled")
+    @classmethod
+    def from_toml_layers(cls, paths: Sequence[str | Path]) -> PluginProfile:
+        if not paths:
+            raise PluginConfigurationError("at least one plugin profile layer is required")
+        if len(paths) > 16:
+            raise PluginConfigurationError("plugin profile stacks are limited to 16 layers")
+        resolved = [Path(path).resolve() for path in paths]
+        if len(resolved) != len(set(resolved)):
+            raise PluginConfigurationError("plugin profile stack contains duplicate paths")
+
+        default_enabled = True
+        selections: dict[str, bool] = {}
         config: dict[str, Mapping[str, Any]] = {}
-        for plugin_id, value in plugins.items():
-            if not isinstance(value, dict):
-                raise PluginConfigurationError("plugins.%s must be a TOML table" % plugin_id)
-            plugin_enabled = value.get("enabled")
-            if plugin_enabled is not None and not isinstance(plugin_enabled, bool):
-                raise PluginConfigurationError("plugins.%s.enabled must be a boolean" % plugin_id)
-            if plugin_enabled is True and enabled:
-                enabled.add(plugin_id)
-            elif plugin_enabled is False:
-                disabled.add(plugin_id)
-            raw_config = value.get("config", {})
-            if not isinstance(raw_config, dict):
-                raise PluginConfigurationError("plugins.%s.config must be a TOML table" % plugin_id)
-            config[plugin_id] = raw_config
+        # Preserve the single-file Profile identity when no layer declares a name.
+        name = resolved[0].stem
+        labels = []
+        for source in resolved:
+            patch = _load_profile_patch(source)
+            labels.append("%s@sha256:%s" % (source.name, patch["source_sha256"]))
+            if patch["name"] is not None:
+                name = str(patch["name"])
+            if patch["reset_selections"]:
+                selections.clear()
+            if patch["default_enabled"] is not None:
+                default_enabled = bool(patch["default_enabled"])
+            selections.update(patch["selections"])
+            config.update(patch["config"])
+
+        enabled = frozenset(plugin_id for plugin_id, selected in selections.items() if selected)
+        disabled = frozenset(
+            plugin_id for plugin_id, selected in selections.items() if not selected
+        )
         try:
             return cls(
-                name=str(profile.get("name", source.stem)),
-                enabled=frozenset(enabled),
-                disabled=frozenset(disabled),
+                name=name,
+                enabled=enabled,
+                disabled=disabled,
                 plugin_config=MappingProxyType(config),
+                default_enabled=default_enabled,
+                layers=tuple(labels),
             )
         except ValueError as exc:
             raise PluginConfigurationError(str(exc)) from exc
 
 
+def _load_profile_patch(source: Path) -> dict[str, Any]:
+    try:
+        raw = source.read_bytes()
+        if len(raw) > 1024 * 1024:
+            raise PluginConfigurationError("plugin profile exceeds the 1 MiB limit: %s" % source)
+        document = tomllib.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise PluginConfigurationError("cannot load plugin profile %s: %s" % (source, exc)) from exc
+    unknown_root = set(document).difference({"profile", "plugins"})
+    if unknown_root:
+        raise PluginConfigurationError(
+            "plugin profile has unknown top-level fields: %s" % ", ".join(sorted(unknown_root))
+        )
+    profile = document.get("profile", {})
+    plugins = document.get("plugins", {})
+    if not isinstance(profile, dict) or not isinstance(plugins, dict):
+        raise PluginConfigurationError("profile and plugins must be TOML tables")
+    unknown_profile = set(profile).difference({"name", "enabled", "disabled", "default_enabled"})
+    if unknown_profile:
+        raise PluginConfigurationError(
+            "profile has unknown fields: %s" % ", ".join(sorted(unknown_profile))
+        )
+    if "name" in profile and not isinstance(profile["name"], str):
+        raise PluginConfigurationError("profile.name must be a string")
+    if "enabled" in profile and "default_enabled" in profile:
+        raise PluginConfigurationError(
+            "profile.enabled and profile.default_enabled cannot be used together"
+        )
+    reset_selections = "enabled" in profile
+    enabled = _string_set(profile.get("enabled", []), "profile.enabled")
+    disabled = _string_set(profile.get("disabled", []), "profile.disabled")
+    overlap = enabled.intersection(disabled)
+    if overlap:
+        raise PluginConfigurationError(
+            "plugins cannot be both enabled and disabled in one layer: %s"
+            % ", ".join(sorted(overlap))
+        )
+    default_enabled: bool | None = None
+    if "enabled" in profile:
+        default_enabled = not bool(enabled)
+    elif "default_enabled" in profile:
+        if not isinstance(profile["default_enabled"], bool):
+            raise PluginConfigurationError("profile.default_enabled must be a boolean")
+        default_enabled = profile["default_enabled"]
+    selections = {plugin_id: True for plugin_id in enabled}
+    selections.update({plugin_id: False for plugin_id in disabled})
+    config: dict[str, Mapping[str, Any]] = {}
+    for plugin_id, value in plugins.items():
+        if not _IDENTIFIER.fullmatch(plugin_id):
+            raise PluginConfigurationError("invalid plugin id in profile: %s" % plugin_id)
+        if not isinstance(value, dict):
+            raise PluginConfigurationError("plugins.%s must be a TOML table" % plugin_id)
+        unknown = set(value).difference({"enabled", "config"})
+        if unknown:
+            raise PluginConfigurationError(
+                "plugins.%s has unknown fields: %s" % (plugin_id, ", ".join(sorted(unknown)))
+            )
+        if not value:
+            raise PluginConfigurationError("plugins.%s must declare enabled or config" % plugin_id)
+        if "enabled" in value:
+            if not isinstance(value["enabled"], bool):
+                raise PluginConfigurationError("plugins.%s.enabled must be a boolean" % plugin_id)
+            selections[plugin_id] = value["enabled"]
+        if "config" in value:
+            raw_config = value["config"]
+            if not isinstance(raw_config, dict):
+                raise PluginConfigurationError("plugins.%s.config must be a TOML table" % plugin_id)
+            config[plugin_id] = raw_config
+    return {
+        "name": profile.get("name"),
+        "source_sha256": hashlib.sha256(raw).hexdigest(),
+        "default_enabled": default_enabled,
+        "reset_selections": reset_selections,
+        "selections": selections,
+        "config": config,
+    }
+
+
+def _canonical_profile_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_profile_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_profile_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return {"toml_type": type(value).__name__, "value": str(value)}
+
+
+def _freeze_profile_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("plugin configuration keys must be strings")
+        return MappingProxyType(
+            {str(key): _freeze_profile_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_profile_value(item) for item in value)
+    return value
+
+
+def _thaw_profile_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _thaw_profile_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_profile_value(item) for item in value]
+    return value
+
+
 def _string_set(value: Any, field_name: str) -> set[str]:
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         raise PluginConfigurationError("%s must be an array of strings" % field_name)
+    if len(value) != len(set(value)):
+        raise PluginConfigurationError("%s must not contain duplicates" % field_name)
     return set(value)
 
 
@@ -601,6 +759,8 @@ class PluginRuntime:
                 "state": self.state.value,
                 "scope": self.scope,
                 "profile": self.profile.name,
+                "profile_layers": list(self.profile.layers),
+                "profile_sha256": self.profile.fingerprint(),
                 "plugins": list(self._activation_order),
                 "plugin_details": details,
                 "capabilities": self.capabilities.inventory(),

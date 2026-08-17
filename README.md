@@ -331,7 +331,10 @@ python -m evoagent
 企业部署可以通过 `EVOAGENT_LLM_ROUTES_FILE` 加载多个按优先级排列的 TOML
 路由；每条路由只引用 API Key 的环境变量名，并可限制租户、仓库模式和驻留区域。
 瞬时故障只会在 `EVOAGENT_LLM_FALLBACK_ATTEMPTS` 的有界预算内切换备用路由，
-每条路由使用独立熔断器。示例见 [`examples/model-routes.toml`](examples/model-routes.toml)。
+每条路由使用独立熔断器。v2 配置还支持同优先级确定性加权、候选模型影子运行和
+只读晋级门禁；候选结果不会进入正式审查，激活仍需评审配置并重新部署。示例见
+[`examples/model-routes.toml`](examples/model-routes.toml) 和
+[`examples/model-routes-v2.toml`](examples/model-routes-v2.toml)。
 
 ## 接入 GitHub
 
@@ -812,9 +815,13 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `EVOAGENT_LLM_MAX_OUTPUT_TOKENS` | `4096` | 单请求最大输出 Token |
 | `EVOAGENT_LLM_DAILY_TOKEN_BUDGET` | `0` | 每租户/仓库/UTC 日 Token 预算；0 为关闭 |
 | `EVOAGENT_LLM_DAILY_COST_MICROS` | `0` | 每租户/仓库/UTC 日成本预算（微单位）；0 为关闭 |
-| `EVOAGENT_LLM_ROUTES_FILE` | 空 | v1 多路由 TOML；设置后替代单 Provider 预设 |
+| `EVOAGENT_LLM_ROUTES_FILE` | 空 | v1/v2 多路由 TOML；设置后替代单 Provider 预设 |
 | `EVOAGENT_LLM_FALLBACK_ATTEMPTS` | `1` | 主路由失败后最多尝试的额外候选路由数 |
 | `EVOAGENT_LLM_RESERVATION_TTL_SECONDS` | `600` | 模型预占转为待对账状态前的秒数，必须大于请求超时 |
+| `EVOAGENT_LLM_SHADOW_WORKERS` | `2` | 候选模型影子执行线程数；0 禁用执行但保留 shed 观测 |
+| `EVOAGENT_LLM_SHADOW_MAX_INFLIGHT` | `8` | 单进程影子调用在途上限（执行中 + 排队） |
+| `EVOAGENT_LLM_SHADOW_DAILY_TOKEN_BUDGET` | `0` | 影子专属日 Token 上限；仍受总预算约束，0 不设额外上限 |
+| `EVOAGENT_LLM_SHADOW_DAILY_COST_MICROS` | `0` | 影子专属日成本上限（微单位）；仍受总预算约束 |
 | `EVOAGENT_DATABASE_URL` | 空 | PostgreSQL URL；为空时使用 SQLite |
 | `EVOAGENT_REDIS_URL` | 空 | Redis URL；为空时使用进程内队列 |
 | `EVOAGENT_ASYNC_WORKERS` | `2` | 异步 Worker 数量 |

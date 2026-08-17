@@ -366,6 +366,8 @@ class ModelUsageStorePort(Protocol):
         period_start: str,
         token_budget: int = 0,
         cost_budget_micros: int = 0,
+        lane_token_budget: int = 0,
+        lane_cost_budget_micros: int = 0,
     ) -> bool: ...
 
     def complete_model_usage(
@@ -396,6 +398,32 @@ class ModelUsageStorePort(Protocol):
         self, tenant_id: str, repository: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]: ...
 
+    def start_model_route_shadow(self, record: dict[str, Any]) -> bool: ...
+
+    def complete_model_route_shadow(
+        self,
+        observation_id: str,
+        status: str,
+        agreement: bool | None,
+        candidate_output_sha256: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_micros: int,
+        duration_ms: int,
+        error_type: str = "",
+        error_ref: str = "",
+    ) -> bool: ...
+
+    def expire_model_route_shadows(self, cutoff: str, limit: int = 1000) -> int: ...
+
+    def model_route_shadow_stats(
+        self,
+        tenant_id: str,
+        candidate_route_id: str,
+        topology_sha256: str,
+        repository: str | None = None,
+    ) -> dict[str, int]: ...
+
 
 @runtime_checkable
 class ModelGatewayPort(Protocol):
@@ -405,6 +433,10 @@ class ModelGatewayPort(Protocol):
     def route_info(self) -> dict[str, Any]: ...
 
     def route_catalog(self, tenant_id: str, repository: str) -> tuple[dict[str, str], ...]: ...
+
+    def promotion_report(
+        self, tenant_id: str, candidate_route_id: str, repository: str | None = None
+    ) -> dict[str, Any]: ...
 
     def complete(self, request: ModelRequest) -> ModelResponse: ...
 

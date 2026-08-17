@@ -512,6 +512,48 @@ MIGRATIONS: tuple[Migration, ...] = (
             "[type=legacy; ref=0000000000000000]\"}'::jsonb WHERE action='shadow.failed'",
         ),
     ),
+    Migration(
+        11,
+        "model-route-shadow-governance",
+        (
+            """CREATE TABLE IF NOT EXISTS model_route_shadows (
+                observation_id TEXT PRIMARY KEY, topology_sha256 TEXT NOT NULL,
+                root_request_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
+                repository TEXT NOT NULL, task_id TEXT, purpose TEXT NOT NULL,
+                active_route_id TEXT NOT NULL, candidate_route_id TEXT NOT NULL,
+                status TEXT NOT NULL, agreement INTEGER,
+                active_output_sha256 TEXT NOT NULL, candidate_output_sha256 TEXT,
+                input_sha256 TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_micros INTEGER NOT NULL DEFAULT 0,
+                duration_ms INTEGER NOT NULL DEFAULT 0, error_type TEXT, error_ref TEXT,
+                created_at TEXT NOT NULL, completed_at TEXT)""",
+            "CREATE INDEX IF NOT EXISTS idx_model_route_shadows_report "
+            "ON model_route_shadows(tenant_id,candidate_route_id,topology_sha256,created_at)",
+        ),
+        (
+            "ALTER TABLE model_usage ADD COLUMN IF NOT EXISTS lane TEXT NOT NULL DEFAULT 'active'",
+            "ALTER TABLE model_usage ADD COLUMN IF NOT EXISTS topology_sha256 TEXT",
+            """CREATE TABLE IF NOT EXISTS model_route_shadows (
+                observation_id TEXT PRIMARY KEY, topology_sha256 TEXT NOT NULL,
+                root_request_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
+                repository TEXT NOT NULL, task_id TEXT, purpose TEXT NOT NULL,
+                active_route_id TEXT NOT NULL, candidate_route_id TEXT NOT NULL,
+                status TEXT NOT NULL, agreement BOOLEAN,
+                active_output_sha256 TEXT NOT NULL, candidate_output_sha256 TEXT,
+                input_sha256 TEXT NOT NULL, input_tokens BIGINT NOT NULL DEFAULT 0,
+                output_tokens BIGINT NOT NULL DEFAULT 0,
+                cost_micros BIGINT NOT NULL DEFAULT 0,
+                duration_ms BIGINT NOT NULL DEFAULT 0, error_type TEXT, error_ref TEXT,
+                created_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ)""",
+            "CREATE INDEX IF NOT EXISTS idx_model_route_shadows_report "
+            "ON model_route_shadows(tenant_id,candidate_route_id,topology_sha256,created_at)",
+        ),
+        (
+            SQLiteColumn("model_usage", "lane", "TEXT NOT NULL DEFAULT 'active'"),
+            SQLiteColumn("model_usage", "topology_sha256", "TEXT"),
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1].version

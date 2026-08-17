@@ -280,6 +280,11 @@ class ReviewService:
             error,
         )
 
+    def model_route_promotion_report(
+        self, tenant_id: str, candidate_route_id: str, repository: str | None = None
+    ) -> dict[str, Any]:
+        return self.model_gateway.promotion_report(tenant_id, candidate_route_id, repository)
+
     def _register_pool_metrics(self) -> None:
         """Expose Postgres pool utilization. Registered in both branches (with a
         constant 0 when unpooled) so the gauge set is consistent. Gated on the

@@ -37,8 +37,10 @@ ledger record so operators can reconstruct one logical request across routes.
 - Repository policy cannot be bypassed by fallback.
 - `fallback_attempts=0` gives strict single-call behavior; every extra attempt
   has its own atomic budget reservation and usage record.
-- Route priority is deterministic rather than weighted. Candidate shadowing,
-  promotion gates, and capacity-aware load balancing remain future work.
+- This decision originally kept route priority deterministic and left weighted
+  routing/candidate shadowing for future work. ADR 0021 adds those capabilities
+  without changing the v1 topology semantics; capacity-aware routing remains
+  future work.
 - The gateway improves application resilience but cannot manufacture regional
   HA; endpoints, credentials, quotas, and network paths must be independent in
   the deployment.

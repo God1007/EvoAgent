@@ -1,6 +1,8 @@
 import json
 import os
+import sqlite3
 import tempfile
+import threading
 import unittest
 import urllib.error
 from io import BytesIO
@@ -358,6 +360,312 @@ class ModelGatewayTests(unittest.TestCase):
         self.assertEqual("eu-primary", routes[0].route_id)
         self.assertEqual("resolved-secret", routes[0].api_key)
         self.assertNotIn("resolved-secret", open(path, encoding="utf-8").read())
+
+    def test_v2_route_file_separates_active_weight_and_candidate_shadow_policy(self):
+        handle, path = tempfile.mkstemp(suffix=".toml")
+        os.close(handle)
+        self.addCleanup(os.unlink, path)
+        with open(path, "w", encoding="utf-8") as output:
+            output.write(
+                'version = 2\n[[routes]]\nid = "stable"\nstate = "active"\nweight = 3\n'
+                'provider = "provider-a"\nmodel = "model-a"\n'
+                'base_url = "https://a.example/v1"\napi_key_env = "TEST_STABLE_KEY"\n'
+                '[[routes]]\nid = "candidate"\nstate = "candidate"\n'
+                'provider = "provider-b"\nmodel = "model-b"\n'
+                'base_url = "https://b.example/v1"\napi_key_env = "TEST_CANDIDATE_KEY"\n'
+                'baseline_route_id = "stable"\nshadow_percent = 25\nmin_shadow_samples = 7\n'
+                "max_shadow_error_rate = 0.03\nmax_shadow_disagreement_rate = 0.15\n"
+                'evaluation_dataset_sha256 = "' + "a" * 64 + '"\n'
+                'evaluation_report_sha256 = "' + "b" * 64 + '"\n'
+            )
+        with mock.patch.dict(
+            os.environ,
+            {"TEST_STABLE_KEY": "stable-secret", "TEST_CANDIDATE_KEY": "candidate-secret"},
+        ):
+            routes = load_model_routes(path)
+
+        active = next(route for route in routes if route.state == "active")
+        candidate = next(route for route in routes if route.state == "candidate")
+        self.assertEqual(3, active.weight)
+        self.assertEqual(0, candidate.weight)
+        self.assertEqual(
+            ("stable", 25, 7),
+            (
+                candidate.baseline_route_id,
+                candidate.shadow_percent,
+                candidate.min_shadow_samples,
+            ),
+        )
+        self.assertEqual(active.topology_sha256, candidate.topology_sha256)
+        self.assertEqual(64, len(active.topology_sha256))
+
+    def test_v2_candidate_baseline_must_reference_an_active_route(self):
+        handle, path = tempfile.mkstemp(suffix=".toml")
+        os.close(handle)
+        self.addCleanup(os.unlink, path)
+        with open(path, "w", encoding="utf-8") as output:
+            output.write(
+                'version = 2\n[[routes]]\nid = "stable"\nstate = "active"\n'
+                'provider = "a"\nmodel = "a"\nbase_url = "https://a.example/v1"\n'
+                'api_key_env = "TEST_STABLE_KEY"\n'
+                '[[routes]]\nid = "candidate"\nstate = "candidate"\n'
+                'provider = "b"\nmodel = "b"\nbase_url = "https://b.example/v1"\n'
+                'api_key_env = "TEST_CANDIDATE_KEY"\n'
+                'baseline_route_id = "missing"\nshadow_percent = 100\n'
+            )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"TEST_STABLE_KEY": "stable-secret", "TEST_CANDIDATE_KEY": "candidate-secret"},
+            ),
+            self.assertRaisesRegex(ValueError, "baseline must reference an active route"),
+        ):
+            load_model_routes(path)
+
+    def test_weighted_routing_is_deterministic_and_preserves_priority_tiers(self):
+        heavy = ModelRoute(
+            "provider-heavy",
+            "model-heavy",
+            "https://heavy.example/v1",
+            "secret-heavy",
+            route_id="heavy",
+            priority=10,
+            weight=3,
+        )
+        light = ModelRoute(
+            "provider-light",
+            "model-light",
+            "https://light.example/v1",
+            "secret-light",
+            route_id="light",
+            priority=10,
+            weight=1,
+        )
+        fallback = ModelRoute(
+            "provider-fallback",
+            "model-fallback",
+            "https://fallback.example/v1",
+            "secret-fallback",
+            route_id="fallback",
+            priority=20,
+            weight=100,
+        )
+        gateway = EnterpriseModelGateway(
+            self.store,
+            (heavy, light, fallback),
+            FakeProvider(),
+            ModelGatewayOptions(
+                allowed_hosts=("heavy.example", "light.example", "fallback.example")
+            ),
+        )
+        selected = []
+        for index in range(800):
+            request = ModelRequest(
+                "tenant-a",
+                "org/repo",
+                "task-%d" % index,
+                "review",
+                (ModelMessage("user", "same input"),),
+            )
+            ordered = gateway._candidate_routes(request, "f" * 64)
+            selected.append(ordered[0].route_id)
+            self.assertEqual("fallback", ordered[-1].route_id)
+
+        heavy_ratio = selected.count("heavy") / len(selected)
+        self.assertGreater(heavy_ratio, 0.68)
+        self.assertLess(heavy_ratio, 0.82)
+        repeated = self.request()
+        self.assertEqual(
+            [route.route_id for route in gateway._candidate_routes(repeated, "e" * 64)],
+            [route.route_id for route in gateway._candidate_routes(repeated, "e" * 64)],
+        )
+
+    def test_candidate_shadow_is_isolated_metered_and_promotion_gated(self):
+        active = ModelRoute(
+            "provider-a",
+            "model-a",
+            "https://a.example/v1",
+            "active-secret",
+            route_id="stable",
+            priority=10,
+            weight=1,
+        )
+        candidate = ModelRoute(
+            "provider-b",
+            "model-b",
+            "https://b.example/v1",
+            "candidate-secret",
+            route_id="candidate",
+            state="candidate",
+            shadow_percent=100,
+            baseline_route_id="stable",
+            min_shadow_samples=1,
+            max_shadow_error_rate=0,
+            max_shadow_disagreement_rate=0,
+            evaluation_dataset_sha256="a" * 64,
+            evaluation_report_sha256="b" * 64,
+        )
+        active_provider = FakeProvider('{"a":1,"b":2}')
+        candidate_provider = FakeProvider('{"b":2,"a":1}')
+        gateway = EnterpriseModelGateway(
+            self.store,
+            (active, candidate),
+            {"stable": active_provider, "candidate": candidate_provider},
+            ModelGatewayOptions(allowed_hosts=("a.example", "b.example")),
+        )
+
+        response = gateway.complete(self.request())
+        self.assertEqual('{"a":1,"b":2}', response.content)
+        self.assertEqual(
+            ("stable",),
+            tuple(item["route_id"] for item in gateway.route_catalog("tenant-a", "org/repo")),
+        )
+        self.assertTrue(gateway.close())
+
+        usage = self.store.list_model_usage("tenant-a", "org/repo")
+        self.assertEqual({"active", "shadow"}, {item["lane"] for item in usage})
+        self.assertEqual({"stable", "candidate"}, {item["route_id"] for item in usage})
+        report = gateway.promotion_report("tenant-a", "candidate", "org/repo")
+        self.assertTrue(report["eligible"])
+        self.assertEqual(1, report["observations"]["samples"])
+        self.assertEqual(0, report["observations"]["disagreements"])
+        with sqlite3.connect(self.path) as conn:
+            observation = conn.execute(
+                "SELECT * FROM model_route_shadows WHERE candidate_route_id='candidate'"
+            ).fetchone()
+        serialized = json.dumps(observation)
+        self.assertNotIn(active_provider.content, serialized)
+        self.assertNotIn(candidate_provider.content, serialized)
+
+    def test_shadow_failure_persists_only_error_fingerprint_and_blocks_promotion(self):
+        active = ModelRoute(
+            "provider-a",
+            "model-a",
+            "https://a.example/v1",
+            "active-secret",
+            route_id="stable",
+            weight=1,
+        )
+        candidate = ModelRoute(
+            "provider-b",
+            "model-b",
+            "https://b.example/v1",
+            "candidate-secret",
+            route_id="candidate",
+            state="candidate",
+            shadow_percent=100,
+            baseline_route_id="stable",
+            min_shadow_samples=1,
+            evaluation_dataset_sha256="a" * 64,
+            evaluation_report_sha256="b" * 64,
+        )
+        gateway = EnterpriseModelGateway(
+            self.store,
+            (active, candidate),
+            {"stable": FakeProvider(), "candidate": FailingProvider()},
+            ModelGatewayOptions(allowed_hosts=("a.example", "b.example")),
+        )
+
+        gateway.complete(self.request())
+        self.assertTrue(gateway.close())
+
+        report = gateway.promotion_report("tenant-a", "candidate")
+        self.assertFalse(report["eligible"])
+        self.assertEqual(1, report["observations"]["errors"])
+        with sqlite3.connect(self.path) as conn:
+            row = conn.execute(
+                "SELECT status,error_type,error_ref FROM model_route_shadows"
+            ).fetchone()
+        self.assertEqual("failed", row[0])
+        self.assertTrue(row[1])
+        self.assertEqual(16, len(row[2]))
+        self.assertNotIn("candidate-secret", json.dumps(row))
+
+    def test_shadow_specific_budget_rejects_candidate_without_affecting_active_call(self):
+        active = ModelRoute(
+            "provider-a",
+            "model-a",
+            "https://a.example/v1",
+            "active-secret",
+            route_id="stable",
+            weight=1,
+        )
+        candidate = ModelRoute(
+            "provider-b",
+            "model-b",
+            "https://b.example/v1",
+            "candidate-secret",
+            route_id="candidate",
+            state="candidate",
+            shadow_percent=100,
+            baseline_route_id="stable",
+            evaluation_dataset_sha256="a" * 64,
+            evaluation_report_sha256="b" * 64,
+        )
+        candidate_provider = FakeProvider()
+        gateway = EnterpriseModelGateway(
+            self.store,
+            (active, candidate),
+            {"stable": FakeProvider(), "candidate": candidate_provider},
+            ModelGatewayOptions(
+                allowed_hosts=("a.example", "b.example"),
+                shadow_daily_token_budget=1,
+            ),
+        )
+
+        response = gateway.complete(self.request())
+        self.assertEqual("provider-a", response.provider)
+        self.assertTrue(gateway.close())
+        self.assertEqual([], candidate_provider.calls)
+        report = gateway.promotion_report("tenant-a", "candidate")
+        self.assertEqual(1, report["observations"]["errors"])
+        with sqlite3.connect(self.path) as conn:
+            status = conn.execute("SELECT status FROM model_route_shadows").fetchone()[0]
+        self.assertEqual("budget-rejected", status)
+
+    def test_shadow_does_not_delay_the_active_response_and_close_drains_it(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class BlockingProvider(FakeProvider):
+            def complete(self, route, messages, max_output_tokens, require_json_object):
+                started.set()
+                release.wait(2)
+                return super().complete(route, messages, max_output_tokens, require_json_object)
+
+        active = ModelRoute(
+            "provider-a",
+            "model-a",
+            "https://a.example/v1",
+            "active-secret",
+            route_id="stable",
+            weight=1,
+        )
+        candidate = ModelRoute(
+            "provider-b",
+            "model-b",
+            "https://b.example/v1",
+            "candidate-secret",
+            route_id="candidate",
+            state="candidate",
+            shadow_percent=100,
+            baseline_route_id="stable",
+        )
+        gateway = EnterpriseModelGateway(
+            self.store,
+            (active, candidate),
+            {"stable": FakeProvider(), "candidate": BlockingProvider()},
+            ModelGatewayOptions(
+                allowed_hosts=("a.example", "b.example"),
+                shadow_shutdown_timeout_seconds=3,
+            ),
+        )
+
+        response = gateway.complete(self.request())
+        self.assertEqual("provider-a", response.provider)
+        self.assertTrue(started.wait(1))
+        release.set()
+        self.assertTrue(gateway.close())
 
 
 class OpenAICompatibleModelProviderTests(unittest.TestCase):

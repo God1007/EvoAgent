@@ -49,6 +49,12 @@ class SQLiteMigrationTests(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'"
                 ).fetchall()
             }
+            model_usage_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(model_usage)").fetchall()
+            }
+            shadow_table = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='model_route_shadows'"
+            ).fetchone()
         self.assertEqual([item.version for item in MIGRATIONS], [row["version"] for row in rows])
         self.assertEqual([item.name for item in MIGRATIONS], [row["name"] for row in rows])
         self.assertEqual([item.checksum for item in MIGRATIONS], [row["checksum"] for row in rows])
@@ -57,6 +63,11 @@ class SQLiteMigrationTests(unittest.TestCase):
         self.assertIn("idx_tasks_recovery", indexes)
         self.assertIn("idx_audit_recovery_epoch", indexes)
         self.assertIn("idx_model_usage_reconciliation", indexes)
+        self.assertIn("idx_model_route_shadows_report", indexes)
+        self.assertEqual(
+            {"lane", "topology_sha256"}, {"lane", "topology_sha256"} & model_usage_columns
+        )
+        self.assertIsNotNone(shadow_table)
 
     def test_read_only_operational_gate_refuses_an_old_schema(self):
         with self.connect() as conn:
@@ -97,8 +108,11 @@ class SQLiteMigrationTests(unittest.TestCase):
         task_id = "legacy-error-" + uuid.uuid4().hex
         secret = "password=legacy-operational-secret"
         now = utc_now()
+        sanitize_version = next(
+            item.version for item in MIGRATIONS if item.name == "sanitize-legacy-operational-errors"
+        )
         with self.connect() as conn:
-            migrate_sqlite(conn, CURRENT_SCHEMA_VERSION - 1)
+            migrate_sqlite(conn, sanitize_version - 1)
             conn.execute(
                 "INSERT INTO tasks(id,state,repository,pull_request,input_json,report_json,error,"
                 "created_at,updated_at,tenant_id,cancel_requested) "

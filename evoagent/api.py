@@ -502,6 +502,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/api/model-routes/promotion":
+            if not principal.can("manage"):
+                self._send_json(403, {"error": "permission denied"})
+                return
+            candidate_route_id = query.get("route_id", [""])[0]
+            if not candidate_route_id:
+                raise ClientInputError("route_id query parameter is required")
+            repository = query.get("repository", [None])[0]
+            self._send_json(
+                200,
+                self.service.model_route_promotion_report(
+                    principal.tenant_id, candidate_route_id, repository
+                ),
+            )
+            return
         if path == "/v1/repository-policies":
             if not principal.can("manage"):
                 self._send_json(403, {"error": "permission denied"})

@@ -168,6 +168,7 @@ def default_plugins(settings: Settings) -> list[Plugin]:
             (SETTINGS, STORE, LLM_BREAKER),
             _model_gateway,
             "Governed model routing, redaction, budget, and usage ledger",
+            close=_close_resource,
         ),
         _provider(
             "evoagent.proof-executor",
@@ -392,12 +393,13 @@ def _model_gateway(context: PluginContext) -> EnterpriseModelGateway:
         )
     providers = {}
     primary_breaker = context.require(LLM_BREAKER)
-    for index, route in enumerate(routes):
+    primary_route_id = next((route.route_id for route in routes if route.state == "active"), "")
+    for route in routes:
         breaker = (
             primary_breaker
-            if index == 0
+            if route.route_id == primary_route_id
             else CircuitBreaker(
-                "llm:%s" % (route.route_id or index),
+                "llm:%s" % (route.route_id or route.model),
                 settings.breaker_failure_threshold,
                 settings.breaker_reset_seconds,
             )
@@ -421,6 +423,11 @@ def _model_gateway(context: PluginContext) -> EnterpriseModelGateway:
             daily_cost_micros=settings.llm_daily_cost_micros,
             fallback_attempts=settings.llm_fallback_attempts,
             reservation_ttl_seconds=settings.llm_reservation_ttl_seconds,
+            shadow_workers=settings.llm_shadow_workers,
+            shadow_max_inflight=settings.llm_shadow_max_inflight,
+            shadow_shutdown_timeout_seconds=float(settings.timeout_seconds + 5),
+            shadow_daily_token_budget=settings.llm_shadow_daily_token_budget,
+            shadow_daily_cost_micros=settings.llm_shadow_daily_cost_micros,
         ),
     )
 

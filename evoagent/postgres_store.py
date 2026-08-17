@@ -497,8 +497,12 @@ class PostgresTaskStore:
         period_start: str,
         token_budget: int = 0,
         cost_budget_micros: int = 0,
+        lane_token_budget: int = 0,
+        lane_cost_budget_micros: int = 0,
     ) -> bool:
         """Atomically enforce one repository's period budget and reserve capacity."""
+        if record.get("lane", "active") not in {"active", "shadow"}:
+            raise ValueError("model usage lane must be active or shadow")
         with self._connect() as conn:
             conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtext(%s))",
@@ -528,11 +532,34 @@ class PostgresTaskStore:
                 and int(used["cost"]) + int(record["reserved_cost_micros"]) > cost_budget_micros
             ):
                 return False
+            lane = record.get("lane", "active")
+            if lane_token_budget > 0 or lane_cost_budget_micros > 0:
+                lane_used = conn.execute(
+                    "SELECT COALESCE(SUM(CASE WHEN status IN ('reserved','uncertain') "
+                    "THEN reserved_tokens ELSE input_tokens+output_tokens END),0) AS tokens,"
+                    "COALESCE(SUM(CASE WHEN status IN ('reserved','uncertain') "
+                    "THEN reserved_cost_micros ELSE cost_micros END),0) AS cost "
+                    "FROM model_usage WHERE tenant_id=%s AND repository=%s AND created_at>=%s "
+                    "AND lane=%s AND status IN ('reserved','uncertain','success','failed')",
+                    (record["tenant_id"], record["repository"], period_start, lane),
+                ).fetchone()
+                if (
+                    lane_token_budget > 0
+                    and int(lane_used["tokens"]) + int(record["reserved_tokens"])
+                    > lane_token_budget
+                ):
+                    return False
+                if (
+                    lane_cost_budget_micros > 0
+                    and int(lane_used["cost"]) + int(record["reserved_cost_micros"])
+                    > lane_cost_budget_micros
+                ):
+                    return False
             conn.execute(
                 "INSERT INTO model_usage(request_id,root_request_id,route_id,attempt,tenant_id,"
                 "repository,task_id,purpose,provider,model,status,reserved_tokens,"
-                "reserved_cost_micros,redactions,request_sha256,created_at) "
-                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'reserved',%s,%s,%s,%s,%s)",
+                "reserved_cost_micros,redactions,request_sha256,lane,topology_sha256,created_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'reserved',%s,%s,%s,%s,%s,%s,%s)",
                 (
                     record["request_id"],
                     record.get("root_request_id") or record["request_id"],
@@ -548,6 +575,8 @@ class PostgresTaskStore:
                     record.get("reserved_cost_micros", 0),
                     record.get("redactions", 0),
                     record["request_sha256"],
+                    record.get("lane", "active"),
+                    record.get("topology_sha256") or None,
                     record.get("created_at") or utc_now(),
                 ),
             )
@@ -669,6 +698,113 @@ class PostgresTaskStore:
                     item[key] = item[key].isoformat()
             values.append(item)
         return values
+
+    def start_model_route_shadow(self, record: dict[str, Any]) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "INSERT INTO model_route_shadows(observation_id,topology_sha256,root_request_id,"
+                "tenant_id,repository,task_id,purpose,active_route_id,candidate_route_id,status,"
+                "active_output_sha256,input_sha256,created_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'scheduled',%s,%s,%s) "
+                "ON CONFLICT(observation_id) DO NOTHING RETURNING observation_id",
+                (
+                    record["observation_id"],
+                    record["topology_sha256"],
+                    record["root_request_id"],
+                    record["tenant_id"],
+                    record["repository"],
+                    record.get("task_id"),
+                    record["purpose"],
+                    record["active_route_id"],
+                    record["candidate_route_id"],
+                    record["active_output_sha256"],
+                    record["input_sha256"],
+                    record.get("created_at") or utc_now(),
+                ),
+            ).fetchone()
+        return row is not None
+
+    def complete_model_route_shadow(
+        self,
+        observation_id: str,
+        status: str,
+        agreement: bool | None,
+        candidate_output_sha256: str,
+        input_tokens: int,
+        output_tokens: int,
+        cost_micros: int,
+        duration_ms: int,
+        error_type: str = "",
+        error_ref: str = "",
+    ) -> bool:
+        if status not in {"success", "failed", "budget-rejected", "shed", "cancelled"}:
+            raise ValueError("invalid model route shadow status")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE model_route_shadows SET status=%s,agreement=%s,"
+                "candidate_output_sha256=%s,input_tokens=%s,output_tokens=%s,cost_micros=%s,"
+                "duration_ms=%s,error_type=%s,error_ref=%s,completed_at=%s "
+                "WHERE observation_id=%s AND status='scheduled'",
+                (
+                    status,
+                    agreement,
+                    candidate_output_sha256 or None,
+                    max(0, input_tokens),
+                    max(0, output_tokens),
+                    max(0, cost_micros),
+                    max(0, duration_ms),
+                    error_type[:160] or None,
+                    error_ref[:16] or None,
+                    utc_now(),
+                    observation_id,
+                ),
+            )
+        return cursor.rowcount > 0
+
+    def expire_model_route_shadows(self, cutoff: str, limit: int = 1000) -> int:
+        """Make crash-orphaned scheduled observations a terminal gate failure."""
+        bounded_limit = max(1, min(limit, 10_000))
+        with self._connect() as conn:
+            rows = conn.execute(
+                "WITH candidates AS (SELECT observation_id FROM model_route_shadows "
+                "WHERE status='scheduled' AND created_at<%s "
+                "ORDER BY created_at,observation_id LIMIT %s FOR UPDATE SKIP LOCKED) "
+                "UPDATE model_route_shadows AS shadow SET status='uncertain',"
+                "error_type='evoagent.shadow.ObservationExpired',"
+                "error_ref='0000000000000000',completed_at=%s FROM candidates "
+                "WHERE shadow.observation_id=candidates.observation_id "
+                "AND shadow.status='scheduled' RETURNING shadow.observation_id",
+                (cutoff, bounded_limit, utc_now()),
+            ).fetchall()
+        return len(rows)
+
+    def model_route_shadow_stats(
+        self,
+        tenant_id: str,
+        candidate_route_id: str,
+        topology_sha256: str,
+        repository: str | None = None,
+    ) -> dict[str, int]:
+        query = (
+            "SELECT COUNT(*) AS attempts,"
+            "COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0) AS samples,"
+            "COALESCE(SUM(CASE WHEN status NOT IN ('scheduled','success') THEN 1 ELSE 0 END),0) "
+            "AS errors,"
+            "COALESCE(SUM(CASE WHEN status='scheduled' THEN 1 ELSE 0 END),0) AS pending,"
+            "COALESCE(SUM(CASE WHEN status='success' AND agreement=FALSE THEN 1 ELSE 0 END),0) "
+            "AS disagreements,COALESCE(SUM(input_tokens),0) AS input_tokens,"
+            "COALESCE(SUM(output_tokens),0) AS output_tokens,"
+            "COALESCE(SUM(cost_micros),0) AS cost_micros "
+            "FROM model_route_shadows WHERE tenant_id=%s AND candidate_route_id=%s "
+            "AND topology_sha256=%s"
+        )
+        params: list[Any] = [tenant_id, candidate_route_id, topology_sha256]
+        if repository is not None:
+            query += " AND repository=%s"
+            params.append(repository)
+        with self._connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        return {key: int(row[key]) for key in row.keys()}
 
     def claim_effect(self, effect_key: str, owner: str, lease_seconds: float) -> dict[str, Any]:
         now = utc_now()

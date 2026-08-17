@@ -549,6 +549,120 @@ class _StoreBehaviorContract:
         self.assertEqual(1, len(usage))
         self.assertEqual("reserved", usage[0]["status"])
 
+    def test_model_route_shadow_observation_contract(self):
+        tenant_id = self.unique("shadow-tenant")
+        candidate_route_id = self.unique("candidate-route")
+        topology_sha256 = "c" * 64
+        repository = "acme/" + self.unique("shadow-repository")
+        first_usage = self.unique("shadow-usage")
+        second_usage = self.unique("shadow-usage")
+        usage_record = {
+            "request_id": first_usage,
+            "tenant_id": tenant_id,
+            "repository": repository,
+            "purpose": "review",
+            "provider": "candidate-provider",
+            "model": "candidate-model",
+            "reserved_tokens": 6,
+            "reserved_cost_micros": 6,
+            "request_sha256": "e" * 64,
+            "lane": "shadow",
+            "topology_sha256": topology_sha256,
+            "created_at": utc_now(),
+        }
+        self.assertTrue(
+            self.store.reserve_model_usage(
+                usage_record,
+                "2000-01-01T00:00:00+00:00",
+                lane_token_budget=10,
+                lane_cost_budget_micros=10,
+            )
+        )
+        self.assertTrue(self.store.complete_model_usage(first_usage, "success", 3, 2, 5))
+        self.assertFalse(
+            self.store.reserve_model_usage(
+                {**usage_record, "request_id": second_usage},
+                "2000-01-01T00:00:00+00:00",
+                lane_token_budget=10,
+                lane_cost_budget_micros=10,
+            )
+        )
+
+        def start(
+            observation_id: str,
+            active_hash: str = "a" * 64,
+            created_at: str | None = None,
+        ) -> bool:
+            return self.store.start_model_route_shadow(
+                {
+                    "observation_id": observation_id,
+                    "topology_sha256": topology_sha256,
+                    "root_request_id": self.unique("root-request"),
+                    "tenant_id": tenant_id,
+                    "repository": repository,
+                    "task_id": self.unique("task"),
+                    "purpose": "review",
+                    "active_route_id": "stable",
+                    "candidate_route_id": candidate_route_id,
+                    "active_output_sha256": active_hash,
+                    "input_sha256": "d" * 64,
+                    "created_at": created_at or utc_now(),
+                }
+            )
+
+        success = self.unique("shadow-observation")
+        failed = self.unique("shadow-observation")
+        pending = self.unique("shadow-observation")
+        stale = self.unique("shadow-observation")
+        self.assertTrue(start(success))
+        self.assertFalse(start(success))
+        self.assertTrue(
+            self.store.complete_model_route_shadow(
+                success, "success", False, "b" * 64, 12, 5, 7, 25
+            )
+        )
+        self.assertFalse(
+            self.store.complete_model_route_shadow(success, "success", True, "b" * 64, 12, 5, 7, 25)
+        )
+        self.assertTrue(start(failed))
+        self.assertTrue(
+            self.store.complete_model_route_shadow(
+                failed,
+                "failed",
+                None,
+                "",
+                0,
+                0,
+                0,
+                9,
+                "builtins.RuntimeError",
+                "1" * 16,
+            )
+        )
+        self.assertTrue(start(pending))
+        self.assertTrue(start(stale, created_at="2000-01-01T00:00:00+00:00"))
+        self.assertEqual(1, self.store.expire_model_route_shadows("2001-01-01T00:00:00+00:00"))
+        self.assertEqual(0, self.store.expire_model_route_shadows("2001-01-01T00:00:00+00:00"))
+
+        stats = self.store.model_route_shadow_stats(tenant_id, candidate_route_id, topology_sha256)
+        self.assertEqual(
+            {
+                "attempts": 4,
+                "samples": 1,
+                "errors": 2,
+                "pending": 1,
+                "disagreements": 1,
+                "input_tokens": 12,
+                "output_tokens": 5,
+                "cost_micros": 7,
+            },
+            stats,
+        )
+        other_repository = self.store.model_route_shadow_stats(
+            tenant_id, candidate_route_id, topology_sha256, repository + "-other"
+        )
+        self.assertEqual(0, other_repository["attempts"])
+
 
 class SQLiteStoreContractTests(_StoreBehaviorContract, unittest.TestCase):
     def setUp(self):

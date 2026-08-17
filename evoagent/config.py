@@ -76,6 +76,10 @@ class Settings:
     llm_routes_file: str = ""
     llm_fallback_attempts: int = 1
     llm_reservation_ttl_seconds: int = 600
+    llm_shadow_workers: int = 2
+    llm_shadow_max_inflight: int = 8
+    llm_shadow_daily_token_budget: int = 0
+    llm_shadow_daily_cost_micros: int = 0
     eval_max_cases: int = 5
     eval_min_cases: int = 3
     eval_min_improvement: float = 0.01
@@ -237,7 +241,7 @@ class Settings:
                 "EVOAGENT_PLUGIN_ALLOWLIST is required when trusted plugin discovery is enabled"
             )
         if (
-            self.llm_daily_cost_micros > 0
+            (self.llm_daily_cost_micros > 0 or self.llm_shadow_daily_cost_micros > 0)
             and self.llm_input_cost_micros_per_million == 0
             and self.llm_output_cost_micros_per_million == 0
             and not self.llm_routes_file
@@ -248,6 +252,14 @@ class Settings:
         if self.llm_reservation_ttl_seconds <= self.timeout_seconds:
             raise ValueError(
                 "EVOAGENT_LLM_RESERVATION_TTL_SECONDS must exceed EVOAGENT_TIMEOUT_SECONDS"
+            )
+        if self.llm_shadow_workers > 32:
+            raise ValueError("EVOAGENT_LLM_SHADOW_WORKERS must be at most 32")
+        if self.llm_shadow_max_inflight <= 0:
+            raise ValueError("EVOAGENT_LLM_SHADOW_MAX_INFLIGHT must be positive")
+        if self.llm_shadow_workers > self.llm_shadow_max_inflight:
+            raise ValueError(
+                "EVOAGENT_LLM_SHADOW_WORKERS cannot exceed EVOAGENT_LLM_SHADOW_MAX_INFLIGHT"
             )
         if self.proof_require_remote and not self.proof_runner_url:
             raise ValueError(
@@ -307,6 +319,14 @@ class Settings:
             llm_routes_file=os.getenv("EVOAGENT_LLM_ROUTES_FILE", ""),
             llm_fallback_attempts=_non_negative_int("EVOAGENT_LLM_FALLBACK_ATTEMPTS", 1),
             llm_reservation_ttl_seconds=_int("EVOAGENT_LLM_RESERVATION_TTL_SECONDS", 600),
+            llm_shadow_workers=_non_negative_int("EVOAGENT_LLM_SHADOW_WORKERS", 2),
+            llm_shadow_max_inflight=_int("EVOAGENT_LLM_SHADOW_MAX_INFLIGHT", 8),
+            llm_shadow_daily_token_budget=_non_negative_int(
+                "EVOAGENT_LLM_SHADOW_DAILY_TOKEN_BUDGET", 0
+            ),
+            llm_shadow_daily_cost_micros=_non_negative_int(
+                "EVOAGENT_LLM_SHADOW_DAILY_COST_MICROS", 0
+            ),
             eval_max_cases=_int("EVOAGENT_EVAL_MAX_CASES", 5),
             eval_min_cases=_int("EVOAGENT_EVAL_MIN_CASES", 3),
             eval_min_improvement=float(os.getenv("EVOAGENT_EVAL_MIN_IMPROVEMENT", "0.01")),

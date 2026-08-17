@@ -8,6 +8,7 @@ import threading
 import unittest
 from contextlib import redirect_stdout
 from http.server import ThreadingHTTPServer
+from unittest import mock
 
 from evoagent.api import ApiHandler
 from evoagent.config import Settings
@@ -322,6 +323,35 @@ class AdmissionControlTests(unittest.TestCase):
         self.assertEqual(200, response.status)
         self.assertEqual([request_id], [item["request_id"] for item in payload["usage"]])
         self.assertNotIn("messages", payload["usage"][0])
+
+    def test_model_route_promotion_report_http_boundary(self):
+        host, port = self._serve(self._settings())
+        expected = {
+            "candidate_route_id": "candidate",
+            "eligible": False,
+            "checks": {"minimum_samples": False},
+        }
+        with mock.patch.object(
+            self.service.model_gateway, "promotion_report", return_value=expected
+        ) as report:
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            self.addCleanup(conn.close)
+            conn.request(
+                "GET",
+                "/api/model-routes/promotion?route_id=candidate&repository=org%2Frepo",
+            )
+            response = conn.getresponse()
+            payload = json.loads(response.read())
+
+        self.assertEqual(200, response.status)
+        self.assertEqual(expected, payload)
+        report.assert_called_once_with("default", "candidate", "org/repo")
+
+        conn.request("GET", "/api/model-routes/promotion")
+        missing = conn.getresponse()
+        missing_payload = json.loads(missing.read())
+        self.assertEqual(400, missing.status)
+        self.assertIn("route_id", missing_payload["error"])
 
     def test_rejected_requests_are_counted_in_metrics(self):
         host, port = self._serve(self._settings(rate_limit_rps=1, rate_limit_burst=1))

@@ -61,7 +61,7 @@ change (webhook | REST | console)
   → TaskQueue                               # in-process or Redis Streams
   → ReviewHarness.run                       # LangGraph nodes, checkpoint each step
       parse → plan → specialists (security, reliability, llm, skills)
-            llm → ModelGateway (scope → route → redact → reserve → call/fallback → validate → account)
+            llm → ModelGateway (scope → weighted active route → redact → reserve → call/fallback → validate → account → isolated shadow)
             → evidence gate (critic, test) → synthesize → verify
   → ReviewReport (findings with stable fingerprints)
   → delivery: report + optional PR comment upsert + optional verified fix PR

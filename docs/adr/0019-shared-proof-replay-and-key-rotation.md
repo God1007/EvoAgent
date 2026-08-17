@@ -46,5 +46,6 @@ The mandatory Redis CI job proves real `SET NX` atomicity and positive TTL.
 Redis is now part of the production proof control plane. Its outage deliberately
 makes proofs inconclusive, not failed reproductions, and operators must not fall
 back to memory during an incident. The adapter does not itself prove regional
-Redis durability. A microVM executor and WORM evidence store remain separate
-hardening requirements.
+Redis durability. The S3 Object Lock adapter is decided separately in ADR 0020;
+a microVM executor and provider-level cloud control drill remain hardening
+requirements.

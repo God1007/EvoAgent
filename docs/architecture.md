@@ -11,7 +11,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Intake | `evoagent/api.py`, `errors.py` | HTTP API, static web console, bounded query admission, explicit client-safe errors, correlated 5xx boundary, `/webhooks/github`, `/health`, `/metrics` |
 | Composition | `evoagent/plugins.py` | Trusted plugin manifests, capability registry, scopes, events, dependency graph, lifecycle rollback |
 | Composition | `evoagent/capabilities.py` | Stable typed capability definitions for providers and consumers |
-| Domain boundary | `evoagent/ports.py` | Focused Store, Queue, CodeHost, Model Gateway, Proof Executor, and Proof Replay Store behavioral contracts |
+| Domain boundary | `evoagent/ports.py` | Focused Store, Queue, CodeHost, Model Gateway, Proof Executor, Proof Replay Store, and Proof Artifact Store behavioral contracts |
 | Composition | `evoagent/bootstrap.py` | Replaceable built-in provider catalog and transactional application startup |
 | Application | `evoagent/application/` | Focused Review, Webhook, Session, Repair, Policy, and Model Usage use cases |
 | Composition facade | `evoagent/service.py` | Capability wiring, lifecycle/health, canary/shadow runtime selection, API compatibility |
@@ -24,7 +24,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Review | `evoagent/skills.py`, `skill_runner.py` | Transactional dynamic-skill snapshots, manifest/hash/signature checks, bounded sandboxed execution |
 | Delivery | `evoagent/fix_rules.py`, `fixer.py` | Pluggable deterministic transforms plus verified auto-repair on a dedicated branch |
 | Delivery | `evoagent/verifier.py` | Compile/test gates with container or host isolation |
-| Evidence | `evoagent/proof.py`, `proof_remote.py` | L1–L4 grading plus authenticated local/remote execution and attestations |
+| Evidence | `evoagent/proof.py`, `proof_remote.py`, `proof_artifacts.py` | L1–L4 grading, authenticated execution, and local/S3 Object Lock evidence persistence |
 | Delivery | `evoagent/report.py` | Injection-safe markdown report rendering |
 | Evolution | `evoagent/evolution.py`, `rollout.py` | Prompt versioning, validation/holdout replay, canary/shadow, rollback |
 | Evolution | `evoagent/evaluation_harness.py`, `evaluation_dataset.py`, `evaluation_provenance.py`, `evaluation_metrics.py`, `evaluation_labels.py`, `evaluation_benchmark.py` | Blind-label compilation, evidence audit, replay orchestration, replaceable slices, and calibration |
@@ -183,6 +183,9 @@ The full analysis lives in [`threat-model.md`](threat-model.md). Key boundaries:
   starts container-only jobs with no application credentials or network.
   Production replicas atomically claim nonces in shared Redis and support one
   previous HMAC key during a body-bound, fail-closed rotation window.
+  Regulated deployments can persist input/evidence into a versioned S3 Object
+  Lock bucket through conditional writes, full-object SHA-256 verification, and
+  explicit non-shortening retention.
 - **Outbound GitHub requests** are restricted to an HTTPS host allowlist with
   redirect token-stripping and response-size caps.
 - **Outbound model requests** pass through a tenant/repository-aware gateway;

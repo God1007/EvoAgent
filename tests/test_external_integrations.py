@@ -1,4 +1,4 @@
-"""Real PostgreSQL and Redis behavior tests enabled by the CI service matrix."""
+"""Real persistence and object-store tests enabled by explicit environments."""
 
 import json
 import os
@@ -10,11 +10,14 @@ import unittest
 import uuid
 
 from evoagent.postgres_store import PostgresTaskStore
+from evoagent.proof_artifacts import S3ObjectLockArtifactStore
 from evoagent.proof_remote import RedisProofReplayStore
 from evoagent.task_queue import PermanentTaskError, TaskQueue
 
 POSTGRES_URL = os.getenv("EVOAGENT_TEST_POSTGRES_URL", "")
 REDIS_URL = os.getenv("EVOAGENT_TEST_REDIS_URL", "")
+S3_OBJECT_LOCK_BUCKET = os.getenv("EVOAGENT_TEST_S3_OBJECT_LOCK_BUCKET", "")
+S3_REGION = os.getenv("EVOAGENT_TEST_S3_REGION", "")
 
 
 def _wait(predicate, timeout: float = 10.0) -> bool:
@@ -217,6 +220,22 @@ class RedisRuntimeIntegrationTests(unittest.TestCase):
                 self.redis.delete(*keys)
             first.close()
             second.close()
+
+
+@unittest.skipUnless(
+    S3_OBJECT_LOCK_BUCKET and S3_REGION,
+    "EVOAGENT_TEST_S3_OBJECT_LOCK_BUCKET/EVOAGENT_TEST_S3_REGION are not configured",
+)
+class S3ObjectLockRuntimeIntegrationTests(unittest.TestCase):
+    def test_bucket_has_object_lock_and_versioning_enabled(self):
+        store = S3ObjectLockArtifactStore(
+            S3_OBJECT_LOCK_BUCKET,
+            region=S3_REGION,
+        )
+        try:
+            self.assertTrue(store.health())
+        finally:
+            store.close()
 
 
 if __name__ == "__main__":

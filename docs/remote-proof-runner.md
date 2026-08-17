@@ -15,13 +15,13 @@ API / worker trust domain                    isolated runner trust domain
 │   → proof.executor       │◄───────────────┤   shared nonce claim         │
 │ no Docker access needed  │ signed result  │   → one netless job container│
 └──────────────────────────┘                └──────────────────────────────┘
-       Store / Redis / GitHub / LLM keys          no application credentials
+       Store / Redis / GitHub / LLM keys          artifact-only IAM identity
 ```
 
 For production, place the runner on dedicated nodes or a separate cluster
 account. Do not mount a production control-plane Docker socket into the API
 container. The runner needs access only to its job runtime, TLS/HMAC secret, and
-optional artifact volume.
+an optional artifact volume or dedicated evidence-only object-store identity.
 
 ## Protocol guarantees
 
@@ -35,7 +35,8 @@ optional artifact volume.
 - HTTPS outside `127.0.0.1`, `::1`, or `localhost`;
 - bounded request, source, file count, response, command output, runtime, CPU,
   memory, PID count, and file size;
-- content-addressed input/evidence artifacts when storage is configured;
+- a pluggable artifact Store: append-only local files or versioned S3 Object
+  Lock objects with conditional create, SHA-256, retention, and version checks;
 - a pluggable replay Store: bounded memory for one local replica or Redis
   `SET NX` with TTL for an atomic claim shared by every production replica;
 - runner/transport/capacity failures map to `error`, never `failed`, so they do
@@ -54,7 +55,11 @@ export EVOAGENT_PROOF_RUNNER_SIGNING_KEY_ID='2026-09'
 export EVOAGENT_PROOF_RUNNER_REPLAY_REDIS_URL='rediss://proof-replay.internal/0'
 export EVOAGENT_PROOF_RUNNER_REQUIRE_SHARED_REPLAY=true
 export EVOAGENT_PROOF_RUNNER_CONTAINER_IMAGE='company/proof-job@sha256:<digest>'
-export EVOAGENT_PROOF_RUNNER_ARTIFACT_DIR=/var/lib/evoagent-proof
+export EVOAGENT_PROOF_RUNNER_ARTIFACT_S3_BUCKET='company-proof-evidence'
+export EVOAGENT_PROOF_RUNNER_ARTIFACT_S3_REGION='ap-southeast-1'
+export EVOAGENT_PROOF_RUNNER_ARTIFACT_S3_RETENTION_MODE='COMPLIANCE'
+export EVOAGENT_PROOF_RUNNER_ARTIFACT_S3_RETENTION_DAYS=2555
+export EVOAGENT_PROOF_RUNNER_ARTIFACT_S3_KMS_KEY_ID='alias/evoagent-proof'
 export EVOAGENT_PROOF_RUNNER_REQUIRE_ARTIFACTS=true
 evoagent-proof-runner
 ```
@@ -92,16 +97,37 @@ evidence/<sha-prefix>/<canonical-outcome-sha>.json
 
 The API response includes both `sha256:` artifact addresses inside each step's
 `attestation`. Identical artifacts deduplicate; existing content is compared and
-never overwritten. Back up the volume or replace the executor/storage provider
-with object storage using retention lock when organizational policy requires
-durable/WORM evidence.
+never overwritten. A local directory is useful for development and controlled
+single-node deployments, but is not a WORM claim.
+
+For regulated retention, configure `ARTIFACT_S3_BUCKET` instead of
+`ARTIFACT_DIR`. The bucket must have Versioning and Object Lock enabled. Each
+object uses a digest-derived key and `If-None-Match: *`, an explicit full-object
+SHA-256, retention mode/date, and SSE-S3 or the configured KMS key. The Runner
+then reads back the exact version and verifies its size, digest metadata,
+checksum, mode, and retain-until date. Reusing content does not create another
+version; if its existing retention ends earlier than the new requirement, the
+Runner extends and re-verifies that exact version. It never requests a shorter
+retention or governance bypass.
+
+`COMPLIANCE` is the safe production default. `GOVERNANCE` is intended for
+pre-production exercises because a specially privileged principal can bypass
+it. Grant the Runner only bucket Object Lock/versioning reads plus object put,
+head/get-retention, and retention-extension permissions. Deny object deletion
+and `BypassGovernanceRetention`; add only the minimum KMS operations when a KMS
+key is selected. AWS documents that Object Lock protects versions rather than
+preventing later versions, which is why the conditional write and exact-version
+verification are both required. See the official [Object Lock
+model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html)
+and [PutObject checksum/retention
+contract](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html).
 
 ## Horizontal scaling and key rotation
 
 Every replica must use the same `REPLAY_REDIS_URL`. The adapter stores only a
 namespaced UUID nonce with a TTL through one atomic `SET NX`; source, command,
 digest, signature, and tenant data are never written to Redis. `/readyz` checks
-the replay Store, while `/healthz` remains process liveness. With
+the replay Store and configured artifact Store, while `/healthz` remains process liveness. With
 `REQUIRE_SHARED_REPLAY=true`, missing configuration fails startup; a Redis
 outage makes execution return 503 before a job starts.
 
@@ -122,8 +148,10 @@ Runner rather than silently downgrade.
 
 ## Operational boundaries
 
-- `/healthz` reports process liveness; `/readyz` verifies the replay dependency;
-  neither endpoint executes a job.
+- `/healthz` reports process liveness; `/readyz` verifies replay, reports every
+  configured artifact dependency, and gates service when artifact persistence
+  is required. It exposes only backend identity/readiness, never a bucket,
+  endpoint, credential, or key; neither endpoint executes a job.
 - When `EVOAGENT_PROOF_REQUIRE_REMOTE=true`, the API `/ready` check includes
   runner liveness and removes the instance from service if it is unavailable.
 - Concurrency is fail-fast and bounded by
@@ -135,4 +163,5 @@ Runner rather than silently downgrade.
   microVMs for hostile public multi-tenant workloads.
 
 See [ADR 0009](adr/0009-authenticated-remote-proof-runner.md) and the
+[Object Lock decision](adr/0020-proof-artifact-object-lock.md) plus
 [threat model](threat-model.md) for the accepted trade-offs.

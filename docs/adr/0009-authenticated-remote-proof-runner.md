@@ -19,20 +19,21 @@ container executor or an authenticated remote adapter.
 
 The remote protocol is versioned and uses canonical JSON. Every request has a
 UUIDv4, timestamp, canonical input SHA-256, body SHA-256, and HMAC-SHA256. The
-runner enforces a replay window and in-process nonce cache before execution.
+runner enforces a replay window and atomic nonce claim before execution.
 Every response repeats the request/input identity and signs the response body;
 the evidence digest is the SHA-256 of the canonical outcome. HTTP redirects are
 disabled, response/request sizes are bounded, the destination uses an exact
 host allowlist, and non-loopback traffic requires HTTPS. HTTP connection
-threads, execution slots, and replay-cache entries are independently bounded.
+threads, execution slots, and local replay entries are independently bounded;
+production replicas share Redis claims.
 
 The standalone `evoagent-proof-runner` process accepts only the runner protocol.
 It requires a container image and creates `RepairVerifier` with
 `require_container=True`. Jobs have no injected environment, no network,
 read-only container roots, dropped Linux capabilities, `no-new-privileges`, and
-CPU/memory/PID/file/output/time limits. Optional runner-local artifact storage
-uses append-only content addresses; it can be required so persistence failures
-fail closed.
+CPU/memory/PID/file/output/time limits. Optional artifact storage is a separate
+Port with append-only local and S3 Object Lock providers; it can be required so
+persistence failures fail closed.
 
 The evidence ladder treats transport, capacity, authentication, timeout, and
 runner errors as uncertainty. Only an actual non-zero reproduction result can
@@ -50,9 +51,9 @@ produce L2, and only a signed passing patched result can produce L3/L4.
 - Replay protection is a Port. Local mode uses a bounded process cache;
   production replicas use Redis atomic `SET NX` + TTL and expose dependency
   readiness separately from liveness.
-- Filesystem content addressing detects mutation but is not object-lock/WORM.
-  Regulated retention should replace `proof.executor` or extend the runner with
-  an immutable object-store adapter.
+- Artifact persistence is a separate Port. Filesystem content addressing remains
+  a local append-only baseline; regulated deployments can select the S3 Object
+  Lock adapter defined in ADR 0020 without replacing execution/evidence policy.
 - Container isolation is materially stronger than host execution but is not a
   microVM boundary. High-risk multi-tenant deployments should use a compatible
   Firecracker/Kata provider behind `ProofExecutorPort`.

@@ -157,6 +157,16 @@ HMAC rotation, verify all Runners accept current+previous IDs before switching
 clients, wait for the request/replay drain, then remove the previous key. Never
 reuse a retired key ID for different key material.
 
+For regulated proof retention, use a dedicated versioned S3 bucket with Object
+Lock, set `REQUIRE_ARTIFACTS=true`, and monitor both `artifact_ready` and the
+Runner `/readyz` result. Prefer `COMPLIANCE`; governance mode is an operational
+test mode because principals with bypass permission can remove protection. The
+Runner identity should not have `DeleteObject` or `BypassGovernanceRetention`.
+Exercise a real conditional write, checksum/version/retention inspection, and
+restore in each target account/region before treating configuration health as
+compliance evidence. Do not shorten `RETENTION_DAYS` during a rollout; existing
+objects are extended when necessary and are never shortened by EvoAgent.
+
 ## Release checklist
 
 1. Ruff, mypy, unit/contract tests, dependency audit, wheel build pass.

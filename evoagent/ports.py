@@ -430,6 +430,20 @@ class ProofReplayStorePort(Protocol):
     def close(self) -> None: ...
 
 
+@runtime_checkable
+class ProofArtifactStorePort(Protocol):
+    """Immutable, content-addressed Proof Runner evidence persistence."""
+
+    @property
+    def backend(self) -> str: ...
+
+    def put(self, namespace: str, content: bytes) -> str: ...
+
+    def health(self) -> bool: ...
+
+    def close(self) -> None: ...
+
+
 class ServiceStorePort(Protocol):
     def ping(self) -> None: ...
 

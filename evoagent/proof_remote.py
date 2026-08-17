@@ -16,7 +16,6 @@ import os
 import re
 import signal
 import ssl
-import tempfile
 import threading
 import time
 import urllib.error
@@ -28,8 +27,13 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .ports import ProofExecutorPort, ProofReplayStorePort
+from .ports import ProofArtifactStorePort, ProofExecutorPort, ProofReplayStorePort
 from .proof import LocalProofExecutor
+from .proof_artifacts import (
+    ContentAddressedArtifactStore,
+    S3ObjectLockArtifactStore,
+    validate_s3_object_lock_settings,
+)
 from .verifier import RepairVerifier
 
 PROTOCOL_VERSION = 1
@@ -241,61 +245,6 @@ class RedisProofReplayStore:
             close()
 
 
-class ContentAddressedArtifactStore:
-    """Append-only, content-addressed JSON artifacts on a trusted runner volume."""
-
-    def __init__(self, root: str):
-        if not root:
-            raise ValueError("artifact root is required")
-        self.root = os.path.abspath(root)
-        os.makedirs(self.root, mode=0o700, exist_ok=True)
-
-    def put(self, namespace: str, content: bytes) -> str:
-        if namespace not in {"inputs", "evidence"}:
-            raise ValueError("unsupported proof artifact namespace")
-        digest = sha256_hex(content)
-        directory = os.path.join(self.root, namespace, digest[:2])
-        os.makedirs(directory, mode=0o700, exist_ok=True)
-        target = os.path.join(directory, digest + ".json")
-        if os.path.exists(target):
-            if self._read_existing(target) != content:
-                raise ProofProtocolError("content-addressed artifact digest collision")
-            return "sha256:" + digest
-
-        descriptor, temporary = tempfile.mkstemp(prefix=".artifact-", dir=directory)
-        try:
-            with os.fdopen(descriptor, "wb") as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, 0o600)
-            try:
-                os.link(temporary, target)
-            except FileExistsError:
-                if self._read_existing(target) != content:
-                    raise ProofProtocolError(
-                        "content-addressed artifact digest collision"
-                    ) from None
-            directory_descriptor = os.open(directory, os.O_RDONLY)
-            try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
-        finally:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
-        return "sha256:" + digest
-
-    @staticmethod
-    def _read_existing(path: str) -> bytes:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path, flags)
-        with os.fdopen(descriptor, "rb") as handle:
-            return handle.read()
-
-
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -429,6 +378,8 @@ class RemoteProofExecutor:
             "mode": "remote",
             "endpoint_host": parsed.hostname or "",
             "replay_backend": str(document.get("replay_backend", "unknown")),
+            "artifact_backend": str(document.get("artifact_backend", "unknown")),
+            "artifact_ready": bool(document.get("artifact_ready", False)),
             "signing_key_id": self.signing_key_id,
         }
 
@@ -574,7 +525,7 @@ class ProofRunnerServer:
         max_files: int = 5000,
         max_source_bytes: int = 8 * 1024 * 1024,
         max_concurrency: int = 2,
-        artifact_store: ContentAddressedArtifactStore | None = None,
+        artifact_store: ProofArtifactStorePort | None = None,
         require_artifacts: bool = False,
         replay_store: ProofReplayStorePort | None = None,
         clock: Any = time.time,
@@ -796,17 +747,32 @@ class ProofRunnerServer:
 
     def readiness(self) -> dict[str, Any]:
         try:
-            ready = bool(self.replay_store.health())
+            replay_ready = bool(self.replay_store.health())
         except Exception:
-            ready = False
+            replay_ready = False
+        artifact_backend = "none"
+        artifact_ready = self.artifact_store is None
+        if self.artifact_store is not None:
+            artifact_backend = self.artifact_store.backend
+            try:
+                artifact_ready = bool(self.artifact_store.health())
+            except Exception:
+                artifact_ready = False
+        ready = replay_ready and (artifact_ready or not self.require_artifacts)
         return {
             "status": "ready" if ready else "not-ready",
             "replay_backend": self.replay_store.backend,
+            "artifact_backend": artifact_backend,
+            "artifact_ready": artifact_ready,
             "signing_key_ids": len(self._signing_keys),
         }
 
     def close(self) -> None:
-        self.replay_store.close()
+        try:
+            self.replay_store.close()
+        finally:
+            if self.artifact_store is not None:
+                self.artifact_store.close()
 
 
 def _error_outcome(detail: str) -> dict[str, Any]:
@@ -843,6 +809,13 @@ class ProofRunnerSettings:
     max_concurrency: int = 2
     max_connections: int = 32
     artifact_dir: str = ""
+    artifact_s3_bucket: str = ""
+    artifact_s3_prefix: str = "evoagent/proof-artifacts/v1"
+    artifact_s3_region: str = ""
+    artifact_s3_endpoint_url: str = field(default="", repr=False)
+    artifact_s3_retention_mode: str = "COMPLIANCE"
+    artifact_s3_retention_days: int = 2555
+    artifact_s3_kms_key_id: str = field(default="", repr=False)
     require_artifacts: bool = False
     tls_cert_file: str = ""
     tls_key_file: str = ""
@@ -882,6 +855,17 @@ class ProofRunnerSettings:
             max_concurrency=integer("MAX_CONCURRENCY", 2),
             max_connections=integer("MAX_CONNECTIONS", 32),
             artifact_dir=os.getenv(prefix + "ARTIFACT_DIR", ""),
+            artifact_s3_bucket=os.getenv(prefix + "ARTIFACT_S3_BUCKET", ""),
+            artifact_s3_prefix=os.getenv(
+                prefix + "ARTIFACT_S3_PREFIX", "evoagent/proof-artifacts/v1"
+            ),
+            artifact_s3_region=os.getenv(prefix + "ARTIFACT_S3_REGION", ""),
+            artifact_s3_endpoint_url=os.getenv(prefix + "ARTIFACT_S3_ENDPOINT_URL", ""),
+            artifact_s3_retention_mode=os.getenv(
+                prefix + "ARTIFACT_S3_RETENTION_MODE", "COMPLIANCE"
+            ),
+            artifact_s3_retention_days=integer("ARTIFACT_S3_RETENTION_DAYS", 2555),
+            artifact_s3_kms_key_id=os.getenv(prefix + "ARTIFACT_S3_KMS_KEY_ID", ""),
             require_artifacts=os.getenv(prefix + "REQUIRE_ARTIFACTS", "false").lower()
             in {"1", "true", "yes", "on"},
             tls_cert_file=os.getenv(prefix + "TLS_CERT_FILE", ""),
@@ -914,7 +898,23 @@ class ProofRunnerSettings:
             raise ValueError("proof runner TLS certificate and key must be configured together")
         if self.host not in {"127.0.0.1", "::1", "localhost"} and not self.tls_cert_file:
             raise ValueError("proof runner TLS is required when binding outside loopback")
-        if self.require_artifacts and not self.artifact_dir:
+        if self.artifact_dir and self.artifact_s3_bucket:
+            raise ValueError(
+                "proof runner filesystem and S3 artifact stores are mutually exclusive"
+            )
+        if self.artifact_s3_bucket:
+            if not self.artifact_s3_region:
+                raise ValueError("EVOAGENT_PROOF_RUNNER_ARTIFACT_S3_REGION is required")
+            validate_s3_object_lock_settings(
+                self.artifact_s3_bucket,
+                self.artifact_s3_prefix,
+                self.artifact_s3_endpoint_url,
+                self.artifact_s3_retention_mode,
+                self.artifact_s3_retention_days,
+                region=self.artifact_s3_region,
+                kms_key_id=self.artifact_s3_kms_key_id,
+            )
+        if self.require_artifacts and not (self.artifact_dir or self.artifact_s3_bucket):
             raise ValueError("required proof artifact storage is not configured")
 
 
@@ -931,35 +931,57 @@ def build_runner_service(settings: ProofRunnerSettings) -> ProofRunnerServer:
             max_output_bytes=settings.max_output_bytes,
         )
     )
-    artifacts = (
-        ContentAddressedArtifactStore(settings.artifact_dir) if settings.artifact_dir else None
-    )
-    replay_store: ProofReplayStorePort = (
-        RedisProofReplayStore(settings.replay_redis_url)
-        if settings.replay_redis_url
-        else InMemoryProofReplayStore(settings.max_replay_entries)
-    )
-    verification_keys = (
-        {settings.previous_signing_key_id: settings.previous_signing_key}
-        if settings.previous_signing_key_id
-        else {}
-    )
-    return ProofRunnerServer(
-        executor,
-        settings.signing_key,
-        signing_key_id=settings.signing_key_id,
-        verification_keys=verification_keys,
-        max_request_bytes=settings.max_request_bytes,
-        max_response_bytes=settings.max_response_bytes,
-        replay_window_seconds=settings.replay_window_seconds,
-        max_replay_entries=settings.max_replay_entries,
-        max_files=settings.max_files,
-        max_source_bytes=settings.max_source_bytes,
-        max_concurrency=settings.max_concurrency,
-        artifact_store=artifacts,
-        require_artifacts=settings.require_artifacts,
-        replay_store=replay_store,
-    )
+    artifacts: ProofArtifactStorePort | None
+    if settings.artifact_s3_bucket:
+        artifacts = S3ObjectLockArtifactStore(
+            settings.artifact_s3_bucket,
+            prefix=settings.artifact_s3_prefix,
+            region=settings.artifact_s3_region,
+            endpoint_url=settings.artifact_s3_endpoint_url,
+            retention_mode=settings.artifact_s3_retention_mode,
+            retention_days=settings.artifact_s3_retention_days,
+            kms_key_id=settings.artifact_s3_kms_key_id,
+        )
+    elif settings.artifact_dir:
+        artifacts = ContentAddressedArtifactStore(settings.artifact_dir)
+    else:
+        artifacts = None
+    replay_store: ProofReplayStorePort | None = None
+    try:
+        replay_store = (
+            RedisProofReplayStore(settings.replay_redis_url)
+            if settings.replay_redis_url
+            else InMemoryProofReplayStore(settings.max_replay_entries)
+        )
+        verification_keys = (
+            {settings.previous_signing_key_id: settings.previous_signing_key}
+            if settings.previous_signing_key_id
+            else {}
+        )
+        return ProofRunnerServer(
+            executor,
+            settings.signing_key,
+            signing_key_id=settings.signing_key_id,
+            verification_keys=verification_keys,
+            max_request_bytes=settings.max_request_bytes,
+            max_response_bytes=settings.max_response_bytes,
+            replay_window_seconds=settings.replay_window_seconds,
+            max_replay_entries=settings.max_replay_entries,
+            max_files=settings.max_files,
+            max_source_bytes=settings.max_source_bytes,
+            max_concurrency=settings.max_concurrency,
+            artifact_store=artifacts,
+            require_artifacts=settings.require_artifacts,
+            replay_store=replay_store,
+        )
+    except Exception:
+        for resource in (replay_store, artifacts):
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception:
+                    pass
+        raise
 
 
 def _handler(service: ProofRunnerServer, max_request_bytes: int):

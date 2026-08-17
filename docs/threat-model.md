@@ -43,7 +43,7 @@ the mitigations that exist in the codebase today, plus known residual risks.
 | T11 | Unexpected in-process plugin activation | Entry-point discovery is disabled by default; enabling it requires an explicit plugin-id allowlist; manifest API/dependencies are validated and startup is transactional | A trusted plugin has process privileges; review and pin it like any production dependency |
 | T12 | Source/API-key leakage through model traffic or errors | Gateway redacts common assignment/Bearer/private-key forms before transport, strips configured credentials from upstream errors, validates exact route host + HTTPS, caps response size/tokens, stores route secrets only via environment references, and persists metadata/hash rather than prompts or responses | Pattern redaction is not a complete DLP system; DNS/network policy and provider retention remain deployment responsibilities |
 | T13 | Forged, replayed, redirected, or altered remote proof | Canonical request/input/evidence hashes, bidirectional HMAC-SHA256, body-bound key IDs, current/previous-key rotation, UUID/timestamp gates, pluggable Redis atomic cross-replica nonce claims, exact host allowlist, HTTPS outside loopback, disabled redirects/proxies, and bounded bodies | Redis durability/availability and rotation timing are operator responsibilities; memory replay mode is single-replica only |
-| T14 | Proof evidence deletion or mutation | Optional fail-closed content-addressed artifacts never overwrite existing content; signed responses expose input/evidence hashes | Local filesystem is not WORM and needs backup; regulated retention requires object lock |
+| T14 | Proof evidence deletion or mutation | `ProofArtifactStorePort` supports local append-only files or S3 Object Lock. The S3 adapter uses a digest-derived key, conditional create, full-object SHA-256, version/metadata/retention verification, and only extends existing retention; signed responses expose content hashes | Object Lock protects object versions, not the AWS account, bucket policy, replication posture, or expired retention. Production still requires independent IAM/bucket-policy review and a provider-backed write/restore drill |
 | T15 | Internal exception or query-secret disclosure at the public HTTP edge | One GET/POST exception boundary returns a generic correlated 500; only explicit client-safe error classes may expose 4xx messages; Proof Executor exceptions expose type but not message; structured edge logs include normalized path and bounded exception type but omit query strings, exception messages, and tracebacks; all responses carry a validated/generated `X-Request-ID` | Reviewed 4xx and sandbox command output remain visible to authorized callers; downstream component telemetry must enforce its own redaction and access control |
 | T16 | Secret/source leakage through persisted failures, readiness, plugins, or automatic tracing | Operational failures use an allowlisted `operation [type; ref]` grammar whose reference hashes only exception type and traceback code locations; application adapters sanitize Queue/DLQ, Outbox/effect, task graph, Agent, proof, plugin and readiness paths; SQLite/PostgreSQL enforce failure fields again; OpenTelemetry automatic exception recording is disabled; migration 10 replaces legacy messages | Model-ledger diagnostics and sandbox command output are separate controlled surfaces; code-location references are diagnostic fingerprints, not globally unique incident IDs |
 
@@ -72,9 +72,10 @@ the mitigations that exist in the codebase today, plus known residual risks.
   Proof Runner jobs always rely on container mode (`--network none`).
 - The LLM reviewer's judgments are advisory and not proof; high-confidence
   claims require Proof Runner evidence.
-- The built-in remote runner uses containers and can share Redis replay claims
-  across replicas; a microVM provider and object-lock/WORM evidence retention
-  remain deployment hardening work for hostile or regulated workloads.
+- The built-in remote runner uses containers, shared Redis replay claims, and
+  optional S3 Object Lock evidence retention. A microVM provider and independent
+  cloud-policy/retention drill remain deployment hardening work for hostile or
+  regulated workloads.
 - Model fallback is bounded and policy-filtered, but is not an availability
   guarantee without independently provisioned provider/region capacity.
 

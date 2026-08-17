@@ -826,6 +826,10 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 | `EVOAGENT_PROOF_RUNNER_SIGNING_KEY_ID` | `default` | 当前 HMAC 密钥的非敏感版本 ID，写入签名证明 |
 | `EVOAGENT_PROOF_RUNNER_REPLAY_REDIS_URL` | 空 | Runner 多副本共享 nonce 存储；生产横向扩容时配置 |
 | `EVOAGENT_PROOF_RUNNER_REQUIRE_SHARED_REPLAY` | `false` | 是否禁止 Runner 使用进程内防重放存储 |
+| `EVOAGENT_PROOF_RUNNER_ARTIFACT_S3_BUCKET` | 空 | 启用了 Versioning 与 Object Lock 的不可变证明桶；与本地目录互斥 |
+| `EVOAGENT_PROOF_RUNNER_ARTIFACT_S3_RETENTION_MODE` | `COMPLIANCE` | 证明对象留存模式：`COMPLIANCE` 或 `GOVERNANCE` |
+| `EVOAGENT_PROOF_RUNNER_ARTIFACT_S3_RETENTION_DAYS` | `2555` | 每个证明对象的最短留存天数；同内容再次写入会延长而不会缩短 |
+| `EVOAGENT_PROOF_RUNNER_REQUIRE_ARTIFACTS` | `false` | 证明存储未配置或不可用时是否禁止产生远程执行证明 |
 | `EVOAGENT_PROOF_REQUIRE_REMOTE` | `false` | 是否要求远程 Runner 完整配置，否则启动失败 |
 | `EVOAGENT_SKILL_SANDBOX` | `true` | 动态 Skill 是否运行在沙箱中 |
 | `EVOAGENT_SKILL_CONTAINER_IMAGE` | 空 | Dynamic Skill 的独立容器镜像（生产建议固定 digest） |
@@ -854,6 +858,7 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 │   ├── model_gateway.py          # 模型脱敏、出口、预算、输出与用量治理
 │   ├── proof.py                  # L1–L4 证据阶梯与执行器端口消费
 │   ├── proof_remote.py           # 双向签名远程执行协议与独立 Runner
+│   ├── proof_artifacts.py        # 本地内容寻址 / S3 Object Lock 证明存储
 │   ├── slo.py                    # 版本化 SLO 与 Prometheus 评估 CLI
 │   ├── dr.py                     # 隔离备份恢复演练与 RPO/RTO 证据
 │   ├── recovery.py               # PostgreSQL/Outbox 到空 Redis 的离线任务重建

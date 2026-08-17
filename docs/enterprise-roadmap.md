@@ -4,7 +4,7 @@ This roadmap separates capabilities already proven in the repository from work
 that is still required before claiming production-grade enterprise readiness.
 It is an execution plan, not a marketing checklist.
 
-## Current maturity (v0.21.0)
+## Current maturity (v0.22.0)
 
 | Area | Status | Evidence / boundary |
 | --- | --- | --- |
@@ -18,7 +18,7 @@ It is an execution plan, not a marketing checklist.
 | Graceful lifecycle | Implemented | Readiness drain plus bounded queue drain before Store/plugin shutdown |
 | Multi-tenancy/governance | Implemented baseline | JWT, RBAC, tenant/repository authorization, audit, canary/shadow/rollback |
 | Model governance | Implemented advanced baseline | Replaceable gateway, scoped policy routing/residency, bounded fallback, per-route breakers, redaction, egress/output limits, atomic budgets, correlated metadata-only ledger, and conservative crash reconciliation; route shadow promotion remains pending |
-| Strong untrusted execution | Implemented advanced baseline | Replaceable remote Proof Runner, mutually authenticated evidence manifests, container-only jobs, cross-replica Redis nonce claims, dual-key rotation, replay/size/capacity gates, and content-addressed artifacts; microVM and WORM retention remain pending |
+| Strong untrusted execution | Implemented advanced baseline | Replaceable remote Proof Runner, mutually authenticated evidence manifests, container-only jobs, cross-replica Redis nonce claims, dual-key rotation, and pluggable local/S3 Object Lock artifacts; a microVM executor and provider-backed compliance drill remain pending |
 | Service-level operations | Implemented baseline | Fixed-cardinality availability/latency/success SLIs, versioned 30-day SLO catalog, multi-window burn alerts, queue/Outbox age, DLQ depth, dashboard, runbooks, and hardened Prometheus evaluator |
 | HTTP edge security | Implemented baseline | Validated/generated request correlation, explicit client-safe 4xx types, bounded list reads, generic 5xx envelopes, query-free structured access logs, consistent hardening headers, and no interpreter-version disclosure |
 | Operational failure security | Implemented baseline | Allowlisted message-free failure summaries, stable code-location references, persistence-adapter enforcement, legacy-data migration, and exception-message-free OpenTelemetry/plugin/proof paths |
@@ -235,10 +235,23 @@ previous verification key provide a documented rolling rotation with no
 unsigned/downgrade window; responses use the request-selected key. Real Redis
 CI proves cross-adapter atomicity and TTL.
 
-Still pending for hostile public multi-tenancy: a microVM executor and
-object-lock/WORM retention. See
+The v0.22 increment extracts `ProofArtifactStorePort` and separates execution
+from retention. Local content addressing remains available, while a production
+adapter uses an S3 bucket with Versioning and Object Lock, conditional create,
+full-object SHA-256, exact version/metadata/mode/date verification, optional KMS,
+and non-shortening retention extension. Required storage participates in Runner
+readiness and fails before repository execution when the input artifact cannot
+be retained. Unit tests cover idempotence, a conflicting/tampered object,
+retention extension, bucket readiness, secret-safe settings, and lifecycle; an
+explicit environment-gated integration test verifies a real bucket's Object
+Lock and Versioning configuration.
+
+Still pending for hostile public multi-tenancy: a microVM executor. Regulated
+production additionally requires an independent IAM/bucket-policy review and a
+provider-backed write/restore/expiry drill; configuration health alone is not a
+compliance certificate. See
 [`ADR 0009`](adr/0009-authenticated-remote-proof-runner.md) and
-[`ADR 0019`](adr/0019-shared-proof-replay-and-key-rotation.md).
+[`ADR 0020`](adr/0020-proof-artifact-object-lock.md).
 
 ## Phase 5 — SLO, operations, and disaster recovery
 
@@ -297,7 +310,7 @@ Outbox data fail closed; terminal duplicates ACK before external or release
 effects. CI exercises this against PostgreSQL and a fresh Redis logical DB. See
 [`ADR 0012`](adr/0012-offline-queue-reconstruction.md).
 
-Still pending in this phase: managed PITR/object-lock integration, a
+Still pending in this phase: managed PITR/backup-artifact object-lock integration, a
 separate-region infrastructure and routing failover exercise, and a sustained
 production-shaped soak. Same-cluster database and queue drills are not a claim
 of full regional DR readiness.

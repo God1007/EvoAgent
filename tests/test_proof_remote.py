@@ -1,13 +1,16 @@
+import base64
 import json
 import os
 import tempfile
 import threading
 import unittest
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
 from evoagent.config import Settings
 from evoagent.proof import EvidenceLevel, ProofRunner
+from evoagent.proof_artifacts import ProofArtifactStoreError, S3ObjectLockArtifactStore
 from evoagent.proof_remote import (
     HEADER_BODY_SHA256,
     HEADER_INPUT_SHA256,
@@ -25,6 +28,7 @@ from evoagent.proof_remote import (
     RemoteProofExecutor,
     _handler,
     _sign,
+    build_runner_service,
     canonical_json,
     sha256_hex,
 )
@@ -53,6 +57,71 @@ class FakeRedis:
 
     def close(self):
         return None
+
+
+class FakeS3Error(RuntimeError):
+    def __init__(self, code):
+        super().__init__(code)
+        self.response = {"Error": {"Code": code}}
+
+
+class FakeS3ObjectLockClient:
+    def __init__(self):
+        self.object_lock_enabled = True
+        self.versioning_enabled = True
+        self.objects = {}
+        self.put_calls = []
+        self.retention_calls = []
+        self.conflicts_remaining = 0
+        self.retention_race_until = None
+        self.closed = False
+
+    def put_object(self, **arguments):
+        self.put_calls.append(arguments)
+        if self.conflicts_remaining:
+            self.conflicts_remaining -= 1
+            raise FakeS3Error("ConditionalRequestConflict")
+        key = arguments["Key"]
+        if key in self.objects:
+            raise FakeS3Error("PreconditionFailed")
+        version_id = "version-1"
+        self.objects[key] = {
+            "VersionId": version_id,
+            "ContentLength": len(arguments["Body"]),
+            "Metadata": dict(arguments["Metadata"]),
+            "ChecksumSHA256": arguments["ChecksumSHA256"],
+            "ObjectLockMode": arguments["ObjectLockMode"],
+            "ObjectLockRetainUntilDate": arguments["ObjectLockRetainUntilDate"],
+        }
+        return {"VersionId": version_id, "ChecksumSHA256": arguments["ChecksumSHA256"]}
+
+    def head_object(self, **arguments):
+        value = self.objects[arguments["Key"]]
+        if arguments.get("VersionId") and arguments["VersionId"] != value["VersionId"]:
+            raise FakeS3Error("NoSuchVersion")
+        return dict(value)
+
+    def put_object_retention(self, **arguments):
+        self.retention_calls.append(arguments)
+        value = self.objects[arguments["Key"]]
+        if self.retention_race_until is not None:
+            value["ObjectLockRetainUntilDate"] = self.retention_race_until
+            raise FakeS3Error("AccessDenied")
+        value["ObjectLockMode"] = arguments["Retention"]["Mode"]
+        value["ObjectLockRetainUntilDate"] = arguments["Retention"]["RetainUntilDate"]
+
+    def get_object_lock_configuration(self, **_arguments):
+        return {
+            "ObjectLockConfiguration": {
+                "ObjectLockEnabled": "Enabled" if self.object_lock_enabled else "Disabled"
+            }
+        }
+
+    def get_bucket_versioning(self, **_arguments):
+        return {"Status": "Enabled" if self.versioning_enabled else "Suspended"}
+
+    def close(self):
+        self.closed = True
 
 
 def _outcome(status="passed"):
@@ -232,7 +301,13 @@ class RemoteProtocolTests(unittest.TestCase):
             client.execute({"app.py": "x = 1\n"}, "pytest -q")
         self.assertEqual([], self.executor.calls)
         self.assertEqual(
-            {"status": "not-ready", "replay_backend": "redis", "signing_key_ids": 1},
+            {
+                "status": "not-ready",
+                "replay_backend": "redis",
+                "artifact_backend": "none",
+                "artifact_ready": True,
+                "signing_key_ids": 1,
+            },
             server.readiness(),
         )
 
@@ -502,6 +577,157 @@ class ArtifactStoreTests(unittest.TestCase):
             self.assertTrue(artifacts["input"].startswith("sha256:"))
             self.assertTrue(artifacts["evidence"].startswith("sha256:"))
 
+    def test_s3_object_lock_write_is_conditional_checksummed_and_retained(self):
+        client = FakeS3ObjectLockClient()
+        now = [datetime(2026, 8, 17, tzinfo=UTC)]
+        store = S3ObjectLockArtifactStore(
+            "proof-evidence",
+            region="ap-southeast-1",
+            retention_mode="COMPLIANCE",
+            retention_days=30,
+            client=client,
+            clock=lambda: now[0],
+        )
+
+        reference = store.put("evidence", b'{"status":"passed"}')
+
+        self.assertTrue(reference.startswith("sha256:"))
+        write = client.put_calls[0]
+        self.assertEqual("*", write["IfNoneMatch"])
+        self.assertEqual("SHA256", write["ChecksumAlgorithm"])
+        self.assertEqual("COMPLIANCE", write["ObjectLockMode"])
+        self.assertEqual("AES256", write["ServerSideEncryption"])
+        self.assertEqual(now[0] + timedelta(days=30), write["ObjectLockRetainUntilDate"])
+        self.assertTrue(store.health())
+
+        now[0] += timedelta(days=1)
+        self.assertEqual(reference, store.put("evidence", b'{"status":"passed"}'))
+        self.assertEqual(1, len(client.objects))
+        self.assertEqual(1, len(client.retention_calls))
+        self.assertEqual(
+            now[0] + timedelta(days=30),
+            client.retention_calls[0]["Retention"]["RetainUntilDate"],
+        )
+
+    def test_s3_object_lock_verification_and_readiness_fail_closed(self):
+        client = FakeS3ObjectLockClient()
+        store = S3ObjectLockArtifactStore(
+            "proof-evidence",
+            region="ap-southeast-1",
+            retention_days=30,
+            client=client,
+            clock=lambda: datetime(2026, 8, 17, tzinfo=UTC),
+        )
+        store.put("inputs", b'{"files":{}}')
+        next(iter(client.objects.values()))["ChecksumSHA256"] = "tampered"
+
+        with self.assertRaisesRegex(ProofArtifactStoreError, "verification failed"):
+            store.put("inputs", b'{"files":{}}')
+
+        client.object_lock_enabled = False
+        self.assertFalse(store.health())
+        server = ProofRunnerServer(
+            FakeExecutor(),
+            SECRET,
+            artifact_store=store,
+            require_artifacts=True,
+            clock=lambda: 1000,
+        )
+        readiness = server.readiness()
+        self.assertEqual("not-ready", readiness["status"])
+        self.assertEqual("s3-object-lock", readiness["artifact_backend"])
+        self.assertFalse(readiness["artifact_ready"])
+        server.close()
+        self.assertTrue(client.closed)
+
+    def test_s3_object_lock_retries_write_race_and_accepts_longer_retention_race(self):
+        client = FakeS3ObjectLockClient()
+        client.conflicts_remaining = 1
+        sleeps = []
+        now = [datetime(2026, 8, 17, tzinfo=UTC)]
+        store = S3ObjectLockArtifactStore(
+            "proof-evidence",
+            region="ap-southeast-1",
+            retention_days=30,
+            client=client,
+            clock=lambda: now[0],
+            sleeper=sleeps.append,
+        )
+        content = b'{"status":"passed"}'
+
+        reference = store.put("evidence", content)
+
+        self.assertEqual([0.05], sleeps)
+        self.assertEqual(2, len(client.put_calls))
+        now[0] += timedelta(days=1)
+        client.retention_race_until = now[0] + timedelta(days=60)
+        self.assertEqual(reference, store.put("evidence", content))
+        self.assertEqual(1, len(client.retention_calls))
+
+    def test_s3_object_lock_calls_match_botocore_contract(self):
+        import boto3
+        from botocore.stub import Stubber
+
+        content = b'{"status":"passed"}'
+        digest = sha256_hex(content)
+        checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+        now = datetime(2026, 8, 17, tzinfo=UTC)
+        retain_until = now + timedelta(days=30)
+        key = "evoagent/proof-artifacts/v1/evidence/%s/%s.json" % (digest[:2], digest)
+        client = boto3.client(
+            "s3",
+            region_name="ap-southeast-1",
+            aws_access_key_id="fixture-access",
+            aws_secret_access_key="fixture-secret",
+        )
+        self.addCleanup(client.close)
+        stubber = Stubber(client)
+        stubber.add_response(
+            "put_object",
+            {"VersionId": "version-1", "ChecksumSHA256": checksum},
+            {
+                "Bucket": "proof-evidence",
+                "Key": key,
+                "Body": content,
+                "ContentType": "application/json",
+                "Metadata": {"sha256": digest, "evoagent-protocol": "proof-v1"},
+                "ChecksumAlgorithm": "SHA256",
+                "ChecksumSHA256": checksum,
+                "IfNoneMatch": "*",
+                "ObjectLockMode": "COMPLIANCE",
+                "ObjectLockRetainUntilDate": retain_until,
+                "ServerSideEncryption": "AES256",
+            },
+        )
+        stubber.add_response(
+            "head_object",
+            {
+                "VersionId": "version-1",
+                "ContentLength": len(content),
+                "Metadata": {"sha256": digest, "evoagent-protocol": "proof-v1"},
+                "ChecksumSHA256": checksum,
+                "ObjectLockMode": "COMPLIANCE",
+                "ObjectLockRetainUntilDate": retain_until,
+            },
+            {
+                "Bucket": "proof-evidence",
+                "Key": key,
+                "ChecksumMode": "ENABLED",
+                "VersionId": "version-1",
+            },
+        )
+        store = S3ObjectLockArtifactStore(
+            "proof-evidence",
+            region="ap-southeast-1",
+            retention_days=30,
+            client=client,
+            clock=lambda: now,
+        )
+
+        with stubber:
+            self.assertEqual("sha256:" + digest, store.put("evidence", content))
+        stubber.assert_no_pending_responses()
+
 
 class RunnerDeploymentTests(unittest.TestCase):
     def test_runner_settings_read_only_the_dedicated_environment_contract(self):
@@ -614,6 +840,100 @@ class RunnerDeploymentTests(unittest.TestCase):
                 previous_signing_key=NEXT_SECRET,
             ).validate()
 
+    def test_s3_object_lock_configuration_is_explicit_and_secret_safe(self):
+        base = {
+            "host": "127.0.0.1",
+            "port": 8091,
+            "signing_key": SECRET,
+            "container_image": "python:3.12-slim",
+        }
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            ProofRunnerSettings(
+                **base,
+                artifact_dir="/var/lib/proof",
+                artifact_s3_bucket="proof-evidence",
+                artifact_s3_region="ap-southeast-1",
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "S3_REGION"):
+            ProofRunnerSettings(
+                **base,
+                artifact_s3_bucket="proof-evidence",
+            ).validate()
+        with self.assertRaisesRegex(ValueError, "credential-free HTTPS"):
+            ProofRunnerSettings(
+                **base,
+                artifact_s3_bucket="proof-evidence",
+                artifact_s3_region="ap-southeast-1",
+                artifact_s3_endpoint_url="https://user:secret@s3.example",
+            ).validate()
+
+        settings = ProofRunnerSettings(
+            **base,
+            artifact_s3_bucket="proof-evidence",
+            artifact_s3_region="ap-southeast-1",
+            artifact_s3_endpoint_url="https://s3.internal.example",
+            artifact_s3_kms_key_id="alias/proof-evidence",
+            require_artifacts=True,
+        )
+        settings.validate()
+        self.assertNotIn("s3.internal.example", repr(settings))
+        self.assertNotIn("alias/proof-evidence", repr(settings))
+
+    def test_runner_composition_selects_s3_artifact_adapter(self):
+        artifact_store = mock.Mock()
+        artifact_store.backend = "s3-object-lock"
+        settings = ProofRunnerSettings(
+            host="127.0.0.1",
+            port=8091,
+            signing_key=SECRET,
+            container_image="python:3.12-slim",
+            artifact_s3_bucket="proof-evidence",
+            artifact_s3_prefix="tenant/proofs",
+            artifact_s3_region="ap-southeast-1",
+            artifact_s3_retention_mode="COMPLIANCE",
+            artifact_s3_retention_days=365,
+            artifact_s3_kms_key_id="alias/proof-evidence",
+            require_artifacts=True,
+        )
+        with mock.patch(
+            "evoagent.proof_remote.S3ObjectLockArtifactStore",
+            return_value=artifact_store,
+        ) as adapter:
+            service = build_runner_service(settings)
+
+        self.assertIs(artifact_store, service.artifact_store)
+        adapter.assert_called_once_with(
+            "proof-evidence",
+            prefix="tenant/proofs",
+            region="ap-southeast-1",
+            endpoint_url="",
+            retention_mode="COMPLIANCE",
+            retention_days=365,
+            kms_key_id="alias/proof-evidence",
+        )
+
+    def test_runner_composition_closes_artifact_when_later_wiring_fails(self):
+        artifact_store = mock.Mock()
+        artifact_store.backend = "s3-object-lock"
+        settings = ProofRunnerSettings(
+            host="127.0.0.1",
+            port=8091,
+            signing_key="too-short",
+            container_image="python:3.12-slim",
+            artifact_s3_bucket="proof-evidence",
+            artifact_s3_region="ap-southeast-1",
+        )
+        with (
+            mock.patch(
+                "evoagent.proof_remote.S3ObjectLockArtifactStore",
+                return_value=artifact_store,
+            ),
+            self.assertRaisesRegex(ValueError, "32 bytes"),
+        ):
+            build_runner_service(settings)
+
+        artifact_store.close.assert_called_once_with()
+
     def test_actual_loopback_http_transport(self):
         executor = FakeExecutor()
         service = ProofRunnerServer(executor, SECRET)
@@ -632,7 +952,11 @@ class RunnerDeploymentTests(unittest.TestCase):
         result = client.execute({"a.py": "x = 1\n"}, "pytest -q")
 
         self.assertTrue(result["passed"])
-        self.assertTrue(client.health()["healthy"])
+        health = client.health()
+        self.assertTrue(health["healthy"])
+        self.assertEqual("memory", health["replay_backend"])
+        self.assertEqual("none", health["artifact_backend"])
+        self.assertTrue(health["artifact_ready"])
 
     def test_client_does_not_follow_runner_redirects(self):
         hits = []

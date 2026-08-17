@@ -15,4 +15,8 @@ regexTarget = "line"
 regexes = [
   # tests/test_reviewer.py: proves .lock paths short-circuit before rules run.
   '''token = "abcdef123456"''',
+  # Synthetic proof-runner signing fixtures; none are deployable credentials.
+  '''integration-proof-signing-key-at-least-32-bytes''',
+  '''proof-test-signing-key-at-least-32-bytes''',
+  '''proof-test-signing-secret-at-least-32-bytes''',
 ]

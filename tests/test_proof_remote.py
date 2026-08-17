@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import ssl
 import tempfile
 import threading
 import unittest
@@ -28,6 +29,7 @@ from evoagent.proof_remote import (
     RemoteProofExecutor,
     _handler,
     _sign,
+    _tls_server_context,
     build_runner_service,
     canonical_json,
     sha256_hex,
@@ -817,6 +819,16 @@ class RunnerDeploymentTests(unittest.TestCase):
                 signing_key=SECRET,
                 container_image="python:3.12-slim",
             ).validate()
+
+    def test_tls_server_context_requires_tls_1_2_or_newer(self):
+        context = mock.Mock()
+        with mock.patch("evoagent.proof_remote.ssl.SSLContext", return_value=context) as factory:
+            result = _tls_server_context("runner.crt", "runner.key")
+
+        self.assertIs(context, result)
+        factory.assert_called_once_with(ssl.PROTOCOL_TLS_SERVER)
+        self.assertEqual(ssl.TLSVersion.TLSv1_2, context.minimum_version)
+        context.load_cert_chain.assert_called_once_with("runner.crt", "runner.key")
 
     def test_shared_replay_and_rotation_configuration_fail_closed(self):
         base = {

@@ -1170,6 +1170,19 @@ class PostgreSQLStoreContractTests(_StoreBehaviorContract, unittest.TestCase):
             pool_min=0,
             pool_max=2,
         )
+        # The CI service database is shared by every contract method. Reset all
+        # application tables after migrations so aggregate operations such as
+        # outbox claims and retention pruning cannot observe another test's rows.
+        with self.store._connect() as conn:
+            rows = conn.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema=current_schema() AND table_type='BASE TABLE' "
+                "AND table_name<>'schema_migrations'"
+            ).fetchall()
+            if rows:
+                sql = self.store.psycopg.sql
+                tables = sql.SQL(", ").join(sql.Identifier(row["table_name"]) for row in rows)
+                conn.execute(sql.SQL("TRUNCATE TABLE {} RESTART IDENTITY CASCADE").format(tables))
 
     def tearDown(self):
         self.store.close()

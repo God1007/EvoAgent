@@ -1067,6 +1067,13 @@ class BoundedThreadingHTTPServer(ThreadingHTTPServer):
             self._connection_slots.release()
 
 
+def _tls_server_context(cert_file: str, key_file: str) -> ssl.SSLContext:
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(cert_file, key_file)
+    return context
+
+
 def run() -> None:
     settings = ProofRunnerSettings.from_env()
     service = build_runner_service(settings)
@@ -1076,8 +1083,7 @@ def run() -> None:
         settings.max_connections,
     )
     if settings.tls_cert_file:
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.load_cert_chain(settings.tls_cert_file, settings.tls_key_file)
+        context = _tls_server_context(settings.tls_cert_file, settings.tls_key_file)
         server.socket = context.wrap_socket(server.socket, server_side=True)
     previous_handlers = {}
 

@@ -29,7 +29,7 @@ from evoagent.session import classify_findings, snapshot_findings
 # for noise. Observed ns/op (fast dev box / GitHub CI): parse 111k/349k,
 # fingerprint 2.2k/6.4k, classify 157k/456k, codegraph 56k/161k. Budgets sit at
 # ~3x the CI figure - loose enough not to flake, tight enough to catch a >3x
-# regression. Tune against `docs/performance-baseline.md`.
+# regression. Recalibrate only from repeated runs on the slowest supported CI host.
 BUDGETS_NS = {
     "parse_unified_diff": 1_000_000,
     "finding_fingerprint": 50_000,

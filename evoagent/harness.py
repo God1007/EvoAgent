@@ -12,7 +12,7 @@ from .errors import safe_exception_summary
 from .models import ChangedLine, Finding, ReviewReport, Severity, TaskState, TraceEvent
 from .ports import ReviewExecutionStorePort
 from .reviewer import Reviewer
-from .store import utc_now
+from .time_utils import utc_now
 
 ALLOWED = {
     TaskState.PENDING: {TaskState.PLANNING, TaskState.FAILED, TaskState.CANCELLED},

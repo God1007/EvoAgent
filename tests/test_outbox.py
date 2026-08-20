@@ -1,17 +1,15 @@
-import os
-import sqlite3
-import tempfile
 import threading
 import time
 import unittest
 import uuid
 
 from evoagent.outbox import OutboxDispatcher
-from evoagent.store import TaskStore
+from evoagent.postgres_store import PostgresTaskStore
 from evoagent.task_queue import TaskQueue
+from tests.db_support import postgres_store
 
 
-def _task(store: TaskStore, task_id: str, outbox_payload=None):
+def _task(store: PostgresTaskStore, task_id: str, outbox_payload=None):
     store.create_review_task(
         task_id,
         "acme/widgets",
@@ -24,7 +22,7 @@ def _task(store: TaskStore, task_id: str, outbox_payload=None):
 
 
 class _ImmediateRetryStore:
-    def __init__(self, store: TaskStore, fail_mark_once: bool = False):
+    def __init__(self, store: PostgresTaskStore, fail_mark_once: bool = False):
         self.store = store
         self.fail_mark_once = fail_mark_once
 
@@ -48,26 +46,31 @@ class _FailingQueue:
 
 class TransactionalOutboxTests(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.path = os.path.join(self.directory.name, "outbox.db")
-        self.store = TaskStore(self.path)
-
-    def tearDown(self):
-        self.directory.cleanup()
+        self.store = postgres_store(self)
 
     def test_task_payload_and_outbox_rollback_as_one_transaction(self):
         with self.store._connect() as conn:
             conn.execute(
-                """CREATE TRIGGER reject_outbox BEFORE INSERT ON outbox_messages
-                BEGIN SELECT RAISE(ABORT, 'fault between task commit and outbox'); END"""
+                """CREATE FUNCTION reject_outbox() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN RAISE EXCEPTION 'fault between task commit and outbox'; END $$"""
             )
+            conn.execute(
+                "CREATE TRIGGER reject_outbox BEFORE INSERT ON outbox_messages "
+                "FOR EACH ROW EXECUTE FUNCTION reject_outbox()"
+            )
+        self.addCleanup(self._drop_reject_outbox)
         task_id = uuid.uuid4().hex
-        with self.assertRaisesRegex(sqlite3.IntegrityError, "fault between"):
+        with self.assertRaisesRegex(Exception, "fault between"):
             _task(self.store, task_id, {"task_id": task_id})
 
         self.assertIsNone(self.store.get(task_id))
         self.assertIsNone(self.store.get_task_payload(task_id))
         self.assertEqual(0, self.store.outbox_stats()["total"])
+
+    def _drop_reject_outbox(self):
+        with self.store._connect() as conn:
+            conn.execute("DROP TRIGGER IF EXISTS reject_outbox ON outbox_messages")
+            conn.execute("DROP FUNCTION IF EXISTS reject_outbox()")
 
     def test_committed_message_is_delivered_after_dispatcher_starts(self):
         task_id = uuid.uuid4().hex

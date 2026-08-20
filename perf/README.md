@@ -1,9 +1,7 @@
 # Performance test kit
 
 Two interchangeable load tools plus a full-stack rig. Read
-[`../docs/performance.md`](../docs/performance.md) for SLOs and methodology and
-[`../docs/performance-baseline.md`](../docs/performance-baseline.md) for captured
-numbers.
+[`../docs/performance.md`](../docs/performance.md) for scope and methodology.
 
 ## 0. One-command baseline capture
 

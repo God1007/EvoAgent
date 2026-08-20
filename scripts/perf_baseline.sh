@@ -4,7 +4,7 @@
 #
 # Orchestrates scripts/loadgen.py and scripts/microbench.py across a fixed suite
 # of scenarios and writes per-run JSON plus a machine-readable index to an output
-# directory. Designed to be re-run on any host to refresh docs/performance-baseline.md.
+# directory. Results are machine-specific and are not committed as a baseline.
 #
 # Suites:
 #   single      steady rate-sweep (knee), intake, spike recovery, compressed soak
@@ -27,6 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PYTHON="${PYTHON:-${PROJECT_DIR}/.venv/bin/python}"
 command -v "$PYTHON" >/dev/null 2>&1 || PYTHON="python3"
+: "${EVOAGENT_DATABASE_URL:?set EVOAGENT_DATABASE_URL to a disposable PostgreSQL database}"
 
 SUITE="all"
 OUT=""
@@ -88,8 +89,8 @@ boot_server() {
   (
     cd "$PROJECT_DIR"
     exec env EVOAGENT_HOST=127.0.0.1 EVOAGENT_PORT="$PORT" EVOAGENT_AUTH_REQUIRED=false \
-        EVOAGENT_DB_PATH="${OUT}/perf-${label}.db" "$@" \
-        "$PYTHON" -m evoagent
+        EVOAGENT_DATABASE_URL="$EVOAGENT_DATABASE_URL" \
+        "$@" "$PYTHON" -m evoagent
   ) >>"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
   local i=1
@@ -332,9 +333,6 @@ case "$SUITE" in
   multiworker) suite_multiworker ;;
   all)         suite_single; suite_overload; suite_micro; suite_multiworker ;;
 esac
-
-# Throwaway SQLite files - keep only the JSON/CSV/txt artifacts.
-rm -f "${OUT}"/perf-*.db "${OUT}"/perf-*.db-* 2>/dev/null || true
 
 ok "Done. Artifacts in ${OUT}"
 ls -1 "$OUT"

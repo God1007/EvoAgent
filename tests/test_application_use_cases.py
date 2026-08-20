@@ -1,11 +1,7 @@
-import os
-import sqlite3
-import tempfile
 import unittest
 from unittest import mock
 
 from evoagent.application import (
-    ModelUsageUseCases,
     PolicyUseCases,
     RepairOptions,
     RepairUseCases,
@@ -20,7 +16,8 @@ from evoagent.models import Finding, ReviewReport, Severity, TaskState, TraceEve
 from evoagent.observability import AlertManager, Observability
 from evoagent.policy import RepositoryPolicyResolver
 from evoagent.rollout import ReleaseManager
-from evoagent.store import TaskStore, utc_now
+from evoagent.time_utils import utc_now
+from tests.db_support import postgres_store
 
 
 def _finding() -> Finding:
@@ -39,10 +36,7 @@ def _finding() -> Finding:
 
 class ApplicationUseCaseTests(unittest.TestCase):
     def setUp(self):
-        handle, self.path = tempfile.mkstemp(suffix=".db")
-        os.close(handle)
-        self.addCleanup(os.unlink, self.path)
-        self.store = TaskStore(self.path)
+        self.store = postgres_store(self)
 
     def test_session_use_case_owns_turn_continuity(self):
         sessions = SessionUseCases(self.store, max_diff_bytes=10_000)
@@ -64,86 +58,6 @@ class ApplicationUseCaseTests(unittest.TestCase):
         timeline = sessions.get_for_pull_request("org/repo", 7, "tenant")
         self.assertEqual(1, len(timeline["turns"]))
         self.assertEqual(1, timeline["turns"][0]["summary"]["new"])
-
-    def test_model_usage_reconciliation_is_tenant_scoped_and_audited(self):
-        request_id = "stale-model-request"
-        self.assertTrue(
-            self.store.reserve_model_usage(
-                {
-                    "request_id": request_id,
-                    "tenant_id": "tenant",
-                    "repository": "org/repo",
-                    "purpose": "review",
-                    "provider": "provider",
-                    "model": "model",
-                    "reserved_tokens": 100,
-                    "reserved_cost_micros": 50,
-                    "request_sha256": "a" * 64,
-                    "created_at": "2000-01-01T00:00:00+00:00",
-                },
-                "2000-01-01T00:00:00+00:00",
-            )
-        )
-        self.assertEqual(
-            1,
-            self.store.expire_model_usage_reservations("2001-01-01T00:00:00+00:00"),
-        )
-        use_cases = ModelUsageUseCases(self.store)
-
-        hidden = use_cases.reconcile("other-tenant", "operator", request_id, "failed", 0, 0, 0)
-        result = use_cases.reconcile("tenant", "operator", request_id, "success", 11, 7, 9)
-
-        self.assertFalse(hidden["reconciled"])
-        self.assertTrue(result["reconciled"])
-        usage = self.store.list_model_usage("tenant", "org/repo")[0]
-        self.assertEqual(
-            ("success", 11, 7, 9),
-            (
-                usage["status"],
-                usage["input_tokens"],
-                usage["output_tokens"],
-                usage["cost_micros"],
-            ),
-        )
-        audit = self.store.list_audit("tenant")
-        self.assertEqual("model-usage.reconciled", audit[0]["action"])
-        self.assertEqual(request_id, audit[0]["resource"])
-
-        with self.assertRaisesRegex(ValueError, "non-negative integer"):
-            use_cases.reconcile("tenant", "operator", "another", "failed", True, 0, 0)
-
-    def test_model_usage_reconciliation_rolls_back_when_audit_write_fails(self):
-        request_id = "stale-model-request"
-        self.store.reserve_model_usage(
-            {
-                "request_id": request_id,
-                "tenant_id": "tenant",
-                "repository": "org/repo",
-                "purpose": "review",
-                "provider": "provider",
-                "model": "model",
-                "reserved_tokens": 100,
-                "request_sha256": "a" * 64,
-                "created_at": "2000-01-01T00:00:00+00:00",
-            },
-            "2000-01-01T00:00:00+00:00",
-        )
-        self.store.expire_model_usage_reservations("2001-01-01T00:00:00+00:00")
-        with sqlite3.connect(self.path) as conn:
-            conn.execute(
-                "CREATE TRIGGER fail_model_usage_audit BEFORE INSERT ON audit_log "
-                "WHEN NEW.action='model-usage.reconciled' "
-                "BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END"
-            )
-
-        with self.assertRaisesRegex(sqlite3.IntegrityError, "audit unavailable"):
-            ModelUsageUseCases(self.store).reconcile(
-                "tenant", "operator", request_id, "success", 11, 7, 9
-            )
-
-        usage = self.store.list_model_usage("tenant", "org/repo")[0]
-        self.assertEqual("uncertain", usage["status"])
-        self.assertIsNone(usage["completed_at"])
 
     def test_policy_use_case_rejects_rules_missing_from_runtime(self):
         policies = RepositoryPolicyResolver(self.store)
@@ -202,13 +116,11 @@ class ApplicationUseCaseTests(unittest.TestCase):
                 return {"branch": "evoagent/fix", "commits": [{"sha": "abc"}]}
 
         fixer = Fixer()
-        events = []
         repairs = RepairUseCases(
             self.store,
             policies,
             fixer,
             lambda _installation_id: object(),
-            lambda name, payload: events.append((name, payload)),
             RepairOptions(
                 max_diff_bytes=10_000,
                 verify_timeout_seconds=10,
@@ -229,7 +141,6 @@ class ApplicationUseCaseTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(1, fixer.calls)
         self.assertEqual(("SEC-EVAL",), fixer.allowed)
-        self.assertEqual("fix.completed", events[0][0])
         output = captured.prometheus()
         self.assertIn("evoagent_fix_attempts_total 1.0", output)
         self.assertIn("evoagent_fix_runs_total 1.0", output)
@@ -277,7 +188,6 @@ class ApplicationUseCaseTests(unittest.TestCase):
                     policies,
                     Fixer(outcome),
                     lambda _installation_id: object(),
-                    lambda *_args: None,
                     options,
                 ).create_fix(name, tenant_id="tenant")
             completed_task("failed")
@@ -287,7 +197,6 @@ class ApplicationUseCaseTests(unittest.TestCase):
                     policies,
                     Fixer(error=True),
                     lambda _installation_id: object(),
-                    lambda *_args: None,
                     options,
                 ).create_fix("failed", tenant_id="tenant")
 
@@ -298,9 +207,8 @@ class ApplicationUseCaseTests(unittest.TestCase):
         self.assertIn("evoagent_fix_verification_blocked_total 1.0", output)
         self.assertIn("evoagent_fix_failed_total 1.0", output)
 
-    def test_review_use_case_owns_admission_execution_and_events(self):
+    def test_review_use_case_owns_admission_and_execution(self):
         report = ReviewReport("org/repo", 7, "one issue", "high", [_finding()])
-        events = []
 
         class Queue:
             backend = "test"
@@ -326,7 +234,6 @@ class ApplicationUseCaseTests(unittest.TestCase):
             lambda *_args: None,
             lambda *_args: "",
             lambda _installation_id: object(),
-            lambda name, payload: events.append((name, payload)),
             ReviewOptions(
                 max_diff_bytes=10_000,
                 queue_lease_seconds=60,
@@ -342,7 +249,6 @@ class ApplicationUseCaseTests(unittest.TestCase):
         self.assertEqual("SUCCESS", result["state"])
         self.assertEqual(0, task["input"]["repository_policy"]["version"])
         self.assertTrue(task["input"]["repository_policy"]["policy"]["enabled"])
-        self.assertEqual(["review.started", "review.completed"], [name for name, _ in events])
         self.assertEqual(0, self.store.tenant_review_admission_stats("tenant")["active"])
 
     def test_review_use_case_fetches_deferred_diff_and_deduplicates_comment(self):
@@ -391,7 +297,6 @@ class ApplicationUseCaseTests(unittest.TestCase):
             lambda *_args: None,
             lambda *_args: "continuity",
             lambda _installation_id: code_host,
-            lambda *_args: None,
             ReviewOptions(10_000, 60, True),
         )
         payload = {
@@ -445,7 +350,6 @@ class ApplicationUseCaseTests(unittest.TestCase):
             lambda *_args: None,
             lambda *_args: "",
             lambda _installation_id: object(),
-            lambda *_args: None,
             ReviewOptions(10_000, 60, False, tenant_max_active_reviews=1),
         )
         task_id = "resume-task"
@@ -505,7 +409,6 @@ class ApplicationUseCaseTests(unittest.TestCase):
             lambda *_args: None,
             lambda *_args: "",
             lambda _installation_id: object(),
-            lambda *_args: None,
             ReviewOptions(10_000, 60, True),
         )
         notifications = []

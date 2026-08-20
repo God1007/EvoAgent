@@ -1,5 +1,3 @@
-import os
-import tempfile
 import unittest
 
 from evoagent.errors import (
@@ -10,7 +8,8 @@ from evoagent.errors import (
 )
 from evoagent.models import TaskState, TraceEvent
 from evoagent.observability import Observability
-from evoagent.store import TaskStore, utc_now
+from evoagent.time_utils import utc_now
+from tests.db_support import postgres_store
 
 
 def _raise_at_stable_site(message):
@@ -51,11 +50,8 @@ class OperationalErrorContractTests(unittest.TestCase):
         self.assertEqual(safe, preserve_safe_summary(safe, "review execution failed"))
         self.assertNotEqual(safe, coerce_safe_summary(safe, "queue dependency failed"))
 
-    def test_sqlite_persistence_boundary_rejects_raw_operational_errors(self):
-        handle, path = tempfile.mkstemp(suffix=".db")
-        os.close(handle)
-        self.addCleanup(os.unlink, path)
-        store = TaskStore(path)
+    def test_persistence_boundary_rejects_raw_operational_errors(self):
+        store = postgres_store(self)
         secret = "credential=must-never-be-persisted"
         now = utc_now()
         store.create_review_task(
@@ -94,7 +90,7 @@ class OperationalErrorContractTests(unittest.TestCase):
         with store._connect() as conn:
             effect_error = conn.execute(
                 "SELECT last_error FROM effect_receipts WHERE effect_key='effect'"
-            ).fetchone()[0]
+            ).fetchone()["last_error"]
         persisted = {
             "task": store.get("task"),
             "checkpoint": store.load_checkpoints("task"),

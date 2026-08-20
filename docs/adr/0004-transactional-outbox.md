@@ -21,7 +21,7 @@ EvoAgent uses a Store-backed transactional outbox:
    horizon (Redis check/append/marker is one Lua operation);
 5. retry exhaustion moves a row to an observable, auditable, operator-replayable
    dead state;
-6. dispatcher shutdown precedes queue drain and Store/plugin shutdown;
+6. dispatcher shutdown precedes queue drain and Store shutdown;
 7. external GitHub effects use stable markers/deterministic branches plus
    durable effect receipts.
 

@@ -1,9 +1,4 @@
-"""Backup/restore drills with machine-readable recovery evidence.
-
-The PostgreSQL path deliberately restores only into a generated disposable
-database.  The SQLite path uses the online backup API twice (source -> artifact
--> restored copy) so a successful report proves restore, not merely file copy.
-"""
+"""PostgreSQL backup/restore drills with machine-readable recovery evidence."""
 
 from __future__ import annotations
 
@@ -14,12 +9,10 @@ import math
 import os
 import re
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
-import urllib.parse
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
@@ -28,7 +21,6 @@ from typing import Any
 
 from .migrations import CURRENT_SCHEMA_VERSION, MIGRATIONS
 from .postgres_store import PostgresTaskStore
-from .store import TaskStore
 
 REPORT_SCHEMA_VERSION = 1
 _DRILL_DATABASE = re.compile(r"^evoagent_drill_[a-f0-9]{32}$")
@@ -147,60 +139,6 @@ def _validate_migration_history(rows: list[dict[str, Any]]) -> int:
     return versions[-1]
 
 
-def _quote_sqlite(identifier: str) -> str:
-    return '"%s"' % identifier.replace('"', '""')
-
-
-def _sqlite_readonly(path: str) -> sqlite3.Connection:
-    encoded_path = urllib.parse.quote(os.path.abspath(path), safe="/:")
-    return sqlite3.connect("file:%s?mode=ro" % encoded_path, uri=True, timeout=30)
-
-
-def _sqlite_fingerprint(path: str) -> DatabaseFingerprint:
-    connection = _sqlite_readonly(path)
-    connection.row_factory = sqlite3.Row
-    try:
-        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
-        if integrity != "ok":
-            raise DisasterRecoveryError("SQLite integrity_check failed: %s" % integrity)
-        foreign_key_error = connection.execute("PRAGMA foreign_key_check").fetchone()
-        if foreign_key_error is not None:
-            raise DisasterRecoveryError("SQLite foreign_key_check found an invalid relationship")
-        tables = [
-            str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
-            ).fetchall()
-        ]
-        schema_rows = [
-            tuple(row)
-            for row in connection.execute(
-                "SELECT type,name,tbl_name,COALESCE(sql,'') FROM sqlite_master "
-                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name"
-            ).fetchall()
-        ]
-        schema_digest = hashlib.sha256(
-            json.dumps(schema_rows, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
-        fingerprints: dict[str, TableFingerprint] = {}
-        for table in tables:
-            cursor = connection.execute("SELECT * FROM %s" % _quote_sqlite(table))
-            fingerprints[table] = _fingerprint_cursor(cursor)
-        rows = [
-            dict(row)
-            for row in connection.execute(
-                "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
-            ).fetchall()
-        ]
-        schema_version = _validate_migration_history(rows)
-        return DatabaseFingerprint(schema_digest, schema_version, fingerprints)
-    except sqlite3.Error as exc:
-        raise DisasterRecoveryError("SQLite recovery validation failed: %s" % exc) from exc
-    finally:
-        connection.close()
-
-
 def _compare_fingerprints(source: DatabaseFingerprint, restored: DatabaseFingerprint) -> None:
     if source != restored:
         raise DisasterRecoveryError("restored database content or schema differs from the snapshot")
@@ -213,12 +151,6 @@ def _secure_output_directory(path: str) -> str:
     if not os.path.exists(output):
         os.makedirs(output, mode=0o700)
     return output
-
-
-def _reserve_sqlite(path: str) -> None:
-    with open(path, "xb"):
-        pass
-    os.chmod(path, 0o600)
 
 
 def _write_manifest(path: str, report: dict[str, Any]) -> None:
@@ -247,110 +179,6 @@ def _objective_report(
             "met": recovery_time <= max_rto_seconds,
         },
     }
-
-
-def run_sqlite_drill(
-    source_path: str,
-    output_dir: str,
-    max_rpo_seconds: float = 3600.0,
-    max_rto_seconds: float = 300.0,
-) -> dict[str, Any]:
-    """Create an online snapshot, restore it, and return recovery evidence."""
-    if max_rpo_seconds <= 0 or max_rto_seconds <= 0:
-        raise ValueError("RPO and RTO objectives must be positive")
-    source = os.path.abspath(source_path)
-    if not os.path.isfile(source):
-        raise ValueError("SQLite source database does not exist")
-    output = _secure_output_directory(output_dir)
-    drill_id = uuid.uuid4().hex
-    artifact = os.path.join(output, "evoagent-%s.sqlite3" % drill_id)
-    restored_path = os.path.join(output, ".evoagent-restored-%s.sqlite3" % drill_id)
-    manifest = os.path.join(output, "evoagent-%s.manifest.json" % drill_id)
-    if source in {artifact, restored_path, manifest}:
-        raise ValueError("DR output must not overwrite the SQLite source")
-
-    started_at = _now()
-    backup_started = time.monotonic()
-    _reserve_sqlite(artifact)
-    source_connection = _sqlite_readonly(source)
-    backup_connection = sqlite3.connect(artifact)
-    try:
-        source_connection.backup(backup_connection)
-    except sqlite3.Error as exc:
-        raise DisasterRecoveryError("SQLite online backup failed: %s" % exc) from exc
-    finally:
-        backup_connection.close()
-        source_connection.close()
-    snapshot_captured_at = _now()
-    backup_seconds = time.monotonic() - backup_started
-    artifact_sha256 = _sha256_file(artifact)
-    source_fingerprint = _sqlite_fingerprint(artifact)
-
-    restore_started_at = _now()
-    restore_started = time.monotonic()
-    _reserve_sqlite(restored_path)
-    artifact_connection = _sqlite_readonly(artifact)
-    restored_connection = sqlite3.connect(restored_path)
-    try:
-        artifact_connection.backup(restored_connection)
-    except sqlite3.Error as exc:
-        raise DisasterRecoveryError("SQLite restore failed: %s" % exc) from exc
-    finally:
-        restored_connection.close()
-        artifact_connection.close()
-    try:
-        restored_fingerprint = _sqlite_fingerprint(restored_path)
-        _compare_fingerprints(source_fingerprint, restored_fingerprint)
-        restored_store = TaskStore(restored_path)
-        restored_store.ping()
-        restored_store.dashboard_stats()
-        restored_store.audit(
-            "drill", "evoagent-dr", "recovery.smoke", drill_id, {"backend": "sqlite"}
-        )
-        validated_at = _now()
-        recovery_seconds = time.monotonic() - restore_started
-        snapshot_age_seconds = (validated_at - snapshot_captured_at).total_seconds()
-    finally:
-        if os.path.exists(restored_path):
-            os.unlink(restored_path)
-
-    objectives = _objective_report(
-        snapshot_age_seconds, recovery_seconds, max_rpo_seconds, max_rto_seconds
-    )
-    status = "pass" if all(item["met"] for item in objectives.values()) else "fail"
-    fingerprint = asdict(source_fingerprint)
-    report: dict[str, Any] = {
-        "report_schema_version": REPORT_SCHEMA_VERSION,
-        "status": status,
-        "backend": "sqlite",
-        "drill_id": drill_id,
-        "source": {"path": source},
-        "started_at": _timestamp(started_at),
-        "snapshot_captured_at": _timestamp(snapshot_captured_at),
-        "restore_started_at": _timestamp(restore_started_at),
-        "validated_at": _timestamp(validated_at),
-        "backup_duration_seconds": round(backup_seconds, 6),
-        "artifact": {
-            "path": artifact,
-            "bytes": os.path.getsize(artifact),
-            "sha256": artifact_sha256,
-        },
-        "manifest_path": manifest,
-        "integrity": {
-            "sqlite_integrity_check": "ok",
-            "schema_version": source_fingerprint.schema_version,
-            "schema_sha256": source_fingerprint.schema_sha256,
-            "table_count": len(source_fingerprint.tables),
-            "total_rows": source_fingerprint.total_rows,
-            "source_fingerprint": fingerprint,
-            "restored_fingerprint": asdict(restored_fingerprint),
-            "application_smoke": "pass",
-        },
-        "objectives": objectives,
-        "cleanup": {"restored_copy_removed": not os.path.exists(restored_path)},
-    }
-    _write_manifest(manifest, report)
-    return report
 
 
 def _postgres_parts(url: str) -> tuple[dict[str, str], str, dict[str, str]]:
@@ -753,8 +581,6 @@ def run_postgres_drill(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run an EvoAgent backup/restore integrity drill")
-    parser.add_argument("--backend", choices=("auto", "sqlite", "postgresql"), default="auto")
-    parser.add_argument("--sqlite-path", default=os.getenv("EVOAGENT_DB_PATH", "evoagent.db"))
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-rpo-seconds", type=float, default=3600.0)
     parser.add_argument("--max-rto-seconds", type=float, default=900.0)
@@ -764,37 +590,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pg-restore", default="pg_restore")
     args = parser.parse_args(argv)
     database_url = os.getenv("EVOAGENT_DATABASE_URL", "")
-    backend = args.backend
-    if backend == "auto":
-        backend = "postgresql" if database_url else "sqlite"
     try:
-        if backend == "postgresql":
-            if not database_url:
-                raise ValueError("EVOAGENT_DATABASE_URL is required for PostgreSQL DR")
-            report = run_postgres_drill(
-                database_url,
-                args.output_dir,
-                args.max_rpo_seconds,
-                args.max_rto_seconds,
-                args.command_timeout_seconds,
-                args.max_backup_bytes,
-                args.pg_dump,
-                args.pg_restore,
-            )
-        else:
-            report = run_sqlite_drill(
-                args.sqlite_path,
-                args.output_dir,
-                args.max_rpo_seconds,
-                args.max_rto_seconds,
-            )
+        if not database_url:
+            raise ValueError("EVOAGENT_DATABASE_URL is required for PostgreSQL DR")
+        report = run_postgres_drill(
+            database_url,
+            args.output_dir,
+            args.max_rpo_seconds,
+            args.max_rto_seconds,
+            args.command_timeout_seconds,
+            args.max_backup_bytes,
+            args.pg_dump,
+            args.pg_restore,
+        )
     except (ValueError, OSError, DisasterRecoveryError) as exc:
         print(
             json.dumps(
                 {
                     "report_schema_version": REPORT_SCHEMA_VERSION,
                     "status": "error",
-                    "backend": backend,
+                    "backend": "postgresql",
                     "error": str(exc),
                 },
                 ensure_ascii=False,
@@ -809,7 +624,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "report_schema_version": REPORT_SCHEMA_VERSION,
                     "status": "error",
-                    "backend": backend,
+                    "backend": "postgresql",
                     "error": "recovery drill failed (%s)" % type(exc).__name__,
                 },
                 ensure_ascii=False,

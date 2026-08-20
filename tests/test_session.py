@@ -1,5 +1,3 @@
-import os
-import tempfile
 import unittest
 
 from evoagent.models import Finding, Severity
@@ -10,7 +8,7 @@ from evoagent.session import (
     open_snapshot,
     snapshot_findings,
 )
-from evoagent.store import TaskStore
+from tests.db_support import postgres_store
 
 REPO = "org/app"
 
@@ -117,10 +115,7 @@ class ClassifyFindingsTests(unittest.TestCase):
 
 class StoreSessionTests(unittest.TestCase):
     def setUp(self):
-        handle, self.path = tempfile.mkstemp(suffix=".db")
-        os.close(handle)
-        self.store = TaskStore(self.path)
-        self.addCleanup(os.unlink, self.path)
+        self.store = postgres_store(self)
 
     def _turn(self, head_sha, trigger, findings):
         turn = self.store.start_session_turn("default", REPO, 7, head_sha, trigger)

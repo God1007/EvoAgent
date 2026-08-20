@@ -99,15 +99,11 @@ sample_query = "two"
 
         self.assertIn("EvoAgentAvailabilityFastBurn", rules)
         self.assertIn("evoagent_queue_oldest_age_seconds", rules)
-        self.assertIn("evoagent:cost:model_micros_per_terminal_review_30m", rules)
-        self.assertIn("EvoAgentModelCapacitySaturated", rules)
         self.assertIn("EvoAgentRepairVerificationBlockedHigh", rules)
         self.assertIn("EvoAgentNegativeFeedbackHigh", rules)
         self.assertIn("EvoAgentRetentionMaintenanceStalled", rules)
         self.assertIn("EvoAgentTenantReviewCapacitySaturated", rules)
-        self.assertIn("EvoAgentTenantFairnessChurnHigh", rules)
         self.assertIn("EvoAgentQueueLeaseHeartbeatFailing", rules)
-        self.assertIn("EvoAgentQueueKeyspaceVersionMixed", rules)
         self.assertIn("or vector(0)", rules)
         for anchor in (
             "availability-fast-burn",
@@ -116,27 +112,22 @@ sample_query = "two"
             "queue-or-outbox-stale",
             "dead-letters",
             "review-failures",
-            "model-route-capacity",
-            "model-economics",
             "repair-outcomes",
             "quality-feedback",
-            "plugin-runtime",
             "history-retention",
             "tenant-review-capacity",
-            "tenant-fair-scheduling",
-            "redis-cluster-queue",
         ):
             self.assertIn("#" + anchor, rules)
             self.assertIn("## " + anchor.replace("-", " "), runbook)
-        self.assertEqual("evoagent-enterprise", dashboard["uid"])
-        self.assertGreaterEqual(len(dashboard["panels"]), 18)
+        self.assertEqual("evoagent-overview", dashboard["uid"])
+        self.assertGreaterEqual(len(dashboard["panels"]), 12)
         dashboard_text = json.dumps(dashboard)
-        self.assertIn("evoagent:ratio:model_capacity_rejected_15m", dashboard_text)
+        self.assertIn("evoagent_model_requests_failed_total", dashboard_text)
         self.assertIn("evoagent:ratio:negative_feedback_24h", dashboard_text)
         self.assertIn("evoagent_retention_trace_events_pruned_total", dashboard_text)
         self.assertIn("evoagent:ratio:tenant_review_capacity_rejected_15m", dashboard_text)
-        self.assertIn("evoagent:ratio:queue_fair_deferrals_15m", dashboard_text)
-        self.assertIn("evoagent_queue_keyspace_version", dashboard_text)
+        self.assertIn("evoagent_queue_lease_heartbeat_failures_total", dashboard_text)
+        self.assertNotIn("evoagent_model_fallback_attempts_total", dashboard_text)
 
 
 class PrometheusClientTests(unittest.TestCase):

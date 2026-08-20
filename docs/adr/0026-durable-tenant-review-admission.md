@@ -25,8 +25,8 @@ claim.
   bounded release reason.
 - `EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS` is a uniform per-tenant hard limit. Zero
   disables rejection but still tracks slots, enabling an observable rollout.
-- SQLite uses `BEGIN IMMEDIATE`. PostgreSQL always takes a transaction advisory
-  lock keyed by the stable tenant identity, including while the limit is zero,
+- PostgreSQL takes a transaction advisory lock keyed by the stable tenant
+  identity, including while the limit is zero,
   so all v0.28 writers participate in the same coordination protocol. Capacity
   count, rejection audit, task/session/Diff, admission, and Outbox changes share
   the intake transaction.

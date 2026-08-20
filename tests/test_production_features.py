@@ -1,5 +1,3 @@
-import os
-import tempfile
 import time
 import unittest
 
@@ -9,21 +7,17 @@ from evoagent.harness import ReviewHarness
 from evoagent.reviewer import LocalRuleReviewer
 from evoagent.rollout import ReleaseManager
 from evoagent.service import ReviewService
-from evoagent.store import TaskStore
 from evoagent.task_queue import TaskQueue
 from evoagent.verifier import RepairVerifier
+from tests.db_support import postgres_store, postgres_url
 
 DIFF = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
 
 
 class ProductionFeatureTests(unittest.TestCase):
     def setUp(self):
-        handle, self.path = tempfile.mkstemp(suffix=".db")
-        os.close(handle)
-        self.store = TaskStore(self.path)
-
-    def tearDown(self):
-        os.unlink(self.path)
+        self.store = postgres_store(self)
+        self.database_url = postgres_url(self)
 
     def test_login_rbac_and_tenant_task_isolation(self):
         auth = AuthManager(
@@ -124,7 +118,6 @@ class ProductionFeatureTests(unittest.TestCase):
             Settings(
                 host="127.0.0.1",
                 port=8080,
-                db_path=self.path,
                 max_diff_bytes=10_000,
                 max_steps=8,
                 timeout_seconds=10,
@@ -134,6 +127,7 @@ class ProductionFeatureTests(unittest.TestCase):
                 github_webhook_secret="",
                 github_token="",
                 auto_post_review=False,
+                database_url=self.database_url,
             )
         )
         self.addCleanup(service.close)

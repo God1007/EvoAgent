@@ -5,8 +5,8 @@
 
 ## Context
 
-SQLite and PostgreSQL adapters previously executed a long list of `CREATE TABLE
-IF NOT EXISTS` and conditional `ALTER TABLE` statements in their constructors.
+The PostgreSQL adapter previously executed a long list of `CREATE TABLE IF NOT
+EXISTS` and conditional `ALTER TABLE` statements in its constructor.
 This made fresh startup convenient but did not record which schema transitions
 had occurred, could not detect a database created by a newer binary, and made
 backend drift easy to miss. Rolling deployments also lacked one explicit lock
@@ -14,12 +14,11 @@ and compatibility decision.
 
 ## Decision
 
-EvoAgent maintains an immutable, integer-versioned migration catalog with one
-logical history and dialect-specific SQL. Each applied row records its version,
+EvoAgent maintains an immutable, integer-versioned PostgreSQL migration catalog.
+Each applied row records its version,
 name, SHA-256 checksum, and timestamp.
 
-- SQLite migrations execute under `BEGIN IMMEDIATE`; PostgreSQL uses a
-  transaction advisory lock.
+- Migrations execute transactionally under a PostgreSQL advisory lock.
 - Histories must be contiguous and checksums must match the application.
 - A database schema newer than the binary is rejected at startup.
 - Existing unversioned databases are adopted through idempotent migrations
@@ -30,8 +29,7 @@ name, SHA-256 checksum, and timestamp.
 - A dedicated `evoagent-migrate` entry point supports deployment jobs, while
   Store startup retains the same safety check as a final guard.
 
-The built-in runner avoids adding a framework dependency and supports the two
-existing adapters through the same catalog. If migration complexity later
+The built-in runner avoids adding a framework dependency. If migration complexity later
 requires online backfills or a dedicated framework, that tooling must preserve
 this history and compatibility policy.
 

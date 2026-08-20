@@ -1,20 +1,13 @@
-import os
-import tempfile
 import unittest
 
 from evoagent.harness import ReviewHarness
 from evoagent.reviewer import LocalRuleReviewer
-from evoagent.store import TaskStore
+from tests.db_support import postgres_store
 
 
 class HarnessTests(unittest.TestCase):
     def setUp(self):
-        handle, self.path = tempfile.mkstemp(suffix=".db")
-        os.close(handle)
-        self.store = TaskStore(self.path)
-
-    def tearDown(self):
-        os.unlink(self.path)
+        self.store = postgres_store(self)
 
     def test_successful_state_flow_is_persisted(self):
         task_id = "test-task"

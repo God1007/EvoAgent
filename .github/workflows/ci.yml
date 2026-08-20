@@ -18,6 +18,22 @@ jobs:
     name: Quality gates
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      EVOAGENT_TEST_POSTGRES_URL: postgresql://evoagent:evoagent-ci@127.0.0.1:5432/evoagent
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: evoagent
+          POSTGRES_USER: evoagent
+          POSTGRES_PASSWORD: evoagent-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U evoagent -d evoagent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v7
         with:
@@ -65,7 +81,7 @@ jobs:
           "$wheel_env/bin/python" -m pip install --no-deps dist/*.whl
           cd "$RUNNER_TEMP"
           EVOAGENT_HOST=127.0.0.1 EVOAGENT_PORT=18081 \
-            EVOAGENT_DB_PATH="${RUNNER_TEMP}/wheel-smoke.db" \
+            EVOAGENT_DATABASE_URL="${EVOAGENT_TEST_POSTGRES_URL}" \
             "$wheel_env/bin/evoagent" > wheel-smoke.log 2>&1 &
           wheel_pid=$!
           trap 'kill "$wheel_pid" 2>/dev/null || true' EXIT
@@ -84,7 +100,6 @@ jobs:
           test -f "$wheel_env/share/evoagent/ops/slo.toml"
           test -f "$wheel_env/share/evoagent/ops/prometheus/evoagent.rules.yml"
           test -f "$wheel_env/share/evoagent/ops/grafana/evoagent-overview.json"
-          test -f "$wheel_env/share/evoagent/examples/tenant-queue-weights.toml"
           "$wheel_env/bin/evoagent-slo" --help >/dev/null
           "$wheel_env/bin/evoagent-dr" --help >/dev/null
           "$wheel_env/bin/evoagent-recover-queue" --help >/dev/null
@@ -100,6 +115,22 @@ jobs:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      EVOAGENT_TEST_POSTGRES_URL: postgresql://evoagent:evoagent-ci@127.0.0.1:5432/evoagent
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: evoagent
+          POSTGRES_USER: evoagent
+          POSTGRES_PASSWORD: evoagent-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U evoagent -d evoagent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     strategy:
       fail-fast: false
       matrix:
@@ -119,47 +150,6 @@ jobs:
           python -m pip install --no-deps -e .
       - name: Run test suite
         run: python -m pytest -q
-
-  docker-smoke:
-    name: Docker build + smoke test
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - name: Build image
-        run: docker build -t evoagent:ci .
-      - name: Run container
-        run: |
-          docker run -d --name evoagent-ci \
-            -e EVOAGENT_HOST=0.0.0.0 \
-            -p 8080:8080 evoagent:ci
-      - name: Wait for /health and assert it is ok
-        run: |
-          for attempt in $(seq 1 30); do
-            if body=$(curl -fsS http://127.0.0.1:8080/health 2>/dev/null); then
-              echo "health payload: $body"
-              echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('status')=='ok' else 1)"
-              echo "smoke test passed"
-              exit 0
-            fi
-            echo "attempt $attempt: /health not ready yet"
-            sleep 2
-          done
-          echo "::error::/health did not become ready"
-          docker logs evoagent-ci || true
-          exit 1
-      - name: Verify the quick-start review endpoint responds
-        run: |
-          curl -fsS -X POST http://127.0.0.1:8080/v1/reviews \
-            -H 'Content-Type: application/json' \
-            -d '{"repository":"demo/api","pull_request":1,"diff":"diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n+password = \"secret\"\n+eval(user_input)"}' \
-            | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('state')=='SUCCESS' else 1)"
-          echo "review endpoint smoke test passed"
-      - name: Tear down
-        if: always()
-        run: docker rm -f evoagent-ci || true
 
   external-integration:
     name: PostgreSQL + Redis + container contracts
@@ -222,59 +212,12 @@ jobs:
             tests/test_adapter_contracts.py \
             tests/test_external_integrations.py \
             tests/test_github_http_fixture.py
-      - name: Start a three-primary Redis Cluster
-        run: |
-          docker run -d --name evoagent-redis-cluster \
-            -p 7000:7000 -p 7001:7001 -p 7002:7002 \
-            -p 17000:17000 -p 17001:17001 -p 17002:17002 \
-            redis:7-alpine sh -ec '
-              redis-server --port 7000 --bind 0.0.0.0 --protected-mode no --appendonly no --cluster-enabled yes --cluster-config-file /tmp/nodes-7000.conf --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7000 --cluster-announce-bus-port 17000 &
-              redis-server --port 7001 --bind 0.0.0.0 --protected-mode no --appendonly no --cluster-enabled yes --cluster-config-file /tmp/nodes-7001.conf --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7001 --cluster-announce-bus-port 17001 &
-              redis-server --port 7002 --bind 0.0.0.0 --protected-mode no --appendonly no --cluster-enabled yes --cluster-config-file /tmp/nodes-7002.conf --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7002 --cluster-announce-bus-port 17002 &
-              wait'
-          for attempt in $(seq 1 30); do
-            if docker exec evoagent-redis-cluster redis-cli -p 7000 ping >/dev/null 2>&1 && \
-               docker exec evoagent-redis-cluster redis-cli -p 7001 ping >/dev/null 2>&1 && \
-               docker exec evoagent-redis-cluster redis-cli -p 7002 ping >/dev/null 2>&1; then
-              break
-            fi
-            if [ "$attempt" = 30 ]; then
-              docker logs evoagent-redis-cluster
-              exit 1
-            fi
-            sleep 1
-          done
-          docker exec evoagent-redis-cluster redis-cli --cluster create \
-            127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 \
-            --cluster-replicas 0 --cluster-yes
-          for attempt in $(seq 1 30); do
-            if docker exec evoagent-redis-cluster redis-cli -p 7000 cluster info \
-              | grep -q 'cluster_state:ok'; then
-              break
-            fi
-            if [ "$attempt" = 30 ]; then
-              docker exec evoagent-redis-cluster redis-cli -p 7000 cluster info
-              docker logs evoagent-redis-cluster
-              exit 1
-            fi
-            sleep 1
-          done
-      - name: Run Redis Cluster queue and recovery contracts
-        env:
-          EVOAGENT_TEST_REDIS_CLUSTER_URL: redis://127.0.0.1:7000/0
-        run: |
-          python -m pytest -q \
-            tests/test_external_integrations.py::RedisClusterQueueIntegrationTests
-      - name: Stop the Redis Cluster fixture
-        if: always()
-        run: docker rm -f evoagent-redis-cluster >/dev/null 2>&1 || true
       - name: Prove backup and isolated restore integrity
         env:
           EVOAGENT_DATABASE_URL: ${{ env.EVOAGENT_TEST_POSTGRES_URL }}
         run: |
           mkdir -p "${RUNNER_TEMP}/evoagent-dr"
           python -m evoagent.dr \
-            --backend postgresql \
             --output-dir "${RUNNER_TEMP}/evoagent-dr" \
             --max-rpo-seconds 300 \
             --max-rto-seconds 300 > recovery-report.json
@@ -304,8 +247,6 @@ jobs:
             -e EVOAGENT_AUTH_REQUIRED=false \
             -e EVOAGENT_DATABASE_URL="${EVOAGENT_TEST_POSTGRES_URL}" \
             -e EVOAGENT_REDIS_URL="${EVOAGENT_TEST_REDIS_URL}" \
-            -e EVOAGENT_QUEUE_NAMESPACE=ci-full-stack \
-            -e EVOAGENT_QUEUE_FAIR_SCHEDULING=true \
             -e EVOAGENT_SKILLS_DIR=/app/skills \
             evoagent:ci
       - name: Prove readiness and end-to-end outbox delivery
@@ -320,7 +261,7 @@ jobs:
             fi
             sleep 1
           done
-          python -c "import json; from evoagent.migrations import CURRENT_SCHEMA_VERSION; d=json.load(open('ready.json')); q=d['checks']['queue']; assert d['status']=='ready'; assert d['queue_backend']=='redis-streams'; assert d['checks']['schema_version']==CURRENT_SCHEMA_VERSION; assert q['healthy'] and q['fair_scheduling'] and q['lease_heartbeat_running']; assert q['keyspace_version']==2 and q['queue_namespace']=='ci-full-stack' and not q['redis_cluster']"
+          python -c "import json; from evoagent.migrations import CURRENT_SCHEMA_VERSION; d=json.load(open('ready.json')); q=d['checks']['queue']; assert d['status']=='ready'; assert d['queue_backend']=='redis-streams'; assert d['checks']['schema_version']==CURRENT_SCHEMA_VERSION; assert q['healthy'] and q['lease_heartbeat_running']"
           curl -fsS -X POST 'http://127.0.0.1:18080/v1/reviews?async=true' \
             -H 'Content-Type: application/json' \
             -d '{"repository":"ci/full-stack","pull_request":17,"diff":"diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n+value = 1\n+print(value)"}' \

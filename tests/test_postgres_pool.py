@@ -1,11 +1,8 @@
-import os
-import tempfile
 import unittest
 from contextlib import contextmanager
 
 from evoagent.metrics import Metrics
 from evoagent.postgres_store import PostgresTaskStore, create_store
-from evoagent.store import TaskStore
 
 
 class FakeConn:
@@ -120,12 +117,9 @@ class FallbackTests(unittest.TestCase):
         store = _store_with_pool(None)
         self.assertIsNone(store.pool_stats())
 
-    def test_create_store_uses_sqlite_for_non_postgres_url(self):
-        handle, path = tempfile.mkstemp(suffix=".db")
-        os.close(handle)
-        self.addCleanup(os.unlink, path)
-        store = create_store("", path)
-        self.assertIsInstance(store, TaskStore)
+    def test_create_store_rejects_non_postgres_url(self):
+        with self.assertRaisesRegex(ValueError, "PostgreSQL URL"):
+            create_store("")
 
 
 class PoolStatGaugeTests(unittest.TestCase):

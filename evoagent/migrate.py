@@ -14,7 +14,6 @@ def run() -> None:
     try:
         store = create_store(
             settings.database_url,
-            settings.db_path,
             settings.pg_pool_min,
             settings.pg_pool_max,
             settings.pg_pool_timeout,
@@ -23,7 +22,7 @@ def run() -> None:
             json.dumps(
                 {
                     "status": "migrated",
-                    "backend": "postgresql" if settings.database_url else "sqlite",
+                    "backend": "postgresql",
                     "schema_version": store.schema_version(),
                 },
                 sort_keys=True,

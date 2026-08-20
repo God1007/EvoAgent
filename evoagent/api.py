@@ -421,7 +421,6 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._serve_file("app.js")
             return
         if path == "/health":
-            plugin_status = self.service.plugin_status()
             self._send_json(
                 200,
                 {
@@ -432,9 +431,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "queue_durable": self.service.queue.durable,
                     "llm_provider": self.service.llm_config.get("provider", "local"),
                     "llm_model": self.service.llm_config.get("model", ""),
-                    "plugin_runtime": plugin_status["state"],
-                    "plugin_profile": plugin_status["profile"],
-                    "plugins": len(plugin_status["plugins"]),
                     "retention": self.service.retention_status(),
                     "review_admission": self.service.review_admission_status(),
                 },
@@ -452,9 +448,6 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         if path == "/metrics":
             self._send_text(200, metrics.prometheus(), "text/plain; version=0.0.4; charset=utf-8")
-            return
-        if path == "/v1/plugins":
-            self._send_json(200, self.service.plugin_status())
             return
         if path == "/api/dashboard":
             self._send_json(
@@ -545,47 +538,6 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send_json(
                 200,
                 self.service.tenant_review_capacity_report(principal.tenant_id),
-            )
-            return
-        if path == "/api/model-usage":
-            if not principal.can("manage"):
-                self._send_json(403, {"error": "permission denied"})
-                return
-            repository = query.get("repository", [None])[0]
-            self._send_json(
-                200,
-                {
-                    "usage": self.service.store.list_model_usage(
-                        principal.tenant_id,
-                        repository,
-                        self._query_limit(query, 100),
-                    )
-                },
-            )
-            return
-        if path == "/api/model-routes/promotion":
-            if not principal.can("manage"):
-                self._send_json(403, {"error": "permission denied"})
-                return
-            candidate_route_id = query.get("route_id", [""])[0]
-            if not candidate_route_id:
-                raise ClientInputError("route_id query parameter is required")
-            repository = query.get("repository", [None])[0]
-            self._send_json(
-                200,
-                self.service.model_route_promotion_report(
-                    principal.tenant_id, candidate_route_id, repository
-                ),
-            )
-            return
-        if path == "/api/model-routes/capacity":
-            if not principal.can("manage"):
-                self._send_json(403, {"error": "permission denied"})
-                return
-            repository = query.get("repository", [None])[0]
-            self._send_json(
-                200,
-                self.service.model_route_capacity_report(principal.tenant_id, repository),
             )
             return
         if path == "/v1/repository-policies":
@@ -748,21 +700,6 @@ class ApiHandler(BaseHTTPRequestHandler):
                     principal.username,
                 )
                 self._send_json(201, result)
-                return
-            if path == "/v1/model-usage/reconcile":
-                principal = self._principal("manage")
-                payload = self._read_json(body)
-                result = self.service.reconcile_model_usage(
-                    principal.tenant_id,
-                    principal.username,
-                    payload.get("request_id", ""),
-                    payload.get("status", ""),
-                    payload.get("input_tokens", -1),
-                    payload.get("output_tokens", -1),
-                    payload.get("cost_micros", -1),
-                    payload.get("error", ""),
-                )
-                self._send_json(200 if result["reconciled"] else 404, result)
                 return
             if path == "/webhooks/github":
                 if self.headers.get("X-GitHub-Event", "") != "pull_request":
@@ -1206,13 +1143,13 @@ def _print_banner(settings: Settings, service: ReviewService) -> None:
     print(
         "Persistence: %s | Queue: %s | Orchestrator: %s"
         % (
-            "postgresql" if settings.database_url else "sqlite",
+            "postgresql",
             service.queue.backend,
             service.reviewer.name,
         )
     )
     exposed = settings.host not in {"127.0.0.1", "localhost", "::1"}
-    if (settings.database_url or exposed) and not service.queue.durable:
+    if exposed and not service.queue.durable:
         print(
             "WARNING: this deployment looks production-facing but the task queue is "
             "'%s' (non-durable). Set EVOAGENT_REDIS_URL for durable, crash-safe "

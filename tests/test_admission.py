@@ -1,9 +1,7 @@
 import http.client
 import io
 import json
-import os
 import re
-import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
@@ -15,9 +13,14 @@ from evoagent.config import Settings
 from evoagent.metrics import Metrics
 from evoagent.migrations import CURRENT_SCHEMA_VERSION
 from evoagent.service import ReviewService
+from tests.db_support import postgres_url, reset_postgres
 
 
 class AdmissionControlTests(unittest.TestCase):
+    def setUp(self):
+        self.database_url = postgres_url(self)
+        reset_postgres(self.database_url)
+
     def _serve(self, settings: Settings):
         service = ReviewService(settings)
         self.service = service
@@ -37,7 +40,6 @@ class AdmissionControlTests(unittest.TestCase):
         base = dict(
             host="127.0.0.1",
             port=0,
-            db_path=os.path.join(tempfile.mkdtemp(), "evoagent.db"),
             max_diff_bytes=10000,
             max_steps=8,
             timeout_seconds=10,
@@ -50,6 +52,7 @@ class AdmissionControlTests(unittest.TestCase):
             auth_required=False,
             redis_url="",
             async_workers=1,
+            database_url=self.database_url,
         )
         base.update(overrides)
         return Settings(**base)
@@ -119,9 +122,6 @@ class AdmissionControlTests(unittest.TestCase):
         self.assertEqual(200, capacity_response.status)
         self.assertEqual(1, capacity["active_reviews"])
         self.assertTrue(capacity["saturated"])
-        self.assertFalse(capacity["queue_fair_scheduling"])
-        self.assertEqual(1, capacity["queue_weight"])
-        self.assertEqual("uniform-v1", capacity["queue_policy_id"])
 
     def test_trusted_proxy_clients_receive_independent_rate_limit_buckets(self):
         host, port = self._serve(
@@ -212,58 +212,6 @@ class AdmissionControlTests(unittest.TestCase):
             captured.prometheus(),
         )
 
-    def test_model_usage_reconciliation_http_boundary_is_state_guarded(self):
-        host, port = self._serve(self._settings())
-        request_id = "http-stale-request"
-        self.service.store.reserve_model_usage(
-            {
-                "request_id": request_id,
-                "tenant_id": "default",
-                "repository": "org/repo",
-                "purpose": "review",
-                "provider": "provider",
-                "model": "model",
-                "reserved_tokens": 100,
-                "request_sha256": "a" * 64,
-                "created_at": "2000-01-01T00:00:00+00:00",
-            },
-            "2000-01-01T00:00:00+00:00",
-        )
-        self.service.store.expire_model_usage_reservations("2001-01-01T00:00:00+00:00")
-        payload = json.dumps(
-            {
-                "request_id": request_id,
-                "status": "success",
-                "input_tokens": 12,
-                "output_tokens": 3,
-                "cost_micros": 7,
-            }
-        )
-        conn = http.client.HTTPConnection(host, port, timeout=5)
-        self.addCleanup(conn.close)
-
-        conn.request(
-            "POST",
-            "/v1/model-usage/reconcile",
-            body=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        first = conn.getresponse()
-        first_body = json.loads(first.read())
-        self.assertEqual(200, first.status)
-        self.assertTrue(first_body["reconciled"])
-
-        conn.request(
-            "POST",
-            "/v1/model-usage/reconcile",
-            body=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        second = conn.getresponse()
-        second_body = json.loads(second.read())
-        self.assertEqual(404, second.status)
-        self.assertFalse(second_body["reconciled"])
-
     def test_probes_are_exempt_from_rate_limiting(self):
         host, port = self._serve(self._settings(rate_limit_rps=1, rate_limit_burst=1))
         conn = http.client.HTTPConnection(host, port, timeout=5)
@@ -274,7 +222,7 @@ class AdmissionControlTests(unittest.TestCase):
             response.read()
             self.assertEqual(200, response.status)
 
-    def test_health_and_inventory_report_plugin_runtime(self):
+    def test_health_and_readiness_report_runtime_state(self):
         host, port = self._serve(self._settings())
         conn = http.client.HTTPConnection(host, port, timeout=5)
         self.addCleanup(conn.close)
@@ -282,26 +230,14 @@ class AdmissionControlTests(unittest.TestCase):
         conn.request("GET", "/health")
         health_response = conn.getresponse()
         health = json.loads(health_response.read())
-        self.assertEqual("running", health["plugin_runtime"])
-        self.assertGreaterEqual(health["plugins"], 10)
         self.assertFalse(health["retention"]["enabled"])
         self.assertFalse(health["review_admission"]["enabled"])
-
-        conn.request("GET", "/v1/plugins")
-        inventory_response = conn.getresponse()
-        inventory = json.loads(inventory_response.read())
-        self.assertEqual(200, inventory_response.status)
-        self.assertIn("store", inventory["capabilities"])
 
         conn.request("GET", "/ready")
         ready_response = conn.getresponse()
         ready = json.loads(ready_response.read())
         self.assertEqual(200, ready_response.status)
         self.assertEqual(CURRENT_SCHEMA_VERSION, ready["checks"]["schema_version"])
-        self.assertFalse(ready["checks"]["queue"]["fair_scheduling"])
-        self.assertEqual("uniform-v1", ready["checks"]["queue"]["fair_policy_id"])
-        self.assertFalse(ready["checks"]["queue"]["redis_cluster"])
-        self.assertEqual(1, ready["checks"]["queue"]["keyspace_version"])
 
     def test_request_identity_and_security_headers_cover_every_response(self):
         host, port = self._serve(self._settings())
@@ -330,15 +266,15 @@ class AdmissionControlTests(unittest.TestCase):
         conn = http.client.HTTPConnection(host, port, timeout=5)
         self.addCleanup(conn.close)
 
-        def fail_inventory():
+        def fail_dashboard(*_args):
             raise RuntimeError("password=provider-secret-value")
 
-        self.service.plugin_status = fail_inventory
+        self.service.store.dashboard_stats = fail_dashboard
         output = io.StringIO()
         with redirect_stdout(output):
             conn.request(
                 "GET",
-                "/v1/plugins?access_token=query-secret-value",
+                "/api/dashboard?access_token=query-secret-value",
                 headers={"X-Request-ID": "edge-error-17"},
             )
             response = conn.getresponse()
@@ -353,33 +289,30 @@ class AdmissionControlTests(unittest.TestCase):
         self.assertNotIn("query-secret-value", logs)
         self.assertIn('"event": "http_internal_error"', logs)
         self.assertIn('"error_type": "builtins.RuntimeError"', logs)
-        self.assertIn('"path": "/v1/plugins"', logs)
+        self.assertIn('"path": "/api/dashboard"', logs)
 
     def test_post_internal_error_uses_the_same_safe_boundary(self):
         host, port = self._serve(self._settings())
         conn = http.client.HTTPConnection(host, port, timeout=5)
         self.addCleanup(conn.close)
 
-        def fail_reconciliation(*_args):
+        def fail_policy_update(*_args):
             # Built-in ValueError is not assumed to be public-safe. Only the
             # explicit ClientInputError marker may cross the HTTP boundary.
             raise ValueError("postgresql://admin:database-secret@db/reviews")
 
-        self.service.reconcile_model_usage = fail_reconciliation
+        self.service.set_repository_policy = fail_policy_update
         body = json.dumps(
             {
-                "request_id": "provider-request",
-                "status": "success",
-                "input_tokens": 1,
-                "output_tokens": 1,
-                "cost_micros": 1,
+                "repository": "org/repo",
+                "policy": {"max_diff_bytes": 1024},
             }
         )
         output = io.StringIO()
         with redirect_stdout(output):
             conn.request(
                 "POST",
-                "/v1/model-usage/reconcile",
+                "/v1/repository-policies",
                 body=body,
                 headers={
                     "Content-Type": "application/json",
@@ -437,86 +370,6 @@ class AdmissionControlTests(unittest.TestCase):
         self.assertEqual("configured", fetched["source"])
         self.assertEqual(4096, fetched["policy"]["max_diff_bytes"])
         self.assertEqual([1], [item["version"] for item in fetched["history"]])
-
-    def test_model_usage_api_is_tenant_scoped_operational_metadata(self):
-        host, port = self._serve(self._settings())
-        request_id = "model-request-1"
-        self.service.store.reserve_model_usage(
-            {
-                "request_id": request_id,
-                "tenant_id": "default",
-                "repository": "org/repo",
-                "task_id": "task-1",
-                "purpose": "review",
-                "provider": "test",
-                "model": "model-a",
-                "reserved_tokens": 20,
-                "reserved_cost_micros": 4,
-                "redactions": 1,
-                "request_sha256": "a" * 64,
-                "created_at": "2026-08-17T00:00:00+00:00",
-            },
-            "2026-08-17T00:00:00+00:00",
-        )
-        self.service.store.complete_model_usage(request_id, "success", 10, 3, 2)
-
-        conn = http.client.HTTPConnection(host, port, timeout=5)
-        self.addCleanup(conn.close)
-        conn.request("GET", "/api/model-usage?repository=org%2Frepo")
-        response = conn.getresponse()
-        payload = json.loads(response.read())
-
-        self.assertEqual(200, response.status)
-        self.assertEqual([request_id], [item["request_id"] for item in payload["usage"]])
-        self.assertNotIn("messages", payload["usage"][0])
-
-    def test_model_route_promotion_report_http_boundary(self):
-        host, port = self._serve(self._settings())
-        expected = {
-            "candidate_route_id": "candidate",
-            "eligible": False,
-            "checks": {"minimum_samples": False},
-        }
-        with mock.patch.object(
-            self.service.model_gateway, "promotion_report", return_value=expected
-        ) as report:
-            conn = http.client.HTTPConnection(host, port, timeout=5)
-            self.addCleanup(conn.close)
-            conn.request(
-                "GET",
-                "/api/model-routes/promotion?route_id=candidate&repository=org%2Frepo",
-            )
-            response = conn.getresponse()
-            payload = json.loads(response.read())
-
-        self.assertEqual(200, response.status)
-        self.assertEqual(expected, payload)
-        report.assert_called_once_with("default", "candidate", "org/repo")
-
-        conn.request("GET", "/api/model-routes/promotion")
-        missing = conn.getresponse()
-        missing_payload = json.loads(missing.read())
-        self.assertEqual(400, missing.status)
-        self.assertIn("route_id", missing_payload["error"])
-
-    def test_model_route_capacity_report_http_boundary(self):
-        host, port = self._serve(self._settings())
-        expected = {
-            "topology_sha256": "a" * 64,
-            "routes": [{"route_id": "primary", "available": True}],
-        }
-        with mock.patch.object(
-            self.service.model_gateway, "capacity_report", return_value=expected
-        ) as report:
-            conn = http.client.HTTPConnection(host, port, timeout=5)
-            self.addCleanup(conn.close)
-            conn.request("GET", "/api/model-routes/capacity?repository=org%2Frepo")
-            response = conn.getresponse()
-            payload = json.loads(response.read())
-
-        self.assertEqual(200, response.status)
-        self.assertEqual(expected, payload)
-        report.assert_called_once_with("default", "org/repo")
 
     def test_rejected_requests_are_counted_in_metrics(self):
         host, port = self._serve(self._settings(rate_limit_rps=1, rate_limit_burst=1))

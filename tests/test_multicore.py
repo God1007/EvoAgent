@@ -2,7 +2,6 @@ import http.client
 import os
 import signal
 import socket
-import tempfile
 import threading
 import time
 import unittest
@@ -17,13 +16,13 @@ from evoagent.api import (
 )
 from evoagent.config import Settings
 from evoagent.service import ReviewService
+from tests.db_support import postgres_url, reset_postgres
 
 
-def _settings(**overrides) -> Settings:
+def _settings(database_url="", **overrides) -> Settings:
     base = dict(
         host="127.0.0.1",
         port=0,
-        db_path=os.path.join(tempfile.mkdtemp(), "evoagent.db"),
         max_diff_bytes=10000,
         max_steps=8,
         timeout_seconds=10,
@@ -36,6 +35,7 @@ def _settings(**overrides) -> Settings:
         auth_required=False,
         redis_url="",
         async_workers=1,
+        database_url=database_url,
     )
     base.update(overrides)
     return Settings(**base)
@@ -45,9 +45,11 @@ class ReadinessTests(unittest.TestCase):
     def setUp(self):
         DRAINING.clear()
         self.addCleanup(DRAINING.clear)
-        self.service = ReviewService(_settings())
+        database_url = postgres_url(self)
+        reset_postgres(database_url)
+        self.service = ReviewService(_settings(database_url))
         self.addCleanup(self.service.close)
-        self.server = _make_server(_settings(), self.service)
+        self.server = _make_server(_settings(database_url), self.service)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -86,14 +88,16 @@ class ReuseportTests(unittest.TestCase):
         # mechanism the multi-process workers rely on.
         DRAINING.clear()
         self.addCleanup(DRAINING.clear)
-        service_a = ReviewService(_settings())
+        database_url = postgres_url(self)
+        reset_postgres(database_url)
+        service_a = ReviewService(_settings(database_url))
         self.addCleanup(service_a.close)
-        server_a = _make_server(_settings(), service_a)
+        server_a = _make_server(_settings(database_url), service_a)
         host, port = server_a.server_address
 
-        service_b = ReviewService(_settings())
+        service_b = ReviewService(_settings(database_url))
         self.addCleanup(service_b.close)
-        server_b = _make_server(_settings(port=port), service_b)
+        server_b = _make_server(_settings(database_url, port=port), service_b)
         self.assertEqual(port, server_b.server_address[1])
 
         for server in (server_a, server_b):

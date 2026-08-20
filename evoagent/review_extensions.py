@@ -1,4 +1,4 @@
-"""Stable service-definition types for pluggable review contributors."""
+"""Stable metadata for review contributors."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ class ReviewerContribution:
     reviewer: Reviewer
     version: str = "1.0.0"
     description: str = ""
-    source: str = "trusted-plugin"
+    source: str = "builtin"
 
     def __post_init__(self) -> None:
         if not _CONTRIBUTION_ID.fullmatch(self.contribution_id):

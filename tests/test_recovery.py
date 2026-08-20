@@ -1,17 +1,14 @@
-import os
-import tempfile
 import unittest
 import uuid
 
 from evoagent.models import TaskState, TraceEvent
 from evoagent.recovery import (
     QueueRecoveryError,
-    RedisRecoveryTarget,
     build_queue_recovery_plan,
     execute_queue_recovery,
 )
-from evoagent.store import TaskStore, utc_now
-from evoagent.task_queue import build_queue_keyspace
+from evoagent.time_utils import utc_now
+from tests.db_support import postgres_store
 
 
 class FakeRedisRecoveryTarget:
@@ -34,9 +31,7 @@ class FakeRedisRecoveryTarget:
 
 class QueueRecoveryTests(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        self.store = TaskStore(os.path.join(self.directory.name, "recovery.db"))
+        self.store = postgres_store(self)
 
     def create_async(self, task_id="async-task"):
         self.store.create_review_task(
@@ -93,10 +88,6 @@ class QueueRecoveryTests(unittest.TestCase):
         )
 
         self.assertEqual("planned", planned["status"])
-        self.assertEqual(
-            {"redis_cluster": False, "queue_namespace": "", "keyspace_version": 1},
-            planned["redis_topology"],
-        )
         self.assertEqual(2, planned["plan"]["recoverable"])
         self.assertEqual("pass", applied["status"])
         self.assertEqual(2, applied["staging"]["staged"])
@@ -216,39 +207,6 @@ class QueueRecoveryTests(unittest.TestCase):
 
         self.assertEqual(0, result["staged"])
         self.assertEqual(1, result["skipped_terminal"])
-
-    def test_v2_recovery_reserves_only_its_queue_namespace(self):
-        class FakeNamespaceRedis:
-            def __init__(self):
-                self.values = {"evoagent:{review:other}:stream": "unrelated"}
-
-            def exists(self, *keys):
-                return sum(key in self.values for key in keys)
-
-            def get(self, key):
-                return self.values.get(key)
-
-            def eval(self, _script, key_count, *values):
-                keys = values[:key_count]
-                marker = values[key_count]
-                if any(key in self.values for key in keys[1:]):
-                    return "nonempty"
-                current = self.values.get(keys[0])
-                if current is None:
-                    self.values[keys[0]] = marker
-                    return "reserved"
-                return "existing" if current == marker else "nonempty"
-
-        target = object.__new__(RedisRecoveryTarget)
-        target.redis_cluster = True
-        target.keyspace = build_queue_keyspace("recovery-prod")
-        target._client = FakeNamespaceRedis()
-
-        self.assertEqual("empty", target.inspect("reviewed"))
-        self.assertEqual("reserved", target.reserve("reviewed"))
-        self.assertEqual("reserved", target.inspect("reviewed"))
-        target._client.values[target.keyspace.stream] = "occupied"
-        self.assertEqual("nonempty", target.inspect("reviewed"))
 
 
 if __name__ == "__main__":

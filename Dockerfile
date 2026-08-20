@@ -2,17 +2,14 @@ FROM python:3.14-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    EVOAGENT_DB_PATH=/data/evoagent.db
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 
 COPY requirements.lock .
 RUN python -m pip install --no-cache-dir --require-hashes -r requirements.lock \
     && groupadd --system evoagent \
-    && useradd --system --gid evoagent --home-dir /app --shell /usr/sbin/nologin evoagent \
-    && mkdir -p /data \
-    && chown evoagent:evoagent /data
+    && useradd --system --gid evoagent --home-dir /app --shell /usr/sbin/nologin evoagent
 
 COPY --chown=evoagent:evoagent evoagent ./evoagent
 COPY --chown=evoagent:evoagent web ./web

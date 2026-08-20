@@ -13,7 +13,6 @@ from ..errors import (
     ClientInputError,
     TenantReviewCapacityError,
     coerce_safe_summary,
-    safe_exception_fields,
     safe_exception_summary,
 )
 from ..metrics import metrics
@@ -26,11 +25,10 @@ from ..ports import (
     ReviewApplicationStorePort,
     ReviewReleasePort,
     TaskQueuePort,
-    TenantFairQueuePort,
 )
 from ..report import to_markdown
-from ..store import utc_now
 from ..task_queue import PermanentTaskError
+from ..time_utils import utc_now
 
 
 @dataclass(frozen=True)
@@ -63,7 +61,6 @@ class ReviewUseCases:
         run_shadow: Callable[[str, str, str, Any], None],
         record_session_turn: Callable[[dict[str, Any], Any], str],
         code_host_for_installation: Callable[[int | None], CodeHostPort],
-        publish_event: Callable[[str, dict[str, Any]], None],
         options: ReviewOptions,
         model_routes: Callable[[str, str], tuple[dict[str, str], ...] | None] | None = None,
     ):
@@ -79,7 +76,6 @@ class ReviewUseCases:
         self.run_shadow = run_shadow
         self.record_session_turn = record_session_turn
         self.code_host_for_installation = code_host_for_installation
-        self.publish_event = publish_event
         self.options = options
         self.model_routes = model_routes or (lambda _tenant_id, _repository: None)
 
@@ -218,7 +214,6 @@ class ReviewUseCases:
     ) -> dict[str, Any]:
         policy = self.authorize_review(tenant_id, repository, diff)
         task_id = self.create_task(repository, diff, pull_request, source, tenant_id, policy=policy)
-        self._review_started(task_id, tenant_id, repository, source, "synchronous")
         try:
             with (
                 self.observability.span(
@@ -232,10 +227,10 @@ class ReviewUseCases:
             ):
                 report = self.execute_review(task_id, repository, pull_request, diff, tenant_id)
             self.run_shadow(task_id, tenant_id, diff, report)
-            self._review_succeeded(task_id, tenant_id, repository, report, "synchronous")
+            self._review_succeeded(task_id, tenant_id)
             return {"task_id": task_id, "state": "SUCCESS", "report": report.to_dict()}
-        except Exception as exc:
-            self._review_failed(task_id, tenant_id, repository, exc, "synchronous")
+        except Exception:
+            self._review_failed(task_id, tenant_id, "synchronous")
             raise
 
     def enqueue_review(
@@ -323,7 +318,6 @@ class ReviewUseCases:
                     "diff_sha256": hashlib.sha256(encoded).hexdigest(),
                 },
             )
-        self._review_started(task_id, tenant_id, repository, "queue", "asynchronous")
         try:
             with (
                 self.observability.span(
@@ -339,7 +333,7 @@ class ReviewUseCases:
                     tenant_id,
                 )
             self.run_shadow(task_id, tenant_id, diff, report)
-            self._review_succeeded(task_id, tenant_id, repository, report, "asynchronous")
+            self._review_succeeded(task_id, tenant_id)
             continuity = self.record_session_turn(payload, report)
             if (
                 payload.get("github_issue_url")
@@ -348,8 +342,8 @@ class ReviewUseCases:
                 and current_policy.post_review_comments
             ):
                 self._post_review_comment(payload, task_id, report, continuity)
-        except Exception as exc:
-            self._review_failed(task_id, tenant_id, repository, exc, "asynchronous")
+        except Exception:
+            self._review_failed(task_id, tenant_id, "asynchronous")
             raise
 
     def _post_review_comment(
@@ -394,51 +388,17 @@ class ReviewUseCases:
         elif receipt["status"] == "busy":
             metrics.inc("effect_receipt_busy_total")
 
-    def _review_started(
-        self, task_id: str, tenant_id: str, repository: str, source: str, mode: str
-    ) -> None:
-        self.publish_event(
-            "review.started",
-            {
-                "task_id": task_id,
-                "tenant_id": tenant_id,
-                "repository": repository,
-                "source": source,
-                "mode": mode,
-            },
-        )
-
-    def _review_succeeded(
-        self,
-        task_id: str,
-        tenant_id: str,
-        repository: str,
-        report: Any,
-        mode: str,
-    ) -> None:
+    def _review_succeeded(self, task_id: str, tenant_id: str) -> None:
         metrics.inc("reviews_total")
         metrics.inc("review_admission_releases_total")
         persisted = self.store.get(task_id, tenant_id) or {}
         lane = (persisted.get("input") or {}).get("release_lane", "stable")
         self.releases.observe(tenant_id, "llm-review", False, lane)
-        self.publish_event(
-            "review.completed",
-            {
-                "task_id": task_id,
-                "tenant_id": tenant_id,
-                "repository": repository,
-                "risk": report.risk,
-                "findings": len(report.findings),
-                "mode": mode,
-            },
-        )
 
     def _review_failed(
         self,
         task_id: str,
         tenant_id: str,
-        repository: str,
-        error: Exception,
         mode: str,
     ) -> None:
         metrics.inc("reviews_failed_total")
@@ -448,18 +408,6 @@ class ReviewUseCases:
         lane = (task.get("input") or {}).get("release_lane", "stable")
         self.releases.observe(tenant_id, "llm-review", True, lane)
         self.alerts.evaluate(tenant_id)
-        failure = safe_exception_fields(error)
-        self.publish_event(
-            "review.failed",
-            {
-                "task_id": task_id,
-                "tenant_id": tenant_id,
-                "repository": repository,
-                "error_type": failure["error_type"],
-                "error_ref": failure["error_ref"],
-                "mode": mode,
-            },
-        )
 
     def on_dead_letter(self, payload: dict[str, Any], error: str) -> None:
         error = coerce_safe_summary(error, "task delivery failed")
@@ -496,10 +444,6 @@ class ReviewUseCases:
             error,
         )
         metrics.inc("dead_letters_total")
-        self.publish_event(
-            "task.dead-lettered",
-            {"task_id": task_id, "tenant_id": tenant_id, "error": error[:500]},
-        )
 
     def record_feedback(
         self,
@@ -567,8 +511,6 @@ class ReviewUseCases:
         stats = self.store.tenant_review_admission_stats(tenant_id)
         limit = self.options.tenant_max_active_reviews
         active = int(stats["active"])
-        queue = self.queue()
-        fair_queue = queue if isinstance(queue, TenantFairQueuePort) else None
         return {
             "tenant_id": tenant_id,
             "enabled": limit > 0,
@@ -577,9 +519,6 @@ class ReviewUseCases:
             "available": max(0, limit - active) if limit else None,
             "saturated": bool(limit and active >= limit),
             "oldest_acquired_at": stats["oldest_acquired_at"],
-            "queue_fair_scheduling": bool(fair_queue and fair_queue.fair_scheduling),
-            "queue_weight": fair_queue.tenant_weight(tenant_id) if fair_queue else 1,
-            "queue_policy_id": fair_queue.fair_policy_id if fair_queue else None,
         }
 
     def cancel_task(self, task_id: str, tenant_id: str | None = None) -> bool:

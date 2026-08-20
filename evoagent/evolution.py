@@ -9,7 +9,7 @@ from .diff_parser import parse_unified_diff
 from .errors import ClientInputError, safe_exception_summary
 from .ports import EvolutionStorePort
 from .reviewer import Reviewer
-from .store import utc_now
+from .time_utils import utc_now
 
 DEFAULT_PROMPT = (
     "Review the unified diff. Return JSON findings with severity, fix and test. "

@@ -109,9 +109,9 @@ Configuration:
 ## Verification evidence
 
 `tests/test_outbox.py` injects failures at transaction insert, post-publish
-pre-ack, lease ownership, retry-budget, and effect-receipt boundaries. Shared
-adapter contracts run the task/outbox/effect behavior against SQLite and
-PostgreSQL. The mandatory external-service CI matrix additionally kills a Redis
+pre-ack, lease ownership, retry-budget, and effect-receipt boundaries. PostgreSQL
+contract tests cover the task/outbox/effect transaction behavior. The mandatory
+external-service CI matrix additionally kills a Redis
 consumer process after delivery but before ACK, then proves lease reclaim,
 dedupe across queue restart, durable DLQ replay, and worker recovery after a
 socket disconnect. Local memory tests are not presented as Redis durability

@@ -289,31 +289,6 @@ class MultiAgentCoordinator(Reviewer):
         self.synthesizer = SynthesizerAgent()
         self.fix_agent = FixAgent()
         self.verifier = VerifierAgent()
-        self.graph = self._build_graph()
-
-    def _build_graph(self):
-        try:
-            from langgraph.graph import END, START, StateGraph
-
-            graph = StateGraph(CollaborationState)
-            graph.add_node("planner", self._plan_node)
-            graph.add_node("specialists", self._specialist_node)
-            graph.add_node("critic", self._critic_node)
-            graph.add_node("test", self._test_node)
-            graph.add_node("synthesizer", self._synthesize_node)
-            graph.add_node("fix", self._fix_node)
-            graph.add_node("verifier", self._verify_node)
-            graph.add_edge(START, "planner")
-            graph.add_edge("planner", "specialists")
-            graph.add_edge("specialists", "critic")
-            graph.add_edge("critic", "test")
-            graph.add_edge("test", "synthesizer")
-            graph.add_edge("synthesizer", "fix")
-            graph.add_edge("fix", "verifier")
-            graph.add_edge("verifier", END)
-            return graph.compile()
-        except ImportError:
-            return None
 
     def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
         return self.review_with_context("", diff, parsed)
@@ -329,20 +304,17 @@ class MultiAgentCoordinator(Reviewer):
             "diff": diff,
             "parsed": parsed,
         }
-        if self.graph:
-            result: dict[str, Any] = dict(self.graph.invoke(state))
-        else:
-            result = dict(state)
-            for node in (
-                self._plan_node,
-                self._specialist_node,
-                self._critic_node,
-                self._test_node,
-                self._synthesize_node,
-                self._fix_node,
-                self._verify_node,
-            ):
-                result.update(node(cast(CollaborationState, result)))
+        result: dict[str, Any] = dict(state)
+        for node in (
+            self._plan_node,
+            self._specialist_node,
+            self._critic_node,
+            self._test_node,
+            self._synthesize_node,
+            self._fix_node,
+            self._verify_node,
+        ):
+            result.update(node(cast(CollaborationState, result)))
         return result["verified"]
 
     def _emit(

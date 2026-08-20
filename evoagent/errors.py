@@ -32,9 +32,6 @@ _OPERATIONS = frozenset(
         "outbox readiness failed",
         "shadow review failed",
         "evaluation case failed",
-        "plugin listener failed",
-        "plugin activation failed",
-        "plugin shutdown failed",
     }
 )
 _UNCLASSIFIED_REF = hashlib.sha256(b"evoagent:unclassified-failure").hexdigest()[:16]

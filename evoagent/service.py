@@ -1,10 +1,8 @@
 import threading
 import time
-from collections.abc import Sequence
 from typing import Any
 
 from .application import (
-    ModelUsageUseCases,
     PolicyUseCases,
     RepairOptions,
     RepairUseCases,
@@ -15,85 +13,56 @@ from .application import (
     WebhookUseCases,
 )
 from .backpressure import ConcurrencyLimiter, RateLimiter, TrustedProxyResolver
-from .bootstrap import build_application_runtime
-from .capabilities import (
-    ALERTS,
-    AUTH,
-    EVOLUTION,
-    FIXER,
-    GITHUB_BREAKER,
-    GITHUB_CLIENT,
-    LLM_BREAKER,
-    MODEL_GATEWAY,
-    OBSERVABILITY,
-    PROOF_EXECUTOR,
-    QUEUE_FACTORY,
-    RELEASES,
-    REPOSITORY_POLICY,
-    REVIEW_ENGINE,
-    STORE,
-)
+from .bootstrap import build_components, close_components
 from .config import Settings
 from .diff_parser import parse_unified_diff
 from .errors import coerce_safe_summary, safe_exception_summary
 from .github import GitHubAppAuthenticator, GitHubClient
 from .metrics import metrics
 from .outbox import OutboxDispatcher
-from .plugins import Plugin, PluginProfile, PluginRuntime
-from .ports import CodeHostPort, QueueTopologyPort, TenantFairQueuePort
+from .ports import CodeHostPort
 from .retention import RetentionManager, RetentionOptions
 from .review_engine import ReviewEngine
 from .reviewer import GatewayReviewer
+from .task_queue import TaskQueue
 
 
 class ReviewService:
-    def __init__(
-        self,
-        settings: Settings,
-        *,
-        plugins: Sequence[Plugin] = (),
-        plugin_profile: PluginProfile | None = None,
-    ):
+    def __init__(self, settings: Settings):
         self.settings = settings
         settings.validate_evolution()
-        self.plugin_runtime: PluginRuntime = build_application_runtime(
-            settings,
-            plugins,
-            plugin_profile,
-        )
+        self.components = build_components(settings)
         self._closed = False
         try:
-            self.github_breaker = self.plugin_runtime.require(GITHUB_BREAKER)
-            self.llm_breaker = self.plugin_runtime.require(LLM_BREAKER)
-            self.model_gateway = self.plugin_runtime.require(MODEL_GATEWAY)
-            self.store = self.plugin_runtime.require(STORE)
-            self.policies = self.plugin_runtime.require(REPOSITORY_POLICY)
-            self.observability = self.plugin_runtime.require(OBSERVABILITY)
-            self.review_engine: ReviewEngine = self.plugin_runtime.require(REVIEW_ENGINE)
+            self.github_breaker = self.components.github_breaker
+            self.llm_breaker = self.components.llm_breaker
+            self.model_gateway = self.components.model_gateway
+            self.store = self.components.store
+            self.policies = self.components.policies
+            self.observability = self.components.observability
+            self.review_engine: ReviewEngine = self.components.review_engine
             self.llm_config = self.review_engine.llm_config
             self.registry = self.review_engine.registry
             self.reviewer = self.review_engine.reviewer
             self.harness = self.review_engine.harness
-            self.github = self.plugin_runtime.require(GITHUB_CLIENT)
-            self.fixer = self.plugin_runtime.require(FIXER)
-            self.proof_executor = self.plugin_runtime.require(PROOF_EXECUTOR)
-            self.auth = self.plugin_runtime.require(AUTH)
-            self.releases = self.plugin_runtime.require(RELEASES)
-            self.alerts = self.plugin_runtime.require(ALERTS)
-            self.evolution = self.plugin_runtime.require(EVOLUTION)
+            self.github = self.components.github
+            self.fixer = self.components.fixer
+            self.proof_executor = self.components.proof_executor
+            self.auth = self.components.auth
+            self.releases = self.components.releases
+            self.alerts = self.components.alerts
+            self.evolution = self.components.evolution
             self.session_use_cases = SessionUseCases(self.store, settings.max_diff_bytes)
             self.policy_use_cases = PolicyUseCases(
                 self.store,
                 self.policies,
                 lambda: tuple(getattr(self.fixer, "rule_ids", ())),
             )
-            self.model_usage_use_cases = ModelUsageUseCases(self.store)
             self.repair_use_cases = RepairUseCases(
                 self.store,
                 self.policies,
                 self.fixer,
                 lambda installation_id: self.github_client_for_installation(installation_id),
-                self._publish_event,
                 RepairOptions(
                     max_diff_bytes=settings.max_diff_bytes,
                     verify_timeout_seconds=settings.repair_verify_timeout_seconds,
@@ -127,7 +96,6 @@ class ReviewService:
                 ),
                 lambda payload, report: self._record_session_turn(payload, report),
                 lambda installation_id: self.github_client_for_installation(installation_id),
-                self._publish_event,
                 ReviewOptions(
                     max_diff_bytes=settings.max_diff_bytes,
                     queue_lease_seconds=settings.queue_lease_seconds,
@@ -135,9 +103,7 @@ class ReviewService:
                     tenant_max_active_reviews=settings.tenant_max_active_reviews,
                 ),
                 lambda tenant_id, repository: (
-                    tuple(self.model_gateway.route_catalog(tenant_id, repository))
-                    if self.model_gateway.configured
-                    else None
+                    (self.model_gateway.route_info(),) if self.model_gateway.configured else None
                 ),
             )
             self.webhook_use_cases = WebhookUseCases(
@@ -150,8 +116,12 @@ class ReviewService:
                     auto_post_review=settings.auto_post_review,
                 ),
             )
-            self.queue = self.plugin_runtime.require(QUEUE_FACTORY).create(
+            self.queue = TaskQueue(
                 self._process_queued,
+                settings.async_workers,
+                settings.redis_url,
+                settings.queue_max_attempts,
+                settings.queue_lease_seconds,
                 self._on_dead_letter,
             )
             self.outbox = OutboxDispatcher(
@@ -180,10 +150,7 @@ class ReviewService:
             queue = getattr(self, "queue", None)
             if queue is not None:
                 queue.close()
-            try:
-                self.plugin_runtime.stop()
-            except Exception:
-                metrics.inc("plugin_cleanup_failures_total")
+            close_components(self.components)
             raise
         metrics.register_gauge_source("queue_depth", self.queue.depth)
         metrics.register_gauge_source("queue_oldest_age_seconds", self.queue.oldest_age_seconds)
@@ -213,14 +180,6 @@ class ReviewService:
             getattr(self.model_gateway, "breaker_state_code", self.llm_breaker.state_code),
         )
         metrics.register_gauge_source(
-            "plugins_loaded",
-            lambda: float(len(self.plugin_runtime.describe()["plugins"])),
-        )
-        metrics.register_gauge_source(
-            "plugin_runtime_ready",
-            lambda: 1.0 if self.plugin_runtime.state.value == "running" else 0.0,
-        )
-        metrics.register_gauge_source(
             "retention_enabled", lambda: 1.0 if self.retention.enabled else 0.0
         )
         metrics.register_gauge_source(
@@ -243,56 +202,16 @@ class ReviewService:
             "review_admission_slots_active",
             lambda: float(self.store.tenant_review_admission_stats()["active"]),
         )
-        metrics.register_gauge_source(
-            "queue_fair_scheduling_enabled",
-            lambda: (
-                1.0
-                if isinstance(self.queue, TenantFairQueuePort) and self.queue.fair_scheduling
-                else 0.0
-            ),
-        )
-        metrics.register_gauge_source(
-            "queue_fair_waiting_tenants",
-            lambda: (
-                float(self.queue.fair_waiting_tenants())
-                if isinstance(self.queue, TenantFairQueuePort)
-                else 0.0
-            ),
-        )
-        metrics.register_gauge_source(
-            "queue_redis_cluster_enabled",
-            lambda: (
-                1.0
-                if isinstance(self.queue, QueueTopologyPort) and self.queue.redis_cluster
-                else 0.0
-            ),
-        )
-        metrics.register_gauge_source(
-            "queue_keyspace_version",
-            lambda: (
-                float(self.queue.keyspace_version)
-                if isinstance(self.queue, QueueTopologyPort)
-                else 1.0
-            ),
-        )
         self._readiness_lock = threading.Lock()
         self._readiness_cache: tuple[float, tuple[bool, dict[str, Any]]] | None = None
         self._readiness_ttl = 1.0
         self._register_pool_metrics()
-        self._publish_event(
-            "service.started",
-            {
-                "queue_backend": self.queue.backend,
-                "llm_provider": self.llm_config.get("provider", "local"),
-            },
-        )
 
     def close(self) -> None:
         """Release owned resources in reverse dependency order."""
         if self._closed:
             return
         self._closed = True
-        self._publish_event("service.stopping", {"queue_backend": self.queue.backend})
         try:
             if not self.retention.close(self.settings.queue_shutdown_timeout_seconds):
                 metrics.inc("retention_shutdown_timeouts_total")
@@ -301,27 +220,8 @@ class ReviewService:
             drained = self.queue.close(self.settings.queue_shutdown_timeout_seconds)
             if not drained:
                 metrics.inc("queue_drain_timeouts_total")
-                self._publish_event(
-                    "queue.drain-timeout",
-                    {
-                        "queue_backend": self.queue.backend,
-                        "timeout_seconds": self.settings.queue_shutdown_timeout_seconds,
-                    },
-                )
         finally:
-            self.plugin_runtime.stop()
-
-    def _publish_event(self, name: str, payload: dict[str, Any]) -> None:
-        runtime = getattr(self, "plugin_runtime", None)
-        if runtime is None:
-            return
-        failures = runtime.publish(name, payload)
-        if failures:
-            metrics.inc("plugin_event_failures_total", len(failures))
-
-    def plugin_status(self) -> dict[str, Any]:
-        """Safe runtime inventory for health/debug endpoints."""
-        return self.plugin_runtime.describe()
+            close_components(self.components)
 
     def retention_status(self) -> dict[str, Any]:
         return self.retention.status()
@@ -338,38 +238,6 @@ class ReviewService:
         if replayed:
             self.outbox.notify()
         return replayed
-
-    def reconcile_model_usage(
-        self,
-        tenant_id: str,
-        actor: str,
-        request_id: str,
-        status: str,
-        input_tokens: int,
-        output_tokens: int,
-        cost_micros: int,
-        error: str = "",
-    ) -> dict[str, Any]:
-        return self.model_usage_use_cases.reconcile(
-            tenant_id,
-            actor,
-            request_id,
-            status,
-            input_tokens,
-            output_tokens,
-            cost_micros,
-            error,
-        )
-
-    def model_route_promotion_report(
-        self, tenant_id: str, candidate_route_id: str, repository: str | None = None
-    ) -> dict[str, Any]:
-        return self.model_gateway.promotion_report(tenant_id, candidate_route_id, repository)
-
-    def model_route_capacity_report(
-        self, tenant_id: str, repository: str | None = None
-    ) -> dict[str, Any]:
-        return self.model_gateway.capacity_report(tenant_id, repository)
 
     def tenant_review_capacity_report(self, tenant_id: str) -> dict[str, Any]:
         return self.review_use_cases.tenant_capacity_report(tenant_id)
@@ -453,14 +321,6 @@ class ReviewService:
         except Exception as exc:
             checks["outbox"] = safe_exception_summary(exc, "outbox readiness failed")
             ready = False
-        if self.settings.proof_require_remote:
-            try:
-                proof_health = self.proof_executor.health()
-            except Exception:
-                proof_health = {"healthy": False, "mode": "remote"}
-            checks["proof_runner"] = proof_health
-            if not proof_health.get("healthy"):
-                ready = False
         return ready, {
             "status": "ready" if ready else "not-ready",
             "checks": checks,
@@ -613,7 +473,6 @@ class ReviewService:
         self.registry = self.review_engine.registry
         self.reviewer = self.review_engine.reviewer
         self.harness = self.review_engine.harness
-        self._publish_event("skills.reloaded", {"count": len(skills)})
         return skills
 
     def create_review(

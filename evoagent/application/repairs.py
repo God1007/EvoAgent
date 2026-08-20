@@ -39,7 +39,6 @@ class RepairUseCases:
         policies: RepositoryPolicyResolver,
         fixer: RepairPublisherPort,
         code_host_for_installation: Callable[[int | None], CodeHostPort],
-        publish_event: Callable[[str, dict[str, Any]], None],
         options: RepairOptions,
         proof_executor: ProofExecutorPort | None = None,
     ):
@@ -47,7 +46,6 @@ class RepairUseCases:
         self.policies = policies
         self.fixer = fixer
         self.code_host_for_installation = code_host_for_installation
-        self.publish_event = publish_event
         self.options = options
         self.proof_executor = proof_executor or LocalProofExecutor(self._proof_verifier)
 
@@ -157,14 +155,4 @@ class RepairUseCases:
             metrics.inc("fix_verification_blocked_total")
         else:
             metrics.inc("fix_abstained_total")
-        self.publish_event(
-            "fix.completed",
-            {
-                "task_id": task_id,
-                "tenant_id": actual_tenant,
-                "repository": task["repository"],
-                "published": bool(result.get("branch")),
-                "commits": commits,
-            },
-        )
         return result

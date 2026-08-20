@@ -1,5 +1,3 @@
-import os
-import tempfile
 import unittest
 from dataclasses import dataclass
 from unittest import mock
@@ -8,7 +6,8 @@ from evoagent.config import Settings
 from evoagent.metrics import Metrics
 from evoagent.models import Finding, ReviewReport, Severity, TaskState, TraceEvent
 from evoagent.service import ReviewService
-from evoagent.store import utc_now
+from evoagent.time_utils import utc_now
+from tests.db_support import postgres_url, reset_postgres
 
 
 @dataclass
@@ -34,12 +33,11 @@ def _finding(**overrides):
 
 class ServiceTests(unittest.TestCase):
     def setUp(self):
-        handle, self.path = tempfile.mkstemp(suffix=".db")
-        os.close(handle)
+        self.database_url = postgres_url(self)
+        reset_postgres(self.database_url)
         self.settings = Settings(
             host="127.0.0.1",
             port=8080,
-            db_path=self.path,
             max_diff_bytes=10000,
             max_steps=8,
             timeout_seconds=10,
@@ -49,6 +47,7 @@ class ServiceTests(unittest.TestCase):
             github_webhook_secret="",
             github_token="",
             auto_post_review=False,
+            database_url=self.database_url,
         )
 
     def test_fix_publication_result_is_cached_by_durable_effect_key(self):
@@ -163,9 +162,6 @@ class ServiceTests(unittest.TestCase):
             )
         self.assertIsNone(service.store.get_repository_policy("default", "org/repo"))
 
-    def tearDown(self):
-        os.unlink(self.path)
-
     def test_end_to_end_review(self):
         diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
         result = ReviewService(self.settings).create_review("org/repo", diff, 1)
@@ -180,14 +176,12 @@ class ServiceTests(unittest.TestCase):
 
 class ServiceSessionTests(unittest.TestCase):
     def setUp(self):
-        handle, self.path = tempfile.mkstemp(suffix=".db")
-        os.close(handle)
-        self.addCleanup(os.unlink, self.path)
+        database_url = postgres_url(self)
+        reset_postgres(database_url)
         self.service = ReviewService(
             Settings(
                 host="127.0.0.1",
                 port=8080,
-                db_path=self.path,
                 max_diff_bytes=10000,
                 max_steps=8,
                 timeout_seconds=10,
@@ -197,6 +191,7 @@ class ServiceSessionTests(unittest.TestCase):
                 github_webhook_secret="",
                 github_token="",
                 auto_post_review=False,
+                database_url=database_url,
             )
         )
 

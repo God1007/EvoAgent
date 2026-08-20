@@ -1,8 +1,7 @@
 # Tenant and repository policies
 
 Repository policy is the application decision boundary between tenant
-governance and review execution. It is provided by the replaceable
-`policy.repository` capability and stored independently from the legacy
+governance and review execution. It is stored independently from the legacy
 repository allowlist.
 
 ## Policy document
@@ -30,19 +29,16 @@ rejected before persistence.
 | --- | --- |
 | `enabled` | Intake, queued execution, and repair publication |
 | `max_diff_bytes` | API Diff intake and webhook Diff fetch, in addition to the global cap |
-| `allowed_reviewers` | Review execution using the currently selected reviewer plugin |
+| `allowed_reviewers` | Review execution using the configured reviewer contributions |
 | `allowed_llm_providers` / `allowed_llm_models` | Intake and queued execution |
 | `llm_region` | Intake route eligibility and every gateway call |
 | `post_review_comments` | GitHub comment publication |
 | `auto_fix` | Repair publication |
 | `allowed_fix_rules` | Findings eligible for deterministic repair |
 
-Token/cost budgets are enforced by the model gateway per tenant/repository and
-UTC day from operator configuration. `llm_region` can bind sensitive repositories
-to routes carrying that exact region identifier; provider and model allowlists
-are evaluated against the complete eligible route catalog at intake and again
-inside the gateway. Per-repository numeric budget overrides are not duplicated
-inside the policy document yet.
+`llm_region` can bind sensitive repositories to the configured route's exact
+region identifier. Provider and model allowlists are evaluated at intake and
+again inside the gateway.
 
 ## Version and execution semantics
 

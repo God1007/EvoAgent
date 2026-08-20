@@ -32,11 +32,8 @@ for that tenant/repository key.
 
 - Governance decisions are testable without HTTP or `ReviewService`.
 - Tenant policy changes are attributable, replayable, and race-safe.
-- Dynamic FixRule plugins remain composable but a repository can restrict the
-  eligible subset.
-- A policy plugin can replace the built-in resolver without replacing storage or
-  review execution.
+- Fix rules remain composable but a repository can restrict the eligible subset.
 - Model cost, quota, and data-residency fields are deferred until a gateway can
   enforce them; the current schema does not pretend otherwise.
-- Policy tables and Store methods become part of the PostgreSQL/SQLite adapter
-  contract and migration history.
+- Policy tables and Store methods are part of the PostgreSQL contract and
+  migration history.

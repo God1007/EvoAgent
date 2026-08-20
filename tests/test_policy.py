@@ -1,17 +1,12 @@
-import os
-import tempfile
 import unittest
 
 from evoagent.policy import RepositoryPolicy, RepositoryPolicyResolver
-from evoagent.store import TaskStore
+from tests.db_support import postgres_store
 
 
 class RepositoryPolicyTests(unittest.TestCase):
     def setUp(self):
-        handle, self.path = tempfile.mkstemp(suffix=".db")
-        os.close(handle)
-        self.addCleanup(os.unlink, self.path)
-        self.store = TaskStore(self.path)
+        self.store = postgres_store(self)
         self.resolver = RepositoryPolicyResolver(self.store)
 
     def test_legacy_grants_remain_the_compatibility_fallback(self):

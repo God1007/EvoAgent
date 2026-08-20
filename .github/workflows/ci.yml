@@ -105,7 +105,8 @@ jobs:
           "$wheel_env/bin/evoagent-recover-queue" --help >/dev/null
           "$wheel_env/bin/evoagent-eval-labels" --help >/dev/null
           "$wheel_env/bin/python" -c "from evoagent.review_extensions import ReviewerContribution"
-          "$wheel_env/bin/evoagent-migrate" | "$wheel_env/bin/python" -c \
+          EVOAGENT_DATABASE_URL="${EVOAGENT_TEST_POSTGRES_URL}" \
+            "$wheel_env/bin/evoagent-migrate" | "$wheel_env/bin/python" -c \
             "import json,sys; from evoagent.migrations import CURRENT_SCHEMA_VERSION; d=json.load(sys.stdin); assert d['schema_version'] == CURRENT_SCHEMA_VERSION"
           kill -TERM "$wheel_pid"
           wait "$wheel_pid"

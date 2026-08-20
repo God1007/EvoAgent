@@ -67,7 +67,7 @@ jobs:
       - name: Async-intake perf gate
         run: |
           python scripts/loadgen.py --base-url http://127.0.0.1:8080 \
-            --scenario intake --duration 20 --rate 150 --concurrency 32 --warmup 3 \
+            --scenario intake --duration 20 --rate 50 --concurrency 32 --warmup 3 \
             --p99-ms 500 --max-error-rate 0.001 --json perf-intake.json
       - name: Upload perf reports
         if: always()

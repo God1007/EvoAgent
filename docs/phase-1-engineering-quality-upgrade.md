@@ -216,7 +216,7 @@ Shadow 对比默认假设 `finding_keys` 一定是可迭代列表。异常载荷
 - JSON、Content-Length、Webhook 时间和灰度输入等用户输入错误使用 `raise ... from None`，避免向接口层泄露无意义的内部异常链；
 - Review Harness 在理论上的“重试结束但无最后异常”分支增加显式 RuntimeError，消除不可达状态中的模糊行为；
 - 队列消息 ID 使用显式字符串变量，避免动态字典值造成类型和返回契约不确定；
-- LangGraph 与本地 fallback 的状态边界使用显式字典和 cast，防止动态框架返回值污染内部类型契约。
+- 原 LangGraph 与本地 fallback 合并为单一线性状态机，减少重复执行路径。
 
 ## 6. 工程增强明细
 
@@ -300,7 +300,7 @@ mypy 对 `evoagent/` 生产代码启用：
 - 为 GitHub App token cache 标注 `ClassVar`；
 - 为任务队列 payload、回调和 Redis 动态客户端补充边界类型；
 - 为 Store/PostgreSQL 参数、Agent 消息、Harness 状态补充精确容器类型；
-- 在 LangGraph 动态返回值与内部强类型状态之间添加显式转换。
+- 在线性状态机节点间使用显式转换，保持内部强类型状态契约。
 
 ### 6.6 本地提交门禁
 

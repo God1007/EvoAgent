@@ -1,9 +1,6 @@
-"""Checkpointed review graph.
+"""Checkpointed review state machine.
 
-LangGraph is used when installed. The same node functions have a small local
-executor so a developer checkout remains usable without optional dependencies.
-Checkpoints are owned by the application store and therefore work with either
-executor and survive worker restarts.
+Checkpoints are owned by the application store and survive worker restarts.
 """
 
 import threading
@@ -61,26 +58,8 @@ class ReviewHarness:
         self.timeout_seconds = timeout_seconds
         self.node_retries = node_retries
         self.observability = observability
-        self.name = "langgraph"
+        self.name = "durable-state-machine"
         self._ctx = threading.local()
-        self.graph = self._build_graph()
-
-    def _build_graph(self):
-        try:
-            from langgraph.graph import END, START, StateGraph
-
-            builder = StateGraph(RuntimeState)
-            builder.add_node("planning", self._planning)
-            builder.add_node("executing", self._executing)
-            builder.add_node("reviewing", self._reviewing)
-            builder.add_edge(START, "planning")
-            builder.add_edge("planning", "executing")
-            builder.add_edge("executing", "reviewing")
-            builder.add_edge("reviewing", END)
-            return builder.compile()
-        except ImportError:
-            self.name = "durable-graph-fallback"
-            return None
 
     def run(
         self,
@@ -110,12 +89,9 @@ class ReviewHarness:
         if checkpoints.get("reviewing", {}).get("status") == "completed":
             self._ctx.state = TaskState.REVIEWING
         try:
-            if self.graph is not None:
-                result: dict[str, Any] = dict(self.graph.invoke(state))
-            else:
-                result = dict(state)
-                for node in (self._planning, self._executing, self._reviewing):
-                    result.update(node(cast(RuntimeState, result)))
+            result: dict[str, Any] = dict(state)
+            for node in (self._planning, self._executing, self._reviewing):
+                result.update(node(cast(RuntimeState, result)))
             report = self._report_from_dict(result["report"])
             self._ctx.step += 1
             self.store.succeed(

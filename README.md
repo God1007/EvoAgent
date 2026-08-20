@@ -12,7 +12,6 @@
 [![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![Coverage](https://img.shields.io/badge/coverage-85%25-brightgreen)](docs/evaluation.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![LangGraph](https://img.shields.io/badge/Orchestration-LangGraph-1C3C3C)](https://github.com/langchain-ai/langgraph)
 [![PostgreSQL](https://img.shields.io/badge/Storage-SQLite%20%7C%20PostgreSQL-4169E1?logo=postgresql&logoColor=white)](#运行模式)
 [![Redis](https://img.shields.io/badge/Queue-In--Process%20%7C%20Redis-DC382D?logo=redis&logoColor=white)](#运行模式)
 [![OpenAI Compatible](https://img.shields.io/badge/LLM-OpenAI%20Compatible-412991)](#接入大模型)
@@ -617,7 +616,7 @@ curl http://127.0.0.1:8080/health
 {
   "status": "ok",
   "reviewer": "multi-agent-collaboration",
-  "runtime": "langgraph",
+  "runtime": "durable-state-machine",
   "queue": "redis-streams",
   "queue_durable": true,
   "llm_provider": "local",
@@ -895,7 +894,7 @@ GitHub PR Webhook 的 delivery、Session Turn、Review Task 与 Outbox 消息在
 │   ├── slo.py                    # 版本化 SLO 与 Prometheus 评估 CLI
 │   ├── dr.py                     # 隔离备份恢复演练与 RPO/RTO 证据
 │   ├── recovery.py               # PostgreSQL/Outbox 到空 Redis 的离线任务重建
-│   ├── harness.py                # LangGraph、状态机与 Checkpoint
+│   ├── harness.py                # 状态机与 Checkpoint
 │   ├── agents.py                 # 多 Agent 协作协议
 │   ├── reviewer.py               # 本地规则与 OpenAI-compatible Reviewer
 │   ├── skills.py                 # 动态 Skill 注册、校验和隔离执行

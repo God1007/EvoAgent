@@ -63,7 +63,6 @@ class Settings:
     github_app_id: str = ""
     github_app_slug: str = ""
     github_private_key_path: str = ""
-    public_base_url: str = "http://127.0.0.1:8080"
     llm_provider: str = "local"
     deepseek_api_key: str = ""
     openrouter_api_key: str = ""
@@ -131,11 +130,6 @@ class Settings:
     otel_service_name: str = "evoagent"
     alert_failure_rate: float = 0.20
     alert_min_samples: int = 10
-    alert_window_seconds: int = 900
-    alert_webhook_url: str = ""
-    alert_smtp_host: str = ""
-    alert_email_to: str = ""
-    continuous_eval_seconds: int = 0
     web_workers: int = 1
     rate_limit_rps: int = 0
     rate_limit_burst: int = 0
@@ -148,7 +142,6 @@ class Settings:
     tenant_capacity_retry_seconds: int = 5
     breaker_failure_threshold: int = 5
     breaker_reset_seconds: int = 30
-    outbound_retries: int = 2
     pg_pool_min: int = 1
     pg_pool_max: int = 10
     pg_pool_timeout: int = 10
@@ -368,9 +361,6 @@ class Settings:
             github_app_id=os.getenv("EVOAGENT_GITHUB_APP_ID", ""),
             github_app_slug=os.getenv("EVOAGENT_GITHUB_APP_SLUG", ""),
             github_private_key_path=os.getenv("EVOAGENT_GITHUB_PRIVATE_KEY_PATH", ""),
-            public_base_url=os.getenv("EVOAGENT_PUBLIC_BASE_URL", "http://127.0.0.1:8080").rstrip(
-                "/"
-            ),
             llm_provider=os.getenv("EVOAGENT_LLM_PROVIDER", "local"),
             deepseek_api_key=os.getenv("EVOAGENT_DEEPSEEK_API_KEY", ""),
             openrouter_api_key=os.getenv("EVOAGENT_OPENROUTER_API_KEY", ""),
@@ -458,11 +448,6 @@ class Settings:
             otel_service_name=os.getenv("EVOAGENT_OTEL_SERVICE_NAME", "evoagent"),
             alert_failure_rate=float(os.getenv("EVOAGENT_ALERT_FAILURE_RATE", "0.20")),
             alert_min_samples=_int("EVOAGENT_ALERT_MIN_SAMPLES", 10),
-            alert_window_seconds=_int("EVOAGENT_ALERT_WINDOW_SECONDS", 900),
-            alert_webhook_url=os.getenv("EVOAGENT_ALERT_WEBHOOK_URL", ""),
-            alert_smtp_host=os.getenv("EVOAGENT_ALERT_SMTP_HOST", ""),
-            alert_email_to=os.getenv("EVOAGENT_ALERT_EMAIL_TO", ""),
-            continuous_eval_seconds=_non_negative_int("EVOAGENT_CONTINUOUS_EVAL_SECONDS", 0),
             web_workers=_int("EVOAGENT_WEB_WORKERS", 1),
             rate_limit_rps=_non_negative_int("EVOAGENT_RATE_LIMIT_RPS", 0),
             rate_limit_burst=_non_negative_int("EVOAGENT_RATE_LIMIT_BURST", 0),
@@ -475,7 +460,6 @@ class Settings:
             tenant_capacity_retry_seconds=_int("EVOAGENT_TENANT_CAPACITY_RETRY_SECONDS", 5),
             breaker_failure_threshold=_int("EVOAGENT_BREAKER_FAILURE_THRESHOLD", 5),
             breaker_reset_seconds=_int("EVOAGENT_BREAKER_RESET_SECONDS", 30),
-            outbound_retries=_non_negative_int("EVOAGENT_OUTBOUND_RETRIES", 2),
             pg_pool_min=_non_negative_int("EVOAGENT_PG_POOL_MIN", 1),
             pg_pool_max=_int("EVOAGENT_PG_POOL_MAX", 10),
             pg_pool_timeout=_int("EVOAGENT_PG_POOL_TIMEOUT", 10),

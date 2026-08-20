@@ -15,7 +15,7 @@ and the durability/recovery model. It complements the high-level diagrams in the
 | Composition | `evoagent/bootstrap.py` | Replaceable built-in provider catalog and transactional application startup |
 | Application | `evoagent/application/` | Focused Review, Webhook, Session, Repair, Policy, and Model Usage use cases |
 | Composition facade | `evoagent/service.py` | Capability wiring, lifecycle/health, canary/shadow runtime selection, API compatibility |
-| Runtime | `evoagent/harness.py` | LangGraph state machine, budget, retry, checkpoint/resume |
+| Runtime | `evoagent/harness.py` | Durable state machine, budget, retry, checkpoint/resume |
 | Runtime | `evoagent/task_queue.py` | In-process queue or Redis Streams (ACK, lease, DLQ, replay, content-addressed weighted tenant turns) |
 | Runtime | `evoagent/outbox.py` | Store-to-queue transactional publication, leases, retry and recovery |
 | Review | `evoagent/review_extensions.py`, `review_engine.py`, `agents.py` | Stable reviewer-contribution seam, replaceable engine, and default multi-agent collaboration protocol |
@@ -61,7 +61,7 @@ change (webhook | REST | console)
       REST: admission + task + Diff + outbox in one transaction
   → OutboxDispatcher                        # lease + idempotent publication
   → TaskQueue                               # memory or Redis Streams; optional weighted tenant turn before handler start
-  → ReviewHarness.run                       # LangGraph nodes, checkpoint each step
+  → ReviewHarness.run                       # ordered nodes, checkpoint each step
       parse → plan → specialists (security, reliability, llm, skills)
             llm → ModelGateway (scope → weighted active route → redact → reserve → call/fallback → validate → account → isolated shadow)
             → evidence gate (critic, test) → synthesize → verify

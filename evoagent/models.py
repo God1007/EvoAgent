@@ -1,11 +1,21 @@
 import hashlib
 import json
+import math
 import re
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from enum import Enum
 from typing import Any
 
 _WHITESPACE = re.compile(r"\s+")
+MAX_RULE_ID_CHARS = 80
+FINDING_TEXT_LIMITS = {
+    "title": 200,
+    "explanation": 2000,
+    "path": 4096,
+    "evidence": 240,
+    "fix": 2000,
+    "test": 2000,
+}
 
 
 class TaskState(str, Enum):
@@ -133,6 +143,42 @@ class Finding:
         missing = required - set(data)
         if missing:
             raise ValueError("finding is missing required fields: %s" % ", ".join(sorted(missing)))
+        text_fields = ("rule_id", "title", "explanation", "path", "evidence", "fix", "test")
+        invalid_text = [name for name in text_fields if not isinstance(data[name], str)]
+        if invalid_text:
+            raise ValueError("finding fields must be strings: %s" % ", ".join(sorted(invalid_text)))
+        try:
+            if any("\x00" in data[name] for name in text_fields):
+                raise UnicodeError
+            for name in text_fields:
+                data[name].encode("utf-8")
+        except UnicodeError:
+            raise ValueError("finding fields must be valid UTF-8 without NUL bytes") from None
+        rule_id = data["rule_id"]
+        if (
+            not rule_id
+            or rule_id != rule_id.strip()
+            or len(rule_id) > MAX_RULE_ID_CHARS
+            or not all(character.isprintable() and not character.isspace() for character in rule_id)
+        ):
+            raise ValueError(
+                "finding rule_id must be a printable whitespace-free token of at most %d characters"
+                % MAX_RULE_ID_CHARS
+            )
+        oversized = [name for name, limit in FINDING_TEXT_LIMITS.items() if len(data[name]) > limit]
+        if oversized:
+            raise ValueError("finding fields exceed size limits: %s" % ", ".join(sorted(oversized)))
+        if not isinstance(data["line"], int) or isinstance(data["line"], bool) or data["line"] < 1:
+            raise ValueError("finding line must be a positive integer")
+        confidence = data.get("confidence", 0.8)
+        if (
+            not isinstance(confidence, (int, float))
+            or isinstance(confidence, bool)
+            or not math.isfinite(confidence)
+            or not 0 <= confidence <= 1
+        ):
+            raise ValueError("finding confidence must be a finite number between 0 and 1")
+        data["confidence"] = float(confidence)
         return cls(**data)
 
 
@@ -145,6 +191,48 @@ class ReviewReport:
     findings: list[Finding] = field(default_factory=list)
     files_reviewed: list[str] = field(default_factory=list)
     reviewer: str = "local-rules"
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ReviewReport":
+        if not isinstance(value, dict):
+            raise ValueError("review report must be an object")
+        missing = {"repository", "summary", "risk"}.difference(value)
+        if missing:
+            raise ValueError(
+                "review report is missing required fields: %s" % ", ".join(sorted(missing))
+            )
+        reviewer = value.get("reviewer", "unknown")
+        if any(
+            not isinstance(item, str)
+            for item in (value["repository"], value["summary"], value["risk"], reviewer)
+        ):
+            raise ValueError("review report text fields must be strings")
+        if not value["repository"] or value["risk"] not in {"low", "medium", "high"}:
+            raise ValueError("review report repository and risk are invalid")
+        pull_request = value.get("pull_request")
+        if pull_request is not None and (
+            isinstance(pull_request, bool) or not isinstance(pull_request, int) or pull_request <= 0
+        ):
+            raise ValueError("review report pull_request must be a positive integer or null")
+        raw_findings = value.get("findings", [])
+        if not isinstance(raw_findings, list) or any(
+            not isinstance(item, dict) for item in raw_findings
+        ):
+            raise ValueError("review report findings must be a list of objects")
+        files_reviewed = value.get("files_reviewed", [])
+        if not isinstance(files_reviewed, list) or any(
+            not isinstance(item, str) for item in files_reviewed
+        ):
+            raise ValueError("review report files_reviewed must be a list of strings")
+        return cls(
+            repository=value["repository"],
+            pull_request=pull_request,
+            summary=value["summary"],
+            risk=value["risk"],
+            findings=[Finding.from_dict(item) for item in raw_findings],
+            files_reviewed=files_reviewed,
+            reviewer=reviewer,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {

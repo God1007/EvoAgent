@@ -33,7 +33,6 @@ from dataclasses import dataclass, field
 _READ_MIX = [
     ("GET", "/health", 3, None),
     ("GET", "/ready", 1, None),
-    ("GET", "/metrics", 1, None),
 ]
 _INTAKE_MIX = [
     ("GET", "/health", 1, None),

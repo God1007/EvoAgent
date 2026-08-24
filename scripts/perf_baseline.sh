@@ -4,13 +4,12 @@
 #
 # Orchestrates scripts/loadgen.py and scripts/microbench.py across a fixed suite
 # of scenarios and writes per-run JSON plus a machine-readable index to an output
-# directory. Designed to be re-run on any host to refresh docs/performance-baseline.md.
+# directory. Results are machine-specific and are not committed as a baseline.
 #
 # Suites:
 #   single      steady rate-sweep (knee), intake, spike recovery, compressed soak
 #   overload    rate-limit shed (429 + Retry-After) and heavy-gate shed (503) + recovery
 #   micro       hot-path micro-benchmarks
-#   multiworker web-layer horizontal scaling via SO_REUSEPORT workers
 #   all         everything above (default)
 #
 # Usage:
@@ -27,6 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PYTHON="${PYTHON:-${PROJECT_DIR}/.venv/bin/python}"
 command -v "$PYTHON" >/dev/null 2>&1 || PYTHON="python3"
+: "${EVOAGENT_DATABASE_URL:?set EVOAGENT_DATABASE_URL to a disposable PostgreSQL database}"
 
 SUITE="all"
 OUT=""
@@ -35,7 +35,7 @@ PORT="${EVOAGENT_PERF_PORT:-8199}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    single|overload|micro|multiworker|all) SUITE="$1" ;;
+    single|overload|micro|all) SUITE="$1" ;;
     --out) shift; OUT="$1" ;;
     --quick) QUICK=1 ;;
     -h|--help) sed -n '3,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -64,9 +64,7 @@ ok()   { printf "\033[32m✓\033[0m %s\n" "$*"; }
 warn() { printf "\033[33m!\033[0m %s\n" "$*"; }
 
 # --- server lifecycle -------------------------------------------------------
-# The server always enables SO_REUSEPORT, so a leaked/orphaned instance can keep
-# sharing $PORT and silently pollute results. Guarantee the port is empty by
-# killing anything still listening on it.
+# Guarantee the port is empty so a leaked instance cannot pollute results.
 free_port() {
   local pids i=1
   while [ "$i" -le 20 ]; do
@@ -88,13 +86,13 @@ boot_server() {
   (
     cd "$PROJECT_DIR"
     exec env EVOAGENT_HOST=127.0.0.1 EVOAGENT_PORT="$PORT" EVOAGENT_AUTH_REQUIRED=false \
-        EVOAGENT_DB_PATH="${OUT}/perf-${label}.db" "$@" \
-        "$PYTHON" -m evoagent
+        EVOAGENT_DATABASE_URL="$EVOAGENT_DATABASE_URL" \
+        "$@" "$PYTHON" -m evoagent
   ) >>"$SERVER_LOG" 2>&1 &
   SERVER_PID=$!
   local i=1
   while [ "$i" -le 40 ]; do
-    if curl -fsS "${BASE_URL}/health" >/dev/null 2>&1; then
+    if curl -fsS "${BASE_URL}/ready" >/dev/null 2>&1; then
       ok "server ready (pid ${SERVER_PID})"; return 0
     fi
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -107,35 +105,18 @@ boot_server() {
 
 stop_server() {
   [ -n "$SERVER_PID" ] || return 0
-  # Capture workers BEFORE killing the parent (once the parent dies they are
-  # reparented and pgrep -P can no longer find them).
-  local kids; kids=$(pgrep -P "$SERVER_PID" 2>/dev/null || true)
-  # Kill the supervisor FIRST so it stops respawning crashed workers (the
-  # multi-worker master auto-restarts children; killing workers first just makes
-  # it spawn new ones that keep the SO_REUSEPORT socket alive forever).
   kill "$SERVER_PID" 2>/dev/null || true
-  # shellcheck disable=SC2086
-  [ -n "$kids" ] && kill $kids 2>/dev/null || true
   local i=1
   while [ "$i" -le 10 ] && kill -0 "$SERVER_PID" 2>/dev/null; do sleep 0.3; i=$((i + 1)); done
   kill -9 "$SERVER_PID" 2>/dev/null || true
-  # shellcheck disable=SC2086
-  [ -n "$kids" ] && kill -9 $kids 2>/dev/null || true
   wait "$SERVER_PID" 2>/dev/null || true
-  # Belt and suspenders: nothing must survive on the port (SO_REUSEPORT).
   free_port
   SERVER_PID=""
 }
 trap stop_server EXIT
 
 rss_kb() {
-  # Total RSS (KB) of the server process tree (parent + forked workers).
-  local total=0 r
-  for pid in $(pgrep -P "$SERVER_PID" 2>/dev/null) "$SERVER_PID"; do
-    r=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
-    [ -n "$r" ] && total=$((total + r))
-  done
-  echo "$total"
+  ps -o rss= -p "$SERVER_PID" 2>/dev/null | tr -d ' '
 }
 
 # --- loadgen wrapper --------------------------------------------------------
@@ -299,18 +280,6 @@ suite_micro() {
     | tee "${OUT}/microbench.txt" || true
 }
 
-suite_multiworker() {
-  local cores; cores=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)
-  for w in 1 2 4; do
-    boot_server "mw${w}" EVOAGENT_WEB_WORKERS="$w" || { warn "skip w=${w}"; continue; }
-    info "Multi-worker w=${w}: read mix @ 3000 rps"
-    "$PYTHON" "${PROJECT_DIR}/scripts/loadgen.py" --base-url "$BASE_URL" \
-      --scenario steady --duration "$STEADY_DUR" --rate 3000 --concurrency 64 --warmup "$WARMUP" \
-      --json "${OUT}/multiworker-w${w}.json" | tee "${OUT}/multiworker-w${w}.txt" || true
-    stop_server
-  done
-}
-
 # --- run --------------------------------------------------------------------
 info "Output dir: ${OUT}"
 "$PYTHON" --version 2>&1 | sed 's/^/python: /'
@@ -329,12 +298,8 @@ case "$SUITE" in
   single)      suite_single ;;
   overload)    suite_overload ;;
   micro)       suite_micro ;;
-  multiworker) suite_multiworker ;;
-  all)         suite_single; suite_overload; suite_micro; suite_multiworker ;;
+  all)         suite_single; suite_overload; suite_micro ;;
 esac
-
-# Throwaway SQLite files - keep only the JSON/CSV/txt artifacts.
-rm -f "${OUT}"/perf-*.db "${OUT}"/perf-*.db-* 2>/dev/null || true
 
 ok "Done. Artifacts in ${OUT}"
 ls -1 "$OUT"

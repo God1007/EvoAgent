@@ -29,9 +29,10 @@ from evoagent.session import classify_findings, snapshot_findings
 # for noise. Observed ns/op (fast dev box / GitHub CI): parse 111k/349k,
 # fingerprint 2.2k/6.4k, classify 157k/456k, codegraph 56k/161k. Budgets sit at
 # ~3x the CI figure - loose enough not to flake, tight enough to catch a >3x
-# regression. Tune against `docs/performance-baseline.md`.
+# regression. Recalibrate only from repeated runs on the slowest supported CI host.
 BUDGETS_NS = {
     "parse_unified_diff": 1_000_000,
+    "parse_many_files": 50_000_000,
     "finding_fingerprint": 50_000,
     "scoped_fingerprint": 50_000,
     "classify_findings": 1_500_000,
@@ -80,6 +81,7 @@ def _make_sources(modules: int = 30) -> dict[str, str]:
 
 def _benchmarks():
     diff = _make_diff()
+    many_files = "".join("+++ b/f%d.py\n" % index for index in range(10_000))
     findings = _make_findings()
     one_finding = findings[0]
     previous = snapshot_findings("org/repo", findings)
@@ -89,6 +91,7 @@ def _benchmarks():
 
     return {
         "parse_unified_diff": (lambda: parse_unified_diff(diff), 2000),
+        "parse_many_files": (lambda: parse_unified_diff(many_files), 20),
         "finding_fingerprint": (lambda: one_finding.fingerprint(), 20000),
         "scoped_fingerprint": (lambda: one_finding.scoped_fingerprint("org/repo"), 20000),
         "classify_findings": (lambda: classify_findings("org/repo", previous, current), 2000),

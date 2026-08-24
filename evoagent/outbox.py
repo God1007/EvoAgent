@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import socket
 import threading
@@ -26,12 +27,36 @@ class OutboxDispatcher:
         max_attempts: int = 20,
         autostart: bool = True,
     ):
+        if (
+            isinstance(poll_seconds, bool)
+            or not isinstance(poll_seconds, (int, float))
+            or not math.isfinite(poll_seconds)
+            or poll_seconds < 0.01
+        ):
+            raise ValueError("outbox poll interval must be finite and at least 0.01 seconds")
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or not 1 <= batch_size <= 500
+        ):
+            raise ValueError("outbox batch size must be an integer between 1 and 500")
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, (int, float))
+            or not math.isfinite(lease_seconds)
+            or lease_seconds < 1
+        ):
+            raise ValueError("outbox lease must be finite and at least one second")
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts <= 0:
+            raise ValueError("outbox attempts must be a positive integer")
+        if not isinstance(autostart, bool):
+            raise ValueError("outbox autostart must be boolean")
         self.store = store
         self.queue = queue
-        self.poll_seconds = max(0.01, poll_seconds)
-        self.batch_size = max(1, min(batch_size, 500))
-        self.lease_seconds = max(1.0, lease_seconds)
-        self.max_attempts = max(1, max_attempts)
+        self.poll_seconds = float(poll_seconds)
+        self.batch_size = batch_size
+        self.lease_seconds = float(lease_seconds)
+        self.max_attempts = max_attempts
         self.owner = "%s:%d:%s" % (socket.gethostname(), os.getpid(), uuid.uuid4().hex[:12])
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -67,6 +92,7 @@ class OutboxDispatcher:
             self.max_attempts,
         )
         published = 0
+        failed = False
         for message in messages:
             try:
                 if message.get("topic") != "review":
@@ -79,17 +105,25 @@ class OutboxDispatcher:
                     metrics.inc("outbox_lease_conflicts_total")
             except Exception as exc:
                 attempts = int(message.get("attempts", 1))
-                delay = min(float(2 ** max(0, attempts - 1)), 30.0)
-                self.store.release_outbox(
-                    str(message["id"]),
-                    self.owner,
-                    safe_exception_summary(exc, "outbox dispatch failed"),
-                    delay,
-                    self.max_attempts,
-                )
+                delay = min(2.0 ** min(max(0, attempts - 1), 5), 30.0)
                 metrics.inc("outbox_publish_failures_total")
-                self._set_error(exc)
-        if published:
+                failed = True
+                try:
+                    released = self.store.release_outbox(
+                        str(message["id"]),
+                        self.owner,
+                        safe_exception_summary(exc, "outbox dispatch failed"),
+                        delay,
+                        self.max_attempts,
+                    )
+                except Exception as release_error:
+                    metrics.inc("outbox_dispatch_failures_total")
+                    self._set_error(release_error)
+                else:
+                    if not released:
+                        metrics.inc("outbox_lease_conflicts_total")
+                    self._set_error(exc)
+        if not failed:
             self._set_error(None)
         return published
 

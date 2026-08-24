@@ -8,6 +8,22 @@ def _boom():
 
 
 class CircuitBreakerTests(unittest.TestCase):
+    def test_constructor_rejects_invalid_runtime_limits(self):
+        for kwargs in (
+            {"failure_threshold": 0},
+            {"failure_threshold": True},
+            {"failure_threshold": 1.0},
+            {"reset_seconds": -1},
+            {"reset_seconds": True},
+            {"reset_seconds": float("nan")},
+            {"reset_seconds": float("inf")},
+            {"half_open_max": 0},
+            {"half_open_max": True},
+            {"half_open_max": 1.0},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, "circuit breaker"):
+                CircuitBreaker("t", **kwargs)
+
     def test_opens_after_threshold_failures(self):
         breaker = CircuitBreaker("t", failure_threshold=2, reset_seconds=999)
         for _ in range(2):

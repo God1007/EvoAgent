@@ -14,6 +14,7 @@ State machine:
   breaker, a failure re-opens it.
 """
 
+import math
 import random
 import threading
 import time
@@ -39,10 +40,29 @@ class CircuitBreaker:
         reset_seconds: float = 30.0,
         half_open_max: int = 1,
     ):
+        if (
+            isinstance(failure_threshold, bool)
+            or not isinstance(failure_threshold, int)
+            or failure_threshold <= 0
+        ):
+            raise ValueError("circuit breaker failure threshold must be a positive integer")
+        if (
+            isinstance(reset_seconds, bool)
+            or not isinstance(reset_seconds, (int, float))
+            or not math.isfinite(reset_seconds)
+            or reset_seconds < 0
+        ):
+            raise ValueError("circuit breaker reset seconds must be finite and non-negative")
+        if (
+            isinstance(half_open_max, bool)
+            or not isinstance(half_open_max, int)
+            or half_open_max <= 0
+        ):
+            raise ValueError("circuit breaker half-open limit must be a positive integer")
         self.name = name
-        self.failure_threshold = max(1, failure_threshold)
-        self.reset_seconds = max(0.0, reset_seconds)
-        self.half_open_max = max(1, half_open_max)
+        self.failure_threshold = failure_threshold
+        self.reset_seconds = float(reset_seconds)
+        self.half_open_max = half_open_max
         self._state = self.CLOSED
         self._failures = 0
         self._opened_at = 0.0

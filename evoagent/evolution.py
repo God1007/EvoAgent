@@ -1,6 +1,8 @@
 import hashlib
 import json
+import math
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -9,7 +11,7 @@ from .diff_parser import parse_unified_diff
 from .errors import ClientInputError, safe_exception_summary
 from .ports import EvolutionStorePort
 from .reviewer import Reviewer
-from .store import utc_now
+from .time_utils import utc_now
 
 DEFAULT_PROMPT = (
     "Review the unified diff. Return JSON findings with severity, fix and test. "
@@ -57,6 +59,8 @@ DEFAULT_EVALUATION_CASES: list[dict[str, Any]] = [
 ]
 
 SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+MAX_PROMPT_CHARS = 12_000
+MAX_EVALUATION_CASES = 500
 
 
 class RegressionEvaluator:
@@ -65,7 +69,13 @@ class RegressionEvaluator:
     def __init__(self, reviewer_factory: Callable[[str], Reviewer]):
         self.reviewer_factory = reviewer_factory
 
-    def run(self, prompt: str, cases: list[dict]) -> dict[str, Any]:
+    def run(
+        self,
+        prompt: str,
+        cases: list[dict],
+        *,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
         reviewer = self.reviewer_factory(prompt)
         reviewer_name = str(getattr(reviewer, "name", reviewer.__class__.__name__))
         true_positive = false_positive = false_negative = 0
@@ -80,6 +90,8 @@ class RegressionEvaluator:
             expected_total += len(expected_items)
             clean_total += int(not expected_items)
             try:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("evaluation budget exceeded")
                 parsed = parse_unified_diff(case["diff"])
                 findings = reviewer.review(case["diff"], parsed)
                 predicted: dict[tuple[str, int, str], str] = {}
@@ -220,7 +232,7 @@ class RegressionEvaluator:
 
 
 class EvolutionEngine:
-    """Prompt evolution backed by replay evaluation, audit records and activation gates."""
+    """Prompt evolution backed by replay evaluation and qualification gates."""
 
     FORBIDDEN = ("ignore previous", "disable safety", "bypass", "直接执行生产")
 
@@ -234,7 +246,43 @@ class EvolutionEngine:
         min_holdout_cases: int = 0,
         max_metric_regression: float = 0.0,
         seed_defaults: bool = True,
+        timeout_seconds: float = 120,
+        execution_revision: str = "",
     ):
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in (min_cases, max_cases, min_holdout_cases)
+        ):
+            raise ValueError("evolution case limits must be integers")
+        if not 1 <= min_cases <= max_cases <= MAX_EVALUATION_CASES:
+            raise ValueError("evolution validation cases must satisfy 1 <= min <= max <= 500")
+        if not 0 <= min_holdout_cases <= max_cases:
+            raise ValueError("evolution holdout minimum must be between 0 and max cases")
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or not 0 <= value <= 1
+            for value in (min_improvement, max_metric_regression)
+        ):
+            raise ValueError("evolution metric thresholds must be finite numbers between 0 and 1")
+        if not isinstance(seed_defaults, bool):
+            raise ValueError("evolution seed_defaults must be boolean")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("evolution timeout must be positive and finite")
+        if not isinstance(execution_revision, str) or (
+            execution_revision
+            and (
+                len(execution_revision) != 64
+                or any(character not in "0123456789abcdef" for character in execution_revision)
+            )
+        ):
+            raise ValueError("evolution execution revision must be a SHA-256 digest")
         self.store = store
         self.reviewer_factory = reviewer_factory
         self.min_cases = min_cases
@@ -242,6 +290,8 @@ class EvolutionEngine:
         self.min_improvement = min_improvement
         self.min_holdout_cases = min_holdout_cases
         self.max_metric_regression = max_metric_regression
+        self.timeout_seconds = float(timeout_seconds)
+        self.execution_revision = execution_revision
         self._lock = threading.RLock()
         if seed_defaults:
             self._seed_default_cases()
@@ -281,18 +331,32 @@ class EvolutionEngine:
         for item in expected:
             if not isinstance(item, dict):
                 raise ClientInputError("each expected finding must be an object")
-            try:
-                location = (str(item.get("path", "")), int(item.get("line", 0)))
-            except (TypeError, ValueError) as exc:
-                raise ClientInputError("expected finding line must be an integer") from exc
+            unknown = set(item).difference({"path", "line", "min_severity", "rule_id"})
+            if unknown:
+                raise ClientInputError(
+                    "unsupported expected finding fields: %s" % ", ".join(sorted(unknown))
+                )
+            path = item.get("path")
+            line = item.get("line")
+            if not isinstance(path, str) or not path or len(path) > 4096:
+                raise ClientInputError("expected finding path must be a non-empty string")
+            if isinstance(line, bool) or not isinstance(line, int):
+                raise ClientInputError("expected finding line must be an integer")
+            location = (path, line)
             if location not in valid_locations:
                 raise ClientInputError(
                     "expected finding must point to an added line: %s:%s" % location
                 )
-            if str(item.get("min_severity", "low")).lower() not in SEVERITY_RANK:
+            minimum = item.get("min_severity", "low")
+            if not isinstance(minimum, str) or minimum.lower() not in SEVERITY_RANK:
                 raise ClientInputError("invalid min_severity")
-            rule_id = str(item.get("rule_id", "")).strip()
-            if "rule_id" in item and (not rule_id or len(rule_id) > 80):
+            rule_id = item.get("rule_id", "")
+            if "rule_id" in item and (
+                not isinstance(rule_id, str)
+                or not rule_id
+                or rule_id != rule_id.strip()
+                or len(rule_id) > 80
+            ):
                 raise ClientInputError("rule_id must be non-empty and at most 80 characters")
             identity = location + (rule_id,)
             if identity in seen:
@@ -317,7 +381,7 @@ class EvolutionEngine:
         lowered = normalized.lower()
         safety = (
             bool(normalized)
-            and len(normalized) <= 12000
+            and len(normalized) <= MAX_PROMPT_CHARS
             and not any(token in lowered for token in self.FORBIDDEN)
         )
         required = ("diff", "severity", "fix", "test", "json")
@@ -358,6 +422,9 @@ class EvolutionEngine:
         skill_name = skill_name.strip()
         if not skill_name or len(skill_name) > 120:
             raise ClientInputError("skill_name is required and must be at most 120 characters")
+        prompt = prompt.strip()
+        if len(prompt) > MAX_PROMPT_CHARS:
+            raise ClientInputError("candidate prompt must be at most 12000 characters")
         with self._lock:
             return self._propose(skill_name, prompt, regression_score)
 
@@ -367,25 +434,34 @@ class EvolutionEngine:
         prompt: str,
         regression_score: float | None,
     ) -> dict[str, Any]:
+        prompt = prompt.strip()
         safety = self.safety_evaluate(prompt)
         active = self.store.get_active_skill_version(skill_name)
-        if active and prompt.strip() == active["prompt"].strip():
-            return {
-                "version": {
-                    "skill_name": active["skill_name"],
-                    "version": active["version"],
-                    "score": active["score"],
-                    "active": bool(active["active"]),
-                },
-                "decision": "deferred",
-                "reason": "candidate prompt is identical to the active version",
-                "candidate": self._empty_metrics(0),
-                "baseline": self._empty_metrics(0),
-                "candidate_holdout": self._redact_holdout_metrics(self._empty_metrics(0)),
-                "baseline_holdout": self._redact_holdout_metrics(self._empty_metrics(0)),
-                "safety": safety,
-                "run_id": None,
-            }
+        existing = self.store.get_skill_version_by_prompt(skill_name, prompt)
+        if existing and (existing["qualification"] != "legacy" or existing["active"]):
+            evaluated_revision = (
+                self.store.get_skill_evaluation_revision(skill_name, existing["version"])
+                if self.execution_revision and not existing["active"]
+                else self.execution_revision
+            )
+            if not self.execution_revision or evaluated_revision == self.execution_revision:
+                return {
+                    "version": {
+                        "skill_name": existing["skill_name"],
+                        "version": existing["version"],
+                        "score": existing["score"],
+                        "active": bool(existing["active"]),
+                        "qualification": existing["qualification"],
+                    },
+                    "decision": "deferred",
+                    "reason": "candidate prompt is identical to an existing version",
+                    "candidate": self._empty_metrics(0),
+                    "baseline": self._empty_metrics(0),
+                    "candidate_holdout": self._redact_holdout_metrics(self._empty_metrics(0)),
+                    "baseline_holdout": self._redact_holdout_metrics(self._empty_metrics(0)),
+                    "safety": safety,
+                    "run_id": None,
+                }
         baseline_prompt = active["prompt"] if active else DEFAULT_PROMPT
         cases = self.store.list_evaluation_cases("validation", True, self.max_cases)
         holdout_cases = self.store.list_evaluation_cases("holdout", True, self.max_cases)
@@ -413,20 +489,19 @@ class EvolutionEngine:
                 "candidate saved but no LLM provider is configured; replay evaluation was not run"
             )
         elif len(cases) < self.min_cases:
-            reason = (
-                "candidate saved but the validation dataset is smaller than the activation minimum"
-            )
+            reason = "candidate saved but the validation dataset is smaller than the qualification minimum"
         elif len(holdout_cases) < self.min_holdout_cases:
             reason = (
-                "candidate saved but the holdout dataset is smaller than the activation minimum"
+                "candidate saved but the holdout dataset is smaller than the qualification minimum"
             )
         else:
             evaluator = RegressionEvaluator(self.reviewer_factory)
-            baseline_metrics = evaluator.run(baseline_prompt, cases)
-            candidate_metrics = evaluator.run(prompt, cases)
+            deadline = time.monotonic() + self.timeout_seconds
+            baseline_metrics = evaluator.run(baseline_prompt, cases, deadline=deadline)
+            candidate_metrics = evaluator.run(prompt, cases, deadline=deadline)
             if holdout_cases:
-                baseline_holdout = evaluator.run(baseline_prompt, holdout_cases)
-                candidate_holdout = evaluator.run(prompt, holdout_cases)
+                baseline_holdout = evaluator.run(baseline_prompt, holdout_cases, deadline=deadline)
+                candidate_holdout = evaluator.run(prompt, holdout_cases, deadline=deadline)
             no_errors = not (
                 baseline_metrics["errors"]
                 or candidate_metrics["errors"]
@@ -447,10 +522,8 @@ class EvolutionEngine:
                 }
             )
             if no_errors and improved and validation_safe and holdout_safe:
-                decision = "activated"
-                reason = (
-                    "candidate improved on validation and passed the non-regression holdout gate"
-                )
+                decision = "approved"
+                reason = "candidate passed evaluation and is approved for a governed rollout"
             else:
                 decision = "rejected"
                 reasons = []
@@ -465,7 +538,10 @@ class EvolutionEngine:
                 reason = "; ".join(reasons)
 
         version = self.store.save_skill_version(
-            skill_name, prompt.strip(), candidate_metrics["score"], decision == "activated"
+            skill_name,
+            prompt,
+            candidate_metrics["score"],
+            qualification=decision,
         )
         run = {
             "id": str(uuid.uuid4()),
@@ -484,8 +560,9 @@ class EvolutionEngine:
                 "gates": gates,
                 "reason": reason,
                 "reproducibility": {
-                    "evaluation_schema_version": 2,
-                    "candidate_prompt_sha256": self._sha256(prompt.strip()),
+                    "evaluation_schema_version": 3,
+                    "execution_revision": self.execution_revision,
+                    "candidate_prompt_sha256": self._sha256(prompt),
                     "baseline_prompt_sha256": self._sha256(baseline_prompt),
                     "validation_dataset_sha256": self._dataset_fingerprint(cases),
                     "holdout_dataset_sha256": self._dataset_fingerprint(holdout_cases),
@@ -509,10 +586,6 @@ class EvolutionEngine:
             "gates": gates,
             "run_id": run["id"],
         }
-
-    def rollback(self, skill_name: str, version: int) -> bool:
-        with self._lock:
-            return self.store.activate_skill_version(skill_name, version)
 
     def auto_propose(self, skill_name: str = "llm-review") -> dict[str, Any]:
         cases = self.store.list_failure_cases(True, 100)
@@ -555,8 +628,6 @@ class EvolutionEngine:
         result = self.propose(skill_name, candidate)
         result["failure_cases_used"] = len(cases)
         result["learned_categories"] = counts
-        if result["decision"] == "activated":
-            self.store.resolve_failure_cases([case["id"] for case in cases])
         return result
 
     @staticmethod

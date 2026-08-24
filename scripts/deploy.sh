@@ -3,20 +3,19 @@
 # One-click deployment for EvoAgent.
 #
 # Brings up the full stack (EvoAgent + PostgreSQL + Redis) via Docker Compose.
-# It is idempotent and safe to re-run: existing secrets in .env are never
-# overwritten, only missing ones are generated.
+# Existing secrets in .env are preserved. `up` refuses to replace a running
+# application; drain it first using docs/operations.md.
 #
 # Usage:
-#   scripts/deploy.sh            Provision .env, build and start the stack, wait for health
+#   scripts/deploy.sh            Provision .env, build and start the stack, wait for readiness
 #   scripts/deploy.sh up         Same as default
 #   scripts/deploy.sh down       Stop the stack (keeps volumes/data)
 #   scripts/deploy.sh destroy    Stop the stack and remove volumes (DELETES DATA)
 #   scripts/deploy.sh logs       Follow application logs
-#   scripts/deploy.sh status     Show container status and run a health check
+#   scripts/deploy.sh status     Show container status and run a readiness check
 #
 # Options:
 #   --no-build       Start without rebuilding the image
-#   --no-auth        Deploy with authentication disabled (local/testing only)
 #   --port <PORT>    Host port to publish (default: 8080)
 #   -h, --help       Show this help
 
@@ -29,7 +28,6 @@ ENV_EXAMPLE="${PROJECT_DIR}/.env.example"
 
 HOST_PORT="8080"
 DO_BUILD=1
-ENABLE_AUTH=1
 COMMAND="up"
 
 # --- pretty output ----------------------------------------------------------
@@ -55,7 +53,6 @@ while [ $# -gt 0 ]; do
   case "$1" in
     up|down|destroy|logs|status) COMMAND="$1" ;;
     --no-build) DO_BUILD=0 ;;
-    --no-auth)  ENABLE_AUTH=0 ;;
     --port) shift; [ $# -gt 0 ] || die "--port requires a value"; HOST_PORT="$1" ;;
     -h|--help) usage; exit 0 ;;
     *) die "Unknown argument: $1 (use --help)" ;;
@@ -131,29 +128,21 @@ provision_env() {
     info "Reusing existing .env"
   fi
 
-  if [ "$ENABLE_AUTH" -eq 1 ]; then
-    env_set EVOAGENT_AUTH_REQUIRED "true"
+  env_set EVOAGENT_AUTH_REQUIRED "true"
 
-    if [ -z "$(env_get EVOAGENT_AUTH_SECRET)" ]; then
-      env_set EVOAGENT_AUTH_SECRET "$(gen_secret 32)"
-      ok "Generated EVOAGENT_AUTH_SECRET"
-    fi
+  if [ -z "$(env_get EVOAGENT_AUTH_SECRET)" ]; then
+    env_set EVOAGENT_AUTH_SECRET "$(gen_secret 32)"
+    ok "Generated EVOAGENT_AUTH_SECRET"
+  fi
 
-    if [ -z "$(env_get EVOAGENT_BOOTSTRAP_ADMIN_USERNAME)" ]; then
-      env_set EVOAGENT_BOOTSTRAP_ADMIN_USERNAME "admin"
-    fi
+  if [ -z "$(env_get EVOAGENT_BOOTSTRAP_ADMIN_USERNAME)" ]; then
+    env_set EVOAGENT_BOOTSTRAP_ADMIN_USERNAME "admin"
+  fi
 
-    if [ -z "$(env_get EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD)" ]; then
-      GENERATED_ADMIN_PASSWORD="$(gen_password 20)"
-      env_set EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD "$GENERATED_ADMIN_PASSWORD"
-      ok "Generated bootstrap admin password"
-    fi
-  else
-    warn "Deploying with authentication DISABLED (--no-auth). Do not expose publicly."
-    env_set EVOAGENT_AUTH_REQUIRED "false"
-    # Provide placeholders so the compose interpolation guards are satisfied.
-    [ -n "$(env_get EVOAGENT_AUTH_SECRET)" ] || env_set EVOAGENT_AUTH_SECRET "$(gen_secret 32)"
-    [ -n "$(env_get EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD)" ] || env_set EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD "$(gen_password 20)"
+  if [ -z "$(env_get EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD)" ]; then
+    GENERATED_ADMIN_PASSWORD="$(gen_password 20)"
+    env_set EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD "$GENERATED_ADMIN_PASSWORD"
+    ok "Generated bootstrap admin password"
   fi
 
   if [ -z "$(env_get EVOAGENT_GITHUB_WEBHOOK_SECRET)" ]; then
@@ -162,14 +151,14 @@ provision_env() {
   fi
 }
 
-# --- health check -----------------------------------------------------------
-wait_for_health() {
-  local url="http://127.0.0.1:${HOST_PORT}/health"
+# --- readiness check --------------------------------------------------------
+wait_for_ready() {
+  local url="http://127.0.0.1:${HOST_PORT}/ready"
   local attempts=60 i=1
   info "Waiting for ${url} ..."
   while [ "$i" -le "$attempts" ]; do
     if curl -fsS "$url" >/dev/null 2>&1; then
-      ok "Service is healthy"
+      ok "Service is ready"
       curl -fsS "$url" 2>/dev/null || true
       echo
       return 0
@@ -177,7 +166,7 @@ wait_for_health() {
     sleep 2
     i=$((i + 1))
   done
-  err "Health check did not pass after $((attempts * 2))s."
+  err "Readiness check did not pass after $((attempts * 2))s."
   warn "Inspect logs with: ${COMPOSE} logs evoagent"
   return 1
 }
@@ -186,18 +175,14 @@ print_summary() {
   echo
   printf "${C_BOLD}EvoAgent is up.${C_RESET}\n"
   echo "  URL:       http://127.0.0.1:${HOST_PORT}"
-  echo "  Health:    http://127.0.0.1:${HOST_PORT}/health"
+  echo "  Ready:     http://127.0.0.1:${HOST_PORT}/ready"
   echo "  Dashboard: http://127.0.0.1:${HOST_PORT}/"
-  if [ "$ENABLE_AUTH" -eq 1 ]; then
-    echo "  Auth:      enabled"
-    echo "  Admin:     $(env_get EVOAGENT_BOOTSTRAP_ADMIN_USERNAME)"
-    if [ -n "${GENERATED_ADMIN_PASSWORD:-}" ]; then
-      printf "  Password:  ${C_BOLD}%s${C_RESET}  (generated once, saved in .env)\n" "$GENERATED_ADMIN_PASSWORD"
-    else
-      echo "  Password:  (see EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD in .env)"
-    fi
+  echo "  Auth:      enabled"
+  echo "  Admin:     $(env_get EVOAGENT_BOOTSTRAP_ADMIN_USERNAME)"
+  if [ -n "${GENERATED_ADMIN_PASSWORD:-}" ]; then
+    printf "  Password:  ${C_BOLD}%s${C_RESET}  (generated once, saved in .env)\n" "$GENERATED_ADMIN_PASSWORD"
   else
-    echo "  Auth:      disabled"
+    echo "  Password:  (see EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD in .env)"
   fi
   echo
   echo "  Stop:      scripts/deploy.sh down"
@@ -207,6 +192,9 @@ print_summary() {
 # --- commands ---------------------------------------------------------------
 cmd_up() {
   require_docker
+  if [ -n "$(cd "$PROJECT_DIR" && $COMPOSE ps -q evoagent)" ]; then
+    die "Refusing to replace a running EvoAgent; pause intake, drain it, then run 'scripts/deploy.sh down' before 'up'."
+  fi
   provision_env
   export EVOAGENT_HOST_PORT="$HOST_PORT"
 
@@ -216,7 +204,7 @@ cmd_up() {
   info "Starting stack (${COMPOSE} up ${build_flag} -d)"
   (cd "$PROJECT_DIR" && EVOAGENT_HOST_PORT="$HOST_PORT" $COMPOSE up $build_flag -d)
 
-  wait_for_health || exit 1
+  wait_for_ready || exit 1
   print_summary
 }
 
@@ -246,10 +234,10 @@ cmd_status() {
   require_docker
   (cd "$PROJECT_DIR" && $COMPOSE ps)
   echo
-  if curl -fsS "http://127.0.0.1:${HOST_PORT}/health" 2>/dev/null; then
-    echo; ok "Health OK"
+  if curl -fsS "http://127.0.0.1:${HOST_PORT}/ready" 2>/dev/null; then
+    echo; ok "Ready"
   else
-    warn "Health endpoint not reachable on port ${HOST_PORT}"
+    warn "Readiness endpoint not ready on port ${HOST_PORT}"
   fi
 }
 

@@ -9,7 +9,7 @@ ADR 0017 removed raw exception text from the public HTTP boundary, but the same
 text could still cross less visible boundaries: task error and Trace rows,
 graph Checkpoints, evaluation failure cases, Agent messages, Queue/DLQ entries,
 Outbox/effect receipts, readiness responses, shadow-review audit details,
-proof/verifier results, plugin lifecycle failures, and OpenTelemetry's automatic
+proof/verifier results, and OpenTelemetry's automatic
 exception event. Exception messages can contain credentials, connection strings,
 provider response bodies, file paths, source fragments, or attacker-controlled
 input. Hiding them at HTTP while retaining them throughout the system is not a
@@ -30,9 +30,9 @@ site without retaining the message or stack values.
   content. Identical stacks and types therefore correlate even when their
   messages contain different values.
 - Review Harness, Agent coordinator, Queue/DLQ, Outbox/effect, readiness,
-  shadow/evaluation, Proof/Verifier, plugin listener/lifecycle, and HTTP error
+  shadow/evaluation, Proof/Verifier, and HTTP error
   logging construct these summaries at their component boundary.
-- SQLite and PostgreSQL validate failure-bearing task, Trace, Checkpoint,
+- PostgreSQL validates failure-bearing task, Trace, Checkpoint,
   execution-case, Agent, Outbox, and effect writes again. An untrusted string
   reaching a Store Port becomes `type=unknown` with a fixed unclassified
   reference. This is defense in depth for future call paths.
@@ -42,17 +42,16 @@ site without retaining the message or stack values.
 - Forward migration 10 replaces known legacy operational exception fields with
   `type=legacy` summaries. Redis DLQ values cannot be migrated transactionally,
   so they are normalized when read, replayed, or delivered to callbacks.
-- Explicit reviewed client/configuration errors remain human-readable. The
-  credential-redacted model usage ledger and deliberately captured sandbox
-  command output remain separate, access-controlled data-retention surfaces.
+- Explicit reviewed client/configuration errors remain human-readable.
+  Deliberately captured sandbox command output remains a separate,
+  access-controlled data-retention surface.
 
 ## Consequences
 
-Routine operational records, health APIs, plugin callbacks, and spans no longer
+Routine operational records, health APIs, and spans no longer
 become secondary stores for secret-bearing exception strings. Security tests
 inject distinct credentials across every persistence and telemetry path and
-require them to be absent. SQLite/PostgreSQL migration parity is kept in one
-checksummed logical migration.
+require them to be absent. The cleanup is kept in a checksummed migration.
 
 The contract trades raw convenience for safer correlation. Operators must use
 `type + ref`, the application image/version, request/task IDs, dependency

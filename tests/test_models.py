@@ -1,6 +1,6 @@
 import unittest
 
-from evoagent.models import Finding, Severity
+from evoagent.models import FINDING_TEXT_LIMITS, Finding, ReviewReport, Severity
 
 
 def _finding(**overrides):
@@ -131,6 +131,50 @@ class FindingFromDictTests(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             Finding.from_dict(payload)
         self.assertIn("rule_id", str(ctx.exception))
+
+    def test_rejects_types_that_would_break_downstream_review_nodes(self):
+        for field, value in (("path", []), ("line", "1"), ("confidence", float("nan"))):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                Finding.from_dict({**_finding().to_dict(), field: value})
+
+    def test_rejects_text_that_cannot_be_persisted_as_postgres_json(self):
+        for field, value in (("title", "bad\x00title"), ("explanation", "bad\ud800text")):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "valid UTF-8"):
+                Finding.from_dict({**_finding().to_dict(), field: value})
+
+    def test_rejects_rule_ids_that_cannot_be_stable_identifiers(self):
+        for rule_id in ("", " SEC-EVAL", "SEC-EVAL ", "SEC\tEVAL", "SEC\x00EVAL", "X" * 81):
+            with self.subTest(rule_id=rule_id), self.assertRaises(ValueError):
+                Finding.from_dict({**_finding().to_dict(), "rule_id": rule_id})
+
+    def test_rejects_oversized_reviewer_text_at_the_shared_boundary(self):
+        for field, limit in FINDING_TEXT_LIMITS.items():
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                Finding.from_dict({**_finding().to_dict(), field: "X" * (limit + 1)})
+
+
+class ReviewReportFromDictTests(unittest.TestCase):
+    def test_round_trip_preserves_valid_report(self):
+        report = ReviewReport("org/repo", 7, "done", "high", [_finding()], ["a.py"], "rules")
+
+        self.assertEqual(report, ReviewReport.from_dict(report.to_dict()))
+
+    def test_rejects_ambiguous_checkpoint_types(self):
+        valid = ReviewReport("org/repo", 7, "done", "low").to_dict()
+        for field, value, message in (
+            ("repository", 7, "text fields"),
+            ("summary", [], "text fields"),
+            ("risk", "urgent", "repository and risk"),
+            ("pull_request", True, "positive integer"),
+            ("findings", {}, "list of objects"),
+            ("findings", ["finding"], "list of objects"),
+            ("files_reviewed", "a.py", "list of strings"),
+            ("files_reviewed", [7], "list of strings"),
+            ("reviewer", 7, "text fields"),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(ValueError, message):
+                    ReviewReport.from_dict({**valid, field: value})
 
 
 if __name__ == "__main__":

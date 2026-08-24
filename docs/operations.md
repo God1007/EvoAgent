@@ -1,464 +1,376 @@
-# Production operations and SLO runbook
+# Operations
 
-This runbook turns EvoAgent's telemetry into operator actions. The source of
-truth for objectives is [`ops/slo.toml`](../ops/slo.toml); Prometheus recording
-and alert rules live in
-[`ops/prometheus/evoagent.rules.yml`](../ops/prometheus/evoagent.rules.yml).
+## Health
 
-## SLO contract
+- `/health` reports process liveness only.
+- `/ready` checks PostgreSQL, queue worker/heartbeat and schema version, and
+  reports GitHub/LLM circuit states; concurrent probes share one short-lived
+  dependency check. An open downstream circuit does not eject every healthy
+  replica, so intake can remain available while affected work fails fast.
+- `/ready` separately reports optional Docker-backed Proof and Repair capability
+  state. Repair is configured only when both the immutable container image and
+  repository test command are present; a disabled optional capability does not
+  eject review replicas.
+- Startup fails when `EVOAGENT_SKILLS_DIR` is missing; use an existing empty
+  directory when dynamic Skills are intentionally disabled.
+- Non-loopback startup requires `EVOAGENT_SKILL_REQUIRE_CONTAINER=true`; an
+  installed dynamic Skill then also requires a preloaded container image.
+- Sign a release manifest with `EVOAGENT_SKILL_SIGNING_KEY=... evoagent-sign-skill
+  path/to/skill.json`; the command refreshes the source hash and atomically writes
+  the canonical manifest signature used at startup.
+- Dead Outbox rows remain visible in `/ready` and metrics without removing every
+  healthy replica from service; a stopped or persistently failing local dispatcher
+  fails readiness.
+- `/metrics` exposes bounded global Prometheus metrics to platform
+  administrators; authenticated deployments must refresh the scraper JWT before
+  its configured session expiry. Authenticated scrapes pass the pre-auth client
+  rate limiter so invalid-token floods cannot amplify into user-store reads.
 
-| Objective | 30-day target | Indicator |
-| --- | ---: | --- |
-| API availability | 99.9% | Non-probe requests whose response is not 5xx |
-| Async intake latency | 99% within 500 ms | Webhook and async-review intake histogram |
-| Review success | 99% | Successful / all terminal review executions |
+The in-process queue is for loopback development only. Non-loopback startup
+requires standalone Redis Streams so tasks survive worker restarts.
+Application startup also requires its configured bounded PostgreSQL pool; it
+fails closed instead of silently switching to per-request connections.
+Every pooled and maintenance connection applies
+`EVOAGENT_PG_STATEMENT_TIMEOUT_SECONDS`; raise it explicitly for a measured
+long-running migration instead of allowing runtime queries to wait forever.
+The HTTP listener caps accepted connections before creating handler threads;
+tune `EVOAGENT_MAX_HTTP_CONNECTIONS` from file-descriptor and memory limits.
 
-`429` is deliberate client-level throttling and does not consume the 5xx
-availability budget. A heavy-gate `503` does consume it: admitted capacity is
-part of the service contract. Authentication/validation 4xx responses do not
-consume availability but must be monitored for client regressions separately.
+## First checks
 
-Evaluate the current Prometheus window in CI, a release gate, or an incident:
+| Symptom | Check |
+| --- | --- |
+| Intake 5xx/latency | `/ready`, PostgreSQL pool, rate/admission limits, oldest outbox age |
+| Stale outbox | store connectivity, dispatcher liveness, publish failures |
+| Stale queue | Redis connectivity, worker and heartbeat liveness, handler duration |
+| Dead letters | classify the root cause, resume one failed task, then a bounded batch |
+| GitHub failures | allowed host, transport/sustained-5xx circuit state, rate-limit headers and installation-token refresh |
+| Model failures | route host/policy, circuit state, redaction/output validation counters |
+| Repair/Proof failures | container availability, image, limits and bounded command output |
 
-```bash
-evoagent-slo --catalog ops/slo.toml \
-  --prometheus-url https://prometheus.internal.example \
-  --allowed-host prometheus.internal.example
-```
+## Monitoring target down
 
-The command exits `0` when all objectives pass, `1` on an SLO breach, and `2`
-when an objective has insufficient samples. `--allow-no-data` is appropriate
-only for a new, intentionally idle environment. Credentials come from
-`EVOAGENT_PROMETHEUS_BEARER_TOKEN`; redirects and environment HTTP proxies are
-disabled and non-loopback endpoints require HTTPS.
+The bundled rules expect the Prometheus scrape job to be named `evoagent`.
+If every target is down or the job disappears, check service discovery and
+scrape authentication first, then instance liveness and `/ready`. Restore at
+least one healthy target before trusting any application-derived SLO or alert.
 
-Run one `EVOAGENT_WEB_WORKERS=1` process per production pod and scale pods
-horizontally. The built-in metric registry is process-local, so scraping one
-shared `SO_REUSEPORT` socket cannot aggregate several local worker processes.
-Prometheus should attach deployment/cluster/region labels at scrape time and
-aggregate across pods in queries.
+Preload configured Skill and repair images in the Docker daemon available to
+the EvoAgent process. Request execution never pulls images; configured images
+are inspected during startup, resolved to immutable local image IDs and fail
+closed if the CLI, daemon or image is unavailable. The Skill image must contain the EvoAgent runtime at
+`/app/evoagent`; startup resolves its local immutable image ID, and execution
+mounts no application or Skill source from the Docker host.
+Repair/Proof worktrees are copied through the Docker client into a bounded
+container tmpfs; they also require no shared host path.
 
-## Trusted proxy client identity
-
-`X-Forwarded-For` is ignored by default. Set `EVOAGENT_TRUSTED_PROXY_CIDRS` only
-to the canonical CIDRs of proxies that can connect directly to EvoAgent. The
-resolver starts at the kernel-supplied socket peer, consumes the chain from
-right to left while each current hop is trusted, and stops at the first
-untrusted address. An attacker-controlled prefix farther left is never used for
-rate limiting or access logs. Empty hops, hostnames, addresses with ports, more
-than 32 hops, or more than 4096 header bytes fail closed to the socket peer.
-
-During ingress rollout, send two test requests with different client addresses
-through the real proxy and confirm `client_source=forwarded`, the expected
-`client`/`peer`, and independent rate-limit buckets. Direct requests with the
-same headers must produce `client_source=ignored`. Alert or investigate growth
-in `http_forwarded_invalid_total`; compare the proxy's append/overwrite policy
-without logging the raw header. Never configure `0.0.0.0/0` or `::/0`—startup
-rejects both—and do not copy an entire cloud public range when only private
-ingress addresses can reach the service.
+Every response carries `X-Request-ID`. Unexpected HTTP errors return a generic
+message; correlate the identifier with structured logs. Persisted operational
+failures use `operation [type=...; ref=...]` and never store exception text.
+Graceful service shutdown flushes the process-owned OpenTelemetry provider after
+background work stops, so the final batch of spans is exported before exit.
+While draining, probes remain available but new application requests receive
+`503` with `Retry-After`; only work admitted before SIGTERM may use the grace period.
+If the drain budget expires, dependencies stay open for process teardown rather
+than being closed underneath a live worker; embedded callers may retry `close()`
+after work drains, while the orchestrator must enforce its termination grace
+period. Redis entries that race with shutdown before active
+registration remain pending for lease-based reclaim by a healthy worker.
 
 ## Availability fast burn
 
-This alert means the 99.9% monthly error budget is being consumed at more than
-14.4× over both 5-minute and 1-hour windows.
-
-1. Check `/ready` and split 5xx rate by pod, deployment version, and region.
-2. Stop rollout or route traffic back to the last healthy version if failures
-   correlate with a release.
-3. Check Store/Redis readiness, circuit-breaker state, pool availability,
-   Outbox age, and worker liveness before restarting anything.
-4. Preserve failed task IDs and traces; do not replay DLQ/Outbox items until the
-   dependency or code fault is fixed.
-5. Record incident start/end, affected requests, budget consumed, and rollback
-   decision.
+Check `/ready`, split 5xx by release, and stop the rollout before restarting
+dependencies. Preserve task IDs and traces for the incident record.
 
 ## Availability slow burn
 
-This is a sustained 6× budget burn over 30-minute and 6-hour windows. Open an
-incident ticket, freeze nonessential releases, compare error types and tenant
-distribution, and schedule remediation before the remaining budget reaches
-zero. Page immediately if the fast-burn alert also fires.
-
-## Correlated HTTP failures
-
-Every response carries `X-Request-ID`. For an unexpected failure, the JSON body
-contains only `internal server error` plus that identifier. Search structured
-container logs for the same `request_id` and `event=http_internal_error`, then
-use the bounded `error_type`, deployment metadata, component telemetry, and task
-trace to locate the failing dependency. The public edge intentionally records no
-exception message, traceback, or query string.
-
-Do not temporarily enable raw client errors during an incident. If additional
-detail is required, add it to access-controlled component tracing with explicit
-redaction. Treat caller-provided request IDs as untrusted labels; never use them
-to authorize a replay, reconciliation, or tenant operation.
-
-## Operational failure references
-
-Asynchronous and component failures use this message-free shape:
-
-```text
-task delivery failed [type=builtins.RuntimeError; ref=4d8f6a19c3e57021]
-```
-
-`type` identifies the bounded exception class. `ref` hashes that class and the
-traceback's module/function/line locations; it never hashes the exception
-message, arguments, locals, request values, or source content. Group the same
-`type + ref` within one image/version to find a common failure site, then use
-deployment metadata, request/task IDs, dependency metrics, and code ownership
-to investigate. A reference is neither globally unique nor an authorization or
-idempotency key, and source-line changes can change it between releases.
-
-Task/Trace/Checkpoint, Agent failure, Queue/DLQ, Outbox/effect, readiness,
-shadow/evaluation failure, Proof/Verifier, plugin lifecycle, and OpenTelemetry
-paths must not be temporarily switched back to raw exception messages. Schema
-version 10 replaces legacy values in these persisted operational fields. The
-model usage ledger's credential-redacted provider diagnostics and authorized
-sandbox command output are separate, access-controlled retention surfaces; do
-not copy them into general task or readiness records.
+Freeze nonessential releases, compare failure classes and tenant distribution,
+and schedule remediation before the remaining error budget reaches zero.
 
 ## Intake latency
 
-1. Compare intake RPS, p99, `outbox_oldest_age_seconds`, Postgres pool available,
-   and CPU saturation.
-2. If DB pool waiters rise, confirm total pool demand across pods is below the
-   Postgres connection budget before increasing a pool.
-3. If only SQLite is configured, migrate production traffic to PostgreSQL;
-   SQLite intake is a development topology.
-4. Shed burst traffic with the existing token bucket instead of increasing
-   unbounded HTTP concurrency.
+Compare intake rate with PostgreSQL pool waiters, outbox age and CPU. Shed burst
+traffic through configured admission limits before increasing concurrency.
 
-## Queue or Outbox stale
+## Queue or outbox stale
 
-- **Outbox stale, queue healthy:** inspect dispatcher error, Store connectivity,
-  and `outbox_publish_failures_total`. A committed task is safe in the Store;
-  restart the dispatcher only after confirming another owner is not publishing.
-- **Queue stale:** inspect Redis health, worker count, task duration, and lease
-  reclaim. Scale workers only if downstream GitHub/model/DB capacity can absorb
-  them.
-- **Lease heartbeat failure:** every live Redis handler periodically resets its
-  pending-entry idle time. Check readiness `lease_heartbeat_running`, Redis
-  latency/timeouts, and `queue_lease_heartbeat_failures_total`. Do not increase
-  the reclaim threshold to hide a broken heartbeat; restore Redis connectivity
-  so only a truly lost process becomes eligible for `XAUTOCLAIM`.
-- **Regional reconstruction:** a `FAILED` async task with an active durable
-  admission is still retry-managed and is included in an offline recovery plan;
-  a synchronous failed task whose slot was released remains terminal.
-- Never edit queue/Outbox rows manually. Use `/v1/outbox/replay` or
-  `/v1/queue/dead-letters/replay`, which audit the operation and preserve
-  idempotency keys.
+PostgreSQL retains committed intent. Restore the failing dispatcher/Redis path;
+`evoagent_queue_healthy=0` covers Redis connectivity, worker and lease-heartbeat
+health even when queue age cannot be collected. Check `/ready` for the safe failure
+reference before restarting the affected replica.
+`evoagent_outbox_dispatcher_running=0` means the local dispatcher thread stopped,
+even if no backlog has formed yet. Restart the unhealthy replica after preserving
+its logs; do not manually alter rows or stream entries.
+Sustained `evoagent_outbox_lease_conflicts_total` growth means publication is
+outliving its lease or PostgreSQL is stalling. Check process and database latency
+before increasing `EVOAGENT_OUTBOX_LEASE_SECONDS`; queue message keys keep retries
+idempotent while the lease is recovered.
+`evoagent_effect_lease_conflicts_total` applies the same diagnosis to GitHub
+comment and repair ownership. Confirm provider latency and concurrent retries;
+the losing worker stops before its next write and durable replay performs recovery.
+
+## Metric collection
+
+`evoagent_metrics_gauge_scrape_failures_total` counts scrapes that omitted one
+or more dynamic gauges because a dependency probe failed. Compare `/ready` with
+the missing queue, Outbox or PostgreSQL-pool series; restore that dependency
+before treating an absent series as zero.
 
 ## Dead letters
 
-Classify the error as permanent input/policy failure or transient infrastructure
-failure. Fix the root cause, replay one item, verify its terminal state and
-external effects, then replay the bounded batch. A growing DLQ is not resolved
-by deleting entries; export task IDs and retain the audit trail.
+Fix the root cause, resume one failed task through `/v1/tasks/<task-id>/resume`,
+verify its terminal state and external effects, then resume a bounded batch.
+For a successful task whose GitHub delivery exhausted retries, the same endpoint
+publishes only the missing delivery effect and never recomputes the review.
+Repeated delivery resumes coalesce while that Outbox/queue attempt is active;
+an Outbox `dead` row or queue DLQ transition reopens the task for an operator retry.
 
 ## Review failures
 
-Split failures by reviewer, model route, repository, and error type using task
-traces and the metadata-only model ledger. Check policy rejections separately
-from execution failures. Roll back a candidate Prompt/Skill if the failure spike
-is lane-correlated; do not weaken evidence or repair gates to restore throughput.
+Separate policy rejection, reviewer failure, model transport and Skill failure.
+Do not weaken evidence gates to restore throughput.
+`evoagent_review_attempts_failed_total` counts retryable worker attempts; compare
+it with terminal failures in the Review dashboard before changing retry policy.
+The dashboard excludes failed attempts whose admission is still active from its
+failure count and calculates success rate from completed success/failure outcomes.
+Overview and Task Center label those active failed attempts as `retrying` while
+keeping the persisted workflow state unchanged for recovery.
+The tenant failure-rate notification clears automatically after at least the
+configured minimum sample count recovers to the threshold or below. Every terminal
+success or failure recalculates it; `evoagent_alert_evaluation_failures_total`
+means the review outcome is durable but notification refresh needs investigation.
+`evoagent_release_observation_failures_total` means the durable outcome did not
+reach canary governance; pause that rollout and restore PostgreSQL before relying
+on its error budget. Stable-lane outcomes do not require a rollout observation.
+`evoagent_review_terminal_accounting_failures_total` means a synchronous request
+raised without a matching durable `FAILED` or `CANCELLED` state; restore PostgreSQL
+and inspect the task before retrying the request.
+`evoagent_failure_case_persistence_failures_total` means the task was safely marked
+failed but its learning-corpus record was lost; check PostgreSQL/schema health before
+using failure-case counts for evolution decisions.
+`evoagent_review_agent_budget_timeouts_total` means the combined specialist pool
+exceeded the task deadline; reduce or speed up Skills before increasing the budget.
+`EvoAgentReviewAgentBudgetTimeouts` opens a ticket after more than two timeouts in
+15 minutes; correlate the panel with Skill failures before changing the task budget.
+`evoagent_review_agent_output_limit_rejections_total` means the combined specialist
+output exceeded the bounded review size and was stopped before downstream work.
+Use `evoagent_skill_runs_total`, `evoagent_skill_failures_total`,
+`evoagent_skill_timeouts_total`, `evoagent_skill_sandbox_failures_total`,
+`evoagent_skill_output_rejections_total`,
+`evoagent_skill_output_limit_rejections_total`,
+`evoagent_skill_container_cleanup_failures_total` and the
+`evoagent_skill_execution_seconds` histogram to separate capacity, sandbox and
+protocol failures. The task timeline's `agent_failure.sender` identifies the
+specific Skill without adding user-controlled metric labels.
+`EvoAgentSkillFailureRateHigh` opens a ticket only after more than 20 executions
+and a sustained 15-minute failure ratio above 5%; compare the classified
+counters, then inspect recent `agent_failure` senders before rolling back the
+immutable Skill set.
+`EvoAgentSkillContainerCleanupFailing` pages on any failed removal. Restore the
+container runtime, inspect exact `evoagent-skill-*` leftovers, preserve incident
+metadata and remove those containers before resuming the affected Skill set.
+`EvoAgentRepairContainerCleanupFailing` applies the same response to
+`evoagent-verify-*` repair containers.
+Growth in `evoagent_github_comment_truncations_total` means complete reports no
+longer fit comfortably in PR comments; use the task report until a measured need
+justifies publishing authenticated report artifacts.
+Disabling a repository or its `post_review_comments` policy acts as a delivery
+kill switch: workers re-read it after review execution and at the provider write
+boundary, after any existing-comment scan. Closed, draft, and superseded review
+sessions are checked at the same boundary.
+Draft PR webhook deliveries intentionally have no task ID. `closed` and
+`converted_to_draft` end the session, cancel unfinished turns and suppress
+pending GitHub comments; `reopened` and `ready_for_review` reopen the same
+session with a new turn. Human input can reopen only a same-tenant session that
+is still `input-required`; it cannot override a concurrent webhook close/draft.
+The state transition and secret-free operator audit commit in one transaction.
+Event time is fenced in PostgreSQL, so a delayed older
+delivery is recorded but cannot reverse the newer lifecycle state. Do not replay
+draft deliveries to force early work.
+`reviewer.revision_mismatch` means the accepted application/model/Skill set is
+no longer running. Restore that revision or submit a new review after rollout;
+do not edit the task snapshot or reuse its checkpoints. Tasks admitted before
+execution binding was introduced are rejected and must be submitted again.
 
-## Model route capacity
-
-Query `/api/model-routes/capacity` in the affected tenant/repository scope. A
-high concurrency rejection count with long-lived leases indicates saturated or
-stuck provider calls; a rate rejection means the declared fixed-minute ceiling
-was reached. Exact counters are tenant-visible only for a route bound solely to
-that tenant; investigate a `shared-redacted` pool through restricted platform
-storage/telemetry. Confirm the provider contract before changing either limit.
-Do not delete leases manually: a crashed owner's lease expires after
-`EVOAGENT_LLM_CAPACITY_LEASE_SECONDS`, while a live call must retain its slot.
-
-If fallback is also saturated, reduce intake or restore provider capacity before
-raising worker count. Weight recommendations are declared-capacity ratios, not
-traffic forecasts. Apply them only through reviewed topology and redeployment;
-never treat the report as authorization for a live database edit. Preserve
-stable route IDs across rolling releases so old and new pods share one pool.
-
-## Model economics
-
-`model_input_tokens_total`, `model_output_tokens_total`, and
-`model_cost_micros_total` include successful calls and failed output-contract
-checks when provider usage is already known. Transport failures without usage do
-not invent cost. Active and shadow lane counters are separate fixed metric names,
-and request latency is split into active/shadow histograms without route,
-repository, or tenant labels.
-
-Use `evoagent:cost:model_micros_per_terminal_review_30m` as an operational trend,
-not an invoice: pricing is configured micro-units and providers may reconcile
-usage later. A budget-rejection alert means at least one repository reached its
-explicit ceiling. Identify it through the tenant-authorized model-usage ledger;
-do not add tenant/repository labels to Prometheus or raise the limit before
-confirming ownership and expected workload.
+Cancelling a queued task atomically records `CANCELLED` and releases its tenant
+admission slot even if Redis is unavailable. A running task keeps its slot until
+the bounded reviewer call returns, but cancellation wins every later state or
+success commit and is acknowledged without queue retry or a DLQ alert. Results
+that return after the task budget are discarded before checkpoint persistence.
+An overlapping synchronous HTTP review returns `409 Conflict` instead of
+reporting an internal service failure after that cancellation wins.
+The cancellation endpoint also returns `409` with the current durable state when
+the task already reached a non-cancelled terminal state.
 
 ## Repair outcomes
 
-Repair attempts terminate as published, safely abstained, verification-blocked,
-or failed. Abstention means no deterministic allowlisted transformation applied;
-it is not an infrastructure failure. A verification block means a proposed
-change failed compilation/tests and was correctly withheld. Investigate the
-configured verifier/container and recent rule changes before changing a gate.
-Never lower verification requirements to improve the publication ratio.
+Inspect the container image, command, timeout and resource limits. A verifier
+abstention is safer than publishing an unproven edit.
+Completed verification results retain the execution mode, resolved container
+image and SHA-256 of the exact test command without persisting the command itself.
+The same bounded attestation and verdict are included in `repair.create` audit
+events, including idempotent replays; test output remains only in the effect result.
+For a new repair, the effect receipt and audit event commit in one PostgreSQL
+transaction, so a successful publication cannot become durable without its audit record.
+When `EVOAGENT_REPAIR_TEST_COMMAND` is empty, repair publication stops before
+reading or writing GitHub state; single-file compilation alone is not accepted
+as regression evidence. Configure the repository test command and submit a new
+review task before retrying.
+Disabling the repository or `auto_fix`, or removing an applied rule from the
+allowlist, blocks a verified repair before its GitHub branch/PR writes.
+The source PR must also remain open, non-draft and on the reviewed head before
+each missing branch/PR write. A closed, draft or changed PR requires a fresh
+ready review; never edit the stored head snapshot.
 
 ## Quality feedback
 
-Feedback counters use four fixed names: accepted, false positive, missed issue,
-and bad fix. The 24-hour negative ratio combines the latter three only after a
-minimum sample threshold in the alert. It is a triage signal, not a statistically
-unbiased accuracy estimate: operator reporting is selective. Sample affected
-cases from tenant-authorized failure records, classify rule/model/language
-slices offline, and add independently adjudicated cases to the evaluation
-pipeline before changing prompts or thresholds.
+Sample false positives, missed issues and bad fixes by rule. Change a rule only
+with a reproducible evaluation case.
+Feedback is tenant-fenced on the task row; the learning sample and a
+content-free operator audit commit together.
 
-## Plugin runtime
+## Model rollout
 
-`plugin_runtime_ready=0` means the capability graph is stopping or failed.
-Inspect startup dependency/cycle errors, the active Profile, and the trusted
-plugin allowlist. Roll back the plugin package or Profile as one deployment;
-live global hot-swap is intentionally unsupported.
+`POST /v1/deployments/llm-review` accepts only existing positive
+`stable_version`/`candidate_version` values, integer canary/shadow percentages,
+bounded error/disagreement rates, a positive sample count and a boolean
+`auto_promote`. Auto-promotion requires non-zero shadow traffic. Invalid or
+unknown fields are rejected before PostgreSQL or the audit log. The candidate
+must have an `approved` evaluation qualification; rejected, deferred and legacy
+versions cannot be candidates. The stable lane accepts only approved versions or
+pre-v18 legacy baselines. A valid configuration, its normalized audit record and
+the returned rollout generation share one transaction.
+An approved candidate must also carry the current application/model/Skill execution
+revision. After any runtime revision change, re-run qualification before configuring
+a replacement version as a candidate; an identical Prompt is eligible for a new
+version only after the runtime revision changes. Missing or stale evidence fails closed.
+Existing running deployments are checked again during assignment: a new-revision
+replica suppresses stale candidate and shadow traffic, keeps the stable lane, and
+increments `evoagent_release_revision_mismatch_total` until the candidate is requalified.
 
-## Tenant review capacity
-
-`EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS` is a uniform hard limit on outstanding
-review admissions for each tenant across every replica sharing the database.
-The default `0` does not reject work, but v0.28 still records durable admission
-slots so operators can observe actual occupancy before enabling a limit. A
-capacity rejection returns `429` with `Retry-After` set from
-`EVOAGENT_TENANT_CAPACITY_RETRY_SECONDS`, records a tenant-scoped
-`review.capacity-rejected` audit event, and creates no task, session turn, or
-Outbox intent. A rejected webhook delivery claim remains safely retryable.
-
-Schema migration 14 is additive and backfills non-terminal tasks. Apply it and
-complete an all-pod v0.28-or-newer rollout before setting a non-zero limit:
-older writers neither take the tenant advisory lock nor emit admission
-generations. Also drain or explicitly resolve any pre-v0.28 Redis retry backlog;
-a historical task already marked `FAILED` cannot be distinguished from a
-terminal synchronous failure during migration. Enable the limit only after the
-authorized `/api/tenant-review-capacity` view and
-`review_admission_slots_active` agree with the expected backlog.
-
-The Store transaction owns these lifecycle rules:
-
-- a new REST or webhook review reserves a slot before atomically committing its
-  task, Diff/session state, and Outbox message;
-- synchronous failure releases immediately, while asynchronous failure keeps
-  the slot through queue retries and offline queue reconstruction;
-- success, cancellation, or final dead-letter disposition releases the slot;
-- manual resume atomically reacquires capacity and creates a unique Outbox
-  intent; a monotonically increasing admission generation prevents a late
-  callback from an older delivery from releasing the resumed slot.
-
-Investigate `EvoAgentTenantReviewCapacitySaturated` with the fixed-cardinality
-rejection ratio, global active-slot gauge, authorized tenant capacity view,
-Outbox age, queue age, and DLQ depth. First decide whether occupancy is valid
-load or stuck delivery. Repair the dependency and use the audited Outbox/DLQ
-replay APIs. For abandoned queued work, request cancellation through the
-application path and, if delivery is no longer live, replay it so a worker can
-commit the final `CANCELLED` state and release the slot. Do not edit
-`task_admissions` or task state with SQL. Increase
-the limit only through reviewed deployment configuration after checking worker,
-database, model, and GitHub capacity.
-
-This control alone bounds durable occupancy; it does not order workers. Unless
-the tenant-fair scheduler below is enabled, Redis workers still dequeue admitted
-work in stream order. Per-tenant details stay behind tenant authorization rather
-than becoming Prometheus labels.
-
-## Redis cluster queue
-
-The default empty `EVOAGENT_QUEUE_NAMESPACE` preserves the v1 single-node keys
-used through v0.29. Set a stable, non-sensitive namespace such as `prod-eu1` to
-select the v2 layout. Every stream, DLQ, dedupe, fairness, protocol, and recovery
-key then contains the same `{review:<namespace>}` hash tag. This both isolates
-environments and lets every Lua/transaction boundary execute in one Redis
-Cluster slot. Set `EVOAGENT_REDIS_CLUSTER=true` only with a v2 namespace and a
-Redis URL using logical database 0. All advertised cluster node addresses must
-be reachable from every application pod; use `rediss://` and the managed
-service's authenticated CA configuration outside a trusted private network.
-
-The first v2 process atomically creates a canonical protocol manifest inside the
-namespace. Later processes compare it before creating the consumer group and
-fail startup on an unknown protocol/keyspace version. A Stream/DLQ/fairness key
-without a manifest is treated as an incompatible orphan rather than adopted;
-only a recovery Epoch may legitimately precede first startup. `/ready` exposes
-`redis_cluster`, `queue_namespace`, and `keyspace_version`; Prometheus exports
-fixed gauges without turning the namespace into a label.
-`EvoAgentQueueKeyspaceVersionMixed` means replicas behind one scrape scope do
-not agree: stop the rollout, determine which deployment still serves v1, and do
-not move or delete Redis keys manually.
-
-Changing the namespace is a queue cutover, not an in-place rename:
-
-1. deploy v0.30 to every publisher/consumer while the namespace remains empty;
-2. stop intake and Outbox publication, then drain stream, pending entries,
-   retries, DLQ decisions, and fairness indexes in the old keyspace;
-3. configure one reviewed namespace on every replica and start a canary against
-   standalone Redis first; verify protocol version 1, keyspace version 2, and an
-   end-to-end Outbox delivery;
-4. to move from standalone Redis to Redis Cluster, repeat the freeze/drain,
-   switch the URL and cluster flag together, and verify all cluster slots are
-   covered before reopening traffic;
-5. roll back only after draining the currently active namespace. A pre-v0.30
-   binary ignores the namespace and must never run concurrently with v2.
-
-Use a different namespace for each environment. Sharing a namespace shares the
-stream, consumer group, dedupe decisions, fairness state, and recovery epoch.
-Redis Cluster improves sharding and managed availability but does not by itself
-prove regional failover: run the queue reconstruction procedure against a fresh
-namespace after restoring PostgreSQL. The v2 recovery reservation checks only
-the target namespace, so unrelated cluster workloads do not make the target
-appear non-empty; an existing protocol/stream/DLQ/fairness key still fails
-closed. Dedupe entries are created atomically with the stream, so an occupied
-stream is the recovery guard for their dynamic key family.
-
-## Tenant fair scheduling
-
-`EVOAGENT_QUEUE_FAIR_SCHEDULING=true` enables weighted round-robin dispatch on
-the production Redis Streams backend. It does not change Outbox publication,
-consumer-group ACK, retry/DLQ, or lease-reclaim durability. Every new envelope
-receives a SHA-256 tenant key, an integer weight from 1 to 100, and the
-content-addressed policy digest. Redis Lua atomically grants up to that tenant's
-weight in one turn or moves the entry to the stream tail while another tenant is
-waiting. Raw tenant identifiers never enter scheduler keys or Prometheus labels.
-
-On the legacy v1 layout the scheduler requires a single logical Redis primary.
-The v2 namespace places its stream and scheduler indexes in one cluster slot, so
-the same Lua decision is supported through the Redis Cluster client. This is
-intentional per-queue slot locality: a namespace can move between cluster nodes,
-but one review queue is not striped across all masters. Use separate namespaces
-only for truly independent environments, not to shard tenants and bypass global
-fairness.
-
-The optional `EVOAGENT_QUEUE_TENANT_WEIGHTS_FILE` is bounded v1 TOML:
-
-```toml
-version = 1
-id = "service-tiers-v1"
-default_weight = 1
-
-[tenants]
-"standard-tenant" = 1
-"priority-tenant" = 2
-```
-
-Use a non-sensitive stable `id` for rollout comparison and the smallest weights
-that express the service tier. A weight controls
-dispatch starts, not CPU seconds or model cost: a tenant whose reviews run much
-longer can still consume more worker time. The tenant-authorized
-`/api/tenant-review-capacity` response exposes only that tenant's effective
-weight and the non-sensitive policy ID. Health exposes the ID, configured mode,
-and aggregate waiting-tenant count. The content SHA-256 remains inside the
-trusted Redis envelope as execution evidence rather than becoming a public
-cross-tenant configuration fingerprint.
-
-Roll out in two stages. First deploy v0.29 or newer to every queue publisher and
-consumer with fairness disabled. Only after all old workers are gone may the
-flag be enabled through reviewed configuration; v0.29 workers that are not yet
-enabled still recognize and coordinate marked envelopes during the configuration
-rollout. Legacy unmarked backlog remains compatible and drains in original
-stream order. Before rolling back to a pre-v0.29 binary, disable new marking and
-wait until the Redis stream, pending set, `fair_waiting_tenants`, and fairness
-entry/admission hashes are empty. Do not delete scheduler hashes to force a
-rollback: that can bypass turns or strand accounting.
-
-An admitted entry moves from the waiting hash to an admission hash before its
-handler starts. A dedicated live-delivery heartbeat resets its Redis pending
-idle time, preventing a legitimate task longer than the static lease from being
-claimed concurrently. If the process actually crashes, the heartbeat stops and
-`XAUTOCLAIM` recognizes the retained admission without decrementing the tenant
-twice. A transient failure publishes a newly tracked retry before ACKing the old
-entry; final DLQ uses the existing task admission generation rules. Invalid
-marker/index correspondence fails closed to DLQ instead of bypassing fairness.
-
-Investigate `EvoAgentTenantFairnessChurnHigh` with
-`evoagent:ratio:queue_fair_deferrals_15m`, queue age/depth, waiting tenants,
-worker concurrency, admission saturation, and the current policy ID. A high
-ratio normally means one tenant placed a long contiguous burst ahead of other
-tenants, requiring bounded tail moves to restore turns. Keep the per-tenant
-durable admission limit enabled to bound that work. If queue age also breaches,
-reduce intake or add proven downstream capacity; raising weights merely moves
-latency between tenants. Never add tenant IDs as metric labels.
+Each admitted task snapshots the stable version, candidate version and rollout
+generation. PostgreSQL counts canary and shadow observations only while that
+exact generation is still running, so delayed queue work cannot roll back or
+promote a replacement rollout—even when an operator retries the same candidate.
+Repeated delivery of one task is also counted once, so retries cannot inflate
+the canary error budget or sample size used for automatic promotion.
+Automatic rollback and promotion update the deployment and append their metrics
+to the operator audit in one transaction; alerts are notification, not history.
+`evoagent_release_alert_failures_total` means that durable rollout state and
+audit succeeded but the operator notification did not; inspect the alert store
+without retrying or reclassifying the observation.
+`evoagent_shadow_audit_failures_total` means even the fallback audit for a
+shadow failure could not be persisted; restore PostgreSQL and correlate the task
+with the in-process failure metric before the evidence ages out.
 
 ## History retention
 
-Operational-history deletion is disabled by default. Set
-`EVOAGENT_HISTORY_RETENTION_DAYS` above zero only after the retention period,
-backup/restore evidence, legal holds, and incident-forensics requirements have
-been approved. Schema migration 13 is additive and deletes nothing. During a
-rolling PostgreSQL deployment, apply the migration first, complete the rollout
-so every writer is v0.27 or newer, and only then enable retention: all writers
-must participate in the new per-session coordination lock before pruning can be
-considered safe.
+Keep retention disabled until policy approval. If enabled maintenance stalls,
+check PostgreSQL locks and batch limits; never broaden deletion predicates.
+Old shadow observations are deleted only after their rollout stops running, so
+retention cannot weaken retry deduplication or change promotion evidence.
+After the configured age, successful/cancelled tasks keep their report, final
+trace anchor and audit metadata but lose raw Diff payloads, checkpoints and
+agent messages; completed primary Outbox intents are pruned with the same safety
+window. Completed comment/repair effect receipts also expire at that boundary;
+provider markers and deterministic repair branches reconcile a later retry, while
+in-progress receipts are never pruned. `input.execution_artifacts_pruned_at` makes
+execution cleanup explicit.
+Webhook delivery claims expire at the same boundary. Startup rejects a retention
+age that does not exceed `EVOAGENT_WEBHOOK_MAX_AGE_SECONDS`; older replays then fail
+the API age gate instead of creating duplicate tasks.
+FAILED task artifacts remain available for operator resume.
 
-Each maintenance run is bounded by
-`EVOAGENT_HISTORY_PRUNE_BATCH_SIZE` and ten batches. The batch size limits Trace
-rows and session turns per transaction; one session turn can contain multiple
-findings, so choose a conservative value from measured production snapshots.
-The Store transaction enforces these invariants:
+## Tenant review capacity
 
-- active-task Trace is never removed, and a terminal task always retains its
-  latest event;
-- the latest completed turn in a PR session remains a future-turn anchor;
-- a completed snapshot remains while an out-of-order pending turn could still
-  require it as the immediately preceding completed state;
-- task `trace_pruned_at` and timeline `findings_retained=false` markers make
-  deliberate pruning distinguishable from an originally empty result.
+Sustained rejection means a tenant owns too many non-terminal reviews. Resolve
+or finish existing tasks before raising the bound.
 
-Check `/health.retention`,
-`retention_trace_events_pruned_total`,
-`retention_session_findings_pruned_total`, and `retention_failures_total` after
-enablement. `EvoAgentRetentionMaintenanceStalled` fires when no successful run
-has completed within twice the configured interval (with a ten-minute floor).
-Compare `last_error_type` with Store health and migration compatibility; it is
-intentionally message-free. If the alert persists, disable the setting through
-the reviewed deployment configuration, preserve database/metric evidence, and
-fix the adapter or capacity problem before re-enabling it. Do not delete rows or
-edit prune markers with ad-hoc SQL. Retention is not a backup, VACUUM strategy,
-native PostgreSQL partition policy, or legal-hold system.
+## Queue recovery
 
-## Proof Runner
+A live Redis handler heartbeats its pending entry. Do not increase the reclaim
+threshold to hide heartbeat failures. Restore Redis connectivity; only a dead
+handler should become reclaimable. Never edit stream/outbox records manually.
+Inspect the tenant-scoped DLQ, then resume the failed task through
+`POST /v1/tasks/<task-id>/resume`; this reacquires tenant capacity, publishes a
+fresh delivery generation and records the operator audit transactionally.
+Both queue backends retain approximately the newest 10,000 DLQ entries as a bounded
+incident buffer; resumable task state remains in PostgreSQL rather than depending on it.
+Queue envelopes carry metadata only and are capped at 256 KiB before JSON parsing;
+large Diff payloads remain in PostgreSQL.
+Deferred GitHub tasks refetch the diff from their snapshotted URL when the first
+fetch never completed.
+Offline reconstruction also restores a successful task whose explicit comment
+redelivery was published to Redis but never completed; ordinary successful
+tasks remain terminal and are not replayed.
 
-Use `proof_inconclusive_total / proof_runs_total` and runner capacity logs to
-distinguish bad reproductions from infrastructure uncertainty. Runner errors
-must never be reclassified as failed reproductions. Follow
-[`remote-proof-runner.md`](remote-proof-runner.md) for isolation, key rotation,
-artifact retention, and replica limits.
+## Deployments
 
-For more than one Runner replica, require shared replay and alert when
-`/readyz` is not ready. A replay Redis outage is not a reason to bypass nonce
-claims or switch to memory; stop proof traffic and retain L1 uncertainty. During
-HMAC rotation, verify all Runners accept current+previous IDs before switching
-clients, wait for the request/replay drain, then remove the previous key. Never
-reuse a retired key ID for different key material.
+Run one EvoAgent process per container and scale containers horizontally.
+PostgreSQL pools are capped at 256 connections per process; increase replicas
+rather than removing this database protection.
+Set the orchestrator termination grace above
+`EVOAGENT_SHUTDOWN_GRACE_SECONDS + EVOAGENT_QUEUE_SHUTDOWN_TIMEOUT_SECONDS`;
+the built-in Compose files use 40 seconds for the default 30-second drain budget.
 
-For regulated proof retention, use a dedicated versioned S3 bucket with Object
-Lock, set `REQUIRE_ARTIFACTS=true`, and monitor both `artifact_ready` and the
-Runner `/readyz` result. Prefer `COMPLIANCE`; governance mode is an operational
-test mode because principals with bypass permission can remove protection. The
-Runner identity should not have `DeleteObject` or `BypassGovernanceRetention`.
-Exercise a real conditional write, checksum/version/retention inspection, and
-restore in each target account/region before treating configuration health as
-compliance evidence. Do not shorten `RETENTION_DAYS` during a rollout; existing
-objects are extended when necessary and are never shortened by EvoAgent.
+1. pause review and webhook intake at the ingress;
+2. wait for Outbox pending/publishing, queue depth and active review admission
+   to reach zero;
+3. back up PostgreSQL, verify migrations on a disposable copy, then run one
+   `evoagent-migrate` job against production;
+4. deploy the immutable application/Skill set and verify every `/ready`
+   response reports the expected `reviewer_revision`;
+5. run one review, resume intake, then watch availability, review success,
+   outbox age, queue/DLQ depth and tenant admission rejections.
 
-## Release checklist
+This drain-first cutover is required because one Redis consumer group does not
+route by application revision. Add revision-routed worker pools only when
+zero-downtime deployment is a measured requirement.
+The bundled `scripts/deploy.sh up` therefore refuses to replace a running
+EvoAgent; after steps 1–2, run `down` before starting the new revision.
 
-1. Ruff, mypy, unit/contract tests, dependency audit, wheel build pass.
-2. PostgreSQL/Redis/container boundary CI passes without skipped external tests.
-3. Performance regression gates and SLO catalog validation pass.
-4. Schema migration job completes before new application pods become ready.
-5. Canary health and error budget are observed before widening traffic.
-6. Rollback artifact, previous image digest, and migration compatibility are
-   recorded.
-7. `evoagent-dr` restored into a disposable database, content fingerprints
-   matched, cleanup succeeded, and the report is within declared RPO/RTO.
+Roll back application code only if it understands the active forward-only
+schema. Redis carries no irreplaceable state.
 
-The complete procedure and evidence contract are in the
-[disaster-recovery runbook](disaster-recovery.md). Database recoverability is
-automated together with offline Redis task reconstruction; regional
-infrastructure/routing failover and a production-shaped soak remain required
-before claiming full service disaster-recovery readiness.
+## Security defaults
+
+- Treat an invalid boolean environment value as a startup error; do not rewrite
+  or coerce configuration typos during deployment.
+- Keep `EVOAGENT_DEFAULT_TENANT_ID` stable; startup rejects empty, surrounding-
+  whitespace or over-200-character values before any tenant-scoped data is written.
+- Require JWT authentication before binding beyond loopback.
+- Non-loopback startup also requires positive per-client rate, per-instance
+  heavy-concurrency and cross-replica tenant-review limits. Tune all three from
+  measured traffic; keep ingress limits as defense in depth.
+- Trust forwarded addresses only from explicit ingress CIDRs.
+- Keep GitHub, JWT and model secrets in a secret manager.
+- Configure GitHub App ID and private-key path together. Outside loopback,
+  any GitHub Webhook intake requires the complete tenant-bound GitHub installation
+  OAuth configuration and a Webhook HMAC secret of at least 32 bytes; PAT-only,
+  default-tenant fallback, weak rotation secrets and incomplete credentials fail startup.
+- Rotate the bootstrap administrator password through `POST /v1/auth/password`
+  after first login and whenever credentials may be exposed. The endpoint
+  requires the current password, commits the credential change and secret-free
+  audit row together, and invalidates every existing JWT and GitHub OAuth state;
+  log in again afterward.
+- Create additional local members through `POST /v1/users`. Tenant admins may
+  grant tenant roles in their current tenant; only a platform admin may grant
+  `platform_admin`. User, membership and secret-free audit rows commit together.
+- Offboard or restore a local identity through `POST /v1/users/status`. Because
+  account activity is global across memberships, only platform admins may use
+  it; self-disable and disabling the last active platform admin fail closed.
+  Every real status change revokes existing JWT and OAuth state versions.
+- Rotate `EVOAGENT_AUTH_SECRET` by deploying the new value with the old value in
+  `EVOAGENT_AUTH_PREVIOUS_SECRET`; after every replica is updated, wait for old
+  sessions and GitHub OAuth states to expire and verify
+  `(sum(rate(evoagent_auth_previous_secret_verifications_total[15m])) or vector(0)) == 0`,
+  then remove the previous value.
+- Rotate the GitHub webhook secret by deploying the new current secret with the
+  old value in `EVOAGENT_GITHUB_WEBHOOK_PREVIOUS_SECRET`, updating GitHub, then
+  removing the previous value after old deliveries drain and
+  `(sum(rate(evoagent_github_webhook_previous_secret_verifications_total[15m])) or vector(0)) == 0`.
+- Require a container for untrusted repair verification.
+- Keep model and GitHub egress on exact host allowlists.
+- Leave history retention disabled until backup and legal policies approve it.
+
+For restore procedures see [disaster recovery](disaster-recovery.md).

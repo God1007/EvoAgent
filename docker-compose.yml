@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     environment:
       POSTGRES_DB: evoagent
       POSTGRES_USER: evoagent
@@ -14,7 +14,7 @@ services:
       retries: 15
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
@@ -24,20 +24,34 @@ services:
       timeout: 3s
       retries: 15
 
+  migrate:
+    build: .
+    command: ["python", "-m", "evoagent.migrate"]
+    environment:
+      EVOAGENT_DATABASE_URL: postgresql://evoagent:evoagent-local@postgres:5432/evoagent
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   evoagent:
     build: .
     ports:
-      - "${EVOAGENT_HOST_PORT:-8080}:8080"
+      - "127.0.0.1:${EVOAGENT_HOST_PORT:-8080}:8080"
     environment:
       EVOAGENT_HOST: 0.0.0.0
       EVOAGENT_DATABASE_URL: postgresql://evoagent:evoagent-local@postgres:5432/evoagent
       EVOAGENT_REDIS_URL: redis://redis:6379/0
       EVOAGENT_ASYNC_WORKERS: 4
-      EVOAGENT_SKILLS_DIR: /app/skills
+      EVOAGENT_SKILLS_DIR: /app/dynamic-skills
+      EVOAGENT_SKILL_REQUIRE_CONTAINER: "true"
       EVOAGENT_AUTH_REQUIRED: "true"
       EVOAGENT_AUTH_SECRET: ${EVOAGENT_AUTH_SECRET:?set EVOAGENT_AUTH_SECRET in .env}
-      EVOAGENT_BOOTSTRAP_ADMIN_USERNAME: ${EVOAGENT_BOOTSTRAP_ADMIN_USERNAME:-admin}
-      EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD: ${EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD:?set EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD in .env}
+      EVOAGENT_BOOTSTRAP_ADMIN_USERNAME: ${EVOAGENT_BOOTSTRAP_ADMIN_USERNAME:-}
+      EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD: ${EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD:-}
+      EVOAGENT_RATE_LIMIT_RPS: ${EVOAGENT_RATE_LIMIT_RPS:-20}
+      EVOAGENT_RATE_LIMIT_BURST: ${EVOAGENT_RATE_LIMIT_BURST:-40}
+      EVOAGENT_MAX_INFLIGHT_HEAVY: ${EVOAGENT_MAX_INFLIGHT_HEAVY:-4}
+      EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS: ${EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS:-100}
     env_file:
       - path: .env
         required: false
@@ -46,7 +60,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     init: true
+    stop_grace_period: 40s
     read_only: true
     tmpfs:
       - /tmp:size=256m,mode=1777

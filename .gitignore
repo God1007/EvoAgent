@@ -1,7 +1,8 @@
 __pycache__/
 *.py[cod]
 *.db
-.env
+.env*
+!.env.example
 .venv/
 .pytest_cache/
 .mypy_cache/

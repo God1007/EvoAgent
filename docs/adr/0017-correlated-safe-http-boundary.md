@@ -38,8 +38,8 @@ event without enabling verbose public errors.
   exception type and a message-independent code-location reference. The latter
   is standardized across operational failures by ADR 0018.
 - All responses, including redirects and overload responses, receive the same
-  request identifier and browser hardening headers. The `Server` header does not
-  expose the Python interpreter version.
+  request identifier, strict same-origin content policy and browser hardening
+  headers. The `Server` header does not expose the Python interpreter version.
 - Only explicit `ClientInputError` and `AccessDeniedError` messages may become
   controlled 4xx responses. An arbitrary built-in `ValueError` or
   `PermissionError` is treated as an unexpected 500, so adapters cannot leak raw

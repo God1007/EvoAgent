@@ -11,14 +11,16 @@ from an untrusted pull request. Two isolation modes are provided:
   under best-effort shell ``ulimit`` bounds (CPU time, file size, process
   count) in its own session so timeouts kill the whole process group. Host mode
   is **not** network-isolated and ``RLIMIT_NPROC`` is per-UID, so it must only
-  be used for trusted repositories. Set ``repair_require_container`` to refuse
-  host mode entirely.
+  be used by trusted direct library callers. Application repair and Proof paths
+  refuse host mode.
 
 Output is read with an upper bound so an untrusted test that floods stdout
-cannot exhaust host memory, and the archive extraction path guards against
-zip-slip.
+cannot exhaust host memory, and archive extraction is bounded against zip-slip
+and compression bombs.
 """
 
+import hashlib
+import math
 import os
 import selectors
 import subprocess
@@ -29,9 +31,13 @@ import zipfile
 from io import BytesIO
 
 from .errors import safe_exception_summary
+from .metrics import metrics
 
 
 class RepairVerifier:
+    MAX_ARCHIVE_MEMBERS = 100_000
+    MAX_ARCHIVE_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
+
     def __init__(
         self,
         test_command: str = "",
@@ -44,6 +50,24 @@ class RepairVerifier:
         cpus: float = 1.0,
         require_container: bool = False,
     ):
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (
+                timeout_seconds,
+                memory_mb,
+                pids_limit,
+                max_output_bytes,
+                max_file_mb,
+            )
+        ):
+            raise ValueError("repair verifier resource limits must be positive integers")
+        if (
+            isinstance(cpus, bool)
+            or not isinstance(cpus, (int, float))
+            or not math.isfinite(cpus)
+            or cpus <= 0
+        ):
+            raise ValueError("repair verifier CPU limit must be positive and finite")
         self.test_command = test_command
         self.timeout_seconds = timeout_seconds
         self.container_image = container_image
@@ -53,6 +77,9 @@ class RepairVerifier:
         self.max_file_mb = max_file_mb
         self.cpus = cpus
         self.require_container = require_container
+        self.max_archive_uncompressed_bytes = min(
+            self.MAX_ARCHIVE_UNCOMPRESSED_BYTES, memory_mb * 1024 * 1024
+        )
 
     def verify_contents(self, files: dict[str, str]) -> dict:
         started = time.monotonic()
@@ -90,15 +117,24 @@ class RepairVerifier:
             raise ValueError("verification worktree does not exist")
         started = time.monotonic()
         if self.container_image:
+            execution_mode = "container"
             status, detail = self._run_in_container(root)
         elif self.require_container:
+            execution_mode = "none"
             status, detail = (
                 "error",
                 "container isolation is required but no repair container image is configured.",
             )
         else:
+            execution_mode = "host"
             status, detail = self._run_on_host(root)
         passed = status == "passed"
+        attestation = {
+            "execution_mode": execution_mode,
+            "test_command_sha256": hashlib.sha256(self.test_command.encode()).hexdigest(),
+        }
+        if self.container_image:
+            attestation["container_image"] = self.container_image
         # ``status`` distinguishes a genuine non-zero test result ("failed") from
         # non-verdict outcomes ("timeout"/"error") so callers such as the Proof
         # Runner never misread an infra failure as a reproduced bug.
@@ -108,11 +144,21 @@ class RepairVerifier:
             "checks": [
                 {"name": "repository-tests", "passed": passed, "status": status, "detail": detail}
             ],
+            "attestation": attestation,
             "duration_seconds": round(time.monotonic() - started, 4),
         }
 
-    def _execute(self, command: list[str], cwd: str | None, env: dict | None) -> tuple:
+    def _execute(
+        self,
+        command: list[str],
+        cwd: str | None,
+        env: dict | None,
+        timeout_seconds: float | None = None,
+    ) -> tuple:
         """Run a command, bounding output size and killing the process group on timeout."""
+        timeout = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        if timeout <= 0:
+            return None, "", True
         try:
             process = subprocess.Popen(
                 command,
@@ -126,12 +172,12 @@ class RepairVerifier:
             return None, safe_exception_summary(exc, "verification launch failed"), False
         if process.stdout is None:  # pragma: no cover - defensive
             return process.wait(), "", False
-        deadline = time.monotonic() + self.timeout_seconds
+        deadline = time.monotonic() + timeout
         buffer = bytearray()
         timed_out = False
         if os.name == "nt":  # pragma: no cover - Windows host mode is not memory-bounded
             try:
-                out, _ = process.communicate(timeout=self.timeout_seconds)
+                out, _ = process.communicate(timeout=timeout)
                 buffer.extend(out or b"")
             except subprocess.TimeoutExpired:
                 self._terminate(process)
@@ -219,17 +265,21 @@ class RepairVerifier:
     def _run_in_container(self, root: str) -> tuple[str, str]:
         name = "evoagent-verify-%s" % uuid.uuid4().hex[:12]
         file_bytes = self.max_file_mb * 1024 * 1024
+        deadline = time.monotonic() + self.timeout_seconds
+        work_tmpfs = "/work:rw,nosuid,nodev,size=%dm" % self.memory_mb
         command = [
             "docker",
             "run",
-            "--rm",
+            "-d",
+            "--pull",
+            "never",
             "--name",
             name,
             "--network",
             "none",
             "--read-only",
             "--tmpfs",
-            "/tmp:size=%dm" % self.memory_mb,
+            "/tmp:rw,nosuid,nodev,size=%dm,mode=1777" % self.memory_mb,
             "--cap-drop",
             "ALL",
             "--security-opt",
@@ -246,27 +296,85 @@ class RepairVerifier:
             "nofile=1024:1024",
             "--workdir",
             "/work",
-            "-v",
-            root + ":/work",
+            "--mount",
+            "type=bind,src=%s,dst=/source,readonly" % root,
         ]
         if os.name != "nt":
-            command += ["--user", "%d:%d" % (os.getuid(), os.getgid())]
-        command += [self.container_image, "sh", "-c", self.test_command]
-        returncode, detail, timed_out = self._execute(command, cwd=None, env=None)
-        if timed_out:
-            subprocess.run(
-                ["docker", "rm", "-f", name], capture_output=True, text=True, check=False
+            user = "%d:%d" % (os.getuid(), os.getgid())
+            work_tmpfs += ",uid=%d,gid=%d,mode=0700" % (os.getuid(), os.getgid())
+            command += ["--user", user]
+        command += ["--tmpfs", work_tmpfs, self.container_image, "sh", "-c", "sleep 2147483647"]
+        copy = ["docker", "exec", "--workdir", "/work"]
+        if os.name != "nt":
+            copy += ["--user", user]
+        copy += [name, "sh", "-c", "cp -R /source/. /work"]
+        created = False
+        try:
+            for setup in (command, copy):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return "timeout", "verification exceeded %d seconds" % self.timeout_seconds
+                try:
+                    result = subprocess.run(
+                        setup,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=remaining,
+                        check=False,
+                    )
+                except subprocess.TimeoutExpired:
+                    return "timeout", "verification exceeded %d seconds" % self.timeout_seconds
+                except OSError as exc:
+                    return "error", safe_exception_summary(exc, "container preparation failed")
+                if result.returncode:
+                    return "error", "container preparation failed"
+                created = True
+            execute = ["docker", "exec", "--workdir", "/work"]
+            if os.name != "nt":
+                execute += ["--user", user]
+            execute += [name, "sh", "-c", self.test_command]
+            returncode, detail, timed_out = self._execute(
+                execute,
+                cwd=None,
+                env=None,
+                timeout_seconds=deadline - time.monotonic(),
             )
-            return "timeout", "verification exceeded %d seconds" % self.timeout_seconds
-        if returncode is None:
-            return "error", detail
-        return ("passed" if returncode == 0 else "failed"), detail
+            if timed_out:
+                return "timeout", "verification exceeded %d seconds" % self.timeout_seconds
+            if returncode is None:
+                return "error", detail
+            return ("passed" if returncode == 0 else "failed"), detail
+        finally:
+            if created:
+                try:
+                    cleanup = subprocess.run(
+                        ["docker", "rm", "-f", name],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=10,
+                        check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    metrics.inc("repair_container_cleanup_failures_total")
+                    raise RuntimeError("repair container cleanup failed") from exc
+                if cleanup.returncode:
+                    metrics.inc("repair_container_cleanup_failures_total")
+                    raise RuntimeError("repair container cleanup failed")
 
     def verify_archive(self, archive: bytes, files: dict[str, str]) -> dict:
         """Verify changed files inside an isolated copy of the complete repository."""
+        if not isinstance(archive, bytes) or len(archive) > self.max_archive_uncompressed_bytes:
+            raise ValueError("repository archive exceeds extraction limits")
         with tempfile.TemporaryDirectory(prefix="evoagent-repair-") as root:
             with zipfile.ZipFile(BytesIO(archive)) as bundle:
-                for member in bundle.infolist():
+                members = bundle.infolist()
+                if (
+                    len(members) > self.MAX_ARCHIVE_MEMBERS
+                    or sum(member.file_size for member in members)
+                    > self.max_archive_uncompressed_bytes
+                ):
+                    raise ValueError("repository archive exceeds extraction limits")
+                for member in members:
                     normalized = os.path.normpath(member.filename).replace("\\", "/")
                     if normalized.startswith("../") or normalized.startswith("/"):
                         raise ValueError("repository archive contains an unsafe path")
@@ -291,6 +399,11 @@ class RepairVerifier:
             return {
                 "passed": compile_result["passed"] and test_result["passed"],
                 "checks": checks,
+                **(
+                    {"attestation": test_result["attestation"]}
+                    if isinstance(test_result.get("attestation"), dict)
+                    else {}
+                ),
                 "duration_seconds": round(
                     compile_result.get("duration_seconds", 0)
                     + test_result.get("duration_seconds", 0),

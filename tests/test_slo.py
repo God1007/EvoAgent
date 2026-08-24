@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import tempfile
 import unittest
 
@@ -44,6 +45,33 @@ class FakeOpener:
 
 
 class CatalogTests(unittest.TestCase):
+    def test_catalog_does_not_coerce_schema_types(self):
+        valid = """version = 1
+[[objectives]]
+id = "availability"
+description = "available"
+target = 0.9
+window = "30d"
+min_samples = 1
+indicator_query = "up"
+sample_query = "count(up)"
+"""
+        for old, new, message in (
+            ("version = 1", "version = true", "version"),
+            ('id = "availability"', "id = 7", "id must be a string"),
+            ('description = "available"', "description = 7", "must be strings"),
+            ("target = 0.9", 'target = "0.9"', "target must be numeric"),
+            ('window = "30d"', "window = 30", "window must be a string"),
+            ("min_samples = 1", "min_samples = true", "positive integer"),
+            ('indicator_query = "up"', "indicator_query = 7", "must be strings"),
+        ):
+            with self.subTest(field=old.split(" = ", 1)[0]):
+                with tempfile.NamedTemporaryFile("w", suffix=".toml") as handle:
+                    handle.write(valid.replace(old, new))
+                    handle.flush()
+                    with self.assertRaisesRegex(ValueError, message):
+                        load_slo_catalog(handle.name)
+
     def test_repository_catalog_is_versioned_and_valid(self):
         catalog = load_slo_catalog(os.path.join(ROOT, "ops", "slo.toml"))
 
@@ -98,48 +126,101 @@ sample_query = "two"
             dashboard = json.load(handle)
 
         self.assertIn("EvoAgentAvailabilityFastBurn", rules)
+        self.assertIn("EvoAgentMonitoringTargetDown", rules)
+        self.assertIn('absent(up{job="evoagent"})', rules)
         self.assertIn("evoagent_queue_oldest_age_seconds", rules)
-        self.assertIn("evoagent:cost:model_micros_per_terminal_review_30m", rules)
-        self.assertIn("EvoAgentModelCapacitySaturated", rules)
+        self.assertIn("EvoAgentQueueUnhealthy", rules)
+        self.assertIn("evoagent_queue_healthy < 1", rules)
         self.assertIn("EvoAgentRepairVerificationBlockedHigh", rules)
+        self.assertIn("EvoAgentFailureCasePersistenceFailing", rules)
+        self.assertIn("EvoAgentAlertEvaluationFailing", rules)
+        self.assertIn("evoagent_alert_evaluation_failures_total[15m]", rules)
+        self.assertIn("EvoAgentReleaseObservationFailing", rules)
+        self.assertIn("evoagent_release_observation_failures_total[15m]", rules)
+        self.assertIn("EvoAgentShadowAuditFailing", rules)
+        self.assertIn("evoagent_shadow_audit_failures_total[15m]", rules)
+        self.assertIn("EvoAgentReleaseAlertFailing", rules)
+        self.assertIn("evoagent_release_alert_failures_total[15m]", rules)
+        self.assertIn("EvoAgentReleaseRevisionMismatch", rules)
+        self.assertIn("evoagent_release_revision_mismatch_total[15m]", rules)
+        self.assertIn("EvoAgentReviewTerminalAccountingFailing", rules)
+        self.assertIn("evoagent_review_terminal_accounting_failures_total[15m]", rules)
         self.assertIn("EvoAgentNegativeFeedbackHigh", rules)
         self.assertIn("EvoAgentRetentionMaintenanceStalled", rules)
         self.assertIn("EvoAgentTenantReviewCapacitySaturated", rules)
-        self.assertIn("EvoAgentTenantFairnessChurnHigh", rules)
         self.assertIn("EvoAgentQueueLeaseHeartbeatFailing", rules)
-        self.assertIn("EvoAgentQueueKeyspaceVersionMixed", rules)
+        self.assertIn("EvoAgentDeadLetterDecodeFailing", rules)
+        self.assertIn("evoagent_queue_dead_letter_decode_failures_total[15m]", rules)
+        self.assertIn("EvoAgentOutboxDispatcherStopped", rules)
+        self.assertIn("evoagent_outbox_dispatcher_running < 1", rules)
+        self.assertIn("EvoAgentOutboxLeaseConflicts", rules)
+        self.assertIn("evoagent_outbox_lease_conflicts_total[10m]", rules)
+        self.assertIn("EvoAgentEffectLeaseConflicts", rules)
+        self.assertIn("evoagent_effect_lease_conflicts_total[10m]", rules)
+        self.assertIn("EvoAgentMetricGaugeCollectionFailing", rules)
+        self.assertIn("EvoAgentSkillFailureRateHigh", rules)
+        self.assertIn("evoagent:ratio:skill_failure_15m", rules)
+        self.assertIn("EvoAgentSkillContainerCleanupFailing", rules)
+        self.assertIn("evoagent_skill_container_cleanup_failures_total[15m]", rules)
+        self.assertIn("EvoAgentRepairContainerCleanupFailing", rules)
+        self.assertIn("evoagent_repair_container_cleanup_failures_total[15m]", rules)
+        self.assertIn("EvoAgentReviewAgentBudgetTimeouts", rules)
+        self.assertIn("evoagent_review_agent_budget_timeouts_total[15m]", rules)
         self.assertIn("or vector(0)", rules)
+        alerts = re.findall(r"^\s+- alert:", rules, re.MULTILINE)
+        runbook_anchors = re.findall(
+            r"^\s+runbook_url: https://github\.com/God1007/EvoAgent/blob/main/"
+            r"docs/operations\.md#([a-z0-9-]+)$",
+            rules,
+            re.MULTILINE,
+        )
+        self.assertEqual(len(alerts), len(runbook_anchors))
         for anchor in (
+            "monitoring-target-down",
             "availability-fast-burn",
             "availability-slow-burn",
             "intake-latency",
             "queue-or-outbox-stale",
+            "metric-collection",
             "dead-letters",
             "review-failures",
-            "model-route-capacity",
-            "model-economics",
             "repair-outcomes",
             "quality-feedback",
-            "plugin-runtime",
+            "model-rollout",
             "history-retention",
             "tenant-review-capacity",
-            "tenant-fair-scheduling",
-            "redis-cluster-queue",
         ):
-            self.assertIn("#" + anchor, rules)
+            self.assertIn(anchor, runbook_anchors)
             self.assertIn("## " + anchor.replace("-", " "), runbook)
-        self.assertEqual("evoagent-enterprise", dashboard["uid"])
-        self.assertGreaterEqual(len(dashboard["panels"]), 18)
+        self.assertEqual("evoagent-overview", dashboard["uid"])
+        self.assertGreaterEqual(len(dashboard["panels"]), 12)
         dashboard_text = json.dumps(dashboard)
-        self.assertIn("evoagent:ratio:model_capacity_rejected_15m", dashboard_text)
+        self.assertIn("evoagent_model_requests_failed_total", dashboard_text)
         self.assertIn("evoagent:ratio:negative_feedback_24h", dashboard_text)
         self.assertIn("evoagent_retention_trace_events_pruned_total", dashboard_text)
+        self.assertIn("evoagent_retention_outbox_messages_pruned_total", dashboard_text)
         self.assertIn("evoagent:ratio:tenant_review_capacity_rejected_15m", dashboard_text)
-        self.assertIn("evoagent:ratio:queue_fair_deferrals_15m", dashboard_text)
-        self.assertIn("evoagent_queue_keyspace_version", dashboard_text)
+        self.assertIn("evoagent_queue_lease_heartbeat_failures_total", dashboard_text)
+        self.assertIn("evoagent:ratio:skill_failure_15m", dashboard_text)
+        self.assertIn("evoagent_review_agent_budget_timeouts_total[15m]", dashboard_text)
+        self.assertIn("evoagent_review_attempts_failed_total[5m]", dashboard_text)
+        self.assertNotIn("evoagent_model_fallback_attempts_total", dashboard_text)
 
 
 class PrometheusClientTests(unittest.TestCase):
+    def test_transport_limits_cannot_be_disabled(self):
+        for name, value in (
+            ("timeout_seconds", 0),
+            ("timeout_seconds", True),
+            ("timeout_seconds", float("nan")),
+            ("max_response_bytes", 0),
+            ("max_response_bytes", True),
+            ("max_response_bytes", float("nan")),
+        ):
+            with self.subTest(name=name, value=value):
+                with self.assertRaisesRegex(ValueError, "positive integers"):
+                    PrometheusClient("http://127.0.0.1:9090", **{name: value})
+
     def test_query_accepts_one_vector_value_and_sends_bearer_token(self):
         body = json.dumps(
             {
@@ -193,6 +274,15 @@ class PrometheusClientTests(unittest.TestCase):
             opener=FakeOpener(FakeResponse(b"{}", content_length=100)),
         )
         with self.assertRaisesRegex(SLOError, "byte limit"):
+            client.query("up")
+
+    def test_response_json_cannot_override_prometheus_status(self):
+        body = (
+            b'{"status":"error","status":"success","data":{"resultType":"scalar","result":[1,"1"]}}'
+        )
+        client = PrometheusClient("http://127.0.0.1:9090", opener=FakeOpener(FakeResponse(body)))
+
+        with self.assertRaisesRegex(SLOError, "invalid SLO response"):
             client.query("up")
 
 

@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from ..codegraph import build_graph
-from ..errors import ClientInputError
+from ..errors import ClientInputError, ResourceNotFoundError, StateConflictError
 from ..metrics import metrics
 from ..ports import SessionApplicationStorePort
+from ..repository import canonical_repository
 from ..session import classify_findings, continuity_summary, open_snapshot
 
 
@@ -27,7 +28,7 @@ class SessionUseCases:
         classified = classify_findings(repository, previous, list(report.findings))
         summary = continuity_summary(classified)
         snapshots = open_snapshot(repository, classified)
-        self.store.complete_session_turn(
+        completed = self.store.complete_session_turn(
             session_id,
             turn_id,
             payload.get("task_id"),
@@ -35,7 +36,8 @@ class SessionUseCases:
             summary,
             payload.get("head_sha"),
         )
-        metrics.inc("session_turns_total")
+        if completed:
+            metrics.inc("session_turns_total")
         return "" if not previous else self.continuity_note(summary)
 
     @staticmethod
@@ -54,39 +56,52 @@ class SessionUseCases:
     def get_for_pull_request(
         self, repository: str, pull_request: int, tenant_id: str = "default"
     ) -> dict[str, Any] | None:
+        repository = canonical_repository(repository)
         session = self.store.get_session(tenant_id, repository, pull_request)
         if not session:
             return None
         return self.store.get_session_timeline(session["id"], tenant_id)
 
     def provide_input(
-        self, session_id: str, message: str, tenant_id: str | None = None
+        self,
+        session_id: str,
+        message: str,
+        tenant_id: str | None = None,
+        actor: str = "system",
     ) -> dict[str, Any]:
+        if not isinstance(message, str) or not message.strip():
+            raise ClientInputError("session input must be a non-empty string")
         timeline = self.store.get_session_timeline(session_id, tenant_id)
         if timeline is None:
-            raise ClientInputError("session not found")
-        self.store.resolve_session_input(session_id)
-        self.store.audit(
-            tenant_id or timeline.get("tenant_id", "default"),
-            "user",
-            "session.input.provided",
+            raise ResourceNotFoundError("session not found")
+        if timeline.get("status") != "input-required" or not self.store.resolve_session_input(
             session_id,
-            {"message": message[:2000]},
-        )
+            tenant_id or str(timeline.get("tenant_id") or "default"),
+            actor,
+        ):
+            raise StateConflictError("session is not waiting for input")
         return {"session_id": session_id, "status": "open"}
 
     def analyze_impact(self, sources: dict[str, Any], changed_paths: list[Any]) -> dict[str, Any]:
         if not isinstance(sources, dict) or not isinstance(changed_paths, list):
             raise ClientInputError("'files' object and 'changed' list are required")
-        normalized = {
-            path: value
+        if any(
+            not isinstance(path, str) or not isinstance(value, str)
             for path, value in sources.items()
-            if isinstance(path, str) and isinstance(value, str)
-        }
-        if len(normalized) > 5000:
-            raise ClientInputError("too many files to analyse in a single request")
-        total = sum(len(value.encode("utf-8")) for value in normalized.values())
+        ):
+            raise ClientInputError("'files' must map string paths to string contents")
+        if any(not isinstance(path, str) for path in changed_paths):
+            raise ClientInputError("'changed' must contain only string paths")
+        if len(sources) > 5000 or len(changed_paths) > 5000:
+            raise ClientInputError("too many files or changed paths to analyse in one request")
+        try:
+            total = sum(
+                len(path.encode("utf-8")) + len(value.encode("utf-8"))
+                for path, value in sources.items()
+            ) + sum(len(path.encode("utf-8")) for path in changed_paths)
+        except UnicodeEncodeError:
+            raise ClientInputError("source paths and contents must be valid UTF-8") from None
         if total > self.max_diff_bytes * 10:
             raise ClientInputError("source payload exceeds the maximum analysable size")
-        graph = build_graph(normalized)
-        return graph.impact_of([path for path in changed_paths if isinstance(path, str)])
+        graph = build_graph(sources)
+        return graph.impact_of(changed_paths)

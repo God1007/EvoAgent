@@ -98,12 +98,14 @@ class Metrics:
         with self._lock:
             sources = dict(self._gauge_sources)
         sampled: dict[str, float] = {}
+        failed_sources = 0
         for name, source in sources.items():
             try:
                 sampled[name] = float(source())
-            except Exception:  # pragma: no cover - defensive probe isolation
-                continue
+            except Exception:
+                failed_sources += 1
         with self._lock:
+            self.counters["metrics_gauge_scrape_failures_total"] += bool(failed_sources)
             gauges = dict(self.gauges)
             gauges.update(sampled)
             lines: list[str] = []

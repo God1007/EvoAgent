@@ -1,8 +1,16 @@
 import os
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
-from evoagent.proof import EvidenceLevel, ProofRunner, _materialize, unified_patch
+from evoagent.errors import ClientInputError
+from evoagent.proof import (
+    MAX_PROOF_FILES,
+    EvidenceLevel,
+    ProofRunner,
+    _materialize,
+    unified_patch,
+)
 
 REPRO = "run-reproduction"
 REGRESS = "run-regression"
@@ -85,6 +93,20 @@ class ProofLadderTests(unittest.TestCase):
         self.assertEqual(int(EvidenceLevel.L1_STATIC), result["evidence_level"])
         self.assertIn("static analysis only", result["note"])
 
+    def test_rejects_file_sets_that_would_amplify_host_io(self):
+        files = {"f%d.py" % index: "" for index in range(MAX_PROOF_FILES + 1)}
+
+        with self.assertRaisesRegex(ClientInputError, "5000 distinct paths"):
+            self.runner.prove(files, {}, REPRO)
+
+    def test_rejects_unsafe_paths_before_calling_executor(self):
+        executor = mock.Mock()
+
+        with self.assertRaisesRegex(ClientInputError, "unsafe path"):
+            ProofRunner(executor=executor).prove({"../escape.py": "BUG\n"}, {}, REPRO)
+
+        executor.execute.assert_not_called()
+
     def test_l1_when_reproduction_does_not_fail_on_original(self):
         result = self.runner.prove({"a.py": "ok\n"}, {"a.py": "ok\n"}, REPRO)
         self.assertEqual(int(EvidenceLevel.L1_STATIC), result["evidence_level"])
@@ -147,6 +169,22 @@ class ProofLadderTests(unittest.TestCase):
             r"^proof executor failed \[type=builtins\.RuntimeError; ref=[0-9a-f]{16}\]$",
         )
         self.assertNotIn("proof-secret", str(result))
+
+    def test_malformed_executor_result_is_an_inconclusive_error(self):
+        class MalformedExecutor:
+            def execute(self, _files, _command):
+                return None
+
+        result = ProofRunner(executor=MalformedExecutor()).prove(
+            {"a.py": "BUG\n"}, {"a.py": "fixed\n"}, REPRO
+        )
+
+        self.assertEqual(int(EvidenceLevel.L1_STATIC), result["evidence_level"])
+        self.assertEqual("error", result["steps"][0]["status"])
+        self.assertRegex(
+            result["steps"][0]["detail"],
+            r"^proof executor failed \[type=builtins\.TypeError; ref=[0-9a-f]{16}\]$",
+        )
 
 
 class MaterializeSafetyTests(unittest.TestCase):

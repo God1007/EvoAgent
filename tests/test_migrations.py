@@ -1,373 +1,240 @@
+import hashlib
 import json
-import os
-import sqlite3
-import tempfile
 import threading
 import unittest
-import uuid
-from unittest.mock import patch
+from unittest import mock
 
-import evoagent.migrations as migration_module
 from evoagent.migrations import (
     CURRENT_SCHEMA_VERSION,
     MIGRATIONS,
-    Migration,
     MigrationApplyError,
     SchemaHistoryError,
     SchemaTooNewError,
-    migrate_sqlite,
-    validate_current_schema_history,
+    migrate_postgres,
 )
-from evoagent.models import TaskState
-from evoagent.store import TaskStore, utc_now
+from evoagent.postgres_store import PostgresTaskStore
+from evoagent.time_utils import utc_now
+from tests.db_support import postgres_url
 
 
-class SQLiteMigrationTests(unittest.TestCase):
+class MigrationCatalogTests(unittest.TestCase):
+    def test_released_migration_checksums_remain_explicit_and_current(self):
+        self.assertEqual(
+            list(range(1, CURRENT_SCHEMA_VERSION + 1)), [m.version for m in MIGRATIONS]
+        )
+        self.assertTrue(all(len(m.checksum) == 64 for m in MIGRATIONS))
+        # Versions 1-14 retain checksums from the retired dual-database catalog.
+        for migration in MIGRATIONS[14:]:
+            payload = json.dumps(
+                {
+                    "version": migration.version,
+                    "name": migration.name,
+                    "postgres": migration.statements,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            self.assertEqual(migration.checksum, hashlib.sha256(payload.encode()).hexdigest())
+
+    def test_store_schema_version_revalidates_live_history(self):
+        current = [
+            {"version": item.version, "name": item.name, "checksum": item.checksum}
+            for item in MIGRATIONS
+        ]
+        connection = mock.Mock()
+        connection.execute.return_value.fetchall.side_effect = [
+            current,
+            [*current, {"version": CURRENT_SCHEMA_VERSION + 1, "name": "future", "checksum": "x"}],
+        ]
+        manager = mock.MagicMock()
+        manager.__enter__.return_value = connection
+        store = PostgresTaskStore.__new__(PostgresTaskStore)
+        store._connect = mock.Mock(return_value=manager)  # type: ignore[method-assign]
+
+        self.assertEqual(CURRENT_SCHEMA_VERSION, store.schema_version())
+        with self.assertRaises(SchemaTooNewError):
+            store.schema_version()
+
+        self.assertEqual(2, store._connect.call_count)
+
+    def test_migration_failure_does_not_copy_database_error_text(self):
+        connection = mock.Mock()
+        connection.execute.side_effect = RuntimeError("password=database-secret")
+
+        with self.assertRaises(MigrationApplyError) as raised:
+            migrate_postgres(connection)
+
+        self.assertIn("RuntimeError", str(raised.exception))
+        self.assertNotIn("database-secret", str(raised.exception))
+
+
+class PostgreSQLMigrationTests(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.path = os.path.join(self.directory.name, "evoagent.db")
+        self.url = postgres_url(self)
+        self._drop_application_tables()
 
     def tearDown(self):
-        self.directory.cleanup()
+        self._drop_application_tables()
 
-    def connect(self):
-        conn = sqlite3.connect(self.path, timeout=10)
-        conn.row_factory = sqlite3.Row
-        return conn
+    def _drop_application_tables(self):
+        import psycopg
+        from psycopg.rows import dict_row
 
-    def test_fresh_store_records_contiguous_checksummed_history(self):
-        store = TaskStore(self.path)
-        self.assertEqual(CURRENT_SCHEMA_VERSION, store.schema_version())
-
-        with self.connect() as conn:
+        with psycopg.connect(self.url, row_factory=dict_row) as conn:
             rows = conn.execute(
-                "SELECT version,name,checksum,applied_at FROM schema_migrations ORDER BY version"
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema=current_schema() AND table_type='BASE TABLE'"
             ).fetchall()
+            if rows:
+                sql = psycopg.sql
+                tables = sql.SQL(", ").join(sql.Identifier(row["table_name"]) for row in rows)
+                conn.execute(sql.SQL("DROP TABLE {} CASCADE").format(tables))
+
+    def test_clean_database_reaches_current_schema(self):
+        store = PostgresTaskStore(self.url, pool_min=0, pool_max=0)
+        self.addCleanup(store.close)
+
+        self.assertEqual(CURRENT_SCHEMA_VERSION, store.schema_version())
+        with store._connect() as conn:
+            tables = {
+                row["table_name"]
+                for row in conn.execute(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema=current_schema()"
+                ).fetchall()
+            }
+            session_columns = {
+                row["column_name"]
+                for row in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema=current_schema() AND table_name='review_sessions'"
+                ).fetchall()
+            }
             indexes = {
-                row["name"]
+                row["indexname"]
                 for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'"
+                    "SELECT indexname FROM pg_indexes WHERE schemaname=current_schema()"
                 ).fetchall()
             }
-            model_usage_columns = {
-                row["name"] for row in conn.execute("PRAGMA table_info(model_usage)").fetchall()
-            }
-            task_columns = {
-                row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
-            }
-            session_turn_columns = {
-                row["name"] for row in conn.execute("PRAGMA table_info(session_turns)").fetchall()
-            }
-            shadow_table = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='model_route_shadows'"
-            ).fetchone()
-            capacity_tables = {
-                row["name"]
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' "
-                    "AND name LIKE 'model_route_capacity_%'"
-                ).fetchall()
-            }
-            admission_table = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='task_admissions'"
-            ).fetchone()
-            admission_columns = {
-                row["name"] for row in conn.execute("PRAGMA table_info(task_admissions)").fetchall()
-            }
-        self.assertEqual([item.version for item in MIGRATIONS], [row["version"] for row in rows])
-        self.assertEqual([item.name for item in MIGRATIONS], [row["name"] for row in rows])
-        self.assertEqual([item.checksum for item in MIGRATIONS], [row["checksum"] for row in rows])
-        self.assertTrue(all(row["applied_at"] for row in rows))
-        self.assertEqual(CURRENT_SCHEMA_VERSION, validate_current_schema_history(list(rows)))
-        self.assertIn("idx_tasks_recovery", indexes)
-        self.assertIn("idx_audit_recovery_epoch", indexes)
-        self.assertIn("idx_model_usage_reconciliation", indexes)
-        self.assertIn("idx_model_route_shadows_report", indexes)
-        self.assertIn("idx_model_route_capacity_leases", indexes)
-        self.assertIn("idx_model_route_capacity_windows", indexes)
-        self.assertIn("idx_trace_events_retention", indexes)
-        self.assertIn("idx_session_findings_retention", indexes)
-        self.assertIn("idx_task_admissions_tenant_active", indexes)
-        self.assertEqual(
-            {"lane", "topology_sha256"}, {"lane", "topology_sha256"} & model_usage_columns
-        )
-        self.assertIsNotNone(shadow_table)
-        self.assertIn("trace_pruned_at", task_columns)
-        self.assertIn("findings_pruned_at", session_turn_columns)
-        self.assertEqual(
-            {"model_route_capacity_leases", "model_route_capacity_windows"}, capacity_tables
-        )
-        self.assertIsNotNone(admission_table)
-        self.assertIn("generation", admission_columns)
+        self.assertIn("tasks", tables)
+        self.assertIn("outbox_messages", tables)
+        self.assertIn("consumed_auth_states", tables)
+        self.assertNotIn("model_usage", tables)
+        self.assertNotIn("model_route_shadows", tables)
+        self.assertNotIn("model_route_capacity_leases", tables)
+        self.assertIn("last_webhook_at", session_columns)
+        self.assertIn("idx_evolution_runs_skill_candidate_created", indexes)
+        self.assertIn("idx_effect_receipts_completed_at", indexes)
+        self.assertIn("idx_webhook_deliveries_received_at", indexes)
 
-    def test_read_only_operational_gate_refuses_an_old_schema(self):
-        with self.connect() as conn:
-            migrate_sqlite(conn, CURRENT_SCHEMA_VERSION - 1)
-            rows = conn.execute(
-                "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
-            ).fetchall()
+    def test_tampered_history_fails_closed(self):
+        store = PostgresTaskStore(self.url, pool_min=0, pool_max=0)
+        with store._connect() as conn:
+            conn.execute("UPDATE schema_migrations SET checksum='tampered' WHERE version=1")
+        store.close()
 
-        with self.assertRaisesRegex(SchemaHistoryError, "required version"):
-            validate_current_schema_history(list(rows))
+        with self.assertRaises(SchemaHistoryError):
+            PostgresTaskStore(self.url, pool_min=0, pool_max=0)
 
-    def test_forward_migrates_from_previous_version_without_data_loss(self):
-        previous = CURRENT_SCHEMA_VERSION - 1
-        task_id = "task-" + uuid.uuid4().hex
-        with self.connect() as conn:
-            migrate_sqlite(conn, previous)
-            now = utc_now()
+    def test_newer_schema_fails_closed(self):
+        store = PostgresTaskStore(self.url, pool_min=0, pool_max=0)
+        with store._connect() as conn:
             conn.execute(
-                "INSERT INTO tasks(id,state,repository,pull_request,input_json,report_json,error,"
-                "created_at,updated_at,tenant_id,cancel_requested) VALUES (?,?,?,?,?,NULL,NULL,?,?,?,0)",
-                (
-                    task_id,
-                    TaskState.PENDING.value,
-                    "acme/widgets",
-                    9,
-                    json.dumps({"source": "previous-release"}),
-                    now,
-                    now,
-                    "tenant-a",
-                ),
-            )
-
-        store = TaskStore(self.path)
-        self.assertEqual(CURRENT_SCHEMA_VERSION, store.schema_version())
-        self.assertEqual("previous-release", store.get(task_id, "tenant-a")["input"]["source"])
-        self.assertEqual(1, store.tenant_review_admission_stats("tenant-a")["active"])
-
-    def test_forward_migration_removes_legacy_operational_exception_text(self):
-        task_id = "legacy-error-" + uuid.uuid4().hex
-        secret = "password=legacy-operational-secret"
-        now = utc_now()
-        sanitize_version = next(
-            item.version for item in MIGRATIONS if item.name == "sanitize-legacy-operational-errors"
-        )
-        with self.connect() as conn:
-            migrate_sqlite(conn, sanitize_version - 1)
-            conn.execute(
-                "INSERT INTO tasks(id,state,repository,pull_request,input_json,report_json,error,"
-                "created_at,updated_at,tenant_id,cancel_requested) "
-                "VALUES (?,?,?,?,?,NULL,?,?,?,?,0)",
-                (task_id, TaskState.FAILED.value, "acme/widgets", 1, "{}", secret, now, now, "t"),
-            )
-            conn.execute(
-                "INSERT INTO trace_events(task_id,step,state,message,created_at) VALUES (?,?,?,?,?)",
-                (task_id, 1, TaskState.FAILED.value, secret, now),
-            )
-            conn.execute(
-                "INSERT INTO failure_cases(task_id,category,payload_json,resolved,created_at) "
-                "VALUES (?,?,?,?,?)",
-                (task_id, "execution_error", json.dumps({"error": secret}), 0, now),
-            )
-            conn.execute(
-                "INSERT INTO checkpoints(task_id,node,status,attempt,state_json,error,updated_at) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (task_id, "reviewing", "failed", 1, "{}", secret, now),
-            )
-            conn.execute(
-                "INSERT INTO agent_messages(task_id,sender,recipient,kind,correlation_id,"
-                "content_json,created_at) VALUES (?,?,?,?,?,?,?)",
-                (
-                    task_id,
-                    "agent",
-                    "planner",
-                    "agent_failure",
-                    "",
-                    json.dumps({"error": secret}),
-                    now,
-                ),
-            )
-            conn.execute(
-                "INSERT INTO outbox_messages(id,topic,message_key,payload_json,status,attempts,"
-                "available_at,last_error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-                ("outbox", "review", "outbox", "{}", "dead", 1, now, secret, now, now),
-            )
-            conn.execute(
-                "INSERT INTO effect_receipts(effect_key,status,attempts,last_error,created_at,"
-                "updated_at) VALUES (?,?,?,?,?,?)",
-                ("effect", "pending", 1, secret, now, now),
-            )
-            conn.execute(
-                "INSERT INTO alerts(tenant_id,alert_key,severity,message,status,created_at,"
-                "updated_at) VALUES (?,?,?,?,?,?,?)",
-                ("t", "dlq:" + task_id, "critical", secret, "open", now, now),
-            )
-            conn.execute(
-                "INSERT INTO audit_log(tenant_id,actor,action,resource,detail_json,created_at) "
-                "VALUES (?,?,?,?,?,?)",
-                ("t", "system", "shadow.failed", task_id, json.dumps({"error": secret}), now),
-            )
-            conn.commit()
-            migrate_sqlite(conn)
-            values = {
-                "task": conn.execute("SELECT error FROM tasks WHERE id=?", (task_id,)).fetchone()[
-                    0
-                ],
-                "trace": conn.execute(
-                    "SELECT message FROM trace_events WHERE task_id=?", (task_id,)
-                ).fetchone()[0],
-                "failure": conn.execute(
-                    "SELECT payload_json FROM failure_cases WHERE task_id=?", (task_id,)
-                ).fetchone()[0],
-                "checkpoint": conn.execute(
-                    "SELECT error FROM checkpoints WHERE task_id=?", (task_id,)
-                ).fetchone()[0],
-                "agent": conn.execute(
-                    "SELECT content_json FROM agent_messages WHERE task_id=?", (task_id,)
-                ).fetchone()[0],
-                "outbox": conn.execute(
-                    "SELECT last_error FROM outbox_messages WHERE id='outbox'"
-                ).fetchone()[0],
-                "effect": conn.execute(
-                    "SELECT last_error FROM effect_receipts WHERE effect_key='effect'"
-                ).fetchone()[0],
-                "alert": conn.execute(
-                    "SELECT message FROM alerts WHERE alert_key=?", ("dlq:" + task_id,)
-                ).fetchone()[0],
-                "audit": conn.execute(
-                    "SELECT detail_json FROM audit_log WHERE action='shadow.failed'"
-                ).fetchone()[0],
-            }
-
-        self.assertNotIn(secret, json.dumps(values))
-        self.assertEqual("review execution failed", values["task"].split(" [", 1)[0])
-        self.assertEqual(
-            "review agent failed", json.loads(values["agent"])["error"].split(" [", 1)[0]
-        )
-        self.assertEqual(
-            "shadow review failed", json.loads(values["audit"])["error"].split(" [", 1)[0]
-        )
-
-    def test_adopts_unversioned_legacy_schema_and_preserves_rows(self):
-        task_id = "legacy-" + uuid.uuid4().hex
-        now = utc_now()
-        with self.connect() as conn:
-            conn.execute(
-                """CREATE TABLE tasks (
-                    id TEXT PRIMARY KEY, state TEXT NOT NULL, repository TEXT NOT NULL,
-                    pull_request INTEGER, input_json TEXT NOT NULL, report_json TEXT,
-                    error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"""
-            )
-            conn.execute(
-                """CREATE TABLE installations (
-                    installation_id INTEGER PRIMARY KEY, account_login TEXT NOT NULL,
-                    created_at TEXT NOT NULL)"""
-            )
-            conn.execute(
-                "INSERT INTO tasks VALUES (?,?,?,?,?,NULL,NULL,?,?)",
-                (
-                    task_id,
-                    TaskState.PENDING.value,
-                    "legacy/repository",
-                    3,
-                    json.dumps({"legacy": True}),
-                    now,
-                    now,
-                ),
-            )
-
-        store = TaskStore(self.path)
-        task = store.get(task_id, "default")
-        self.assertIsNotNone(task)
-        self.assertTrue(task["input"]["legacy"])
-        with self.connect() as conn:
-            task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
-            installation_columns = {
-                row["name"] for row in conn.execute("PRAGMA table_info(installations)")
-            }
-        self.assertIn("tenant_id", task_columns)
-        self.assertIn("cancel_requested", task_columns)
-        self.assertIn("tenant_id", installation_columns)
-
-    def test_refuses_schema_created_by_newer_application(self):
-        TaskStore(self.path)
-        with self.connect() as conn:
-            conn.execute(
-                "INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES (?,?,?,?)",
+                "INSERT INTO schema_migrations(version,name,checksum,applied_at) "
+                "VALUES (%s,%s,%s,%s)",
                 (CURRENT_SCHEMA_VERSION + 1, "future", "future", utc_now()),
             )
-        with self.assertRaisesRegex(SchemaTooNewError, "newer than supported"):
-            TaskStore(self.path)
+        with self.assertRaises(SchemaTooNewError):
+            store.schema_version()
+        store.close()
 
-    def test_refuses_modified_migration_history(self):
-        TaskStore(self.path)
-        with self.connect() as conn:
-            conn.execute("UPDATE schema_migrations SET checksum='tampered' WHERE version=1")
-        with self.assertRaisesRegex(SchemaHistoryError, "immutable application history"):
-            TaskStore(self.path)
+        with self.assertRaises(SchemaTooNewError):
+            PostgresTaskStore(self.url, pool_min=0, pool_max=0)
 
-    def test_refuses_non_contiguous_history(self):
-        with self.connect() as conn:
-            conn.execute(
-                """CREATE TABLE schema_migrations (
-                    version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT NOT NULL,
-                    applied_at TEXT NOT NULL)"""
-            )
-            migration = MIGRATIONS[1]
-            conn.execute(
-                "INSERT INTO schema_migrations VALUES (?,?,?,?)",
-                (migration.version, migration.name, migration.checksum, utc_now()),
-            )
-        with self.assertRaisesRegex(SchemaHistoryError, "not contiguous"):
-            TaskStore(self.path)
-
-    def test_failed_migration_rolls_back_schema_and_history(self):
-        TaskStore(self.path)
-        failing = Migration(
-            CURRENT_SCHEMA_VERSION + 1,
-            "failure-injection",
-            ("CREATE TABLE must_rollback(id INTEGER)", "THIS IS NOT VALID SQL"),
-            (),
-        )
-        catalog = MIGRATIONS + (failing,)
-        by_version = {item.version: item for item in catalog}
-        with (
-            patch.object(migration_module, "MIGRATIONS", catalog),
-            patch.object(migration_module, "CURRENT_SCHEMA_VERSION", CURRENT_SCHEMA_VERSION + 1),
-            patch.object(migration_module, "_MIGRATION_BY_VERSION", by_version),
-            self.connect() as conn,
-        ):
-            with self.assertRaisesRegex(MigrationApplyError, "migration failed"):
-                migrate_sqlite(conn, CURRENT_SCHEMA_VERSION + 1)
-
-        with self.connect() as conn:
-            table = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='must_rollback'"
-            ).fetchone()
-            newest = conn.execute(
-                "SELECT MAX(version) AS version FROM schema_migrations"
-            ).fetchone()
-        self.assertIsNone(table)
-        self.assertEqual(CURRENT_SCHEMA_VERSION, newest["version"])
-
-    def test_concurrent_startup_serializes_migration(self):
-        barrier = threading.Barrier(3)
-        versions: list[int] = []
-        failures: list[Exception] = []
+    def test_concurrent_startup_serializes_migrations(self):
+        versions = []
+        failures = []
 
         def start():
-            barrier.wait()
             try:
-                versions.append(TaskStore(self.path).schema_version())
-            except Exception as exc:  # pragma: no cover - assertion captures diagnostics
+                store = PostgresTaskStore(self.url, pool_min=0, pool_max=0)
+                versions.append(store.schema_version())
+                store.close()
+            except Exception as exc:
                 failures.append(exc)
 
-        threads = [threading.Thread(target=start) for _ in range(2)]
+        threads = [threading.Thread(target=start) for _ in range(4)]
         for thread in threads:
             thread.start()
-        barrier.wait()
         for thread in threads:
-            thread.join(10)
+            thread.join(20)
 
-        self.assertFalse(failures)
-        self.assertEqual([CURRENT_SCHEMA_VERSION, CURRENT_SCHEMA_VERSION], sorted(versions))
+        self.assertEqual([], failures)
+        self.assertEqual([CURRENT_SCHEMA_VERSION] * 4, sorted(versions))
 
-    def test_target_version_is_bounded(self):
-        with self.connect() as conn:
-            with self.assertRaisesRegex(ValueError, "target schema version"):
-                migrate_sqlite(conn, CURRENT_SCHEMA_VERSION + 1)
+    def test_deployment_invariants_are_enforced_by_postgresql(self):
+        import psycopg
 
+        store = PostgresTaskStore(self.url, pool_min=0, pool_max=0)
+        self.addCleanup(store.close)
+        store.save_deployment(
+            "tenant-a",
+            "review-skill",
+            {
+                "stable_version": 1,
+                "candidate_version": 2,
+                "status": "running",
+            },
+        )
 
-if __name__ == "__main__":
-    unittest.main()
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            with store._connect() as conn:
+                conn.execute(
+                    "UPDATE deployments SET errors=samples+1 "
+                    "WHERE tenant_id='tenant-a' AND skill_name='review-skill'"
+                )
+
+    def test_old_writer_cannot_activate_an_unqualified_skill_version(self):
+        import psycopg
+
+        store = PostgresTaskStore(self.url, pool_min=0, pool_max=0)
+        self.addCleanup(store.close)
+
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            with store._connect() as conn:
+                conn.execute(
+                    "INSERT INTO skill_versions(skill_name,version,prompt,score,active,"
+                    "parent_version,created_at) VALUES (%s,1,%s,0,TRUE,NULL,%s)",
+                    ("llm-review", "unqualified", utc_now()),
+                )
+
+    def test_qualification_migration_preserves_evolution_decisions(self):
+        import psycopg
+        from psycopg.rows import dict_row
+
+        with psycopg.connect(self.url, row_factory=dict_row) as conn:
+            migrate_postgres(conn, 17)
+            for version, active in ((1, True), (2, False), (3, False), (4, False)):
+                conn.execute(
+                    "INSERT INTO skill_versions(skill_name,version,prompt,score,active,"
+                    "parent_version,created_at) VALUES (%s,%s,%s,0,%s,NULL,%s)",
+                    ("llm-review", version, "prompt-%s" % version, active, utc_now()),
+                )
+            for version, decision in ((1, "activated"), (2, "rejected"), (4, "activated")):
+                conn.execute(
+                    "INSERT INTO evolution_runs(id,skill_name,candidate_version,baseline_version,"
+                    "decision,candidate_score,baseline_score,metrics_json,created_at) "
+                    "VALUES (%s,%s,%s,NULL,%s,0,0,'{}'::jsonb,%s)",
+                    ("run-%s" % version, "llm-review", version, decision, utc_now()),
+                )
+
+            migrate_postgres(conn)
+            rows = conn.execute(
+                "SELECT version,qualification FROM skill_versions ORDER BY version"
+            ).fetchall()
+
+        self.assertEqual(
+            [(1, "legacy"), (2, "rejected"), (3, "rejected"), (4, "approved")],
+            [(row["version"], row["qualification"]) for row in rows],
+        )

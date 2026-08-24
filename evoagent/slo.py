@@ -14,6 +14,8 @@ import urllib.request
 from dataclasses import asdict, dataclass
 from typing import Any, Protocol
 
+from .json_boundary import strict_json_loads
+
 _ID = re.compile(r"^[a-z][a-z0-9-]{1,63}$")
 _WINDOW = re.compile(r"^[1-9][0-9]*[smhdwy]$")
 _LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
@@ -62,7 +64,8 @@ class SLOResult:
 def load_slo_catalog(path: str) -> SLOCatalog:
     with open(path, "rb") as handle:
         document = tomllib.load(handle)
-    if document.get("version") != 1:
+    version = document.get("version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
         raise ValueError("unsupported SLO catalog version")
     raw_objectives = document.get("objectives")
     if not isinstance(raw_objectives, list) or not raw_objectives:
@@ -72,27 +75,42 @@ def load_slo_catalog(path: str) -> SLOCatalog:
     for raw in raw_objectives:
         if not isinstance(raw, dict):
             raise ValueError("SLO objective must be a table")
-        objective_id = str(raw.get("id", ""))
+        objective_id = raw.get("id", "")
+        if not isinstance(objective_id, str):
+            raise ValueError("SLO objective id must be a string")
         if not _ID.fullmatch(objective_id) or objective_id in seen:
             raise ValueError("SLO objective ids must be unique lowercase slugs")
         seen.add(objective_id)
-        target = float(raw.get("target", 0))
+        raw_target = raw.get("target", 0)
+        if isinstance(raw_target, bool) or not isinstance(raw_target, (int, float)):
+            raise ValueError("SLO target must be numeric")
+        target = float(raw_target)
         if not 0 < target < 1:
             raise ValueError("SLO target must be greater than 0 and less than 1")
-        window = str(raw.get("window", ""))
+        window = raw.get("window", "")
+        if not isinstance(window, str):
+            raise ValueError("SLO window must be a string")
         if not _WINDOW.fullmatch(window):
             raise ValueError("SLO window must use Prometheus duration syntax")
-        indicator_query = str(raw.get("indicator_query", "")).strip()
-        sample_query = str(raw.get("sample_query", "")).strip()
+        description = raw.get("description", "")
+        indicator_query = raw.get("indicator_query", "")
+        sample_query = raw.get("sample_query", "")
+        if not all(
+            isinstance(value, str) for value in (description, indicator_query, sample_query)
+        ):
+            raise ValueError("SLO description and queries must be strings")
+        description = description.strip()
+        indicator_query = indicator_query.strip()
+        sample_query = sample_query.strip()
         if not indicator_query or not sample_query:
             raise ValueError("SLO indicator and sample queries are required")
-        min_samples = int(raw.get("min_samples", 1))
-        if min_samples <= 0:
-            raise ValueError("SLO min_samples must be positive")
+        min_samples = raw.get("min_samples", 1)
+        if isinstance(min_samples, bool) or not isinstance(min_samples, int) or min_samples <= 0:
+            raise ValueError("SLO min_samples must be a positive integer")
         objectives.append(
             SLOObjective(
                 objective_id,
-                str(raw.get("description", "")).strip(),
+                description,
                 target,
                 window,
                 indicator_query,
@@ -129,8 +147,11 @@ class PrometheusClient:
             raise ValueError("Prometheus URL must use HTTP(S)")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("Prometheus URL must not contain credentials, query, or fragment")
-        if timeout_seconds <= 0 or max_response_bytes <= 0:
-            raise ValueError("Prometheus client limits must be positive")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (timeout_seconds, max_response_bytes)
+        ):
+            raise ValueError("Prometheus client limits must be positive integers")
         self.base_url = urllib.parse.urlunsplit(
             (parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", "")
         )
@@ -160,7 +181,7 @@ class PrometheusClient:
         if len(body) > self.max_response_bytes:
             raise SLOError("Prometheus response exceeds the byte limit")
         try:
-            document = json.loads(body)
+            document = strict_json_loads(body)
             if not isinstance(document, dict):
                 raise SLOError("Prometheus returned an invalid SLO response")
             if document.get("status") != "success":
@@ -175,7 +196,7 @@ class PrometheusClient:
             else:
                 raise SLOError("Prometheus SLO query must return exactly one value")
             value = float(raw_value)
-        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        except (KeyError, IndexError, TypeError, ValueError, RecursionError) as exc:
             raise SLOError("Prometheus returned an invalid SLO response") from exc
         if value != value or value in {float("inf"), float("-inf")}:
             raise SLOError("Prometheus returned a non-finite SLO value")

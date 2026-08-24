@@ -94,6 +94,13 @@ class CodeGraph:
             # Honour the "index as empty rather than abort" contract for
             # unparseable, null-byte-bearing, or pathologically nested input.
             return index
+        call_aliases = {
+            alias.asname: alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+            if alias.asname
+        }
 
         def visit_body(body: list[ast.stmt], prefix: str, container_kind: str) -> None:
             for node in body:
@@ -125,7 +132,9 @@ class CodeGraph:
                     # Union rather than assign: two symbols can collide on a
                     # qualname (a nested function and a same-named method), and
                     # dropping one side would silently lose real call edges.
-                    index.calls.setdefault(qualname, set()).update(_called_names(node))
+                    index.calls.setdefault(qualname, set()).update(
+                        _called_names(node, call_aliases)
+                    )
                     # Nested functions/classes are addressable too.
                     visit_body(node.body, qualname, "function")
                 elif isinstance(node, ast.Import):
@@ -259,13 +268,13 @@ def _import_from_targets(module: str, node: ast.ImportFrom) -> set[str]:
     return targets
 
 
-def _called_names(func: ast.AST) -> set[str]:
+def _called_names(func: ast.AST, aliases: dict[str, str]) -> set[str]:
     names: set[str] = set()
     for node in ast.walk(func):
         if isinstance(node, ast.Call):
             target = node.func
             if isinstance(target, ast.Name):
-                names.add(target.id)
+                names.add(aliases.get(target.id, target.id))
             elif isinstance(target, ast.Attribute):
                 names.add(target.attr)
     return names

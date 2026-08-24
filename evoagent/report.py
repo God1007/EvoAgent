@@ -41,7 +41,7 @@ def _fence(value: Any) -> str:
     return "%s\n%s\n%s" % (fence, text, fence)
 
 
-def to_markdown(report: dict[str, Any]) -> str:
+def to_markdown(report: dict[str, Any], max_chars: int | None = None) -> str:
     title = "# EvoAgent PR Review"
     if report.get("pull_request") is not None:
         title += " — #%s" % _text(report["pull_request"])
@@ -58,7 +58,8 @@ def to_markdown(report: dict[str, Any]) -> str:
     findings = report.get("findings", [])
     if not findings:
         lines.append("✅ No actionable issue detected in the added lines.")
-        return "\n".join(lines) + "\n"
+        markdown = "\n".join(lines) + "\n"
+        return markdown if max_chars is None else markdown[:max_chars]
     lines.extend(["## Findings", ""])
     icons = {"critical": "🚨", "high": "🔴", "medium": "🟠", "low": "🟡"}
     for index, item in enumerate(findings, 1):
@@ -73,22 +74,44 @@ def to_markdown(report: dict[str, Any]) -> str:
             _text(severity).upper(),
             _code(item.get("rule_id", "")),
         )
-        lines.extend(
+        section = [
+            heading,
+            "",
+            location,
+            "",
+            _escape(item.get("explanation", "")),
+            "",
+            "**Evidence**",
+            "",
+            _fence(item.get("evidence", "")),
+            "",
+            "**Suggested fix:** %s" % _escape(item.get("fix", "")),
+            "",
+            "**Suggested test:** %s" % _escape(item.get("test", "")),
+            "",
+        ]
+        remaining = len(findings) - index
+        reservation = (
             [
-                heading,
-                "",
-                location,
-                "",
-                _escape(item.get("explanation", "")),
-                "",
-                "**Evidence**",
-                "",
-                _fence(item.get("evidence", "")),
-                "",
-                "**Suggested fix:** %s" % _escape(item.get("fix", "")),
-                "",
-                "**Suggested test:** %s" % _escape(item.get("test", "")),
+                "> **Comment truncated** — %d additional finding(s) are available in the "
+                "EvoAgent task report." % remaining,
                 "",
             ]
+            if remaining
+            else []
         )
-    return "\n".join(lines) + "\n"
+        if (
+            max_chars is not None
+            and len("\n".join(lines + section + reservation) + "\n") > max_chars
+        ):
+            lines.extend(
+                [
+                    "> **Comment truncated** — %d finding(s) are available in the EvoAgent "
+                    "task report." % (remaining + 1),
+                    "",
+                ]
+            )
+            break
+        lines.extend(section)
+    markdown = "\n".join(lines) + "\n"
+    return markdown if max_chars is None else markdown[:max_chars]

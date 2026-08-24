@@ -18,13 +18,29 @@ jobs:
     name: Quality gates
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      EVOAGENT_TEST_POSTGRES_URL: postgresql://evoagent:evoagent-ci@127.0.0.1:5432/evoagent
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+        env:
+          POSTGRES_DB: evoagent
+          POSTGRES_USER: evoagent
+          POSTGRES_PASSWORD: evoagent-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U evoagent -d evoagent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
-          python-version: "3.12"
+          python-version: "3.12.13"
           cache: pip
           cache-dependency-path: requirements-dev.lock
       - name: Install locked dependencies
@@ -35,22 +51,60 @@ jobs:
         run: |
           python -m ruff check .
           python -m ruff format --check .
+          bash -n scripts/deploy.sh
       - name: Type check
         run: python -m mypy
       - name: Validate Prometheus recording and alert rules
         run: |
           docker run --rm --entrypoint=/bin/promtool \
             -v "$PWD/ops/prometheus:/rules:ro" \
-            prom/prometheus:v3.5.0 check rules /rules/evoagent.rules.yml
+            prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996 \
+            check rules /rules/evoagent.rules.yml
       - name: Test with coverage gate
         run: python -m pytest --cov=evoagent --cov-report=term-missing --cov-report=xml
       - name: Reproduce controlled evaluation evidence
         run: |
           python scripts/run_e2e_evaluation.py --reuse-dataset
-          python -c "import json; d=json.load(open('output/evaluation/evaluation-report.json')); c=d['candidate']; g=d['comparison']['release_gate']; assert d['schema_version']==2; assert c['schema_version']==2; assert c['dataset']['sha256']=='844b6d45c3de39c6c1d8080067bb77900a7234a68891c264f5833b6abdf6e770'; assert g['quantitative_passed']; assert not g['production_activation_allowed']; assert c['confidence_calibration']['invalid_confidences']==0"
+          python - <<'PY'
+          import hashlib
+          import json
+          import platform
+
+          from evoagent import __version__
+          from evoagent.review_engine import _APPLICATION_SOURCE_REVISION
+
+          with open("output/evaluation/evaluation-report.json", encoding="utf-8") as handle:
+              report = json.load(handle)
+          with open("requirements.lock", "rb") as handle:
+              lock_sha256 = hashlib.sha256(handle.read()).hexdigest()
+          with open("docs/evaluation-baseline.md", encoding="utf-8") as handle:
+              baseline_document = handle.read()
+          candidate = report["candidate"]
+          release = report["comparison"]["release_gate"]
+          reproducibility = report["reproducibility"]
+          failures = {name for name, gate in release["gates"].items() if not gate["passed"]}
+          assert report["schema_version"] == 3
+          assert candidate["schema_version"] == 2
+          assert candidate["dataset"]["sha256"] == "8d2271ec666dcbc96b0c8a13e05adcf71c08f33bf17da5d1c102fe9a3434af38"
+          assert reproducibility == {
+              "application_source_sha256": _APPLICATION_SOURCE_REVISION,
+              "evoagent_version": __version__,
+              "python_version": platform.python_version(),
+              "requirements_lock_sha256": lock_sha256,
+          }
+          assert all(str(value) in baseline_document for value in reproducibility.values())
+          assert candidate["dataset"]["sha256"] in baseline_document
+          assert "| Evaluation report schema | 3 |" in baseline_document
+          assert candidate["metrics"]["safe_fix_rate"] == 1.0
+          assert candidate["metrics"]["e2e_security_fix_rate"] == 0.35
+          assert failures == {"e2e_security_fix_rate", "production_data_provenance"}
+          assert not release["quantitative_passed"]
+          assert not release["production_activation_allowed"]
+          assert candidate["confidence_calibration"]["invalid_confidences"] == 0
+          PY
       - name: Retain synthetic evaluation evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: synthetic-evaluation-evidence
           path: output/evaluation/evaluation-report.*
@@ -58,19 +112,36 @@ jobs:
           retention-days: 14
       - name: Build distributions
         run: python -m build
+      - name: Generate and audit the runtime dependency SBOM
+        run: |
+          python -m pip_audit -r requirements.lock --require-hashes --disable-pip \
+            --format cyclonedx-json --output evoagent-runtime.cdx.json \
+            --progress-spinner off
+          python -c "import json; d=json.load(open('evoagent-runtime.cdx.json')); c={x['name'].lower() for x in d.get('components',[])}; assert d['bomFormat']=='CycloneDX' and {'psycopg','redis','pyjwt'} <= c"
+      - name: Retain the runtime dependency SBOM
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-dependency-sbom
+          path: evoagent-runtime.cdx.json
+          if-no-files-found: error
+          retention-days: 30
       - name: Smoke-test the installed wheel and packaged resources
         run: |
           wheel_env="${RUNNER_TEMP}/evoagent-wheel"
           python -m venv --system-site-packages "$wheel_env"
           "$wheel_env/bin/python" -m pip install --no-deps dist/*.whl
           cd "$RUNNER_TEMP"
+          EVOAGENT_DATABASE_URL="${EVOAGENT_TEST_POSTGRES_URL}" \
+            "$wheel_env/bin/evoagent-migrate" | "$wheel_env/bin/python" -c \
+            "import json,sys; from evoagent.migrations import CURRENT_SCHEMA_VERSION; d=json.load(sys.stdin); assert d['schema_version'] == CURRENT_SCHEMA_VERSION"
           EVOAGENT_HOST=127.0.0.1 EVOAGENT_PORT=18081 \
-            EVOAGENT_DB_PATH="${RUNNER_TEMP}/wheel-smoke.db" \
+            EVOAGENT_DATABASE_URL="${EVOAGENT_TEST_POSTGRES_URL}" \
             "$wheel_env/bin/evoagent" > wheel-smoke.log 2>&1 &
           wheel_pid=$!
           trap 'kill "$wheel_pid" 2>/dev/null || true' EXIT
           for attempt in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:18081/health >/dev/null 2>&1; then
+            if curl -fsS http://127.0.0.1:18081/ready >/dev/null 2>&1; then
               break
             fi
             if [ "$attempt" = 30 ]; then
@@ -84,14 +155,11 @@ jobs:
           test -f "$wheel_env/share/evoagent/ops/slo.toml"
           test -f "$wheel_env/share/evoagent/ops/prometheus/evoagent.rules.yml"
           test -f "$wheel_env/share/evoagent/ops/grafana/evoagent-overview.json"
-          test -f "$wheel_env/share/evoagent/examples/tenant-queue-weights.toml"
           "$wheel_env/bin/evoagent-slo" --help >/dev/null
           "$wheel_env/bin/evoagent-dr" --help >/dev/null
           "$wheel_env/bin/evoagent-recover-queue" --help >/dev/null
           "$wheel_env/bin/evoagent-eval-labels" --help >/dev/null
           "$wheel_env/bin/python" -c "from evoagent.review_extensions import ReviewerContribution"
-          "$wheel_env/bin/evoagent-migrate" | "$wheel_env/bin/python" -c \
-            "import json,sys; from evoagent.migrations import CURRENT_SCHEMA_VERSION; d=json.load(sys.stdin); assert d['schema_version'] == CURRENT_SCHEMA_VERSION"
           kill -TERM "$wheel_pid"
           wait "$wheel_pid"
           trap - EXIT
@@ -100,15 +168,31 @@ jobs:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    env:
+      EVOAGENT_TEST_POSTGRES_URL: postgresql://evoagent:evoagent-ci@127.0.0.1:5432/evoagent
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+        env:
+          POSTGRES_DB: evoagent
+          POSTGRES_USER: evoagent
+          POSTGRES_PASSWORD: evoagent-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U evoagent -d evoagent"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -120,47 +204,6 @@ jobs:
       - name: Run test suite
         run: python -m pytest -q
 
-  docker-smoke:
-    name: Docker build + smoke test
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - name: Build image
-        run: docker build -t evoagent:ci .
-      - name: Run container
-        run: |
-          docker run -d --name evoagent-ci \
-            -e EVOAGENT_HOST=0.0.0.0 \
-            -p 8080:8080 evoagent:ci
-      - name: Wait for /health and assert it is ok
-        run: |
-          for attempt in $(seq 1 30); do
-            if body=$(curl -fsS http://127.0.0.1:8080/health 2>/dev/null); then
-              echo "health payload: $body"
-              echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('status')=='ok' else 1)"
-              echo "smoke test passed"
-              exit 0
-            fi
-            echo "attempt $attempt: /health not ready yet"
-            sleep 2
-          done
-          echo "::error::/health did not become ready"
-          docker logs evoagent-ci || true
-          exit 1
-      - name: Verify the quick-start review endpoint responds
-        run: |
-          curl -fsS -X POST http://127.0.0.1:8080/v1/reviews \
-            -H 'Content-Type: application/json' \
-            -d '{"repository":"demo/api","pull_request":1,"diff":"diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n+password = \"secret\"\n+eval(user_input)"}' \
-            | python3 -c "import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get('state')=='SUCCESS' else 1)"
-          echo "review endpoint smoke test passed"
-      - name: Tear down
-        if: always()
-        run: docker rm -f evoagent-ci || true
-
   external-integration:
     name: PostgreSQL + Redis + container contracts
     runs-on: ubuntu-latest
@@ -170,7 +213,7 @@ jobs:
       EVOAGENT_TEST_REDIS_URL: redis://127.0.0.1:6379/0
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
         env:
           POSTGRES_DB: evoagent
           POSTGRES_USER: evoagent
@@ -183,7 +226,7 @@ jobs:
           --health-timeout 3s
           --health-retries 20
       redis:
-        image: redis:7-alpine
+        image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
         ports:
           - 6379:6379
         options: >-
@@ -192,10 +235,10 @@ jobs:
           --health-timeout 3s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
           cache: pip
@@ -221,60 +264,30 @@ jobs:
           python -m pytest -q \
             tests/test_adapter_contracts.py \
             tests/test_external_integrations.py \
-            tests/test_github_http_fixture.py
-      - name: Start a three-primary Redis Cluster
-        run: |
-          docker run -d --name evoagent-redis-cluster \
-            -p 7000:7000 -p 7001:7001 -p 7002:7002 \
-            -p 17000:17000 -p 17001:17001 -p 17002:17002 \
-            redis:7-alpine sh -ec '
-              redis-server --port 7000 --bind 0.0.0.0 --protected-mode no --appendonly no --cluster-enabled yes --cluster-config-file /tmp/nodes-7000.conf --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7000 --cluster-announce-bus-port 17000 &
-              redis-server --port 7001 --bind 0.0.0.0 --protected-mode no --appendonly no --cluster-enabled yes --cluster-config-file /tmp/nodes-7001.conf --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7001 --cluster-announce-bus-port 17001 &
-              redis-server --port 7002 --bind 0.0.0.0 --protected-mode no --appendonly no --cluster-enabled yes --cluster-config-file /tmp/nodes-7002.conf --cluster-announce-ip 127.0.0.1 --cluster-announce-port 7002 --cluster-announce-bus-port 17002 &
-              wait'
-          for attempt in $(seq 1 30); do
-            if docker exec evoagent-redis-cluster redis-cli -p 7000 ping >/dev/null 2>&1 && \
-               docker exec evoagent-redis-cluster redis-cli -p 7001 ping >/dev/null 2>&1 && \
-               docker exec evoagent-redis-cluster redis-cli -p 7002 ping >/dev/null 2>&1; then
-              break
-            fi
-            if [ "$attempt" = 30 ]; then
-              docker logs evoagent-redis-cluster
-              exit 1
-            fi
-            sleep 1
-          done
-          docker exec evoagent-redis-cluster redis-cli --cluster create \
-            127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 \
-            --cluster-replicas 0 --cluster-yes
-          for attempt in $(seq 1 30); do
-            if docker exec evoagent-redis-cluster redis-cli -p 7000 cluster info \
-              | grep -q 'cluster_state:ok'; then
-              break
-            fi
-            if [ "$attempt" = 30 ]; then
-              docker exec evoagent-redis-cluster redis-cli -p 7000 cluster info
-              docker logs evoagent-redis-cluster
-              exit 1
-            fi
-            sleep 1
-          done
-      - name: Run Redis Cluster queue and recovery contracts
-        env:
-          EVOAGENT_TEST_REDIS_CLUSTER_URL: redis://127.0.0.1:7000/0
-        run: |
-          python -m pytest -q \
-            tests/test_external_integrations.py::RedisClusterQueueIntegrationTests
-      - name: Stop the Redis Cluster fixture
+            tests/test_github_http_fixture.py \
+            --cov=evoagent.postgres_store \
+            --cov-config=/dev/null \
+            --cov-report=term-missing \
+            --cov-report=xml:postgres-coverage.xml \
+            --cov-fail-under=0 \
+            --junitxml=external-contracts.xml
+          python -c "import xml.etree.ElementTree as ET; r=ET.parse('external-contracts.xml').getroot(); n=sum(int(x.attrib.get('skipped',0)) for x in r.iter('testsuite')); assert n == 0, f'{n} external contracts were skipped'"
+      - name: Retain infrastructure contract evidence
         if: always()
-        run: docker rm -f evoagent-redis-cluster >/dev/null 2>&1 || true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: infrastructure-contract-evidence
+          path: |
+            external-contracts.xml
+            postgres-coverage.xml
+          if-no-files-found: warn
+          retention-days: 14
       - name: Prove backup and isolated restore integrity
         env:
           EVOAGENT_DATABASE_URL: ${{ env.EVOAGENT_TEST_POSTGRES_URL }}
         run: |
           mkdir -p "${RUNNER_TEMP}/evoagent-dr"
           python -m evoagent.dr \
-            --backend postgresql \
             --output-dir "${RUNNER_TEMP}/evoagent-dr" \
             --max-rpo-seconds 300 \
             --max-rto-seconds 300 > recovery-report.json
@@ -282,7 +295,7 @@ jobs:
           python -c "import json; d=json.load(open('recovery-report.json')); assert d['status']=='pass'; assert d['integrity']['source_fingerprint']==d['integrity']['restored_fingerprint']; assert d['cleanup']['restored_database_removed']"
       - name: Retain non-sensitive recovery evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: database-recovery-evidence
           path: |
@@ -291,21 +304,33 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
       - name: Build the production image
-        run: docker build -t evoagent:ci .
+        run: |
+          docker build -t evoagent:ci .
+          test "$(docker image inspect --format '{{.Config.User}}' evoagent:ci)" = evoagent
+      - name: Run migrations from the production image
+        run: |
+          docker run --rm --network host \
+            -e EVOAGENT_DATABASE_URL="${EVOAGENT_TEST_POSTGRES_URL}" \
+            evoagent:ci python -m evoagent.migrate | python -c \
+            "import json,sys; from evoagent.migrations import CURRENT_SCHEMA_VERSION; d=json.load(sys.stdin); assert d == {'backend':'postgresql','schema_version':CURRENT_SCHEMA_VERSION,'status':'migrated'}"
       - name: Run the real container verifier boundary tests
         env:
           EVOAGENT_TEST_CONTAINER_IMAGE: evoagent:ci
-        run: python -m pytest -q tests/test_container_integration.py
+        run: |
+          python -m pytest -q tests/test_container_integration.py \
+            --junitxml=container-contracts.xml
+          python -c "import xml.etree.ElementTree as ET; r=ET.parse('container-contracts.xml').getroot(); n=sum(int(x.attrib.get('skipped',0)) for x in r.iter('testsuite')); assert n == 0, f'{n} container contracts were skipped'"
       - name: Start the built image with PostgreSQL and Redis
         run: |
           docker run -d --name evoagent-full-stack --network host \
+            --read-only --tmpfs /tmp:size=256m,mode=1777 \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --health-interval 1s --health-start-period 1s \
             -e EVOAGENT_HOST=127.0.0.1 \
             -e EVOAGENT_PORT=18080 \
             -e EVOAGENT_AUTH_REQUIRED=false \
             -e EVOAGENT_DATABASE_URL="${EVOAGENT_TEST_POSTGRES_URL}" \
             -e EVOAGENT_REDIS_URL="${EVOAGENT_TEST_REDIS_URL}" \
-            -e EVOAGENT_QUEUE_NAMESPACE=ci-full-stack \
-            -e EVOAGENT_QUEUE_FAIR_SCHEDULING=true \
             -e EVOAGENT_SKILLS_DIR=/app/skills \
             evoagent:ci
       - name: Prove readiness and end-to-end outbox delivery
@@ -320,7 +345,17 @@ jobs:
             fi
             sleep 1
           done
-          python -c "import json; from evoagent.migrations import CURRENT_SCHEMA_VERSION; d=json.load(open('ready.json')); q=d['checks']['queue']; assert d['status']=='ready'; assert d['queue_backend']=='redis-streams'; assert d['checks']['schema_version']==CURRENT_SCHEMA_VERSION; assert q['healthy'] and q['fair_scheduling'] and q['lease_heartbeat_running']; assert q['keyspace_version']==2 and q['queue_namespace']=='ci-full-stack' and not q['redis_cluster']"
+          for attempt in $(seq 1 10); do
+            if [ "$(docker inspect -f '{{.State.Health.Status}}' evoagent-full-stack)" = healthy ]; then
+              break
+            fi
+            if [ "$attempt" = 10 ]; then
+              docker inspect -f '{{json .State.Health}}' evoagent-full-stack
+              exit 1
+            fi
+            sleep 1
+          done
+          python -c "import json; from evoagent.migrations import CURRENT_SCHEMA_VERSION; d=json.load(open('ready.json')); q=d['checks']['queue']; assert d['status']=='ready'; assert d['queue_backend']=='redis-streams'; assert d['checks']['schema_version']==CURRENT_SCHEMA_VERSION; assert q['healthy'] and q['lease_heartbeat_running']"
           curl -fsS -X POST 'http://127.0.0.1:18080/v1/reviews?async=true' \
             -H 'Content-Type: application/json' \
             -d '{"repository":"ci/full-stack","pull_request":17,"diff":"diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n+value = 1\n+print(value)"}' \
@@ -376,7 +411,7 @@ jobs:
             --report queue-recovery-report.json
       - name: Retain queue recovery evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: queue-recovery-evidence
           path: |

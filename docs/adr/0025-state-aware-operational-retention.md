@@ -24,12 +24,27 @@ markers.
 - Retention remains disabled while `EVOAGENT_HISTORY_RETENTION_DAYS=0`.
   Operators explicitly set the age, interval, and batch size after approving
   backup, legal, and investigation requirements.
-- The Store Port owns one atomic `prune_operational_history` operation so
-  eligibility, markers, and deletion cannot diverge. SQLite serializes writers
-  with `BEGIN IMMEDIATE`; PostgreSQL locks candidate events and coordinates all
+- The Store owns one atomic `prune_operational_history` operation so
+  eligibility, markers, and deletion cannot diverge. PostgreSQL locks candidate
+  events and coordinates all
   session start/completion/prune transactions with a per-session advisory lock.
 - Trace pruning considers only terminal tasks and events older than the cutoff.
   It never removes the maximum/latest event for a task.
+- Execution-artifact pruning considers only old `SUCCESS`/`CANCELLED` tasks
+  without active admission. It removes the raw Diff payload, checkpoints and
+  inter-agent messages in one transaction, records
+  `execution_artifacts_pruned_at` in task input, and retains FAILED artifacts so
+  operator resume remains possible.
+- Primary Outbox intents are removed only for cancelled tasks or successful tasks
+  whose external delivery is complete; active, failed and delivery-incomplete work is retained.
+- Completed effect receipts are removed only after the configured retention age.
+  In-progress receipts remain ownership fences; old comment markers and deterministic
+  repair branches provide provider-side reconciliation after a completed receipt expires.
+- Webhook delivery claims are removed after the same age only when that age is
+  strictly longer than the configured replay window. A replay after retention is
+  rejected as stale instead of being admitted as a new task.
+- Old release observations are removed only when no rollout for their tenant and
+  skill is running, preserving the rows used to deduplicate shadow retries.
 - Session pruning considers only old completed turns that have a later completed
   turn. It refuses to remove a snapshot if a later pending turn has no completed
   intermediate predecessor, preserving the exact anchor needed when turns
@@ -47,10 +62,11 @@ markers.
 
 ## Consequences
 
-The application can govern its dominant operational-history tables without
-breaking live tasks, future PR turns, or out-of-order session completion.
-Deletion is opt-in, transactional, observable, idempotent, and exercised by the
-same SQLite/PostgreSQL adapter contract.
+The application can govern its dominant operational-history and raw execution
+artifact tables without breaking live tasks, failed-task recovery, future PR
+turns, out-of-order session completion, or active external-effect ownership.
+Deletion is opt-in, transactional, observable, idempotent, and covered by the
+PostgreSQL contract tests.
 
 PostgreSQL operators must complete a v0.27-or-newer rollout before enabling the
 job because older writers do not acquire the new session advisory lock. The

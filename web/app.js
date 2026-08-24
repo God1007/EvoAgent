@@ -15,6 +15,7 @@ const stateLabels = {
   PLANNING: "规划中",
   EXECUTING: "执行中",
   REVIEWING: "汇总中",
+  RETRYING: "重试中",
   SUCCESS: "已完成",
   FAILED: "失败",
   CANCELLED: "已取消",
@@ -22,6 +23,7 @@ const stateLabels = {
 
 let selectedTask = null;
 let accessToken = localStorage.getItem("evoagent_token") || "";
+let currentRole = localStorage.getItem("evoagent_role") || "";
 let toastTimer = null;
 
 function escapeHtml(value) {
@@ -82,6 +84,12 @@ function setButtonBusy(button, busy, busyText) {
   }
 }
 
+function applyRole() {
+  const platform = currentRole === "platform_admin";
+  $('.nav-item[data-view="evolution"]').classList.toggle("hidden", !platform);
+  if (!platform && location.hash.slice(1) === "evolution") show("overview");
+}
+
 function show(view, updateHash = true) {
   if (!titles[view]) view = "overview";
   $$(".view").forEach((element) => element.classList.remove("active"));
@@ -110,7 +118,7 @@ function taskRows(tasks) {
     return '<div class="empty-state"><span><b>还没有审查任务</b>提交一个 Diff 开始首次审查</span></div>';
   }
   return tasks.map((task) => {
-    const state = String(task.state || "PENDING").toUpperCase();
+    const state = task.retrying ? "RETRYING" : String(task.state || "PENDING").toUpperCase();
     const repository = escapeHtml(task.repository || "未命名仓库");
     const pr = task.pull_request ? `PR #${escapeHtml(task.pull_request)}` : "手动审查";
     return `
@@ -131,9 +139,9 @@ function bindTasks(root) {
   $$("[data-task]", root).forEach((row) => row.addEventListener("click", () => openTask(row.dataset.task)));
 }
 
-function statCard(label, value, note, style, icon) {
+function statCard(label, value, note, style) {
   return `<article class="stat ${style}">
-    <div class="stat-head"><span>${label}</span><i>${icon}</i></div>
+    <span class="stat-label">${label}</span>
     <b>${value}</b><small>${note}</small>
   </article>`;
 }
@@ -145,12 +153,12 @@ async function loadDashboard() {
     const stats = data.stats || {};
     const rate = Math.round(Number(stats.success_rate || 0) * 100);
     $("#stats").innerHTML = [
-      statCard("总任务", stats.tasks_total ?? 0, "累计审查任务", "", "Σ"),
-      statCard("已完成", stats.tasks_success ?? 0, "通过质量门禁", "success", "✓"),
-      statCard("失败", stats.tasks_failed ?? 0, "需要进一步处理", "failed", "!"),
-      statCard("成功率", `${rate}%`, "全部任务成功率", "rate", "%"),
-      statCard("待处理案例", stats.unresolved_failure_cases ?? 0, "未解决反馈", "feedback", "•"),
-      statCard("活跃 Skills", stats.active_skill_versions ?? 0, "当前生效版本", "skills", "◇"),
+      statCard("总任务", stats.tasks_total ?? 0, "累计审查任务", ""),
+      statCard("已完成", stats.tasks_success ?? 0, "通过质量门禁", "success"),
+      statCard("失败", stats.tasks_failed ?? 0, "需要进一步处理", "failed"),
+      statCard("成功率", `${rate}%`, "已结束审查成功率", "rate"),
+      statCard("待处理案例", stats.unresolved_failure_cases ?? 0, "未解决反馈", "feedback"),
+      statCard("活跃 Skills", stats.active_skill_versions ?? 0, "当前生效版本", "skills"),
     ].join("");
     $("#recent-tasks").innerHTML = taskRows((data.tasks || []).slice(0, 5));
     bindTasks($("#recent-tasks"));
@@ -182,7 +190,10 @@ async function openTask(id) {
     const task = await api(`/v1/tasks/${encodeURIComponent(id)}`);
     selectedTask = id;
     $("#task-report").textContent = formatJson(task);
-    $("#create-fix").classList.toggle("hidden", !(task.report && task.pull_request));
+    $("#create-fix").classList.toggle(
+      "hidden",
+      !(task.report && task.pull_request && task.input?.head_sha),
+    );
   } catch (error) {
     $("#task-report").textContent = error.message;
   }
@@ -193,6 +204,7 @@ async function loadSkills() {
   root.innerHTML = '<div class="skill-card loading"></div><div class="skill-card loading"></div>';
   try {
     const data = await api("/api/skills");
+    $("#skill-revision").textContent = data.reviewer_revision || "未知";
     const skills = data.skills || [];
     root.innerHTML = skills.length ? skills.map((skill) => `
       <article class="skill-card">
@@ -200,8 +212,9 @@ async function loadSkills() {
         <h3>${escapeHtml(skill.name)}</h3>
         <p>${escapeHtml(skill.description || "暂无能力描述")}</p>
         <span class="skill-meta"><i></i>v${escapeHtml(skill.version)} · ${escapeHtml(skill.source)}</span>
-      </article>`).join("") : '<div class="empty-state"><span><b>尚未加载 Skill</b>扫描目录以加载可用能力</span></div>';
+      </article>`).join("") : '<div class="empty-state"><span><b>尚未加载 Skill</b>部署 Skill 后重启服务以加载能力</span></div>';
   } catch (error) {
+    $("#skill-revision").textContent = "读取失败";
     root.innerHTML = '<div class="empty-state"><span>Skills 加载失败</span></div>';
     toast(error.message);
   }
@@ -228,7 +241,7 @@ async function loadFailures() {
           </div>`).join("")
       : '<div class="empty-state"><span><b>暂无失败反馈</b>系统当前没有未处理案例</span></div>';
     const historyHtml = runs.length
-      ? `<p class="eyebrow" style="margin:20px 0 4px">RECENT EVALUATIONS</p>${runs.map((run) => `
+      ? `<p class="history-heading">最近评测</p>${runs.map((run) => `
           <div class="task-row">
             <span class="task-main"><span class="task-glyph">V${escapeHtml(run.candidate_version)}</span><span class="task-copy">
               <span class="task-name">${escapeHtml(run.decision)}</span>
@@ -274,14 +287,13 @@ $("#review-form").addEventListener("submit", async (event) => {
 
 $("#create-fix").addEventListener("click", async () => {
   if (!selectedTask) return;
-  const installationId = prompt("GitHub App installation_id（使用 PAT 可留空）", "");
   const button = $("#create-fix");
   setButtonBusy(button, true, "正在创建…");
   try {
     const data = await api(`/v1/tasks/${encodeURIComponent(selectedTask)}/fix`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ installation_id: installationId ? Number(installationId) : null }),
+      body: "{}",
     });
     $("#task-report").textContent = formatJson(data);
     toast("修复分支已创建");
@@ -292,20 +304,18 @@ $("#create-fix").addEventListener("click", async () => {
   }
 });
 
-$("#reload-skills").addEventListener("click", async () => {
-  const button = $("#reload-skills");
-  setButtonBusy(button, true, "正在扫描…");
+$("#install-github").addEventListener("click", async () => {
+  const button = $("#install-github");
+  setButtonBusy(button, true, "正在连接…");
   try {
-    await api("/v1/skills/reload", {
+    const data = await api("/v1/github/installations", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
     });
-    await loadSkills();
-    toast("Skills 已重新加载");
+    window.location.assign(data.url);
   } catch (error) {
     toast(error.message);
-  } finally {
     setButtonBusy(button, false);
   }
 });
@@ -380,7 +390,10 @@ $("#login-form").addEventListener("submit", async (event) => {
       }),
     });
     accessToken = data.access_token;
+    currentRole = data.role;
     localStorage.setItem("evoagent_token", accessToken);
+    localStorage.setItem("evoagent_role", currentRole);
+    applyRole();
     $("#login-overlay").classList.add("hidden");
     $("#logout").classList.remove("hidden");
     $("#login-error").textContent = "";
@@ -394,11 +407,15 @@ $("#login-form").addEventListener("submit", async (event) => {
 
 $("#logout").addEventListener("click", () => {
   accessToken = "";
+  currentRole = "";
   localStorage.removeItem("evoagent_token");
+  localStorage.removeItem("evoagent_role");
+  applyRole();
   $("#login-overlay").classList.remove("hidden");
   $("#logout").classList.add("hidden");
 });
 
+applyRole();
 if (accessToken) $("#logout").classList.remove("hidden");
 show(location.hash.slice(1) || "overview", false);
 loadDashboard();

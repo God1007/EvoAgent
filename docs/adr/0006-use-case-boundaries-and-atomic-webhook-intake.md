@@ -52,8 +52,8 @@ with unsupported actions are recorded as intentionally ignored.
 ## Consequences
 
 - HTTP and queue adapters keep their current `ReviewService` API.
-- Use cases can be tested with SQLite or fakes without starting an HTTP server,
-  worker pool, or plugin graph.
+- Use cases can be tested with fakes without starting an HTTP server or worker
+  pool.
 - Store adapters must satisfy atomic rollback, duplicate, payload-binding, and
   concurrent exact-once acceptance contracts.
 - A committed PR task always has a committed queue intent and session turn.

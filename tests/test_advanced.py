@@ -1,6 +1,4 @@
 import ast
-import os
-import tempfile
 import time
 import unittest
 
@@ -9,14 +7,13 @@ from evoagent.evolution import EvolutionEngine, RegressionEvaluator
 from evoagent.fixer import SafeFixer
 from evoagent.models import Finding, Severity
 from evoagent.service import ReviewService
-from evoagent.store import TaskStore
+from tests.db_support import postgres_store, postgres_url
 
 
-def settings(path):
+def settings(database_url):
     return Settings(
         host="127.0.0.1",
         port=8080,
-        db_path=path,
         max_diff_bytes=10000,
         max_steps=8,
         timeout_seconds=10,
@@ -26,17 +23,15 @@ def settings(path):
         github_webhook_secret="",
         github_token="",
         auto_post_review=False,
+        database_url=database_url,
         skills_dir="skills",
     )
 
 
 class AdvancedFeatureTests(unittest.TestCase):
     def setUp(self):
-        handle, self.path = tempfile.mkstemp(suffix=".db")
-        os.close(handle)
-
-    def tearDown(self):
-        os.unlink(self.path)
+        self.store = postgres_store(self)
+        self.database_url = postgres_url(self)
 
     def test_safe_fixer_changes_only_supported_rules(self):
         content = 'password = "secret-value"\nresult = eval(user_input)\nprint(result)\n'
@@ -91,14 +86,14 @@ class AdvancedFeatureTests(unittest.TestCase):
         self.assertEqual([], result["rules"])
 
     def test_deepseek_and_free_openrouter_provider_presets(self):
-        deepseek = settings(self.path)
+        deepseek = settings(self.database_url)
         deepseek = deepseek.__class__(
             **{**deepseek.__dict__, "llm_provider": "deepseek", "deepseek_api_key": "test-key"}
         )
         self.assertEqual("https://api.deepseek.com", deepseek.resolved_llm()["base_url"])
         self.assertEqual("deepseek-v4-flash", deepseek.resolved_llm()["model"])
 
-        free = settings(self.path)
+        free = settings(self.database_url)
         free = free.__class__(
             **{
                 **free.__dict__,
@@ -108,38 +103,8 @@ class AdvancedFeatureTests(unittest.TestCase):
         )
         self.assertTrue(str(free.resolved_llm()["model"]).endswith(":free"))
 
-    def test_cost_budget_requires_pricing_to_avoid_false_enforcement(self):
-        configured = settings(self.path)
-        configured = configured.__class__(**{**configured.__dict__, "llm_daily_cost_micros": 1000})
-        with self.assertRaisesRegex(ValueError, "pricing is required"):
-            configured.validate_evolution()
-
-    def test_model_reservation_ttl_must_exceed_provider_timeout(self):
-        configured = settings(self.path)
-        configured = configured.__class__(
-            **{
-                **configured.__dict__,
-                "timeout_seconds": 120,
-                "llm_reservation_ttl_seconds": 120,
-            }
-        )
-        with self.assertRaisesRegex(ValueError, "must exceed"):
-            configured.validate_evolution()
-
-    def test_model_capacity_lease_must_exceed_provider_timeout(self):
-        configured = settings(self.path)
-        configured = configured.__class__(
-            **{
-                **configured.__dict__,
-                "timeout_seconds": 120,
-                "llm_capacity_lease_seconds": 120,
-            }
-        )
-        with self.assertRaisesRegex(ValueError, "CAPACITY_LEASE_SECONDS must exceed"):
-            configured.validate_evolution()
-
     def test_trusted_proxy_networks_must_be_bounded_canonical_cidrs(self):
-        configured = settings(self.path)
+        configured = settings(self.database_url)
         for cidrs in (
             ("0.0.0.0/0",),
             ("10.0.0.1/8",),
@@ -154,16 +119,8 @@ class AdvancedFeatureTests(unittest.TestCase):
                     **{**configured.__dict__, "trusted_proxy_cidrs": cidrs}
                 ).validate_evolution()
 
-    def test_model_capacity_window_retention_is_bounded(self):
-        configured = settings(self.path)
-        configured = configured.__class__(
-            **{**configured.__dict__, "llm_capacity_window_retention_hours": 721}
-        )
-        with self.assertRaisesRegex(ValueError, "between 1 and 720"):
-            configured.validate_evolution()
-
     def test_operational_history_retention_configuration_is_bounded(self):
-        configured = settings(self.path)
+        configured = settings(self.database_url)
         invalid = (
             {"history_retention_days": 36_501},
             {"history_maintenance_seconds": 0},
@@ -179,7 +136,7 @@ class AdvancedFeatureTests(unittest.TestCase):
                 configured.__class__(**{**configured.__dict__, **changes}).validate_evolution()
 
     def test_tenant_review_capacity_configuration_is_bounded(self):
-        configured = settings(self.path)
+        configured = settings(self.database_url)
         invalid = (
             {"tenant_max_active_reviews": -1},
             {"tenant_max_active_reviews": 1_000_001},
@@ -193,62 +150,20 @@ class AdvancedFeatureTests(unittest.TestCase):
             ):
                 configured.__class__(**{**configured.__dict__, **changes}).validate_evolution()
 
-    def test_tenant_fair_queue_requires_durable_redis(self):
-        configured = settings(self.path)
-        with self.assertRaisesRegex(ValueError, "QUEUE_FAIR_SCHEDULING requires"):
-            configured.__class__(
-                **{**configured.__dict__, "queue_fair_scheduling": True}
-            ).validate_evolution()
-
-        configured.__class__(
-            **{
-                **configured.__dict__,
-                "redis_url": "redis://127.0.0.1:6379/0",
-                "queue_fair_scheduling": True,
-            }
-        ).validate_evolution()
-
-    def test_cluster_queue_requires_a_canonical_namespace_and_database_zero(self):
-        configured = settings(self.path)
-        invalid = (
-            {"queue_namespace": "prod"},
-            {"redis_url": "redis://127.0.0.1:6379/0", "queue_redis_cluster": True},
-            {
-                "redis_url": "redis://127.0.0.1:6379/0",
-                "queue_namespace": "bad/name",
-            },
-            {
-                "redis_url": "redis://127.0.0.1:6379/2",
-                "queue_namespace": "prod",
-                "queue_redis_cluster": True,
-            },
-        )
-        for changes in invalid:
-            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, "QUEUE|CLUSTER"):
-                configured.__class__(**{**configured.__dict__, **changes}).validate_evolution()
-
-        configured.__class__(
-            **{
-                **configured.__dict__,
-                "redis_url": "redis://127.0.0.1:6379/0",
-                "queue_namespace": "prod-eu1",
-                "queue_redis_cluster": True,
-            }
-        ).validate_evolution()
-
     def test_feedback_candidate_is_deferred_without_a_model(self):
-        store = TaskStore(self.path)
+        store = self.store
         store.create("task", "org/repo", 1, {"source": "test"})
         store.record_failure_case("task", "false_positive", {"note": "style-only"})
         engine = EvolutionEngine(store)
         result = engine.auto_propose("llm-review")
         self.assertEqual("deferred", result["decision"])
         self.assertEqual(1, result["failure_cases_used"])
-        version = result["version"]["version"]
-        self.assertTrue(engine.rollback("llm-review", version))
+        self.assertFalse(result["version"]["active"])
+        self.assertEqual("deferred", result["version"]["qualification"])
+        self.assertIsNone(store.get_active_skill_version("llm-review"))
 
-    def test_replay_evaluation_activates_only_an_improved_prompt(self):
-        store = TaskStore(self.path)
+    def test_replay_evaluation_approves_an_improved_prompt_without_activating_it(self):
+        store = self.store
         diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
         store.save_evaluation_case(
             "eval-case",
@@ -294,21 +209,25 @@ class AdvancedFeatureTests(unittest.TestCase):
             "improved: Review the diff and return JSON with severity, fix and test.",
             regression_score=0.0,
         )
-        self.assertEqual("activated", result["decision"])
+        self.assertEqual("approved", result["decision"])
         self.assertGreater(result["candidate"]["score"], result["baseline"]["score"])
-        self.assertTrue(result["version"]["active"])
+        self.assertFalse(result["version"]["active"])
+        self.assertEqual("approved", result["version"]["qualification"])
         self.assertTrue(
             store.list_evolution_runs()[0]["metrics"]["external_regression_score_ignored"]
         )
+        duplicate = engine.propose(
+            "llm-review",
+            "improved: Review the diff and return JSON with severity, fix and test.",
+        )
+        self.assertEqual("deferred", duplicate["decision"])
+        self.assertEqual(result["version"]["version"], duplicate["version"]["version"])
         rejected = engine.propose(
             "llm-review",
             "Review the diff and return JSON with severity, fix and test.",
         )
         self.assertEqual("rejected", rejected["decision"])
-        self.assertEqual(
-            result["version"]["version"],
-            store.get_active_skill_version("llm-review")["version"],
-        )
+        self.assertIsNone(store.get_active_skill_version("llm-review"))
 
     def test_evaluation_errors_are_counted_as_misses_and_reduce_score(self):
         positive = {
@@ -375,8 +294,8 @@ class AdvancedFeatureTests(unittest.TestCase):
         self.assertEqual(1, metrics["case_results"][0]["fp"])
         self.assertEqual(1, metrics["case_results"][0]["fn"])
 
-    def test_holdout_regression_blocks_activation_without_leaking_case_details(self):
-        store = TaskStore(self.path)
+    def test_holdout_regression_blocks_qualification_without_leaking_case_details(self):
+        store = self.store
         validation_diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
         holdout_diff = "--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n-old\n+safe_call(data)\n"
         store.save_evaluation_case(
@@ -452,7 +371,7 @@ class AdvancedFeatureTests(unittest.TestCase):
         self.assertEqual(1, persisted["candidate_holdout"]["clean_cases"])
 
     def test_auto_evolution_does_not_create_duplicate_noop_versions(self):
-        store = TaskStore(self.path)
+        store = self.store
         engine = EvolutionEngine(store, seed_defaults=False)
         result = engine.auto_propose("llm-review")
         self.assertEqual("deferred", result["decision"])
@@ -460,7 +379,7 @@ class AdvancedFeatureTests(unittest.TestCase):
         self.assertEqual([], store.list_skill_versions("llm-review"))
 
     def test_evaluation_cases_are_immutable_and_idempotent(self):
-        store = TaskStore(self.path)
+        store = self.store
         diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
         expected = [{"path": "a.py", "line": 1, "min_severity": "high"}]
         first = store.save_evaluation_case("stable-case-v1", "validation", diff, expected, "test")
@@ -472,7 +391,7 @@ class AdvancedFeatureTests(unittest.TestCase):
             store.save_evaluation_case("stable-case-v1", "validation", diff, [], "test")
 
     def test_async_multi_agent_review(self):
-        service = ReviewService(settings(self.path))
+        service = ReviewService(settings(self.database_url))
         diff = (
             "--- a/a.py\n+++ b/a.py\n@@ -1 +1,2 @@\n-old\n+eval(data)\n+# TODO finish validation\n"
         )

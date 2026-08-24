@@ -1,13 +1,13 @@
-# Full-stack performance rig: multi-worker app + Postgres (pooled) + Redis queue.
-# Auth is disabled here ON PURPOSE for load generation - do NOT use this file to
-# deploy. Run with: docker compose -f docker-compose.perf.yml up --build
+# Full-stack performance rig: app + Postgres (pooled) + Redis queue.
+# Fixed perf-only credentials make the fixture reproducible; do NOT use this file
+# to deploy. Run with: docker compose -f docker-compose.perf.yml up --build
 #
 #   k6 (host):        k6 run perf/k6/steady.js
 #   pure-python:      python scripts/loadgen.py --base-url http://127.0.0.1:8080 ...
 #   k6 (containered): docker compose -f docker-compose.perf.yml run --rm k6 run /perf/steady.js
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
     environment:
       POSTGRES_DB: evoagent
       POSTGRES_USER: evoagent
@@ -20,7 +20,7 @@ services:
       retries: 15
 
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     command: ["redis-server", "--appendonly", "no"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -28,34 +28,50 @@ services:
       timeout: 3s
       retries: 15
 
+  migrate:
+    build: .
+    command: ["python", "-m", "evoagent.migrate"]
+    environment:
+      EVOAGENT_DATABASE_URL: postgresql://evoagent:evoagent-local@postgres:5432/evoagent
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   evoagent:
     build: .
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       EVOAGENT_HOST: 0.0.0.0
       EVOAGENT_DATABASE_URL: postgresql://evoagent:evoagent-local@postgres:5432/evoagent
       EVOAGENT_REDIS_URL: redis://redis:6379/0
-      EVOAGENT_WEB_WORKERS: ${EVOAGENT_WEB_WORKERS:-4}
       EVOAGENT_ASYNC_WORKERS: ${EVOAGENT_ASYNC_WORKERS:-8}
       EVOAGENT_PG_POOL_MAX: ${EVOAGENT_PG_POOL_MAX:-10}
-      EVOAGENT_RATE_LIMIT_RPS: ${EVOAGENT_RATE_LIMIT_RPS:-0}
-      EVOAGENT_MAX_INFLIGHT_HEAVY: ${EVOAGENT_MAX_INFLIGHT_HEAVY:-0}
+      EVOAGENT_RATE_LIMIT_RPS: ${EVOAGENT_RATE_LIMIT_RPS:-1000000}
+      EVOAGENT_MAX_INFLIGHT_HEAVY: ${EVOAGENT_MAX_INFLIGHT_HEAVY:-256}
+      EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS: ${EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS:-1000000}
       EVOAGENT_SHUTDOWN_GRACE_SECONDS: ${EVOAGENT_SHUTDOWN_GRACE_SECONDS:-2}
-      EVOAGENT_SKILLS_DIR: /app/skills
-      EVOAGENT_AUTH_REQUIRED: "false"
+      EVOAGENT_SKILLS_DIR: /app/dynamic-skills
+      EVOAGENT_SKILL_REQUIRE_CONTAINER: "true"
+      EVOAGENT_AUTH_REQUIRED: "true"
+      EVOAGENT_AUTH_SECRET: perf-only-secret-not-for-production-0000
+      EVOAGENT_BOOTSTRAP_ADMIN_USERNAME: perf
+      EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD: perf-only-password
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     init: true
+    stop_grace_period: 40s
     tmpfs:
       - /tmp:size=256m,mode=1777
 
   # Optional in-cluster k6 runner (profile: k6). Scripts are mounted read-only.
   k6:
-    image: grafana/k6:latest
+    image: grafana/k6:latest@sha256:5221b620a4f874faff6e32ba597aa667c058391fe4898b1c6f6377f062c6cdec
     profiles: ["k6"]
     environment:
       BASE_URL: http://evoagent:8080

@@ -8,6 +8,8 @@ import re
 import sys
 from typing import Any
 
+SKILL_PROTOCOL_VERSION = 1
+
 
 def _set_resource_limit(resource_module, limit_name: str, value: int) -> bool:
     """Apply a best-effort POSIX limit without breaking unsupported platforms."""
@@ -26,9 +28,13 @@ def _set_resource_limit(resource_module, limit_name: str, value: int) -> bool:
 
 def main() -> None:
     module_path = os.path.abspath(sys.argv[1])
-    package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    package_root = os.path.dirname(package_dir)
     sys.path.insert(0, package_root)
     payload = json.load(sys.stdin)
+    protocol_version = payload.get("protocol_version")
+    if type(protocol_version) is not int or protocol_version != SKILL_PROTOCOL_VERSION:
+        raise RuntimeError("unsupported skill protocol version")
     source = payload.get("skill_source")
     expected_sha256 = str(payload.get("skill_sha256", ""))
     if not isinstance(source, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
@@ -36,13 +42,17 @@ def main() -> None:
     actual_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
     if not hmac.compare_digest(actual_sha256, expected_sha256):
         raise RuntimeError("skill snapshot checksum mismatch")
+    memory_mb = payload.get("memory_mb")
+    timeout_seconds = payload.get("timeout_seconds")
+    if any(type(value) is not int or value <= 0 for value in (memory_mb, timeout_seconds)):
+        raise RuntimeError("invalid skill resource limits")
 
     if os.name != "nt":
         import resource
 
-        memory = int(payload.get("memory_mb", 256)) * 1024 * 1024
+        memory = memory_mb * 1024 * 1024
         _set_resource_limit(resource, "RLIMIT_AS", memory)
-        _set_resource_limit(resource, "RLIMIT_CPU", 30)
+        _set_resource_limit(resource, "RLIMIT_CPU", timeout_seconds)
         _set_resource_limit(resource, "RLIMIT_FSIZE", 8 * 1024 * 1024)
         _set_resource_limit(resource, "RLIMIT_NOFILE", 64)
 
@@ -50,7 +60,7 @@ def main() -> None:
         os.path.realpath(os.getcwd()),
         os.path.realpath(sys.prefix),
         os.path.realpath(sys.base_prefix),
-        os.path.realpath(package_root),
+        os.path.realpath(package_dir),
     }
 
     def audit(event, args):
@@ -93,7 +103,6 @@ def main() -> None:
 
     sys.addaudithook(audit)
     from evoagent.diff_parser import ParsedDiff
-    from evoagent.models import ChangedLine
 
     namespace: dict[str, Any] = {
         "__name__": "evoagent_isolated_skill",
@@ -101,10 +110,7 @@ def main() -> None:
         "__package__": None,
     }
     exec(compile(source, module_path, "exec"), namespace)
-    parsed_value = payload["parsed"]
-    parsed = ParsedDiff(
-        parsed_value["files"], [ChangedLine(**item) for item in parsed_value["added_lines"]]
-    )
+    parsed = ParsedDiff.from_dict(payload["parsed"])
     create_skill = namespace.get("create_skill")
     if not callable(create_skill):
         raise RuntimeError("skill module does not export create_skill")

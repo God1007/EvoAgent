@@ -21,9 +21,10 @@ EvoAgent uses a Store-backed transactional outbox:
    horizon (Redis check/append/marker is one Lua operation);
 5. retry exhaustion moves a row to an observable, auditable, operator-replayable
    dead state;
-6. dispatcher shutdown precedes queue drain and Store/plugin shutdown;
+6. dispatcher shutdown precedes queue drain and Store shutdown;
 7. external GitHub effects use stable markers/deterministic branches plus
-   durable effect receipts.
+   durable effect receipts; a redelivered successful task completes any pending
+   session/comment effect without recomputing the review.
 
 Queue processing remains at-least-once. The system guarantees durable acceptance
 and idempotent publication, not exactly-once computation. Domain handlers and
@@ -36,8 +37,8 @@ external effects must remain safe under retry.
 - The Store Port grows outbox/effect operations and schema version 4 adds two
   operational tables.
 - Operators must monitor pending age/dead rows and own explicit replay.
-- Redis dedupe keys have bounded retention; the configured retention exceeds
-  the outbox retry horizon but is not an eternal exactly-once claim.
+- Redis dedupe keys expire after one hour, beyond the bounded automatic outbox
+  retry horizon but not an eternal exactly-once claim.
 - Real PostgreSQL/Redis crash recovery still requires service-backed integration
   and chaos tests in CI.
 

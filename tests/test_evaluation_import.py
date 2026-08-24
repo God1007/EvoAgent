@@ -124,6 +124,24 @@ class PublicPrImportTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "contains answer data"):
                     importer.main()
 
+    def test_import_rejects_duplicate_manifest_fields(self):
+        record = json.dumps(self.manifest()).replace(
+            '"split": "holdout"', '"split": "validation", "split": "holdout"'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = os.path.join(directory, "manifest.jsonl")
+            output = os.path.join(directory, "inputs.jsonl")
+            with open(manifest, "w", encoding="utf-8") as handle:
+                handle.write(record + "\n")
+            with (
+                patch.object(sys, "argv", ["importer", manifest, output, "--limit", "1"]),
+                patch.object(importer, "fetch_pull_request") as fetch,
+                self.assertRaisesRegex(ValueError, "invalid JSON"),
+            ):
+                importer.main()
+
+            fetch.assert_not_called()
+
     def test_import_requires_explicit_rights_review_record(self):
         record = self.manifest()
         record.pop("rights")

@@ -7,7 +7,7 @@ from typing import Any
 
 from .diff_parser import parse_unified_diff
 from .errors import safe_exception_summary
-from .evaluation_dataset import dataset_fingerprint, normalized_path
+from .evaluation_dataset import dataset_fingerprint, normalized_path, validate_case
 from .evaluation_metrics import (
     RULE_TO_CWE,
     accumulate,
@@ -96,10 +96,11 @@ def one_to_one_match(
 
 
 class FixtureRepairer:
-    """Conservative deterministic repairer used by the controlled benchmark.
+    """Run production deterministic repairs against controlled fixture checks.
 
-    Production repositories should replace this with a worktree-based repair runner.
-    The same evaluator and gates can consume either implementation.
+    The fixture supplies reproduction and regression patterns; patch generation
+    deliberately reuses :class:`SafeFixer` so benchmark-only rewrites cannot
+    inflate the reported production repair capability.
     """
 
     def repair(self, case: dict, finding: Finding) -> dict[str, Any]:
@@ -114,7 +115,12 @@ class FixtureRepairer:
             checks.append({"name": "patch-generated", "passed": False})
             return {"passed": False, "checks": checks, "content": content}
 
-        repaired = self._transform(content, finding)
+        result = SafeFixer().apply(
+            content,
+            [{"path": path, "line": finding.line, "rule_id": finding.rule_id}],
+            path,
+        )
+        repaired = str(result["content"])
         patch_applied = repaired != content
         checks.append({"name": "patch-generated", "passed": patch_applied})
         compile_result = RepairVerifier().verify_contents({path: repaired})
@@ -130,62 +136,6 @@ class FixtureRepairer:
             "checks": checks,
             "content": repaired,
         }
-
-    @staticmethod
-    def _transform(content: str, finding: Finding) -> str:
-        rule = finding.rule_id
-        if rule == "SEC-EVAL":
-            value = re.sub(r"\beval\s*\(", "json.loads(", content)
-            return FixtureRepairer._ensure_import(value, "json")
-        if rule == "SEC-SUBPROCESS-SHELL":
-            return re.sub(r"shell\s*=\s*True", "shell=False", content)
-        if rule == "SEC-HARDCODED-SECRET":
-            value = re.sub(
-                r"(?m)^(\s*)(password|passwd|api_key|secret|token)\s*=\s*['\"][^'\"]+['\"]",
-                lambda match: (
-                    '%s%s = os.environ["%s"]'
-                    % (match.group(1), match.group(2), match.group(2).upper())
-                ),
-                content,
-            )
-            return FixtureRepairer._ensure_import(value, "os")
-        if rule == "SEC-SQL-CONCAT":
-            return re.sub(
-                r"(?m)^(\s*)cursor\.execute\(.+$",
-                r'\1cursor.execute("SELECT * FROM users WHERE id = ?", (value,))',
-                content,
-            )
-        if rule == "REL-EMPTY-EXCEPT":
-            return content.replace("except Exception:", "except ValueError:")
-        if rule == "REL-DEBUG-PRINT":
-            return re.sub(r"(?m)^\s*(print|console\.log)\s*\(.+\)\s*$\n?", "", content)
-        if rule == "SEC-PATH-TRAVERSAL":
-            return re.sub(
-                r"open\(base\s*/\s*user_path\)\.read\(\)",
-                "read_under_base(base, user_path)",
-                content,
-            )
-        if rule in {"SEC-YAML-LOAD", "SEC-INSECURE-COOKIE"}:
-            result = SafeFixer().apply(
-                content,
-                [
-                    {
-                        "path": finding.path,
-                        "line": finding.line,
-                        "rule_id": rule,
-                    }
-                ],
-                finding.path,
-            )
-            if rule in result["rules"]:
-                return str(result["content"])
-        return content
-
-    @staticmethod
-    def _ensure_import(content: str, module: str) -> str:
-        if re.search(r"(?m)^\s*(import %s|from %s import)" % (module, module), content):
-            return content
-        return "import %s\n" % module + content
 
 
 class EndToEndEvaluationHarness:
@@ -207,7 +157,10 @@ class EndToEndEvaluationHarness:
         started = time.monotonic()
         totals = empty_totals()
         case_results = []
-        for case in cases:
+        for line_number, case in enumerate(cases, 1):
+            if not isinstance(case, dict):
+                raise ValueError("dataset line %d must be a JSON object" % line_number)
+            validate_case(case, line_number)
             result = self._run_case(reviewer, case)
             case_results.append(result)
             accumulate(totals, result)

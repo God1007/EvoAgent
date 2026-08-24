@@ -47,6 +47,7 @@ LEVEL_LABELS = {
     EvidenceLevel.L3_FIX_VERIFIED: "L3-fix-verified",
     EvidenceLevel.L4_REGRESSION_CLEAN: "L4-regression-clean",
 }
+MAX_PROOF_FILES = 5_000
 
 
 def _diff_lines(text: str) -> list[str]:
@@ -85,9 +86,6 @@ class LocalProofExecutor:
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
-    def health(self) -> dict[str, Any]:
-        return {"healthy": True, "mode": "local-container-required"}
-
 
 class ProofRunner:
     def __init__(self, verifier_factory=None, executor: ProofExecutorPort | None = None):
@@ -105,6 +103,11 @@ class ProofRunner:
         reproduction_command: str = "",
         regression_command: str = "",
     ) -> dict:
+        paths = set(original_files) | set(patched_files)
+        if len(paths) > MAX_PROOF_FILES:
+            raise ClientInputError("proof file set cannot contain more than 5000 distinct paths")
+        for path in paths:
+            _proof_target(os.curdir, path)
         patch = unified_patch(original_files, patched_files)
         result: dict = {
             "evidence_level": int(EvidenceLevel.L1_STATIC),
@@ -182,37 +185,51 @@ class ProofRunner:
     def _run(self, files: dict[str, str], command: str) -> dict:
         try:
             outcome = self.executor.execute(files, command)
+            if not isinstance(outcome, dict):
+                raise TypeError("proof executor result must be a mapping")
+            checks = outcome.get("checks", [])
+            if not isinstance(checks, list) or any(not isinstance(check, dict) for check in checks):
+                raise TypeError("proof executor checks must be a list of mappings")
+            passed = outcome.get("passed")
+            if not isinstance(passed, bool):
+                raise TypeError("proof executor passed verdict must be boolean")
+            status = outcome.get("status") or ("passed" if passed else "failed")
+            if status not in {"passed", "failed", "timeout", "error"} or passed != (
+                status == "passed"
+            ):
+                raise TypeError("proof executor returned an inconsistent status")
+            duration = outcome.get("duration_seconds", 0.0)
+            if (
+                isinstance(duration, bool)
+                or not isinstance(duration, (int, float))
+                or not 0 <= duration < float("inf")
+            ):
+                raise TypeError("proof executor duration must be finite and non-negative")
+            detail = ""
+            for check in checks:
+                if "detail" in check and not isinstance(check["detail"], str):
+                    raise TypeError("proof executor check detail must be a string")
+                if check.get("detail"):
+                    detail = check["detail"]
+                    break
+            return {
+                "passed": passed,
+                "status": status,
+                "detail": detail,
+                "duration_seconds": duration,
+                **(
+                    {"attestation": outcome["attestation"]}
+                    if isinstance(outcome.get("attestation"), dict)
+                    else {}
+                ),
+            }
         except Exception as exc:
-            outcome = {
+            return {
                 "passed": False,
                 "status": "error",
-                "checks": [
-                    {
-                        "name": "proof-executor",
-                        "detail": safe_exception_summary(exc, "proof executor failed"),
-                    }
-                ],
+                "detail": safe_exception_summary(exc, "proof executor failed"),
+                "duration_seconds": 0.0,
             }
-        detail = ""
-        for check in outcome.get("checks", []):
-            if check.get("detail"):
-                detail = check["detail"]
-                break
-        passed = bool(outcome.get("passed"))
-        # Fall back for minimal verifiers that only report ``passed``; a real
-        # RepairVerifier supplies the richer status the ladder relies on.
-        status = outcome.get("status") or ("passed" if passed else "failed")
-        return {
-            "passed": passed,
-            "status": status,
-            "detail": detail,
-            "duration_seconds": outcome.get("duration_seconds", 0.0),
-            **(
-                {"attestation": outcome["attestation"]}
-                if isinstance(outcome.get("attestation"), dict)
-                else {}
-            ),
-        }
 
 
 def _materialize(files: dict[str, str], root: str) -> None:
@@ -220,9 +237,17 @@ def _materialize(files: dict[str, str], root: str) -> None:
     for rel, content in files.items():
         if not isinstance(rel, str) or not isinstance(content, str):
             raise ClientInputError("proof file set must be a mapping of str paths to str content")
-        target = os.path.normpath(os.path.join(root, rel))
-        if target != root and not target.startswith(root + os.sep):
-            raise ClientInputError("unsafe path in proof file set: %s" % rel)
+        target = _proof_target(root, rel)
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(content)
+
+
+def _proof_target(root: str, rel: str) -> str:
+    root = os.path.abspath(root)
+    if not isinstance(rel, str) or not rel or "\0" in rel or os.path.isabs(rel):
+        raise ClientInputError("unsafe path in proof file set: %s" % rel)
+    target = os.path.abspath(os.path.join(root, rel))
+    if target == root or not target.startswith(root + os.sep):
+        raise ClientInputError("unsafe path in proof file set: %s" % rel)
+    return target

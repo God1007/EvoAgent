@@ -4,6 +4,10 @@ version: 2
 # actually install with --require-hashes). After merging a pip bump, run
 # `make lock` to refresh the locks. tests/test_dependencies.py fails if a bumped
 # pyproject bound no longer matches the pinned lock version.
+# Workflow Actions are pinned to full commits; keep their trailing version
+# comments so Dependabot can update the SHA without hiding the release line.
+# Docker and Compose images keep a readable tag plus an immutable digest; the
+# Docker updater refreshes those digests instead of making rebuilds mutable.
 updates:
   - package-ecosystem: pip
     directory: /

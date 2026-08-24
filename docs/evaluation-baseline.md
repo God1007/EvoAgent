@@ -9,12 +9,13 @@ Reproducible snapshot of the end-to-end evaluation harness. Regenerate with
 | Field | Value |
 | --- | --- |
 | EvoAgent version | 0.30.0 |
-| Python | 3.12 |
-| Dependencies | pinned via `requirements.lock` (hash-locked) |
+| Python | 3.12.13 |
+| Application source SHA-256 | `1888605e211c10174ef2ea51897c6e396fea60aba3ab2df8ee8d53b4763cb3d3` |
+| Dependencies | `requirements.lock` SHA-256 `dd3a30c26aa196e7afcc88a1d16336ee391ce408fcebcc3bd996a0f80537ac0e` |
 | Dataset | `evaluation_data/pr_diff_100.jsonl` |
-| Dataset semantic SHA-256 | `844b6d45c3de39c6c1d8080067bb77900a7234a68891c264f5833b6abdf6e770` |
+| Dataset semantic SHA-256 | `8d2271ec666dcbc96b0c8a13e05adcf71c08f33bf17da5d1c102fe9a3434af38` |
 | Corpus kind | `synthetic-controlled` (not real production PRs) |
-| Evaluation report schema | 2 |
+| Evaluation report schema | 3 |
 
 ## Dataset
 
@@ -33,12 +34,13 @@ Reproducible snapshot of the end-to-end evaluation harness. Regenerate with
 | Clean PR accuracy | 91.7% | 91.7% | +0.0 pp |
 | Execution success | 100.0% | 100.0% | +0.0 pp |
 | Safe-fix rate | — | 100.0% | — |
-| E2E security-fix rate | — | 70.0% | — |
+| E2E security-fix rate | — | 35.0% | — |
 
 Counts: baseline TP/FP/FN = 27/5/13; candidate TP/FP/FN = 33/7/7.
-Auto-repair: all 28 deterministic-whitelist-eligible risks passed all five
-repair gates; 5 detected but ambiguous/non-whitelisted risks safely abstained;
-28 of 40 total risk cases succeeded end-to-end.
+Auto-repair: the production `SafeFixer` attempted all 14 safely generic
+repairs and every one passed all five repair gates. Another 19 detected risks
+required business context and abstained; 14 of 40 total risk cases succeeded
+end-to-end. Benchmark-only semantic rewrites are not used.
 
 ## Per-split results
 
@@ -61,7 +63,8 @@ repair gates; 5 detected but ambiguous/non-whitelisted risks safely abstained;
 
 ## Release gate
 
-- Quantitative gate: **PASS**
+- Quantitative gate: **FAIL** — production repair coverage remains below the
+  declared thresholds.
 - Production activation: **BLOCKED** — requires a real, independently-labeled
   public-PR dataset (`production_data_provenance` fails by design on synthetic
   data).
@@ -76,7 +79,7 @@ repair gates; 5 detected but ambiguous/non-whitelisted risks safely abstained;
 | `execution_success` | PASS |
 | `confidence_validity` | PASS |
 | `safe_fix_rate` | PASS |
-| `e2e_security_fix_rate` | PASS |
+| `e2e_security_fix_rate` | FAIL |
 | `production_data_provenance` | FAIL (expected on synthetic corpus) |
 
 The provenance audit passes sample size, unique content, repository-disjoint

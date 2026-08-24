@@ -15,7 +15,6 @@ from typing import Any
 from .migrations import SchemaMigrationError
 from .ports import RecoveryStorePort
 from .postgres_store import PostgresTaskStore
-from .task_queue import build_queue_keyspace, validate_redis_cluster_url
 
 RECOVERY_SCHEMA_VERSION = 1
 RECOVERY_MARKER = "evoagent:recovery:epoch"
@@ -87,6 +86,7 @@ def build_queue_recovery_plan(store: RecoveryStorePort, max_tasks: int) -> Queue
             {
                 "task_id": str(candidate.get("task_id", "")),
                 "tenant_id": str(candidate.get("tenant_id", "")),
+                "outbox_id": str(candidate.get("outbox_id", "")),
                 "outbox_status": status,
                 "recoverable": is_recoverable,
                 "payload_sha256": payload_sha256,
@@ -104,29 +104,24 @@ def build_queue_recovery_plan(store: RecoveryStorePort, max_tasks: int) -> Queue
 
 
 class RedisRecoveryTarget:
-    """An empty legacy DB or empty v2 queue namespace reserved for recovery."""
+    """An empty Redis database reserved for queue recovery."""
 
-    def __init__(self, url: str, redis_cluster: bool = False, namespace: str = ""):
+    def __init__(self, url: str):
         parsed = urllib.parse.urlsplit(url)
         host = (parsed.hostname or "").lower().rstrip(".")
         if parsed.scheme not in {"redis", "rediss"} or not host:
             raise ValueError("Redis recovery URL must use redis:// or rediss://")
         if parsed.scheme == "redis" and host not in _LOOPBACK:
             raise ValueError("Redis recovery requires TLS outside loopback")
+        if parsed.query:
+            raise ValueError("Redis recovery URL must not contain query parameters")
         if parsed.fragment:
             raise ValueError("Redis recovery URL must not contain a fragment")
         try:
             import redis
         except ImportError as exc:  # pragma: no cover - runtime dependency
             raise QueueRecoveryError("queue recovery requires redis") from exc
-        if redis_cluster and not namespace:
-            raise ValueError("Redis Cluster recovery requires EVOAGENT_QUEUE_NAMESPACE")
-        if redis_cluster:
-            validate_redis_cluster_url(url)
-        self.redis_cluster = bool(redis_cluster)
-        self.keyspace = build_queue_keyspace(namespace)
-        client_type = redis.RedisCluster if self.redis_cluster else redis.Redis
-        self._client: Any = client_type.from_url(
+        self._client: Any = redis.Redis.from_url(
             url,
             decode_responses=True,
             socket_connect_timeout=5,
@@ -136,35 +131,19 @@ class RedisRecoveryTarget:
         self._client.ping()
 
     def inspect(self, marker: str) -> str:
-        if self.keyspace.version == 2:
-            marker_key = self.keyspace.recovery_marker
-            occupied = int(self._client.exists(marker_key, *self.keyspace.fixed_keys))
-            if occupied == 0:
-                return "empty"
-            if occupied == 1 and self._client.get(marker_key) == marker:
-                return "reserved"
-            return "nonempty"
-        size = int(self._client.dbsize())
-        if size == 0:
-            return "empty"
-        if size == 1 and self._client.get(RECOVERY_MARKER) == marker:
-            return "reserved"
-        return "nonempty"
-
-    def reserve(self, marker: str) -> str:
-        if self.keyspace.version == 2:
-            result = self._client.eval(
-                "for index=2,#KEYS do "
-                "if redis.call('EXISTS',KEYS[index]) == 1 then return 'nonempty' end end; "
-                "local current=redis.call('GET',KEYS[1]); "
-                "if not current then redis.call('SET',KEYS[1],ARGV[1]); return 'reserved' end; "
-                "if current==ARGV[1] then return 'existing' end; return 'nonempty'",
-                1 + len(self.keyspace.fixed_keys),
-                self.keyspace.recovery_marker,
-                *self.keyspace.fixed_keys,
+        return str(
+            self._client.eval(
+                "local size=redis.call('DBSIZE'); "
+                "if size==0 then return 'empty' end; "
+                "if size==1 and redis.call('GET',KEYS[1])==ARGV[1] then return 'reserved' end; "
+                "return 'nonempty'",
+                1,
+                RECOVERY_MARKER,
                 marker,
             )
-            return str(result)
+        )
+
+    def reserve(self, marker: str) -> str:
         result = self._client.eval(
             "local size=redis.call('DBSIZE'); "
             "if size==0 then redis.call('SET',KEYS[1],ARGV[1]); return 'reserved' end; "
@@ -189,15 +168,6 @@ def _marker(recovery_id: str, database: str, plan_sha256: str) -> str:
             "plan_sha256": plan_sha256,
         }
     )
-
-
-def _target_evidence(redis_target: Any) -> dict[str, Any]:
-    keyspace = getattr(redis_target, "keyspace", None)
-    return {
-        "redis_cluster": bool(getattr(redis_target, "redis_cluster", False)),
-        "queue_namespace": str(getattr(keyspace, "namespace", "")),
-        "keyspace_version": int(getattr(keyspace, "version", 1)),
-    }
 
 
 def execute_queue_recovery(
@@ -246,7 +216,6 @@ def execute_queue_recovery(
             "recovery_id": recovery_id,
             "database": database,
             "redis_target_state": "reserved",
-            "redis_topology": _target_evidence(redis_target),
             "reservation": "existing",
             "plan": {
                 "plan_sha256": recorded_sha256,
@@ -287,7 +256,6 @@ def execute_queue_recovery(
             "recovery_id": recovery_id,
             "database": database,
             "redis_target_state": target_state,
-            "redis_topology": _target_evidence(redis_target),
             "plan": public_plan,
         }
     reservation = str(redis_target.reserve(marker))
@@ -306,7 +274,6 @@ def execute_queue_recovery(
         "recovery_id": recovery_id,
         "database": database,
         "redis_target_state": "reserved",
-        "redis_topology": _target_evidence(redis_target),
         "reservation": reservation,
         "plan": public_plan,
         "staging": staged,
@@ -341,13 +308,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     database_url = os.getenv("EVOAGENT_DATABASE_URL", "")
     redis_url = os.getenv("EVOAGENT_REDIS_URL", "")
-    redis_cluster = os.getenv("EVOAGENT_REDIS_CLUSTER", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    queue_namespace = os.getenv("EVOAGENT_QUEUE_NAMESPACE", "")
     store = None
     target = None
     try:
@@ -367,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if store.connected_database_name() != database:
             raise ValueError("connected PostgreSQL database does not match the confirmed name")
-        target = RedisRecoveryTarget(redis_url, redis_cluster, queue_namespace)
+        target = RedisRecoveryTarget(redis_url)
         report = execute_queue_recovery(
             store,
             target,

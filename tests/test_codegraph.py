@@ -99,6 +99,18 @@ class RelativeImportTests(unittest.TestCase):
         impact = graph.impact_of(["pkg/util.py"])
         self.assertIn("pkg/service.py", impact["importing_files"])
 
+    def test_direct_import_alias_preserves_call_edge(self):
+        graph = build_graph(
+            {
+                "pkg/util.py": "def helper():\n    return 1\n",
+                "pkg/service.py": (
+                    "from pkg.util import helper as execute\ndef use():\n    return execute()\n"
+                ),
+            }
+        )
+
+        self.assertIn("pkg.service.use", graph.impact_of(["pkg/util.py"])["impacted_symbols"])
+
 
 class CallEdgeRobustnessTests(unittest.TestCase):
     def _graph(self):

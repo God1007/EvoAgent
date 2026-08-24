@@ -42,7 +42,7 @@ class _FixtureHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._record()
-        if self.path == "/repos/o/r/issues/1/comments?per_page=100":
+        if self.path == "/repos/o/r/issues/1/comments?per_page=100&page=1":
             type(self).comment_reads += 1
             if type(self).comment_reads == 1:
                 self._json(503, {"message": "retry fixture"}, {"Retry-After": "0"})

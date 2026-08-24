@@ -21,8 +21,9 @@ policy and its audit record is one database transaction.
 
 Application use cases resolve one immutable `RepositoryPolicy` at intake. The
 task persists its versioned snapshot for retry determinism. Current `enabled`
-and comment-publication restrictions are also checked during queued execution
-so emergency revocation takes effect without mutating accepted history.
+and comment-publication restrictions are also checked during queued execution;
+shadow model egress rechecks `enabled` after the primary review, so emergency
+revocation takes effect without mutating accepted history.
 
 The legacy grant behavior remains a compatibility fallback only when an exact
 versioned policy does not exist. The first explicit policy becomes authoritative
@@ -32,11 +33,8 @@ for that tenant/repository key.
 
 - Governance decisions are testable without HTTP or `ReviewService`.
 - Tenant policy changes are attributable, replayable, and race-safe.
-- Dynamic FixRule plugins remain composable but a repository can restrict the
-  eligible subset.
-- A policy plugin can replace the built-in resolver without replacing storage or
-  review execution.
+- Fix rules remain composable but a repository can restrict the eligible subset.
 - Model cost, quota, and data-residency fields are deferred until a gateway can
   enforce them; the current schema does not pretend otherwise.
-- Policy tables and Store methods become part of the PostgreSQL/SQLite adapter
-  contract and migration history.
+- Policy tables and Store methods are part of the PostgreSQL contract and
+  migration history.

@@ -691,10 +691,6 @@ class PostgresTaskStore:
                             now,
                         ),
                     )
-                    conn.execute(
-                        "UPDATE tasks SET state=%s,error=NULL,updated_at=%s WHERE id=%s",
-                        (TaskState.PENDING.value, now, task_id),
-                    )
                     result = {"status": "resumed", "generation": generation}
             self._audit_task_resume(conn, tenant_id, actor, task_id, result["status"], now)
         if rejected:

@@ -2169,7 +2169,7 @@ class ApplicationUseCaseTests(unittest.TestCase):
             dead_letter_error,
         )
         self.assertEqual(1, self.store.tenant_review_admission_stats("tenant")["active"])
-        self.assertEqual(TaskState.PENDING.value, self.store.get(task_id, "tenant")["state"])
+        self.assertEqual(TaskState.FAILED.value, self.store.get(task_id, "tenant")["state"])
         reviews.on_dead_letter(
             {"task_id": task_id, "tenant_id": "tenant", "admission_generation": 2},
             dead_letter_error,

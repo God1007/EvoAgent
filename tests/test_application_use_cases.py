@@ -1996,7 +1996,7 @@ class ApplicationUseCaseTests(unittest.TestCase):
         class Queue:
             backend = "test"
 
-        def execute(task_id, _repository, _pull_request, _diff, _tenant_id):
+        def execute(task_id, _repository, _pull_request, _diff, _tenant_id, _execution_generation):
             self.store.succeed(
                 task_id,
                 report,
@@ -2060,7 +2060,7 @@ class ApplicationUseCaseTests(unittest.TestCase):
         code_host = CodeHost()
         executions = []
 
-        def execute(task_id, _repository, _pull_request, _diff, _tenant_id):
+        def execute(task_id, _repository, _pull_request, _diff, _tenant_id, _execution_generation):
             executions.append(task_id)
             self.store.succeed(
                 task_id,

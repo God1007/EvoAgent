@@ -691,6 +691,10 @@ class PostgresTaskStore:
                             now,
                         ),
                     )
+                    conn.execute(
+                        "UPDATE tasks SET state=%s,error=NULL,updated_at=%s WHERE id=%s",
+                        (TaskState.PENDING.value, now, task_id),
+                    )
                     result = {"status": "resumed", "generation": generation}
             self._audit_task_resume(conn, tenant_id, actor, task_id, result["status"], now)
         if rejected:
@@ -1134,7 +1138,7 @@ class PostgresTaskStore:
                     if delivery_resume:
                         conn.execute(
                             "UPDATE tasks SET input_json=input_json||"
-                            "jsonb_build_object('_delivery_resume_outbox_id',%s),updated_at=%s "
+                            "jsonb_build_object('_delivery_resume_outbox_id',%s::text),updated_at=%s "
                             "WHERE id=%s",
                             (recovery_message_key, now, candidate["task_id"]),
                         )
@@ -1559,12 +1563,13 @@ class PostgresTaskStore:
                 ("session-state:%s" % session_id,),
             )
             turn = conn.execute(
-                "SELECT summary_json FROM session_turns WHERE id=%s AND session_id=%s",
+                "SELECT summary_json,findings_pruned_at FROM session_turns "
+                "WHERE id=%s AND session_id=%s",
                 (turn_id, session_id),
             ).fetchone()
             if not turn:
                 raise ValueError("session turn not found")
-            if turn["summary_json"] is not None:
+            if turn["summary_json"] is not None and turn.get("findings_pruned_at") is None:
                 return False
             conn.execute("DELETE FROM session_findings WHERE turn_id=%s", (turn_id,))
             if open_snapshots:
@@ -2915,7 +2920,8 @@ class PostgresTaskStore:
                 return None
             recorded = conn.execute(
                 "UPDATE tasks SET input_json=jsonb_set(input_json,'{_release_results}',"
-                "COALESCE(input_json->'_release_results','{}'::jsonb)||jsonb_build_object(%s,TRUE)),"
+                "COALESCE(input_json->'_release_results','{}'::jsonb)||"
+                "jsonb_build_object(%s::text,TRUE)),"
                 "updated_at=%s "
                 "WHERE id=%s AND tenant_id=%s "
                 "AND NOT (COALESCE(input_json->'_release_results','{}'::jsonb) ? %s) RETURNING id",

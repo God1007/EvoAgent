@@ -1091,7 +1091,7 @@ class AdmissionControlTests(unittest.TestCase):
     def _settings(self, **overrides) -> Settings:
         base = dict(
             host="127.0.0.1",
-            port=0,
+            port=8080,
             max_diff_bytes=10000,
             max_steps=8,
             timeout_seconds=10,

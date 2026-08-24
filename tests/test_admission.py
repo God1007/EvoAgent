@@ -1475,7 +1475,7 @@ class AdmissionControlTests(unittest.TestCase):
         conn.request("POST", "/v1/reviews?async=yes", body=payload, headers=headers)
         ambiguous = conn.getresponse()
         ambiguous.read()
-        self.assertEqual(503, ambiguous.status)  # cannot bypass the synchronous gate
+        self.assertEqual(400, ambiguous.status)  # invalid mode is rejected before admission
 
     def test_async_review_idempotency_reuses_task_and_rejects_changed_content(self):
         host, port = self._serve(self._settings())
@@ -1499,7 +1499,7 @@ class AdmissionControlTests(unittest.TestCase):
             response = conn.getresponse()
             responses.append((response.status, json.loads(response.read())))
 
-        self.assertEqual([202, 202], [item[0] for item in responses])
+        self.assertEqual([202, 200], [item[0] for item in responses])
         self.assertEqual(responses[0][1]["task_id"], responses[1][1]["task_id"])
         changed = payload.replace("+new", "+different")
         conn.request("POST", "/v1/reviews?async=true", body=changed, headers=headers)

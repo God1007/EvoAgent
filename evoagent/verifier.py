@@ -296,18 +296,21 @@ class RepairVerifier:
             "nofile=1024:1024",
             "--workdir",
             "/work",
+            "--mount",
+            "type=bind,src=%s,dst=/source,readonly" % root,
         ]
         if os.name != "nt":
             user = "%d:%d" % (os.getuid(), os.getgid())
             work_tmpfs += ",uid=%d,gid=%d,mode=0700" % (os.getuid(), os.getgid())
             command += ["--user", user]
         command += ["--tmpfs", work_tmpfs, self.container_image, "sh", "-c", "sleep 2147483647"]
+        copy = ["docker", "exec", "--workdir", "/work"]
+        if os.name != "nt":
+            copy += ["--user", user]
+        copy += [name, "sh", "-c", "cp -R /source/. /work"]
         created = False
         try:
-            for setup in (
-                command,
-                ["docker", "cp", "--archive", root + os.sep + ".", name + ":/work"],
-            ):
+            for setup in (command, copy):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return "timeout", "verification exceeded %d seconds" % self.timeout_seconds

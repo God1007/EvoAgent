@@ -299,8 +299,9 @@ class VerifierContainerModeTests(unittest.TestCase):
             self.assertIn("--user", command)
         self.assertIn("python:3.12-slim", command)
         self.assertNotIn("-v", command)
-        self.assertEqual(["docker", "cp", "--archive"], copy[:3])
-        self.assertEqual("/work", copy[-1].split(":", 1)[1])
+        self.assertTrue(command[command.index("--mount") + 1].endswith(",dst=/source,readonly"))
+        self.assertEqual(["docker", "exec", "--workdir", "/work"], copy[:4])
+        self.assertEqual(["sh", "-c", "cp -R /source/. /work"], copy[-3:])
         self.assertEqual(["sh", "-c", "pytest -q"], execute[-3:])
         self.assertEqual(
             {
@@ -349,9 +350,7 @@ class VerifierContainerModeTests(unittest.TestCase):
 
         def run(command, **_kwargs):
             calls.append(command)
-            return SimpleNamespace(
-                returncode=1 if command[:3] == ["docker", "cp", "--archive"] else 0
-            )
+            return SimpleNamespace(returncode=1 if "cp -R /source/. /work" in command else 0)
 
         def execute(*_args, **_kwargs):
             raise AssertionError("tests must not run after a failed worktree copy")

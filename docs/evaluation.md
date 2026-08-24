@@ -95,9 +95,20 @@ within 2 lines. Duplicate predictions match once; the rest count as FP.
 ## 3. Splits and gating
 
 - Validation and Holdout are split **by repository** to avoid leakage.
-- A candidate activates only if the quantitative gate passes **and** protected
-  metrics do not regress beyond tolerance on both splits.
+- A candidate is approved for rollout only if the quantitative gate passes
+  **and** protected metrics do not regress beyond tolerance on both splits.
+- Candidate Prompts are capped before persistence; expected findings use a closed,
+  type-strict schema and must point to an added line.
+- Baseline/candidate and validation/holdout replays share one
+  `EVOAGENT_TIMEOUT_SECONDS` deadline; remaining cases become failed evaluations
+  after expiry and cannot approve a partial run.
+- Every qualification record binds the application/model/Skill execution revision
+  alongside both Prompt hashes and both dataset hashes.
+- Approval never changes production traffic; tenant canary/shadow rollout is the
+  only activation path.
 - Baseline and candidate reports must have the same semantic dataset SHA-256.
+- Confidence metrics accept only finite JSON numbers in `[0,1]`; malformed values
+  count as invalid and fail the release gate instead of being coerced or aborting the run.
 - The `production_data_provenance` gate requires at least 50 unique cases,
   repository-disjoint validation/holdout splits, two or more holdout
   repositories, risk and clean cases in each split, immutable GitHub URL/head/diff
@@ -118,7 +129,8 @@ ethics review.
 
 ## 5. What to capture per release
 
-The baseline snapshot records: version + commit SHA, dataset SHA-256, Python and
-dependency versions, the metric table, per-split results, and the release-gate
-verdict. Regenerate it with the commands above and update
+Report schema v3 records the EvoAgent version, path-independent application
+source SHA-256, exact Python version and `requirements.lock` SHA-256 alongside
+the dataset SHA-256, metric table, per-split results and release-gate verdict.
+Regenerate the baseline with the commands above and update
 [`evaluation-baseline.md`](evaluation-baseline.md).

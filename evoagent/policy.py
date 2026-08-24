@@ -8,6 +8,7 @@ from typing import Any
 
 from .errors import AccessDeniedError, ClientInputError
 from .ports import RepositoryPolicyStorePort
+from .repository import canonical_repository
 
 _POLICY_FIELDS = frozenset(
     {
@@ -126,21 +127,29 @@ class RepositoryPolicyResolver:
         self.store = store
 
     def resolve(self, tenant_id: str, repository: str) -> RepositoryPolicy:
+        repository = canonical_repository(repository)
         record = self.store.get_repository_policy(tenant_id, repository)
         if record is not None:
+            version = record.get("version")
+            if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+                raise ValueError("configured repository policy version is invalid")
             policy = RepositoryPolicy.from_dict(record["policy"])
-            return replace(policy, version=int(record["version"]), source="configured")
+            return replace(policy, version=version, source="configured")
         return RepositoryPolicy(
             enabled=self.store.repository_allowed(tenant_id, repository),
             auto_fix=self.store.repository_allowed(tenant_id, repository, True),
             source="legacy-grant",
         )
 
-    def from_snapshot(self, value: Any) -> RepositoryPolicy:
+    @staticmethod
+    def from_snapshot(value: Any) -> RepositoryPolicy:
         if not isinstance(value, dict):
             raise ValueError("task does not contain a valid repository policy snapshot")
-        policy = RepositoryPolicy.from_dict(value.get("policy") or {})
-        version = value.get("version", 0)
+        raw_policy = value.get("policy")
+        if not isinstance(raw_policy, dict):
+            raise ValueError("task does not contain a valid repository policy snapshot")
+        policy = RepositoryPolicy.from_dict(raw_policy)
+        version = value.get("version")
         if isinstance(version, bool) or not isinstance(version, int) or version < 0:
             raise ValueError("task repository policy version is invalid")
         return replace(policy, version=version, source="task-snapshot")
@@ -154,8 +163,7 @@ class RepositoryPolicyResolver:
     ) -> dict[str, Any]:
         if not tenant_id or len(tenant_id) > 200:
             raise ClientInputError("tenant_id is required and must be at most 200 characters")
-        if not repository or len(repository) > 250:
-            raise ClientInputError("repository is required and must be at most 250 characters")
+        repository = canonical_repository(repository)
         if not actor or len(actor) > 200:
             raise ClientInputError("policy actor is required and must be at most 200 characters")
         policy = RepositoryPolicy.from_dict(raw_policy)

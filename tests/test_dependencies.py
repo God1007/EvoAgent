@@ -82,6 +82,73 @@ class DependencyLockConsistencyTests(unittest.TestCase):
             "requirements.txt duplicates pyproject dependencies; remove it to avoid drift",
         )
 
+    def test_workflow_actions_are_pinned_to_full_commit_shas(self):
+        for workflow in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+            for action, revision in re.findall(
+                r"uses:\s+([^@\s]+)@([^\s#]+)", workflow.read_text(encoding="utf-8")
+            ):
+                self.assertRegex(
+                    revision,
+                    r"^[0-9a-f]{40}$",
+                    "%s uses mutable action reference %s@%s" % (workflow.name, action, revision),
+                )
+
+    def test_workflow_service_images_are_pinned_by_digest(self):
+        for workflow in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+            for image in re.findall(
+                r"^\s+image:\s+(\S+)",
+                workflow.read_text(encoding="utf-8"),
+                re.MULTILINE,
+            ):
+                self.assertRegex(
+                    image,
+                    r"@sha256:[0-9a-f]{64}$",
+                    "%s uses mutable service image %s" % (workflow.name, image),
+                )
+
+    def test_workflow_namespaced_cli_images_are_pinned_by_digest(self):
+        for workflow in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+            for image in re.findall(
+                r"\b([a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._/-]*:"
+                r"[A-Za-z0-9._-]+(?:@sha256:[0-9a-f]{64})?)",
+                workflow.read_text(encoding="utf-8"),
+            ):
+                self.assertRegex(
+                    image,
+                    r"@sha256:[0-9a-f]{64}$",
+                    "%s uses mutable command image %s" % (workflow.name, image),
+                )
+
+    def test_docker_base_images_are_pinned_by_digest(self):
+        for dockerfile in ROOT.glob("Dockerfile*"):
+            for image in re.findall(
+                r"^FROM(?:\s+--platform=\S+)?\s+(\S+)",
+                dockerfile.read_text(encoding="utf-8"),
+                re.MULTILINE,
+            ):
+                self.assertTrue(
+                    image == "scratch" or re.search(r"@sha256:[0-9a-f]{64}$", image),
+                    "%s uses mutable base image %s" % (dockerfile.name, image),
+                )
+
+    def test_compose_images_are_pinned_by_digest(self):
+        for compose_file in ROOT.glob("*compose*.yml"):
+            for image in re.findall(
+                r"^\s+image:\s+(\S+)",
+                compose_file.read_text(encoding="utf-8"),
+                re.MULTILINE,
+            ):
+                self.assertRegex(
+                    image,
+                    r"@sha256:[0-9a-f]{64}$",
+                    "%s uses mutable image %s" % (compose_file.name, image),
+                )
+
+    def test_local_env_variants_never_enter_git_or_docker_context(self):
+        for name in (".gitignore", ".dockerignore"):
+            lines = (ROOT / name).read_text(encoding="utf-8").splitlines()
+            self.assertLess(lines.index(".env*"), lines.index("!.env.example"), name)
+
 
 if __name__ == "__main__":
     unittest.main()

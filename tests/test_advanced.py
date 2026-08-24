@@ -158,10 +158,11 @@ class AdvancedFeatureTests(unittest.TestCase):
         result = engine.auto_propose("llm-review")
         self.assertEqual("deferred", result["decision"])
         self.assertEqual(1, result["failure_cases_used"])
-        version = result["version"]["version"]
-        self.assertTrue(engine.rollback("llm-review", version))
+        self.assertFalse(result["version"]["active"])
+        self.assertEqual("deferred", result["version"]["qualification"])
+        self.assertIsNone(store.get_active_skill_version("llm-review"))
 
-    def test_replay_evaluation_activates_only_an_improved_prompt(self):
+    def test_replay_evaluation_approves_an_improved_prompt_without_activating_it(self):
         store = self.store
         diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
         store.save_evaluation_case(
@@ -208,21 +209,25 @@ class AdvancedFeatureTests(unittest.TestCase):
             "improved: Review the diff and return JSON with severity, fix and test.",
             regression_score=0.0,
         )
-        self.assertEqual("activated", result["decision"])
+        self.assertEqual("approved", result["decision"])
         self.assertGreater(result["candidate"]["score"], result["baseline"]["score"])
-        self.assertTrue(result["version"]["active"])
+        self.assertFalse(result["version"]["active"])
+        self.assertEqual("approved", result["version"]["qualification"])
         self.assertTrue(
             store.list_evolution_runs()[0]["metrics"]["external_regression_score_ignored"]
         )
+        duplicate = engine.propose(
+            "llm-review",
+            "improved: Review the diff and return JSON with severity, fix and test.",
+        )
+        self.assertEqual("deferred", duplicate["decision"])
+        self.assertEqual(result["version"]["version"], duplicate["version"]["version"])
         rejected = engine.propose(
             "llm-review",
             "Review the diff and return JSON with severity, fix and test.",
         )
         self.assertEqual("rejected", rejected["decision"])
-        self.assertEqual(
-            result["version"]["version"],
-            store.get_active_skill_version("llm-review")["version"],
-        )
+        self.assertIsNone(store.get_active_skill_version("llm-review"))
 
     def test_evaluation_errors_are_counted_as_misses_and_reduce_score(self):
         positive = {
@@ -289,7 +294,7 @@ class AdvancedFeatureTests(unittest.TestCase):
         self.assertEqual(1, metrics["case_results"][0]["fp"])
         self.assertEqual(1, metrics["case_results"][0]["fn"])
 
-    def test_holdout_regression_blocks_activation_without_leaking_case_details(self):
+    def test_holdout_regression_blocks_qualification_without_leaking_case_details(self):
         store = self.store
         validation_diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
         holdout_diff = "--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n-old\n+safe_call(data)\n"

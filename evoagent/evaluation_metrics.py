@@ -67,11 +67,10 @@ def languages_for_paths(paths: Iterable[str]) -> list[str]:
 
 
 def serializable_confidence(value: Any) -> float | None:
-    try:
-        confidence = float(value)
-    except (TypeError, ValueError):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return confidence if math.isfinite(confidence) else None
+    confidence = float(value)
+    return confidence if math.isfinite(confidence) and 0 <= confidence <= 1 else None
 
 
 def empty_totals() -> dict[str, int]:
@@ -201,9 +200,9 @@ def rule_slices(results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         selected = [item for item in predictions if item.get("rule_id") == rule]
         true_positives = sum(bool(item.get("matched")) for item in selected)
         valid_confidences = [
-            float(item["confidence"])
+            confidence
             for item in selected
-            if item.get("confidence") is not None and 0 <= float(item["confidence"]) <= 1
+            if (confidence := serializable_confidence(item.get("confidence"))) is not None
         ]
         slices[rule] = {
             "predicted": len(selected),
@@ -224,11 +223,11 @@ def confidence_calibration(results: list[dict[str, Any]]) -> dict[str, Any]:
     values = []
     invalid = 0
     for prediction in predictions:
-        confidence = prediction.get("confidence")
-        if confidence is None or not 0 <= float(confidence) <= 1:
+        confidence = serializable_confidence(prediction.get("confidence"))
+        if confidence is None:
             invalid += 1
             continue
-        values.append((float(confidence), int(bool(prediction.get("matched")))))
+        values.append((confidence, int(bool(prediction.get("matched")))))
     bins = []
     weighted_gap = 0.0
     for index in range(10):

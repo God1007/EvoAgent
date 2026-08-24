@@ -41,6 +41,14 @@ class ClientInputError(ValueError):
     """An expected request-validation failure with a client-safe message."""
 
 
+class ResourceNotFoundError(ClientInputError):
+    """A requested tenant-scoped resource does not exist."""
+
+
+class StateConflictError(ClientInputError):
+    """A valid request cannot run from the resource's current state."""
+
+
 class AccessDeniedError(PermissionError):
     """An expected authorization/policy denial with a client-safe message."""
 

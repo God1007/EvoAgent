@@ -21,6 +21,7 @@ if ROOT not in sys.path:
 from evoagent.diff_parser import parse_unified_diff  # noqa: E402
 from evoagent.evaluation_dataset import validate_case  # noqa: E402
 from evoagent.github import GitHubClient  # noqa: E402
+from evoagent.json_boundary import strict_json_loads  # noqa: E402
 
 
 def _public_pr_head(payload, repository, pull_request):
@@ -80,8 +81,8 @@ def main():
             if not raw.strip():
                 continue
             try:
-                item = json.loads(raw)
-            except json.JSONDecodeError as exc:
+                item = strict_json_loads(raw)
+            except (ValueError, RecursionError) as exc:
                 raise ValueError("manifest line %d is invalid JSON" % line_number) from exc
             if not isinstance(item, dict):
                 raise ValueError("manifest line %d must be a JSON object" % line_number)

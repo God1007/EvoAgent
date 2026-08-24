@@ -13,6 +13,7 @@ from evoagent.dr import (
     _postgres_parts,
     _run_pg_dump_bounded,
     _run_pg_tool,
+    run_postgres_drill,
 )
 
 
@@ -33,7 +34,13 @@ class RecoverySafetyTests(unittest.TestCase):
     def test_postgres_command_conninfo_never_contains_password(self):
         with patch.dict(
             os.environ,
-            {"EVOAGENT_DATABASE_URL": "postgresql://leaked:secret@example/db"},
+            {
+                "EVOAGENT_DATABASE_URL": "postgresql://leaked:secret@example/db",
+                "EVOAGENT_AUTH_SECRET": "jwt-secret",
+                "GITHUB_TOKEN": "github-secret",
+                "MODEL_API_KEY": "model-secret",
+                "PGPASSFILE": "/secure/pgpass",
+            },
         ):
             parts, command_conninfo, environment = _postgres_parts(
                 "postgresql://dr-user:p%40ss@db.example:5432/evoagent?sslmode=require"
@@ -43,6 +50,10 @@ class RecoverySafetyTests(unittest.TestCase):
         self.assertNotIn("p@ss", command_conninfo)
         self.assertEqual("p@ss", environment["PGPASSWORD"])
         self.assertNotIn("EVOAGENT_DATABASE_URL", environment)
+        self.assertNotIn("EVOAGENT_AUTH_SECRET", environment)
+        self.assertNotIn("GITHUB_TOKEN", environment)
+        self.assertNotIn("MODEL_API_KEY", environment)
+        self.assertEqual("/secure/pgpass", environment["PGPASSFILE"])
 
     def test_pg_tool_uses_argument_vector_and_propagates_failure(self):
         _run_pg_tool(sys.executable, ["-c", "raise SystemExit(0)"], dict(os.environ), 5)
@@ -73,6 +84,35 @@ class RecoverySafetyTests(unittest.TestCase):
                     100,
                 )
             self.assertFalse(os.path.exists(oversized))
+
+    def test_validation_and_cleanup_failures_both_remain_actionable(self):
+        connection = unittest.mock.MagicMock()
+        connection.execute.return_value.fetchone.return_value = {"snapshot_id": "snapshot"}
+        context = unittest.mock.MagicMock()
+        context.__enter__.return_value = connection
+        fingerprint = DatabaseFingerprint("schema", 1, {"tasks": TableFingerprint(1, "a" * 64)})
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch("psycopg.connect", return_value=context) as connect,
+            patch("evoagent.dr._postgres_fingerprint", return_value=fingerprint),
+            patch("evoagent.dr._run_pg_dump_bounded"),
+            patch("evoagent.dr.os.path.getsize", return_value=4),
+            patch("evoagent.dr._sha256_file", return_value="a" * 64),
+            patch("evoagent.dr._create_drill_database"),
+            patch("evoagent.dr._run_pg_tool", side_effect=RuntimeError("restore failed")),
+            patch("evoagent.dr._drop_drill_database", side_effect=RuntimeError("cleanup failed")),
+            self.assertRaisesRegex(
+                DisasterRecoveryError,
+                "validation failed: restore failed; restored database cleanup failed: "
+                "cleanup failed; manual cleanup required for evoagent_drill_",
+            ),
+        ):
+            run_postgres_drill("postgresql://user:password@localhost/source", directory)
+
+        for call in connect.call_args_list:
+            self.assertEqual(30, call.kwargs["connect_timeout"])
+            self.assertEqual("-c statement_timeout=900000", call.kwargs["options"])
 
 
 if __name__ == "__main__":

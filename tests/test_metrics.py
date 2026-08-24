@@ -1,6 +1,8 @@
 import unittest
+from unittest import mock
 
 from evoagent.metrics import Metrics
+from evoagent.observability import AlertManager
 
 
 class CounterAndGaugeTests(unittest.TestCase):
@@ -38,6 +40,7 @@ class CounterAndGaugeTests(unittest.TestCase):
         out = m.prometheus()
         self.assertIn("evoagent_ok_total", out)
         self.assertNotIn("evoagent_bad", out)
+        self.assertIn("evoagent_metrics_gauge_scrape_failures_total 1.0", out)
 
 
 class HistogramTests(unittest.TestCase):
@@ -64,6 +67,38 @@ class HistogramTests(unittest.TestCase):
         with m.latency("http_request_GET"):
             pass
         self.assertIn("evoagent_http_request_GET_count 1", m.prometheus())
+
+
+class AlertManagerTests(unittest.TestCase):
+    def test_failure_rate_uses_only_evaluated_review_outcomes(self):
+        store = mock.Mock()
+        store.dashboard_stats.return_value = {
+            "tasks_total": 100,
+            "tasks_success": 8,
+            "tasks_failed": 2,
+        }
+
+        AlertManager(store, failure_rate=0.1, min_samples=10).evaluate("tenant-a")
+
+        store.create_alert.assert_called_once_with(
+            "tenant-a",
+            "review-failure-rate",
+            "critical",
+            "Review failure rate 20.0% exceeds the 10.0% threshold.",
+        )
+
+    def test_failure_rate_alert_clears_after_recovery(self):
+        store = mock.Mock()
+        store.dashboard_stats.return_value = {
+            "tasks_total": 100,
+            "tasks_success": 9,
+            "tasks_failed": 1,
+        }
+
+        AlertManager(store, failure_rate=0.1, min_samples=10).evaluate("tenant-a")
+
+        store.clear_alert.assert_called_once_with("tenant-a", "review-failure-rate")
+        store.create_alert.assert_not_called()
 
 
 if __name__ == "__main__":

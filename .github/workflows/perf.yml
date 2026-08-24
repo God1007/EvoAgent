@@ -22,7 +22,7 @@ jobs:
       EVOAGENT_DATABASE_URL: postgresql://evoagent:evoagent-perf@127.0.0.1:5432/evoagent
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
         env:
           POSTGRES_DB: evoagent
           POSTGRES_USER: evoagent
@@ -35,10 +35,10 @@ jobs:
           --health-timeout 3s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
           cache: pip
@@ -47,13 +47,15 @@ jobs:
         run: |
           python -m pip install --require-hashes -r requirements-dev.lock
           python -m pip install --no-deps -e .
+      - name: Run migrations
+        run: python -m evoagent.migrate
       - name: Boot the server
         run: |
           EVOAGENT_HOST=127.0.0.1 EVOAGENT_PORT=8080 EVOAGENT_AUTH_REQUIRED=false \
             python -m evoagent > server.log 2>&1 &
           echo $! > server.pid
           for attempt in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
+            if curl -fsS http://127.0.0.1:8080/ready >/dev/null 2>&1; then
               echo "server ready"; exit 0
             fi
             sleep 1
@@ -71,7 +73,7 @@ jobs:
             --p99-ms 500 --max-error-rate 0.001 --json perf-intake.json
       - name: Upload perf reports
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: perf-reports
           path: perf-*.json
@@ -84,10 +86,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.12"
           cache: pip
@@ -100,7 +102,7 @@ jobs:
         run: python scripts/microbench.py --check --json microbench.json
       - name: Upload micro-benchmark report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: microbench-report
           path: microbench.json

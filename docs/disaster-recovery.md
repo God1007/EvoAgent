@@ -20,6 +20,8 @@ evoagent-dr \
 
 Use credentials that may create and drop only disposable drill databases. The
 tool accepts only generated `evoagent_drill_<uuid>` targets and cleans them up.
+Database connections and statements use the command timeout; connection setup is
+capped at 30 seconds.
 Retain the dump and manifest according to the deployment's backup policy.
 
 ## Redis reconstruction
@@ -28,6 +30,9 @@ When Redis is lost, stop workers first. `evoagent-recover-queue` reads incomplet
 tasks and outbox state from PostgreSQL, creates a content-hashed plan, and only
 publishes after an operator repeats that hash with `--apply`. The target Redis
 database must be empty and must use TLS outside loopback.
+Connection query parameters are rejected because redis-py lets them override
+the tool's TLS and timeout policy; select the logical database with the URL path
+(for example, `rediss://cache.example/3`).
 
 Run a dry plan, review unrecoverable task IDs, then apply exactly that plan.
 Start one worker, verify terminal state and external-effect idempotency, then

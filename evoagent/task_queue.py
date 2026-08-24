@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import json
+import math
 import socket
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from .errors import coerce_safe_summary, safe_exception_summary
+from .json_boundary import strict_json_loads
 from .metrics import metrics
 
 
@@ -25,7 +28,13 @@ class TaskQueue:
     STREAM = "evoagent:review:stream"
     DLQ = "evoagent:review:dlq"
     DEDUP = "evoagent:review:dedup:"
-    DEDUP_TTL_SECONDS = 7 * 24 * 60 * 60
+    # ponytail: fixed one-hour window; add a bounded index for longer recovery.
+    DEDUP_TTL_SECONDS = 60 * 60
+    # ponytail: fixed incident buffer; move the DLQ to durable tenant storage if 10k is too small.
+    MAX_DLQ_MESSAGES = 10_000
+    # ponytail: queue messages are metadata; raise only if valid task context outgrows 256 KiB.
+    MAX_ENVELOPE_BYTES = 256 * 1024
+    MAX_DLQ_ENTRY_BYTES = MAX_ENVELOPE_BYTES + 4096
     GROUP = "evoagent-workers"
 
     def __init__(
@@ -39,6 +48,21 @@ class TaskQueue:
         backoff_base: float = 1.0,
         backoff_cap: float = 10.0,
     ):
+        if isinstance(workers, bool) or not isinstance(workers, int) or not 1 <= workers <= 256:
+            raise ValueError("task queue workers must be an integer between 1 and 256")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (max_attempts, lease_seconds)
+        ):
+            raise ValueError("task queue attempts and lease must be positive integers")
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+            for value in (backoff_base, backoff_cap)
+        ):
+            raise ValueError("task queue backoff limits must be positive and finite")
         self.handler = handler
         self.redis_url = redis_url
         self.max_attempts = max_attempts
@@ -46,6 +70,9 @@ class TaskQueue:
         self.on_dead_letter = on_dead_letter
         self.backoff_base = backoff_base
         self.backoff_cap = backoff_cap
+        self._backoff_cap_exponent = max(
+            0, math.ceil(math.log2(backoff_cap) - math.log2(backoff_base))
+        )
         self._executor = ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="evoagent-worker"
         )
@@ -55,7 +82,7 @@ class TaskQueue:
         self._redis_active_ids: set[str] = set()
         self._last_worker_error = ""
         self._last_heartbeat_error = ""
-        self._memory_dlq: list[dict[str, Any]] = []
+        self._memory_dlq: deque[dict[str, Any]] = deque(maxlen=self.MAX_DLQ_MESSAGES)
         self._memory_published_ids: dict[str, float] = {}
         self._memory_submission_times: dict[str, float] = {}
         self._lock = threading.Lock()
@@ -114,6 +141,8 @@ class TaskQueue:
         with self._lifecycle_lock:
             if self._stop.is_set():
                 raise RuntimeError("task queue is closed")
+            if not isinstance(payload, dict):
+                raise ValueError("task queue payload must be an object")
             identifier = message_id or str(payload.get("task_id") or uuid.uuid4())
             self._publish_envelope(
                 {
@@ -126,8 +155,45 @@ class TaskQueue:
             )
         return identifier
 
+    def _validate_envelope(self, value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValueError("task queue envelope must be an object")
+        message_id = value.get("message_id")
+        attempt = value.get("attempt")
+        submitted_at = value.get("submitted_at")
+        if not isinstance(message_id, str) or not message_id:
+            raise ValueError("task queue message_id must be a non-empty string")
+        if (
+            isinstance(attempt, bool)
+            or not isinstance(attempt, int)
+            or not 0 <= attempt < self.max_attempts
+        ):
+            raise ValueError("task queue attempt is outside the retry budget")
+        if not isinstance(value.get("payload"), dict):
+            raise ValueError("task queue payload must be an object")
+        if (
+            isinstance(submitted_at, bool)
+            or not isinstance(submitted_at, (int, float))
+            or not math.isfinite(submitted_at)
+            or submitted_at < 0
+        ):
+            raise ValueError("task queue submitted_at must be finite and non-negative")
+        return value
+
+    @staticmethod
+    def _bounded_json(value: Any, limit: int) -> Any:
+        if not isinstance(value, (str, bytes)):
+            raise ValueError("task queue JSON must be text")
+        encoded = value.encode("utf-8") if isinstance(value, str) else value
+        if len(encoded) > limit:
+            raise ValueError("task queue JSON exceeds the byte limit")
+        return strict_json_loads(value)
+
     def _publish_envelope(self, envelope: dict[str, Any], deduplicate: bool) -> None:
-        serialized = json.dumps(envelope, ensure_ascii=False)
+        envelope = self._validate_envelope(envelope)
+        serialized = json.dumps(envelope, ensure_ascii=False, allow_nan=False)
+        if self._bounded_json(serialized, self.MAX_ENVELOPE_BYTES) != envelope:
+            raise ValueError("task queue values must use JSON-native types")
         message_id = str(envelope["message_id"])
         if self._redis:
             if deduplicate:
@@ -188,16 +254,22 @@ class TaskQueue:
             except Exception as exc:
                 if envelope["attempt"] >= self.max_attempts:
                     self._dead_letter(envelope, safe_exception_summary(exc, "task delivery failed"))
-                elif self._redis:
-                    self._publish_envelope(envelope, deduplicate=False)
                 else:
-                    delay = min(
-                        self.backoff_base * 2 ** (envelope["attempt"] - 1),
-                        self.backoff_cap,
+                    exponent = envelope["attempt"] - 1
+                    delay = (
+                        self.backoff_cap
+                        if exponent >= self._backoff_cap_exponent
+                        else min(math.ldexp(self.backoff_base, exponent), self.backoff_cap)
                     )
-                    timer = threading.Timer(delay, self._schedule_memory, args=(envelope,))
-                    timer.daemon = True
-                    timer.start()
+                    if self._redis:
+                        # ponytail: one bounded worker sleeps; add delayed delivery only if
+                        # retries measurably starve fresh queue traffic.
+                        self._stop.wait(delay)
+                        self._publish_envelope(envelope, deduplicate=False)
+                    else:
+                        timer = threading.Timer(delay, self._schedule_memory, args=(envelope,))
+                        timer.daemon = True
+                        timer.start()
         finally:
             with self._drain_condition:
                 self._active_deliveries -= 1
@@ -219,7 +291,9 @@ class TaskQueue:
                 if not self._stop.is_set():
                     raise
 
-    def _memory_done(self, _future: Future[Any]) -> None:
+    def _memory_done(self, future: Future[Any]) -> None:
+        if not future.cancelled() and (error := future.exception()) is not None:
+            self._last_worker_error = safe_exception_summary(error, "queue dependency failed")
         with self._drain_condition:
             self._scheduled_memory -= 1
             self._drain_condition.notify_all()
@@ -245,23 +319,28 @@ class TaskQueue:
                 retry_delay = min(retry_delay * 2, 5.0)
 
     def _consume_redis_entry(self, redis_id: str, fields: dict[str, Any]) -> None:
+        with self._lifecycle_lock:
+            if self._stop.is_set():
+                return
+            with self._drain_condition:
+                if redis_id in self._redis_active_ids:
+                    return
+                self._redis_active_ids.add(redis_id)
         try:
-            envelope = json.loads(fields["envelope"])
-            if not isinstance(envelope, dict):
-                raise ValueError("task queue envelope must be an object")
-        except Exception as exc:
-            envelope = {
-                "message_id": redis_id,
-                "attempt": self.max_attempts,
-                "payload": {},
-                "submitted_at": time.time(),
-            }
-            self._dead_letter(envelope, safe_exception_summary(exc, "task delivery failed"))
-            self._ack_redis_entry(redis_id)
-            return
-        with self._drain_condition:
-            self._redis_active_ids.add(redis_id)
-        try:
+            try:
+                envelope = self._validate_envelope(
+                    self._bounded_json(fields["envelope"], self.MAX_ENVELOPE_BYTES)
+                )
+            except Exception as exc:
+                envelope = {
+                    "message_id": redis_id,
+                    "attempt": self.max_attempts,
+                    "payload": {},
+                    "submitted_at": time.time(),
+                }
+                self._dead_letter(envelope, safe_exception_summary(exc, "task delivery failed"))
+                self._ack_redis_entry(redis_id)
+                return
             self._deliver(envelope)
             self._ack_redis_entry(redis_id)
         finally:
@@ -317,43 +396,46 @@ class TaskQueue:
         error = coerce_safe_summary(error, "task delivery failed")
         item = {**envelope, "error": error[:2000], "failed_at": time.time()}
         if self._redis:
-            self._redis.xadd(self.DLQ, {"envelope": json.dumps(item, ensure_ascii=False)})
+            serialized = json.dumps(item, ensure_ascii=False, allow_nan=False)
+            if self._bounded_json(serialized, self.MAX_DLQ_ENTRY_BYTES) != item:
+                raise ValueError("task queue values must use JSON-native types")
+            self._redis.xadd(
+                self.DLQ,
+                {"envelope": serialized},
+                maxlen=self.MAX_DLQ_MESSAGES,
+                approximate=True,
+            )
         else:
             with self._lock:
                 self._memory_dlq.append(item)
                 self._memory_submission_times.pop(str(envelope.get("message_id", "")), None)
         if self.on_dead_letter:
-            self.on_dead_letter(envelope.get("payload") or {}, item["error"])
+            raw_payload = envelope.get("payload")
+            payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+            payload["_queue_message_id"] = str(envelope.get("message_id") or "")
+            self.on_dead_letter(payload, item["error"])
 
     def dead_letters(self, limit: int = 100) -> list:
+        fetch_limit = max(1, min(limit, 500))
         if self._redis:
-            rows = self._redis.xrevrange(self.DLQ, count=max(1, min(limit, 500)))
-            values = [json.loads(fields["envelope"]) for _id, fields in rows]
+            rows = self._redis.xrevrange(self.DLQ, count=fetch_limit)
+            values = []
+            for _redis_id, fields in rows:
+                try:
+                    item = self._bounded_json(fields["envelope"], self.MAX_DLQ_ENTRY_BYTES)
+                    if not isinstance(item, dict):
+                        raise ValueError("dead letter must be an object")
+                except Exception:
+                    metrics.inc("queue_dead_letter_decode_failures_total")
+                    continue
+                values.append(item)
         else:
             with self._lock:
-                values = list(reversed(self._memory_dlq[-limit:]))
+                values = list(reversed(self._memory_dlq))[:fetch_limit]
         return [
             {**item, "error": coerce_safe_summary(item.get("error"), "task delivery failed")}
             for item in values
         ]
-
-    def replay_dead_letter(self, message_id: str) -> bool:
-        for item in self.dead_letters(500):
-            if item.get("message_id") == message_id:
-                with self._lifecycle_lock:
-                    if self._stop.is_set():
-                        raise RuntimeError("task queue is closed")
-                    self._publish_envelope(
-                        {
-                            "message_id": message_id,
-                            "attempt": 0,
-                            "payload": item.get("payload") or {},
-                            "submitted_at": time.time(),
-                        },
-                        deduplicate=False,
-                    )
-                return True
-        return False
 
     def depth(self) -> int:
         try:
@@ -372,7 +454,11 @@ class TaskQueue:
                     return 0.0
                 redis_id, fields = rows[0]
                 try:
-                    submitted_at = float(json.loads(fields["envelope"])["submitted_at"])
+                    submitted_at = float(
+                        self._bounded_json(fields["envelope"], self.MAX_ENVELOPE_BYTES)[
+                            "submitted_at"
+                        ]
+                    )
                 except Exception:
                     submitted_at = int(str(redis_id).split("-", 1)[0]) / 1000.0
                 return max(0.0, time.time() - submitted_at)
@@ -399,12 +485,13 @@ class TaskQueue:
 
     def health(self) -> dict[str, Any]:
         if not self._redis:
+            error = self._last_worker_error
             return {
-                "healthy": not self._stop.is_set(),
+                "healthy": not self._stop.is_set() and not error,
                 "backend": self.backend,
                 "workers_running": 0,
                 "workers_expected": 0,
-                "last_error": "",
+                "last_error": error,
                 "lease_heartbeat_running": False,
             }
         running = sum(not worker.done() for worker in self._redis_workers)

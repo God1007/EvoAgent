@@ -5,7 +5,6 @@ import mimetypes
 import os
 import re
 import signal
-import socket
 import sys
 import threading
 import time
@@ -16,34 +15,51 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from . import __version__
+from .application.webhooks import github_pull_request_updated_at
 from .auth import Principal
-from .backpressure import ClientIdentity
+from .backpressure import ClientIdentity, ConcurrencyLimiter
 from .config import Settings
 from .errors import (
     AccessDeniedError,
     ClientInputError,
+    ResourceNotFoundError,
+    StateConflictError,
     TenantReviewCapacityError,
     safe_exception_fields,
 )
 from .github import verify_signature
+from .harness import TaskCancelled
+from .json_boundary import strict_json_loads
 from .metrics import metrics
 from .report import to_markdown
+from .repository import canonical_repository
 from .service import ReviewService
 
-TASK = re.compile(r"^/v1/tasks/([0-9a-f-]+)$")
-REPORT = re.compile(r"^/v1/tasks/([0-9a-f-]+)/report$")
-FIX = re.compile(r"^/v1/tasks/([0-9a-f-]+)/fix$")
-FEEDBACK = re.compile(r"^/v1/tasks/([0-9a-f-]+)/feedback$")
-CANCEL = re.compile(r"^/v1/tasks/([0-9a-f-]+)/cancel$")
-RESUME = re.compile(r"^/v1/tasks/([0-9a-f-]+)/resume$")
-SESSION = re.compile(r"^/v1/sessions/([0-9a-f-]+)$")
-SESSION_INPUT = re.compile(r"^/v1/sessions/([0-9a-f-]+)/input$")
-ROLLBACK = re.compile(r"^/v1/skills/([A-Za-z0-9_-]+)/versions/(\d+)/activate$")
+RESOURCE_ID = r"(?:[0-9a-f]{32}|[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})"
+TASK = re.compile(r"^/v1/tasks/(%s)$" % RESOURCE_ID)
+REPORT = re.compile(r"^/v1/tasks/(%s)/report$" % RESOURCE_ID)
+FIX = re.compile(r"^/v1/tasks/(%s)/fix$" % RESOURCE_ID)
+FEEDBACK = re.compile(r"^/v1/tasks/(%s)/feedback$" % RESOURCE_ID)
+CANCEL = re.compile(r"^/v1/tasks/(%s)/cancel$" % RESOURCE_ID)
+RESUME = re.compile(r"^/v1/tasks/(%s)/resume$" % RESOURCE_ID)
+SESSION = re.compile(r"^/v1/sessions/(%s)$" % RESOURCE_ID)
+SESSION_INPUT = re.compile(r"^/v1/sessions/(%s)/input$" % RESOURCE_ID)
 REQUEST_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 # CPU/sandbox-heavy POST endpoints guarded by the bounded-concurrency gate.
-HEAVY_PATHS = frozenset({"/v1/reviews", "/v1/proofs", "/v1/codegraph/impact"})
-# Liveness/readiness/metrics probes are never rate-limited: monitoring and
-# orchestration must keep working precisely when the service is under overload.
+HEAVY_PATHS = frozenset(
+    {
+        "/v1/auth/login",
+        "/v1/auth/password",
+        "/v1/users",
+        "/v1/reviews",
+        "/v1/proofs",
+        "/v1/codegraph/impact",
+        "/v1/evolution/auto",
+        "/v1/evolution/propose",
+    }
+)
+# Liveness/readiness are never rate-limited. Authenticated metrics pass the
+# pre-auth limiter so invalid JWT floods cannot amplify into user-store reads.
 PROBE_PATHS = frozenset({"/health", "/ready", "/metrics"})
 SOURCE_WEB_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "web"))
 INSTALLED_WEB_ROOT = os.path.join(sys.prefix, "share", "evoagent", "web")
@@ -51,6 +67,35 @@ WEB_ROOT = SOURCE_WEB_ROOT if os.path.isdir(SOURCE_WEB_ROOT) else INSTALLED_WEB_
 # Set on SIGTERM so /ready starts failing (load balancers drain us) while
 # in-flight requests finish before the process exits.
 DRAINING = threading.Event()
+
+
+def _async_review_requested(query: dict[str, list[str]]) -> bool:
+    if set(query).difference({"async"}):
+        raise ClientInputError("review query accepts only async")
+    values = query.get("async")
+    if values is None:
+        return False
+    if len(values) != 1 or values[0].lower() not in {"true", "false"}:
+        raise ClientInputError("async must be one true or false value")
+    return values[0].lower() == "true"
+
+
+def _request_target(value: str) -> urllib.parse.ParseResult:
+    try:
+        return urllib.parse.urlparse(value)
+    except ValueError:
+        raise ClientInputError("invalid request target") from None
+
+
+def _query_parameters(value: str) -> dict[str, list[str]]:
+    try:
+        return urllib.parse.parse_qs(value, keep_blank_values=True, max_num_fields=100)
+    except ValueError:
+        raise ClientInputError("query string has too many fields") from None
+
+
+def _heavy_request(method: str, path: str) -> bool:
+    return method == "POST" and (path in HEAVY_PATHS or FIX.fullmatch(path) is not None)
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -91,8 +136,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("X-Request-ID", request_id)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; base-uri 'none'; form-action 'self'; "
+            "frame-ancestors 'none'; object-src 'none'",
+        )
         self.send_header("Referrer-Policy", "same-origin")
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
     def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
@@ -146,7 +197,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         if cached:
             return cached
         headers = getattr(self, "headers", None)
-        supplied = headers.get("X-Request-ID", "") if headers is not None else ""
+        values = headers.get_all("X-Request-ID", []) if headers is not None else []
+        supplied = values[0] if len(values) == 1 else ""
         request_id = supplied if REQUEST_ID.fullmatch(supplied) else uuid.uuid4().hex
         self._request_id_cache = request_id
         return request_id
@@ -184,10 +236,21 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(length))
         self.end_headers()
 
+    def _single_header(self, name: str) -> str:
+        values = self.headers.get_all(name, []) or []
+        if len(values) > 1:
+            raise ClientInputError("%s must appear at most once" % name)
+        return values[0] if values else ""
+
     def _principal(self, permission: str = "read") -> Principal:
         if not self.settings.auth_required:
-            return Principal("local", "local-development", self.settings.default_tenant_id, "admin")
-        principal = self.service.auth.authenticate(self.headers.get("Authorization", ""))
+            return Principal(
+                "local",
+                "local-development",
+                self.settings.default_tenant_id,
+                "platform_admin",
+            )
+        principal = self.service.auth.authenticate(self._single_header("Authorization"))
         self.service.auth.require(principal, (permission,))
         return principal
 
@@ -199,7 +262,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             return None
 
     def _send_json(self, status: int, value: dict[str, Any]) -> None:
-        body = json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
+        body = json.dumps(value, ensure_ascii=False, default=str, allow_nan=False).encode("utf-8")
         self._headers(status, "application/json; charset=utf-8", len(body))
         self.wfile.write(body)
 
@@ -209,6 +272,12 @@ class ApiHandler(BaseHTTPRequestHandler):
         body = text.encode("utf-8")
         self._headers(status, content_type, len(body))
         self.wfile.write(body)
+
+    def _redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _serve_file(self, filename: str) -> None:
         path = os.path.abspath(os.path.join(WEB_ROOT, filename))
@@ -230,43 +299,44 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._headers(200, content_type, len(body))
         self.wfile.write(body)
 
+    def _declared_body_length(self) -> int:
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get_all("Transfer-Encoding", []) or len(lengths) > 1:
+            self.close_connection = True
+            raise ClientInputError("ambiguous request body framing")
+        raw_length = lengths[0] if lengths else "0"
+        if len(raw_length) > 20 or not raw_length.isascii() or not raw_length.isdigit():
+            self.close_connection = True
+            raise ClientInputError("invalid Content-Length")
+        return int(raw_length)
+
     def _read_body(self) -> bytes:
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            raise ClientInputError("invalid Content-Length") from None
+        length = self._declared_body_length()
         limit = self.settings.max_diff_bytes + 256 * 1024
         if length <= 0 or length > limit:
+            self.close_connection = length > limit
             raise ClientInputError("request body is empty or too large")
-        return self.rfile.read(length)
-
-    def _drain_body(self) -> None:
-        try:
-            length = int(self.headers.get("Content-Length", "0") or "0")
-        except ValueError:
+        body = self.rfile.read(length)
+        if len(body) != length:
             self.close_connection = True
-            return
-        cap = self.settings.max_diff_bytes + 256 * 1024
-        if length <= 0:
-            return
-        if length > cap:
-            # Too large to safely drain; abandon keep-alive on this connection.
-            self.close_connection = True
-            length = cap
-        while length > 0:
-            chunk = self.rfile.read(min(65536, length))
-            if not chunk:
-                break
-            length -= len(chunk)
+            raise ClientInputError("request body is incomplete")
+        return body
 
     @staticmethod
     def _read_json(body: bytes) -> dict[str, Any]:
         try:
-            value = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            value = strict_json_loads(body)
+        except (UnicodeError, ValueError, RecursionError):
             raise ClientInputError("request body must be valid UTF-8 JSON") from None
         if not isinstance(value, dict):
             raise ClientInputError("JSON root must be an object")
+        return value
+
+    @staticmethod
+    def _string_field(payload: dict[str, Any], name: str, default: str = "") -> str:
+        value = payload.get(name, default)
+        if not isinstance(value, str):
+            raise ClientInputError("%s must be a string" % name)
         return value
 
     @staticmethod
@@ -306,6 +376,21 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
             else:
                 self.close_connection = True
+        except TaskCancelled:
+            if not self._response_started:
+                self._send_json(409, {"error": "review was cancelled"})
+            else:
+                self.close_connection = True
+        except ResourceNotFoundError as exc:
+            if not self._response_started:
+                self._send_json(404, {"error": str(exc)})
+            else:
+                self.close_connection = True
+        except StateConflictError as exc:
+            if not self._response_started:
+                self._send_json(409, {"error": str(exc)})
+            else:
+                self.close_connection = True
         except ClientInputError as exc:
             if not self._response_started:
                 self._send_json(400, {"error": str(exc)})
@@ -324,7 +409,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         observability: per-client rate limiting, a bounded concurrency gate for
         heavy endpoints, a latency histogram, and an in-flight gauge. Overload is
         shed here (429/503 + Retry-After) rather than allowed to pile up."""
-        parsed = urllib.parse.urlparse(self.path)
+        parsed = _request_target(self.path)
         path = parsed.path
         request_class = self._request_metric_class(method, parsed)
         self._metric_class = request_class
@@ -334,7 +419,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         metrics.inc("http_%s_requests_total" % request_class)
         if request_class != "probe":
             metrics.inc("http_nonprobe_requests_total")
-        if path not in PROBE_PATHS:
+        if DRAINING.is_set() and path not in PROBE_PATHS:
+            self._reject(503, 1.0, "service is draining")
+            return
+        if path not in PROBE_PATHS or (path == "/metrics" and self.settings.auth_required):
             client = self._client_identity_value().address
             allowed, retry_after = self.service.rate_limiter.check(client)
             if not allowed:
@@ -343,11 +431,13 @@ class ApiHandler(BaseHTTPRequestHandler):
         # The concurrency gate protects synchronous CPU/sandbox work. Async
         # review intake (?async=true) only enqueues a task and is cheap + already
         # protected by the queue, so it is not gated.
-        gated = method == "POST" and path in HEAVY_PATHS
-        if gated and path == "/v1/reviews":
-            async_values = urllib.parse.parse_qs(parsed.query).get("async", ["false"])
-            if async_values and async_values[0].lower() in {"true", "1", "yes"}:
-                gated = False
+        gated = _heavy_request(method, path)
+        if (
+            gated
+            and path == "/v1/reviews"
+            and _async_review_requested(_query_parameters(parsed.query))
+        ):
+            gated = False
         gate = self.service.heavy_gate if gated else None
         if gate is not None and not gate.try_acquire():
             self._reject(503, 1.0, "server is at capacity, retry shortly")
@@ -372,11 +462,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         if method == "POST" and path == "/webhooks/github":
             return "intake"
         if method == "POST" and path == "/v1/reviews":
-            async_values = urllib.parse.parse_qs(parsed.query).get("async", ["false"])
-            return "intake" if async_values[0].lower() in {"true", "1", "yes"} else "heavy"
+            return "intake" if _async_review_requested(_query_parameters(parsed.query)) else "heavy"
         if path == "/v1/proofs":
             return "proof"
-        if method == "POST" and path in HEAVY_PATHS:
+        if _heavy_request(method, path):
             return "heavy"
         if method == "GET":
             return "read"
@@ -391,11 +480,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         drain_body: bool = True,
     ) -> None:
         metrics.inc("http_rejected_total")
-        # Drain any request body so the JSON error + Retry-After are delivered
-        # cleanly instead of the peer seeing a connection reset (which would make
-        # the Retry-After signal unreliable for exactly the shed heavy requests).
-        if drain_body:
-            self._drain_body()
+        # Admission rejection happens before body reads; never let a shed client
+        # retain a worker by slowly sending its declared body.
+        if drain_body and self._declared_body_length():
+            self.close_connection = True
         body = json.dumps({"error": message}, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -405,9 +493,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _do_GET(self) -> None:
-        parsed_url = urllib.parse.urlparse(self.path)
+        parsed_url = _request_target(self.path)
         path = parsed_url.path
-        query = urllib.parse.parse_qs(parsed_url.query)
+        query = _query_parameters(parsed_url.query)
         if path == "/":
             self._serve_file("index.html")
             return
@@ -421,20 +509,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._serve_file("app.js")
             return
         if path == "/health":
-            self._send_json(
-                200,
-                {
-                    "status": "ok",
-                    "reviewer": self.service.reviewer.name,
-                    "runtime": self.service.harness.name,
-                    "queue": self.service.queue.backend,
-                    "queue_durable": self.service.queue.durable,
-                    "llm_provider": self.service.llm_config.get("provider", "local"),
-                    "llm_model": self.service.llm_config.get("model", ""),
-                    "retention": self.service.retention_status(),
-                    "review_admission": self.service.review_admission_status(),
-                },
-            )
+            self._send_json(200, {"status": "ok"})
             return
         if path == "/ready":
             if DRAINING.is_set():
@@ -443,8 +518,31 @@ class ApiHandler(BaseHTTPRequestHandler):
             ready, detail = self.service.readiness()
             self._send_json(200 if ready else 503, detail)
             return
+        if path == "/github/setup":
+            self._redirect(
+                self.service.authorize_github_installation(
+                    query.get("state", [""])[0],
+                    query.get("installation_id", [""])[0],
+                )
+            )
+            return
+        if path == "/github/oauth/callback":
+            self.service.complete_github_installation(
+                query.get("state", [""])[0],
+                query.get("code", [""])[0],
+            )
+            self._redirect("/#github")
+            return
         principal = self._authenticate_or_send("read")
         if principal is None:
+            return
+        if path in {
+            "/metrics",
+            "/v1/evaluation/cases",
+            "/v1/evolution/runs",
+            "/v1/evolution/status",
+        } and not principal.can("platform"):
+            self._send_json(403, {"error": "permission denied"})
             return
         if path == "/metrics":
             self._send_text(200, metrics.prometheus(), "text/plain; version=0.0.4; charset=utf-8")
@@ -471,7 +569,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/api/skills":
-            self._send_json(200, {"skills": self.service.registry.list()})
+            skills, revision = self.service.skill_inventory()
+            self._send_json(200, {"skills": skills, "reviewer_revision": revision})
             return
         if path == "/api/failures":
             if not principal.can("audit"):
@@ -514,7 +613,11 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(
                 200,
-                {"messages": self.service.queue.dead_letters(self._query_limit(query, 100))},
+                {
+                    "messages": self.service.tenant_dead_letters(
+                        principal.tenant_id, self._query_limit(query, 100)
+                    )
+                },
             )
             return
         if path == "/api/outbox":
@@ -526,7 +629,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "messages": self.service.store.list_outbox(
-                        outbox_status, self._query_limit(query, 100)
+                        outbox_status, self._query_limit(query, 100), principal.tenant_id
                     )
                 },
             )
@@ -544,7 +647,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not principal.can("manage"):
                 self._send_json(403, {"error": "permission denied"})
                 return
-            repository = query.get("repository", [""])[0]
+            repository = canonical_repository(query.get("repository", [""])[0])
             if not repository:
                 self._send_json(400, {"error": "repository query parameter is required"})
                 return
@@ -574,32 +677,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             status["model"] = self.service.llm_config.get("model", "")
             self._send_json(200, status)
             return
-        if path == "/github/install":
-            if not self.settings.github_app_slug:
-                self._send_json(503, {"error": "EVOAGENT_GITHUB_APP_SLUG is not configured"})
-                return
-            self.send_response(302)
-            self.send_header(
-                "Location",
-                "https://github.com/apps/%s/installations/new" % self.settings.github_app_slug,
-            )
-            self.end_headers()
-            return
-        if path == "/github/setup":
-            try:
-                installation_id = int(query.get("installation_id", [""])[0])
-            except ValueError:
-                self._send_json(400, {"error": "missing installation_id"})
-                return
-            self.service.store.save_installation(
-                installation_id, query.get("account", ["github-app"])[0]
-            )
-            self.send_response(302)
-            self.send_header("Location", "/#github")
-            self.end_headers()
-            return
         if path == "/v1/sessions":
-            repository = query.get("repository", [""])[0]
+            repository = canonical_repository(query.get("repository", [""])[0])
             raw_pr = query.get("pull_request", [""])[0]
             try:
                 pull_request = int(raw_pr)
@@ -643,9 +722,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def _do_POST(self) -> None:
-        parsed_url = urllib.parse.urlparse(self.path)
+        parsed_url = _request_target(self.path)
         path = parsed_url.path
-        query = urllib.parse.parse_qs(parsed_url.query)
+        query = _query_parameters(parsed_url.query)
         try:
             body = self._read_body()
             if path == "/v1/auth/login":
@@ -655,41 +734,129 @@ class ApiHandler(BaseHTTPRequestHandler):
                 payload = self._read_json(body)
                 try:
                     result = self.service.auth.login(
-                        str(payload.get("username", "")),
-                        str(payload.get("password", "")),
-                        str(payload.get("tenant_id", "")),
+                        self._string_field(payload, "username"),
+                        self._string_field(payload, "password"),
+                        self._string_field(payload, "tenant_id"),
                     )
                 except AccessDeniedError as exc:
                     self._send_json(401, {"error": str(exc)})
                     return
                 self._send_json(200, result)
                 return
+            if path == "/v1/auth/password":
+                if not self.settings.auth_required:
+                    self._send_json(409, {"error": "authentication is disabled"})
+                    return
+                principal = self._principal("read")
+                payload = self._read_json(body)
+                if set(payload) != {"current_password", "new_password"}:
+                    raise ClientInputError(
+                        "password change requires only current_password and new_password"
+                    )
+                self.service.auth.change_password(
+                    principal,
+                    self._string_field(payload, "current_password"),
+                    self._string_field(payload, "new_password"),
+                )
+                self._send_json(200, {"changed": True, "reauthenticate": True})
+                return
+            if path == "/v1/users":
+                if not self.settings.auth_required:
+                    self._send_json(409, {"error": "authentication is disabled"})
+                    return
+                principal = self._principal("manage")
+                payload = self._read_json(body)
+                if set(payload) != {"username", "password", "role"}:
+                    raise ClientInputError(
+                        "user creation requires only username, password and role"
+                    )
+                self._send_json(
+                    201,
+                    self.service.auth.provision_user(
+                        principal,
+                        self._string_field(payload, "username"),
+                        self._string_field(payload, "password"),
+                        self._string_field(payload, "role"),
+                    ),
+                )
+                return
+            if path == "/v1/users/status":
+                if not self.settings.auth_required:
+                    self._send_json(409, {"error": "authentication is disabled"})
+                    return
+                principal = self._principal("platform")
+                payload = self._read_json(body)
+                if set(payload) != {"username", "active"}:
+                    raise ClientInputError("user status requires only username and active")
+                active = payload["active"]
+                if not isinstance(active, bool):
+                    raise ClientInputError("active must be a boolean")
+                self._send_json(
+                    200,
+                    self.service.auth.set_user_active(
+                        principal,
+                        self._string_field(payload, "username"),
+                        active,
+                    ),
+                )
+                return
+            if path == "/v1/github/installations":
+                principal = self._principal("manage")
+                payload = self._read_json(body)
+                if payload:
+                    raise ClientInputError("GitHub installation request does not accept parameters")
+                self._send_json(200, {"url": self.service.begin_github_installation(principal)})
+                return
             if path == "/v1/reviews":
                 principal = self._principal("review")
                 payload = self._read_json(body)
-                pr = payload.get("pull_request")
-                if pr is not None and not isinstance(pr, int):
-                    raise ClientInputError("pull_request must be an integer")
-                args = (str(payload.get("repository", "")), str(payload.get("diff", "")), pr)
-                if query.get("async", ["false"])[0].lower() == "true":
-                    result = self.service.enqueue_review(*args, tenant_id=principal.tenant_id)
-                    self._send_json(202, result)
-                else:
-                    self._send_json(
-                        201, self.service.create_review(*args, tenant_id=principal.tenant_id)
+                if set(payload).difference({"repository", "diff", "pull_request"}):
+                    raise ClientInputError(
+                        "review request accepts only repository, diff and pull_request"
                     )
-                self.service.store.audit(
-                    principal.tenant_id,
-                    principal.username,
-                    "review.create",
-                    str(payload.get("repository", "")),
-                    {"async": query.get("async", ["false"])[0]},
-                )
+                repository = payload.get("repository")
+                diff = payload.get("diff")
+                pr = payload.get("pull_request")
+                if not isinstance(repository, str) or not isinstance(diff, str):
+                    raise ClientInputError("repository and diff must be strings")
+                repository = canonical_repository(repository)
+                if pr is not None and (
+                    not isinstance(pr, int) or isinstance(pr, bool) or not 1 <= pr <= 2**31 - 1
+                ):
+                    raise ClientInputError("pull_request must be a positive integer")
+                idempotency_values = self.headers.get_all("Idempotency-Key", []) or []
+                if len(idempotency_values) > 1 or (
+                    idempotency_values and not REQUEST_ID.fullmatch(idempotency_values[0])
+                ):
+                    raise ClientInputError("Idempotency-Key must be one 1-64 character token")
+                idempotency_key = idempotency_values[0] if idempotency_values else ""
+                async_requested = _async_review_requested(query)
+                if idempotency_key and not async_requested:
+                    raise ClientInputError(
+                        "Idempotency-Key is supported only for asynchronous reviews"
+                    )
+                args = (repository, diff, pr)
+                if async_requested:
+                    result = self.service.enqueue_review(
+                        *args,
+                        tenant_id=principal.tenant_id,
+                        idempotency_key=idempotency_key,
+                        actor=principal.username,
+                    )
+                else:
+                    result = self.service.create_review(
+                        *args,
+                        tenant_id=principal.tenant_id,
+                        actor=principal.username,
+                    )
+                status = 200 if async_requested and result.get("replayed") else 202
+                self._send_json(status if async_requested else 201, result)
                 return
             if path == "/v1/repository-policies":
                 principal = self._principal("manage")
                 payload = self._read_json(body)
-                repository = str(payload.get("repository", ""))
+                repository = self._string_field(payload, "repository")
+                repository = canonical_repository(repository)
                 raw_policy = payload.get("policy")
                 if not isinstance(raw_policy, dict):
                     raise ClientInputError("policy must be an object")
@@ -702,32 +869,41 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send_json(201, result)
                 return
             if path == "/webhooks/github":
-                if self.headers.get("X-GitHub-Event", "") != "pull_request":
-                    self._send_json(202, {"ignored": True, "reason": "unsupported GitHub event"})
-                    return
                 if not self.settings.github_webhook_secret:
                     self._send_json(503, {"error": "GitHub webhook secret is not configured"})
                     return
-                if not verify_signature(
+                signature = self._single_header("X-Hub-Signature-256")
+                verified = verify_signature(
                     self.settings.github_webhook_secret,
                     body,
-                    self.headers.get("X-Hub-Signature-256", ""),
-                ):
+                    signature,
+                )
+                if not verified and self.settings.github_webhook_previous_secret:
+                    verified = verify_signature(
+                        self.settings.github_webhook_previous_secret,
+                        body,
+                        signature,
+                    )
+                    if verified:
+                        metrics.inc("github_webhook_previous_secret_verifications_total")
+                if not verified:
                     self._send_json(401, {"error": "invalid webhook signature"})
                     return
+                if self._single_header("X-GitHub-Event") != "pull_request":
+                    self._send_json(202, {"ignored": True, "reason": "unsupported GitHub event"})
+                    return
                 payload = self._read_json(body)
-                updated_at = (payload.get("pull_request") or {}).get("updated_at")
-                if updated_at:
-                    try:
-                        event_time = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-                    except ValueError:
-                        raise ClientInputError("invalid pull_request.updated_at") from None
-                    age = abs((datetime.now(UTC) - event_time).total_seconds())
-                    if age > self.settings.webhook_max_age_seconds:
+                event_time = github_pull_request_updated_at(payload)
+                age = abs((datetime.now(UTC) - event_time).total_seconds())
+                delivery_id = self._single_header("X-GitHub-Delivery")
+                if not REQUEST_ID.fullmatch(delivery_id):
+                    raise ClientInputError("invalid X-GitHub-Delivery")
+                digest = hashlib.sha256(body).hexdigest()
+                if age > self.settings.webhook_max_age_seconds:
+                    existing = self.service.store.get_webhook(delivery_id)
+                    if not existing or existing.get("payload_sha256") != digest:
                         self._send_json(409, {"error": "webhook is outside the replay window"})
                         return
-                delivery_id = self.headers.get("X-GitHub-Delivery", "")
-                digest = hashlib.sha256(body).hexdigest()
                 self._send_json(
                     202, self.service.handle_github_pull_request(payload, delivery_id, digest)
                 )
@@ -736,64 +912,69 @@ class ApiHandler(BaseHTTPRequestHandler):
             if match:
                 principal = self._principal("fix")
                 payload = self._read_json(body)
-                installation_id = payload.get("installation_id")
-                if installation_id is not None and not isinstance(installation_id, int):
-                    raise ClientInputError("installation_id must be an integer")
+                if payload:
+                    raise ClientInputError("fix request does not accept parameters")
                 result = self.service.create_fix(
-                    match.group(1), installation_id, principal.tenant_id
+                    match.group(1), principal.tenant_id, principal.username
                 )
-                self.service.store.audit(
-                    principal.tenant_id,
-                    principal.username,
-                    "repair.create",
-                    match.group(1),
-                    {"branch": result.get("branch")},
-                )
-                self._send_json(201, result)
+                self._send_json(200 if result["replayed"] else 201, result)
                 return
             match = FEEDBACK.match(path)
             if match:
                 principal = self._principal("review")
                 payload = self._read_json(body)
+                if set(payload).difference({"category", "finding", "note"}):
+                    raise ClientInputError("feedback accepts only category, finding and note")
+                finding = payload.get("finding")
+                if finding is not None and not isinstance(finding, dict):
+                    raise ClientInputError("finding must be an object or null")
                 self._send_json(
                     201,
                     self.service.record_feedback(
                         match.group(1),
-                        str(payload.get("category", "")),
-                        payload.get("finding"),
-                        str(payload.get("note", "")),
+                        self._string_field(payload, "category"),
+                        finding,
+                        self._string_field(payload, "note"),
                         principal.tenant_id,
+                        principal.username,
                     ),
                 )
                 return
             match = CANCEL.match(path)
             if match:
                 principal = self._principal("review")
-                ok = self.service.cancel_task(match.group(1), principal.tenant_id)
-                self.service.store.audit(
-                    principal.tenant_id, principal.username, "task.cancel", match.group(1)
+                if self._read_json(body):
+                    raise ClientInputError("cancel request does not accept parameters")
+                result = self.service.cancel_task(
+                    match.group(1), principal.tenant_id, principal.username
                 )
-                self._send_json(202 if ok else 404, {"cancel_requested": ok})
+                status = 202 if result["cancel_requested"] else 409 if result["accepted"] else 404
+                self._send_json(status, result)
                 return
             match = RESUME.match(path)
             if match:
                 principal = self._principal("review")
-                result = self.service.resume_task(match.group(1), principal.tenant_id)
-                self.service.store.audit(
-                    principal.tenant_id, principal.username, "task.resume", match.group(1)
+                if self._read_json(body):
+                    raise ClientInputError("resume request does not accept parameters")
+                result = self.service.resume_task(
+                    match.group(1), principal.tenant_id, principal.username
                 )
-                self._send_json(202, result)
+                resumed = result.get("resumed") or result.get("delivery_resumed")
+                self._send_json(202 if resumed else 200, result)
                 return
             match = SESSION_INPUT.match(path)
             if match:
                 principal = self._principal("review")
                 payload = self._read_json(body)
+                if set(payload) != {"message"}:
+                    raise ClientInputError("session input requires only message")
                 result = self.service.provide_session_input(
                     match.group(1),
-                    str(payload.get("message", "")),
+                    self._string_field(payload, "message"),
                     principal.tenant_id,
+                    principal.username,
                 )
-                self._send_json(201, result)
+                self._send_json(200, result)
                 return
             if path == "/v1/codegraph/impact":
                 principal = self._principal("review")
@@ -809,8 +990,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.run_proof(
                     payload.get("original", {}),
                     payload.get("patched", {}),
-                    str(payload.get("reproduction_command", "")),
-                    str(payload.get("regression_command", "")),
+                    self._string_field(payload, "reproduction_command"),
+                    self._string_field(payload, "regression_command"),
                 )
                 steps = result.get("steps")
                 attestations = (
@@ -834,133 +1015,125 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )
                 self._send_json(201, result)
                 return
-            if path == "/v1/skills/reload":
-                principal = self._principal("manage")
-                self._send_json(
-                    200,
-                    {
-                        "skills": self.service.reload_skills(),
-                        "note": "New tasks now use the reloaded skill set.",
-                    },
-                )
-                return
             if path == "/v1/deployments/llm-review":
                 principal = self._principal("manage")
                 payload = self._read_json(body)
-                result = self.service.releases.configure(principal.tenant_id, "llm-review", payload)
-                self.service.store.audit(
+                result = self.service.releases.configure(
                     principal.tenant_id,
-                    principal.username,
-                    "deployment.configure",
                     "llm-review",
                     payload,
+                    principal.username,
                 )
                 self._send_json(201, result)
-                return
-            if path == "/v1/queue/dead-letters/replay":
-                principal = self._principal("manage")
-                payload = self._read_json(body)
-                ok = self.service.queue.replay_dead_letter(str(payload.get("message_id", "")))
-                self._send_json(202 if ok else 404, {"replayed": ok})
                 return
             if path == "/v1/outbox/replay":
                 principal = self._principal("manage")
                 payload = self._read_json(body)
-                message_id = str(payload.get("message_id", ""))
-                ok = self.service.replay_outbox(message_id)
-                self.service.store.audit(
+                message_id = self._string_field(payload, "message_id")
+                ok = self.service.replay_outbox(
+                    message_id,
                     principal.tenant_id,
                     principal.username,
-                    "outbox.replay",
-                    message_id,
-                    {"replayed": ok},
                 )
                 self._send_json(202 if ok else 404, {"replayed": ok})
                 return
             if path == "/v1/evaluation/cases":
-                self._principal("manage")
+                self._principal("platform")
                 payload = self._read_json(body)
                 result = self.service.evolution.add_evaluation_case(
-                    str(payload.get("name", "")),
-                    str(payload.get("diff", "")),
+                    self._string_field(payload, "name"),
+                    self._string_field(payload, "diff"),
                     payload.get("expected_findings", []),
-                    str(payload.get("split", "validation")),
+                    self._string_field(payload, "split", "validation"),
                     "api",
                 )
                 self._send_json(201, result)
                 return
             if path == "/v1/evolution/auto":
-                self._principal("manage")
+                self._principal("platform")
                 payload = self._read_json(body)
                 result = self.service.evolution.auto_propose(
-                    str(payload.get("skill_name", "llm-review"))
+                    self._string_field(payload, "skill_name", "llm-review")
                 )
-                if result["decision"] == "activated":
-                    self.service.reload_skills()
                 self._send_json(201, result)
                 return
             if path == "/v1/evolution/propose":
-                self._principal("manage")
+                self._principal("platform")
                 payload = self._read_json(body)
+                regression_score = payload.get("regression_score")
+                if regression_score is not None and (
+                    isinstance(regression_score, bool)
+                    or not isinstance(regression_score, (int, float))
+                    or not math.isfinite(regression_score)
+                ):
+                    raise ClientInputError("regression_score must be a finite number or null")
                 result = self.service.evolution.propose(
-                    str(payload.get("skill_name", "")),
-                    str(payload.get("prompt", "")),
-                    float(payload["regression_score"]) if "regression_score" in payload else None,
+                    self._string_field(payload, "skill_name"),
+                    self._string_field(payload, "prompt"),
+                    float(regression_score) if regression_score is not None else None,
                 )
-                if result["decision"] == "activated":
-                    self.service.reload_skills()
                 self._send_json(201, result)
                 return
-            match = ROLLBACK.match(path)
-            if match:
-                self._principal("manage")
-                ok = self.service.evolution.rollback(match.group(1), int(match.group(2)))
-                if ok:
-                    self.service.reload_skills()
-                self._send_json(200 if ok else 404, {"activated": ok})
-                return
             self._send_json(404, {"error": "not found"})
+        except ResourceNotFoundError as exc:
+            self._send_json(404, {"error": str(exc)})
+        except StateConflictError as exc:
+            self._send_json(409, {"error": str(exc)})
         except ClientInputError as exc:
             self._send_json(400, {"error": str(exc)})
         except AccessDeniedError as exc:
             self._send_json(403, {"error": str(exc)})
 
 
-class ReuseportThreadingHTTPServer(ThreadingHTTPServer):
-    """ThreadingHTTPServer that enables ``SO_REUSEPORT`` so several worker
-    processes can bind the same port and the kernel load-balances connections
-    across them. ``block_on_close`` (default) makes ``server_close()`` join
-    in-flight handler threads, giving a graceful drain."""
+class EvoAgentHTTPServer(ThreadingHTTPServer):
+    """Threaded server with bounded connections, I/O and graceful drain."""
 
     allow_reuse_address = True
     daemon_threads = False
+    request_io_timeout_seconds = 30.0
 
-    def server_bind(self) -> None:
-        if hasattr(socket, "SO_REUSEPORT"):
-            try:
-                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except OSError as exc:
-                # Without SO_REUSEPORT the 2nd+ worker will fail bind with
-                # EADDRINUSE; surface it instead of failing opaquely later.
-                print("WARNING: could not set SO_REUSEPORT: %s" % exc)
-        super().server_bind()
+    def __init__(self, *args: Any, max_connections: int = 128, **kwargs: Any):
+        self.connection_gate = ConcurrencyLimiter(max_connections)
+        super().__init__(*args, **kwargs)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        connection.settimeout(self.request_io_timeout_seconds)
+        return connection, address
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self.connection_gate.try_acquire():
+            metrics.inc("http_connections_rejected_total")
+            self.shutdown_request(request)
+            return
+        metrics.add_gauge("http_connections_in_flight", 1)
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.connection_gate.release()
+            metrics.add_gauge("http_connections_in_flight", -1)
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connection_gate.release()
+            metrics.add_gauge("http_connections_in_flight", -1)
 
 
-def _make_server(settings: Settings, service: ReviewService) -> ReuseportThreadingHTTPServer:
+def _make_server(settings: Settings, service: ReviewService) -> EvoAgentHTTPServer:
     handler = type(
         "ConfiguredApiHandler", (ApiHandler,), {"service": service, "settings": settings}
     )
-    return ReuseportThreadingHTTPServer((settings.host, settings.port), handler)
+    return EvoAgentHTTPServer(
+        (settings.host, settings.port),
+        handler,
+        max_connections=settings.max_http_connections,
+    )
 
 
-def _grace_seconds() -> float:
-    try:
-        return max(0.0, float(os.getenv("EVOAGENT_SHUTDOWN_GRACE_SECONDS", "0")))
-    except ValueError:
-        return 0.0
-
-
-def _install_drain_on_sigterm(server: ThreadingHTTPServer) -> None:
+def _install_drain_on_sigterm(server: ThreadingHTTPServer, grace_seconds: float) -> None:
     """On SIGTERM: flip readiness to draining (so the LB stops routing), wait a
     short grace period, then stop accepting. Shutdown runs on its own thread
     because ``shutdown()`` must not be called from the ``serve_forever`` thread."""
@@ -969,9 +1142,8 @@ def _install_drain_on_sigterm(server: ThreadingHTTPServer) -> None:
         DRAINING.set()
 
         def _drain() -> None:
-            grace = _grace_seconds()
-            if grace:
-                time.sleep(grace)
+            if grace_seconds:
+                time.sleep(grace_seconds)
             server.shutdown()
 
         threading.Thread(target=_drain, name="evoagent-drain", daemon=True).start()
@@ -980,162 +1152,6 @@ def _install_drain_on_sigterm(server: ThreadingHTTPServer) -> None:
         signal.signal(signal.SIGTERM, _handler)
     except ValueError:  # pragma: no cover - not on main thread (e.g. under tests)
         pass
-
-
-def _can_multiprocess(settings: Settings) -> bool:
-    return (
-        settings.web_workers > 1
-        and os.name == "posix"
-        and hasattr(os, "fork")
-        and hasattr(socket, "SO_REUSEPORT")
-    )
-
-
-def _run_worker(settings: Settings) -> None:
-    """Child worker: owns its own service (post-fork) and serves until drained.
-
-    Signal handlers were reset to SIG_DFL by the spawner before this runs, so a
-    SIGTERM during the (potentially slow) service construction simply terminates
-    the not-yet-serving child; once serving, the drain handler takes over."""
-    DRAINING.clear()
-    service = ReviewService(settings)
-    server = _make_server(settings, service)
-    _install_drain_on_sigterm(server)
-    # Same graceful-drain semantics for Ctrl-C in the worker.
-    try:
-        signal.signal(signal.SIGINT, signal.getsignal(signal.SIGTERM))
-    except (ValueError, OSError, TypeError):  # pragma: no cover
-        pass
-    try:
-        server.serve_forever()
-    finally:
-        service.close()
-        server.server_close()
-
-
-_TERM_SIGNALS = (signal.SIGTERM, signal.SIGINT)
-# Restart storm guard: if more than this many workers die within the window,
-# the master gives up instead of fork-looping against a broken dependency.
-_MAX_RESTARTS = 10
-_RESTART_WINDOW = 60.0
-
-
-def _run_master(settings: Settings) -> None:
-    """Fork ``web_workers`` children (each binds the shared port via SO_REUSEPORT),
-    restart crashed workers with backoff, and on SIGTERM forward the signal, wait
-    a bounded grace period, then SIGKILL any stragglers."""
-    workers = settings.web_workers
-    print(
-        "EvoAgent: master pid %d supervising %d workers on http://%s:%d"
-        % (os.getpid(), workers, settings.host, settings.port)
-    )
-    children: set[int] = set()
-    stopping = threading.Event()
-    restart_times: list[float] = []
-
-    def _spawn() -> None:
-        # Block term signals across fork+bookkeeping so a signal can neither run
-        # the master handler mid-fork nor race the child into `children`.
-        blocked = _block_term_signals()
-        try:
-            pid = os.fork()
-        except OSError:
-            _restore_signals(blocked)
-            raise
-        if pid == 0:
-            # Child: default disposition during startup, restore mask, then run.
-            for sig in _TERM_SIGNALS:
-                try:
-                    signal.signal(sig, signal.SIG_DFL)
-                except (ValueError, OSError):
-                    pass
-            _restore_signals(blocked)
-            try:
-                _run_worker(settings)
-            finally:
-                os._exit(0)
-        children.add(pid)
-        _restore_signals(blocked)
-
-    def _handle_term(_signum: int, _frame: Any) -> None:
-        stopping.set()
-        for pid in list(children):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-
-    for sig in _TERM_SIGNALS:
-        signal.signal(sig, _handle_term)
-
-    for _ in range(workers):
-        _spawn()
-
-    while children and not stopping.is_set():
-        try:
-            pid, _status = os.waitpid(-1, 0)
-        except ChildProcessError:
-            break
-        except InterruptedError:  # pragma: no cover - EINTR retried by CPython
-            continue
-        children.discard(pid)
-        if stopping.is_set():
-            break
-        now = time.monotonic()
-        restart_times[:] = [t for t in restart_times if now - t < _RESTART_WINDOW]
-        if len(restart_times) >= _MAX_RESTARTS:
-            print("EvoAgent: too many worker restarts; shutting down")
-            stopping.set()
-            for other in list(children):
-                try:
-                    os.kill(other, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            break
-        restart_times.append(now)
-        time.sleep(min(0.1 * 2 ** min(len(restart_times), 6), 5.0))
-        print("EvoAgent: worker %d exited; restarting" % pid)
-        _spawn()
-
-    _reap_children(children, deadline_seconds=_grace_seconds() + 10.0)
-
-
-def _block_term_signals():
-    if hasattr(signal, "pthread_sigmask"):
-        return signal.pthread_sigmask(signal.SIG_BLOCK, set(_TERM_SIGNALS))
-    return None
-
-
-def _restore_signals(previous) -> None:
-    if previous is not None and hasattr(signal, "pthread_sigmask"):
-        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
-
-
-def _reap_children(children: set[int], deadline_seconds: float) -> None:
-    """Wait up to the deadline for children to exit after SIGTERM, then SIGKILL
-    and reap any that ignored it, so the master never hangs forever."""
-    deadline = time.monotonic() + max(1.0, deadline_seconds)
-    while children and time.monotonic() < deadline:
-        try:
-            pid, _status = os.waitpid(-1, os.WNOHANG)
-        except ChildProcessError:
-            children.clear()
-            return
-        if pid == 0:
-            time.sleep(0.05)
-            continue
-        children.discard(pid)
-    for pid in list(children):
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    for pid in list(children):
-        try:
-            os.waitpid(pid, 0)
-        except ChildProcessError:
-            pass
-        children.discard(pid)
 
 
 def _print_banner(settings: Settings, service: ReviewService) -> None:
@@ -1160,19 +1176,17 @@ def _print_banner(settings: Settings, service: ReviewService) -> None:
 
 def run() -> None:
     settings = Settings.from_env()
-    if _can_multiprocess(settings):
-        # Banner from a throwaway probe would create a stray service; children
-        # print their own readiness. The master just reports supervision.
-        _run_master(settings)
-        return
     service = ReviewService(settings)
-    _print_banner(settings, service)
-    server = _make_server(settings, service)
-    _install_drain_on_sigterm(server)
+    server: EvoAgentHTTPServer | None = None
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        server = _make_server(settings, service)
+        _print_banner(settings, service)
+        _install_drain_on_sigterm(server, settings.shutdown_grace_seconds)
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
     finally:
+        if server is not None:
+            server.server_close()
         service.close()
-        server.server_close()

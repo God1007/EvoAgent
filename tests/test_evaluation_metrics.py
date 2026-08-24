@@ -1,6 +1,6 @@
 import unittest
 
-from evoagent.evaluation_metrics import confidence_calibration, languages_for_paths
+from evoagent.evaluation_metrics import confidence_calibration, languages_for_paths, rule_slices
 
 
 class EvaluationMetricsTests(unittest.TestCase):
@@ -16,23 +16,29 @@ class EvaluationMetricsTests(unittest.TestCase):
         results = [
             {
                 "predictions": [
-                    {"confidence": 1.0, "matched": True},
-                    {"confidence": 0.0, "matched": False},
-                    {"confidence": None, "matched": False},
-                    {"confidence": 1.01, "matched": True},
+                    {"rule_id": "SEC-EVAL", "confidence": 1.0, "matched": True},
+                    {"rule_id": "SEC-EVAL", "confidence": 0.0, "matched": False},
+                    {"rule_id": "SEC-EVAL", "confidence": None, "matched": False},
+                    {"rule_id": "SEC-EVAL", "confidence": 1.01, "matched": True},
+                    {"rule_id": "SEC-EVAL", "confidence": True, "matched": True},
+                    {"rule_id": "SEC-EVAL", "confidence": "0.9", "matched": True},
+                    {"rule_id": "SEC-EVAL", "confidence": "bad", "matched": True},
+                    {"rule_id": "SEC-EVAL", "confidence": float("nan"), "matched": True},
+                    {"rule_id": "SEC-EVAL", "confidence": float("inf"), "matched": True},
                 ]
             }
         ]
 
         report = confidence_calibration(results)
 
-        self.assertEqual(4, report["predictions"])
+        self.assertEqual(9, report["predictions"])
         self.assertEqual(2, report["valid_confidences"])
-        self.assertEqual(2, report["invalid_confidences"])
+        self.assertEqual(7, report["invalid_confidences"])
         self.assertEqual(1, report["bins"][0]["count"])
         self.assertEqual(1, report["bins"][9]["count"])
         self.assertEqual(0.0, report["expected_calibration_error"])
         self.assertEqual(0.0, report["brier_score"])
+        self.assertEqual(0.5, rule_slices(results)["SEC-EVAL"]["mean_confidence"])
 
 
 if __name__ == "__main__":

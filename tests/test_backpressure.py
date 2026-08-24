@@ -77,6 +77,20 @@ class TokenBucketTests(unittest.TestCase):
 
 
 class RateLimiterTests(unittest.TestCase):
+    def test_invalid_resource_limits_fail_fast(self):
+        for options, message in (
+            ({"rate": -1}, "finite and non-negative"),
+            ({"rate": True}, "finite and non-negative"),
+            ({"rate": float("nan")}, "finite and non-negative"),
+            ({"rate": 1, "burst": 0}, "burst"),
+            ({"rate": 1, "burst": float("nan")}, "burst"),
+            ({"rate": 1, "max_keys": 0}, "key capacity"),
+            ({"rate": 1, "max_keys": True}, "key capacity"),
+        ):
+            with self.subTest(options=options):
+                with self.assertRaisesRegex(ValueError, message):
+                    RateLimiter(**options)
+
     def test_disabled_when_rate_zero(self):
         limiter = RateLimiter(rate=0)
         self.assertFalse(limiter.enabled)
@@ -97,6 +111,11 @@ class RateLimiterTests(unittest.TestCase):
 
 
 class ConcurrencyLimiterTests(unittest.TestCase):
+    def test_limit_rejects_coercion_and_negative_values(self):
+        for limit in (-1, True, 1.5, "2"):
+            with self.subTest(limit=limit), self.assertRaisesRegex(ValueError, "concurrency"):
+                ConcurrencyLimiter(limit)
+
     def test_bounded_acquire_and_release(self):
         gate = ConcurrencyLimiter(limit=2)
         self.assertTrue(gate.try_acquire())
@@ -112,6 +131,15 @@ class ConcurrencyLimiterTests(unittest.TestCase):
         self.assertFalse(gate.enabled)
         for _ in range(100):
             self.assertTrue(gate.try_acquire())
+        self.assertEqual(0, gate.in_flight())
+
+    def test_unmatched_release_does_not_corrupt_capacity(self):
+        gate = ConcurrencyLimiter(limit=1)
+        with self.assertRaisesRegex(RuntimeError, "matching acquire"):
+            gate.release()
+        self.assertEqual(0, gate.in_flight())
+        self.assertTrue(gate.try_acquire())
+        gate.release()
         self.assertEqual(0, gate.in_flight())
 
     def test_guard_releases_on_exit(self):

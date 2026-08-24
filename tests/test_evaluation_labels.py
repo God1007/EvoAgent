@@ -6,7 +6,7 @@ import unittest
 
 from evoagent.evaluation_benchmark import generate_controlled_pr_cases
 from evoagent.evaluation_dataset import dataset_fingerprint, load_jsonl
-from evoagent.evaluation_labels import compile_independent_annotations, main
+from evoagent.evaluation_labels import compile_independent_annotations, load_records, main
 from evoagent.evaluation_provenance import audit_dataset_provenance
 
 
@@ -74,6 +74,29 @@ class IndependentAnnotationTests(unittest.TestCase):
         )
         self.assertEqual(compiled, repeated)
         self.assertEqual(evidence, repeated_evidence)
+
+    def test_evaluation_jsonl_rejects_duplicate_evidence_fields(self):
+        case = generate_controlled_pr_cases()[0]
+        case_json = json.dumps(case)
+        split = '"split": "%s"' % case["split"]
+        packet_json = json.dumps(self.packets()[0])
+        blind = '"blind_to_system_output": true'
+        for loader, raw in (
+            (load_jsonl, case_json.replace(split, '"split": "invalid", ' + split)),
+            (
+                load_records,
+                packet_json.replace(blind, '"blind_to_system_output": false, ' + blind),
+            ),
+        ):
+            with tempfile.NamedTemporaryFile("w", delete=False) as handle:
+                handle.write(raw + "\n")
+                path = handle.name
+            self.addCleanup(os.unlink, path)
+            with (
+                self.subTest(loader=loader.__name__),
+                self.assertRaisesRegex(ValueError, "invalid JSON"),
+            ):
+                loader(path)
 
     def test_records_disagreement_without_changing_adjudicated_truth(self):
         compiled, evidence = compile_independent_annotations(

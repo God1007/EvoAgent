@@ -7,15 +7,30 @@ remediation quality, and a verifier makes the final release decision.
 """
 
 import hashlib
+import json
+import math
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import asdict, dataclass
 from typing import Any, TypedDict, cast
 
 from .diff_parser import ParsedDiff
 from .errors import safe_exception_summary
+from .metrics import metrics
 from .models import Finding, Severity
 from .ports import AgentMessageStorePort
-from .reviewer import Reviewer
+from .reviewer import (
+    MAX_REVIEWER_FINDINGS,
+    MAX_REVIEWER_NAME_CHARS,
+    Reviewer,
+    valid_reviewer_name,
+)
+
+# ponytail: fixed graph ceiling; raise only when 64 active specialists prove insufficient.
+MAX_REVIEW_AGENTS = 64
+MAX_REVIEW_AGENT_NAME_CHARS = MAX_REVIEWER_NAME_CHARS
 
 
 @dataclass
@@ -74,6 +89,7 @@ class CollaborationState(TypedDict, total=False):
     diff: str
     parsed: ParsedDiff
     task_id: str
+    admission_generation: int | None
     plan: ReviewPlan
     specialist_findings: list[Finding]
     critiques: dict[str, Critique]
@@ -84,15 +100,15 @@ class CollaborationState(TypedDict, total=False):
 
 
 def finding_key(finding: Finding) -> str:
-    """Per-run correlation key that stays unique for co-located findings.
+    """Per-run correlation key that distinguishes co-located claims.
 
-    This intentionally includes the line number so two findings with identical
-    evidence on different lines do not collapse into one dict entry while the
-    critic/test/fix agents correlate their work within a single review run. For a
-    line-independent identity that is stable across PR revisions, use
-    ``Finding.fingerprint()`` instead (see ``models.Finding``).
+    Confidence is excluded because synthesis adjusts it before later nodes look
+    the key up again. Exact duplicate claims intentionally share a key. For a
+    line-independent identity stable across PR revisions, use ``fingerprint``.
     """
-    raw = "%s:%s:%s" % (finding.path, finding.line, finding.rule_id)
+    claim = asdict(finding)
+    claim.pop("confidence")
+    raw = json.dumps(claim, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
@@ -103,11 +119,25 @@ class FilteredAgent(Reviewer):
         self.prefixes = prefixes
 
     def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
-        return [
-            item
-            for item in self.reviewer.review(diff, parsed)
-            if item.rule_id.startswith(self.prefixes)
-        ]
+        return self._filter(self.reviewer.review(diff, parsed))
+
+    def review_with_context(
+        self,
+        task_id: str,
+        diff: str,
+        parsed: ParsedDiff,
+        admission_generation: int | None = None,
+    ) -> list[Finding]:
+        contextual = getattr(self.reviewer, "review_with_context", None)
+        findings = (
+            contextual(task_id, diff, parsed, admission_generation)
+            if callable(contextual)
+            else self.reviewer.review(diff, parsed)
+        )
+        return self._filter(findings)
+
+    def _filter(self, findings: list[Finding]) -> list[Finding]:
+        return [item for item in findings if item.rule_id.startswith(self.prefixes)]
 
 
 class PlannerAgent:
@@ -168,8 +198,12 @@ class CriticAgent:
             ),
             "",
         )
-        if finding.evidence and finding.evidence.strip() not in source_line.strip():
+        if not finding.evidence.strip():
+            objections.append("quoted evidence is required")
+        elif finding.evidence.strip() not in source_line.strip():
             objections.append("quoted evidence does not match the changed line")
+        if not finding.title.strip():
+            objections.append("title is required")
         if len(finding.explanation.strip()) < 12:
             objections.append("explanation is not specific enough")
         if len(finding.fix.strip()) < 8:
@@ -236,11 +270,15 @@ class SynthesizerAgent:
             finding.confidence = adjusted
             identity = (finding.path, finding.line, finding.rule_id)
             current = merged.get(identity)
-            if current is None or finding.confidence > current.confidence:
+            if current is None or (finding.confidence, key) > (
+                current.confidence,
+                finding_key(current),
+            ):
                 merged[identity] = finding
         order = {Severity.CRITICAL: 0, Severity.HIGH: 1, Severity.MEDIUM: 2, Severity.LOW: 3}
         return sorted(
-            merged.values(), key=lambda item: (order[item.severity], item.path, item.line)
+            merged.values(),
+            key=lambda item: (order[item.severity], item.path, item.line, item.rule_id),
         )
 
 
@@ -279,16 +317,50 @@ class MultiAgentCoordinator(Reviewer):
         agents: list[Reviewer],
         max_workers: int = 4,
         store: AgentMessageStorePort | None = None,
+        timeout_seconds: float = 120,
     ):
-        self.agents = agents
-        self.max_workers = max_workers
-        self.store = store
+        if not agents:
+            raise ValueError("at least one review agent is required")
+        if len(agents) > MAX_REVIEW_AGENTS:
+            raise ValueError("review graph accepts at most %d agents" % MAX_REVIEW_AGENTS)
+        if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
+            raise ValueError("review agent workers must be a positive integer")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("review agent timeout must be positive and finite")
         self.planner = PlannerAgent()
         self.critic = CriticAgent()
         self.test_agent = TestAgent()
         self.synthesizer = SynthesizerAgent()
         self.fix_agent = FixAgent()
         self.verifier = VerifierAgent()
+        agent_names = [getattr(agent, "name", None) for agent in agents]
+        if any(not valid_reviewer_name(name) for name in agent_names):
+            raise ValueError(
+                "review agent names must be printable, whitespace-free strings of at most %d characters"
+                % MAX_REVIEW_AGENT_NAME_CHARS
+            )
+        names = set(agent_names)
+        if len(names) != len(agents):
+            raise ValueError("review agent names must be unique")
+        if names & {
+            self.planner.name,
+            self.critic.name,
+            self.test_agent.name,
+            self.synthesizer.name,
+            self.fix_agent.name,
+            self.verifier.name,
+        }:
+            raise ValueError("review agent names must not collide with coordinator nodes")
+        self.agents = agents
+        self.max_workers = min(max_workers, len(agents))
+        self._worker_slots = threading.BoundedSemaphore(self.max_workers)
+        self.store = store
+        self.timeout_seconds = timeout_seconds
 
     def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
         return self.review_with_context("", diff, parsed)
@@ -298,11 +370,13 @@ class MultiAgentCoordinator(Reviewer):
         task_id: str,
         diff: str,
         parsed: ParsedDiff,
+        admission_generation: int | None = None,
     ) -> list[Finding]:
         state: CollaborationState = {
             "task_id": task_id,
             "diff": diff,
             "parsed": parsed,
+            "admission_generation": admission_generation,
         }
         result: dict[str, Any] = dict(state)
         for node in (
@@ -328,7 +402,13 @@ class MultiAgentCoordinator(Reviewer):
     ) -> None:
         message = AgentMessage(sender, recipient, kind, content, correlation_id)
         if self.store is not None and state.get("task_id"):
-            self.store.record_agent_message(state["task_id"], message.to_dict())
+            if (
+                self.store.record_agent_message(
+                    state["task_id"], message.to_dict(), state.get("admission_generation")
+                )
+                is False
+            ):
+                raise RuntimeError("agent message persistence was rejected")
 
     def _plan_node(self, state: CollaborationState) -> dict[str, Any]:
         plan = self.planner.plan(state["parsed"], self.agents)
@@ -337,30 +417,45 @@ class MultiAgentCoordinator(Reviewer):
 
     def _specialist_node(self, state: CollaborationState) -> dict[str, Any]:
         findings: list[Finding] = []
+        evidence = []
         failures = []
 
         def invoke(agent: Reviewer) -> list[Finding]:
             contextual = getattr(agent, "review_with_context", None)
-            if contextual:
-                return contextual(state.get("task_id", ""), state["diff"], state["parsed"])
+            if callable(contextual):
+                return contextual(
+                    state.get("task_id", ""),
+                    state["diff"],
+                    state["parsed"],
+                    state.get("admission_generation"),
+                )
             return agent.review(state["diff"], state["parsed"])
 
-        with ThreadPoolExecutor(
-            max_workers=min(self.max_workers, max(1, len(self.agents)))
-        ) as pool:
-            futures = {pool.submit(invoke, agent): agent for agent in self.agents}
-            for future in as_completed(futures):
+        pool = ThreadPoolExecutor(max_workers=self.max_workers)
+        futures = {}
+        deadline = time.monotonic() + self.timeout_seconds
+        try:
+            for agent in self.agents:
+                if not self._worker_slots.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                    raise FuturesTimeoutError
+                try:
+                    future = pool.submit(invoke, agent)
+                except Exception:
+                    self._worker_slots.release()
+                    raise
+                future.add_done_callback(lambda _future: self._worker_slots.release())
+                futures[future] = agent
+            for future in as_completed(futures, timeout=max(0.0, deadline - time.monotonic())):
                 agent = futures[future]
                 try:
                     output = future.result()
+                    if not isinstance(output, list):
+                        raise RuntimeError("review agent returned invalid findings")
+                    if len(output) > MAX_REVIEWER_FINDINGS:
+                        raise RuntimeError("review agent returned too many findings")
+                    output = [Finding.from_dict(asdict(item)) for item in output]
                     findings.extend(output)
-                    self._emit(
-                        state,
-                        agent.name,
-                        self.critic.name,
-                        "specialist_evidence",
-                        {"findings": [item.to_dict() for item in output]},
-                    )
+                    evidence.append((agent, output))
                 except Exception as exc:
                     summary = safe_exception_summary(exc, "review agent failed")
                     failures.append("%s: %s" % (agent.name, summary))
@@ -371,8 +466,31 @@ class MultiAgentCoordinator(Reviewer):
                         "agent_failure",
                         {"error": summary},
                     )
-        if failures and not findings and len(failures) == len(self.agents):
-            raise RuntimeError("all review agents failed: " + "; ".join(failures))
+        except FuturesTimeoutError:
+            metrics.inc("review_agent_budget_timeouts_total")
+            raise RuntimeError("review agents exceeded the execution budget") from None
+        finally:
+            for future in futures:
+                future.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
+        if failures:
+            scope = (
+                "all review agents failed"
+                if len(failures) == len(self.agents)
+                else "review agents failed"
+            )
+            raise RuntimeError(scope + ": " + "; ".join(failures))
+        if len(findings) > MAX_REVIEWER_FINDINGS:
+            metrics.inc("review_agent_output_limit_rejections_total")
+            raise RuntimeError("review agents returned too many findings in aggregate")
+        for agent, output in evidence:
+            self._emit(
+                state,
+                agent.name,
+                self.critic.name,
+                "specialist_evidence",
+                {"findings": [item.to_dict() for item in output]},
+            )
         return {"specialist_findings": findings}
 
     def _critic_node(self, state: CollaborationState) -> dict[str, Any]:

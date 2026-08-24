@@ -1,9 +1,12 @@
 import unittest
 import uuid
+from unittest import mock
 
-from evoagent.models import TaskState, TraceEvent
+from evoagent.models import ReviewReport, TaskState, TraceEvent
 from evoagent.recovery import (
+    RECOVERY_MARKER,
     QueueRecoveryError,
+    RedisRecoveryTarget,
     build_queue_recovery_plan,
     execute_queue_recovery,
 )
@@ -27,6 +30,45 @@ class FakeRedisRecoveryTarget:
         previous = self.state
         self.state = "reserved"
         return "existing" if previous == "reserved" else "reserved"
+
+
+class RedisRecoveryTargetTests(unittest.TestCase):
+    def test_url_cannot_override_recovery_transport_policy(self):
+        for query in ("ssl_cert_reqs=none", "socket_timeout=999999"):
+            with self.subTest(query=query), self.assertRaisesRegex(ValueError, "query"):
+                RedisRecoveryTarget("rediss://cache.example/0?" + query)
+
+    def test_inspection_is_one_atomic_redis_operation(self):
+        target = object.__new__(RedisRecoveryTarget)
+        target._client = mock.Mock()
+        target._client.eval.return_value = "reserved"
+
+        self.assertEqual("reserved", target.inspect("epoch"))
+
+        target._client.eval.assert_called_once_with(mock.ANY, 1, RECOVERY_MARKER, "epoch")
+        target._client.dbsize.assert_not_called()
+        target._client.get.assert_not_called()
+
+
+class QueueRecoveryPlanTests(unittest.TestCase):
+    def test_plan_hash_binds_the_selected_outbox_intent(self):
+        store = mock.Mock()
+        candidate = {
+            "task_id": "task-1",
+            "tenant_id": "tenant-a",
+            "outbox_status": "published",
+            "recoverable": True,
+            "payload": {"task_id": "task-1", "delivery_only": True},
+        }
+        store.queue_recovery_candidates.side_effect = [
+            [{**candidate, "outbox_id": "delivery-a"}],
+            [{**candidate, "outbox_id": "delivery-b"}],
+        ]
+
+        first = build_queue_recovery_plan(store, 10)
+        second = build_queue_recovery_plan(store, 10)
+
+        self.assertNotEqual(first.plan_sha256, second.plan_sha256)
 
 
 class QueueRecoveryTests(unittest.TestCase):
@@ -195,6 +237,55 @@ class QueueRecoveryTests(unittest.TestCase):
         plan = build_queue_recovery_plan(self.store, 10)
 
         self.assertEqual(0, len(plan.candidates))
+
+    def test_successful_incomplete_delivery_is_reconstructed(self):
+        task_id = "successful-delivery"
+        delivery_id = "review-delivery:lost"
+        self.create_async(task_id)
+        self.mark_async_published(task_id)
+        self.store.succeed(
+            task_id,
+            ReviewReport("acme/widgets", 7, "done", "low"),
+            TraceEvent(1, TaskState.SUCCESS, "done", utc_now()),
+        )
+        payload = {
+            "task_id": task_id,
+            "repository": "acme/widgets",
+            "pull_request": 7,
+            "tenant_id": "tenant-a",
+            "delivery_only": True,
+        }
+        self.assertEqual(
+            "resumed",
+            self.store.resume_review_delivery(
+                task_id, "tenant-a", delivery_id, delivery_id, payload
+            )["status"],
+        )
+        claimed = self.store.claim_outbox("worker", 1, 30, 20)[0]
+        self.assertEqual(delivery_id, claimed["id"])
+        self.assertTrue(self.store.mark_outbox_published(delivery_id, "worker"))
+
+        recovery_id = str(uuid.uuid4())
+        target = FakeRedisRecoveryTarget()
+        planned = execute_queue_recovery(self.store, target, recovery_id, "restored")
+        applied = execute_queue_recovery(
+            self.store,
+            target,
+            recovery_id,
+            "restored",
+            apply=True,
+            expected_plan_sha256=planned["plan"]["plan_sha256"],
+        )
+
+        self.assertEqual(1, planned["plan"]["recoverable"])
+        self.assertEqual(1, applied["staging"]["staged"])
+        recovered = self.store.list_outbox("pending", 10)[0]
+        self.assertEqual("recovery:%s:%s" % (recovery_id, task_id), recovered["message_key"])
+        self.assertTrue(recovered["payload"]["delivery_only"])
+        self.assertEqual(
+            recovered["message_key"],
+            self.store.get(task_id)["input"]["_delivery_resume_outbox_id"],
+        )
 
     def test_terminal_race_is_rechecked_inside_staging_transaction(self):
         self.create_async()

@@ -1,15 +1,26 @@
-import json
+import math
 import re
-import urllib.error
-import urllib.request
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import Any
 
 from .diff_parser import ParsedDiff
+from .json_boundary import strict_json_loads
 from .model_gateway import ModelGovernanceContext, ModelMessage, ModelRequest
 from .models import Finding, Severity
 from .ports import ModelGatewayPort
+
+# ponytail: fixed per-reviewer cap; raise it only when 100 findings prove insufficient.
+MAX_REVIEWER_FINDINGS = 100
+MAX_REVIEWER_NAME_CHARS = 100
+
+
+def valid_reviewer_name(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= MAX_REVIEWER_NAME_CHARS
+        and all(character.isprintable() and not character.isspace() for character in value)
+    )
 
 
 class Reviewer(ABC):
@@ -144,19 +155,20 @@ def _review_messages(diff: str, system_prompt: str = "") -> tuple[ModelMessage, 
 
 def _parse_model_findings(content: str, parsed: ParsedDiff) -> list[Finding]:
     try:
-        result = json.loads(content)
-    except json.JSONDecodeError as exc:
+        result = strict_json_loads(content)
+    except (TypeError, UnicodeError, ValueError, RecursionError) as exc:
         raise RuntimeError("model returned an invalid JSON review response") from exc
-    if not isinstance(result, dict) or not isinstance(result.get("findings", []), list):
+    if not isinstance(result, dict) or not isinstance(result.get("findings"), list):
         raise RuntimeError("model returned an invalid JSON review response")
+    if len(result["findings"]) > MAX_REVIEWER_FINDINGS:
+        raise RuntimeError("model returned too many findings")
     valid_locations = {(item.path, item.line) for item in parsed.added_lines}
     findings: list[Finding] = []
-    for raw in result.get("findings", []):
+    for raw in result["findings"]:
         if not isinstance(raw, dict):
             continue
-        try:
-            path, line = str(raw.get("path", "")), int(raw.get("line", 0))
-        except (TypeError, ValueError):
+        path, line = raw.get("path"), raw.get("line")
+        if not isinstance(path, str) or not isinstance(line, int) or isinstance(line, bool):
             continue
         if (path, line) not in valid_locations:
             continue
@@ -164,120 +176,32 @@ def _parse_model_findings(content: str, parsed: ParsedDiff) -> list[Finding]:
             severity = Severity(str(raw.get("severity", "medium")).lower())
         except ValueError:
             severity = Severity.MEDIUM
+        raw_confidence = raw.get("confidence", 0.7)
+        if isinstance(raw_confidence, int) and not isinstance(raw_confidence, bool):
+            confidence = float(max(0, min(1, raw_confidence)))
+        elif isinstance(raw_confidence, float) and math.isfinite(raw_confidence):
+            confidence = max(0.0, min(1.0, raw_confidence))
+        else:
+            confidence = 0.0
         try:
-            confidence = float(raw.get("confidence", 0.7))
-        except (TypeError, ValueError):
-            confidence = 0.7
-        findings.append(
-            Finding(
-                rule_id=str(raw.get("rule_id", "LLM-REVIEW"))[:80],
-                severity=severity,
-                title=str(raw.get("title", "Review finding"))[:200],
-                explanation=str(raw.get("explanation", ""))[:2000],
-                path=path,
-                line=line,
-                evidence=str(raw.get("evidence", ""))[:240],
-                fix=str(raw.get("fix", ""))[:2000],
-                test=str(raw.get("test", ""))[:2000],
-                confidence=max(0.0, min(1.0, confidence)),
+            finding = Finding.from_dict(
+                {
+                    "rule_id": raw.get("rule_id", "LLM-REVIEW"),
+                    "severity": severity,
+                    "title": raw.get("title", "Review finding"),
+                    "explanation": raw.get("explanation", ""),
+                    "path": path,
+                    "line": line,
+                    "evidence": raw.get("evidence", ""),
+                    "fix": raw.get("fix", ""),
+                    "test": raw.get("test", ""),
+                    "confidence": confidence,
+                }
             )
-        )
+        except ValueError:
+            continue
+        findings.append(finding)
     return findings
-
-
-class OpenAICompatibleReviewer(Reviewer):
-    name = "openai-compatible"
-
-    def __init__(
-        self,
-        base_url: str,
-        api_key: str,
-        model: str,
-        timeout: int = 60,
-        system_prompt: str = "",
-        provider: str = "openai-compatible",
-        extra_headers: dict[str, str] | None = None,
-        breaker=None,
-    ):
-        self.base_url = base_url
-        self.api_key = api_key
-        self.model = model
-        self.timeout = timeout
-        self.system_prompt = system_prompt
-        self.provider = provider
-        self.name = "%s:%s" % (provider, model)
-        self.extra_headers = extra_headers or {}
-        # Optional circuit breaker: trips after repeated LLM failures so a dead
-        # endpoint fails fast instead of tying up worker threads.
-        self._breaker = breaker
-
-    def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
-        messages = _review_messages(diff, self.system_prompt)
-        payload = {
-            "model": self.model,
-            "temperature": 0,
-            "messages": [
-                {"role": message.role, "content": message.content} for message in messages
-            ],
-            "response_format": {"type": "json_object"},
-        }
-        headers = {
-            "Authorization": "Bearer " + self.api_key,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        headers.update(self.extra_headers)
-        request = urllib.request.Request(
-            self.base_url + "/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-
-        try:
-            # Only the network transport is guarded by the breaker: hard
-            # connectivity/timeout failures trip it (fail fast on a dead LLM),
-            # while an HTTP error response or a malformed-but-received body means
-            # the endpoint is alive and must not count as a breaker failure.
-            with self._open(request) as response:
-                raw = response.read()
-            body = json.loads(raw.decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read(1000).decode("utf-8", errors="replace")
-            raise RuntimeError(
-                "%s API returned HTTP %d: %s" % (self.provider, exc.code, detail)
-            ) from exc
-        except (TimeoutError, urllib.error.URLError, ValueError, KeyError) as exc:
-            raise RuntimeError("%s review request failed: %s" % (self.provider, exc)) from exc
-        try:
-            content = body["choices"][0]["message"]["content"]
-            if not isinstance(content, str):
-                raise TypeError("model content is not text")
-        except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError(
-                "%s returned an invalid JSON review response" % self.provider
-            ) from exc
-        try:
-            return _parse_model_findings(content, parsed)
-        except RuntimeError as exc:
-            raise RuntimeError(
-                "%s returned an invalid JSON review response" % self.provider
-            ) from exc
-
-    def _open(self, request: "urllib.request.Request"):
-        if self._breaker is None:
-            return urllib.request.urlopen(request, timeout=self.timeout)
-        self._breaker.allow()
-        try:
-            response = urllib.request.urlopen(request, timeout=self.timeout)
-        except urllib.error.HTTPError:
-            self._breaker.record_success()
-            raise
-        except Exception:
-            self._breaker.record_failure()
-            raise
-        self._breaker.record_success()
-        return response
 
 
 class GatewayReviewer(Reviewer):
@@ -304,7 +228,13 @@ class GatewayReviewer(Reviewer):
             parsed,
         )
 
-    def review_with_context(self, task_id: str, diff: str, parsed: ParsedDiff) -> list[Finding]:
+    def review_with_context(
+        self,
+        task_id: str,
+        diff: str,
+        parsed: ParsedDiff,
+        admission_generation: int | None = None,
+    ) -> list[Finding]:
         return self._review(task_id, self.task_context(task_id), "review", diff, parsed)
 
     def _review(
@@ -328,28 +258,3 @@ class GatewayReviewer(Reviewer):
             )
         )
         return _parse_model_findings(response.content, parsed)
-
-
-class CompositeReviewer(Reviewer):
-    name = "composite"
-
-    def __init__(self, reviewers: list[Reviewer]):
-        self.reviewers = reviewers
-        self.name = "+".join(item.name for item in reviewers)
-
-    def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
-        merged: dict[Any, Finding] = {}
-        errors = []
-        for reviewer in self.reviewers:
-            try:
-                for finding in reviewer.review(diff, parsed):
-                    key = (finding.path, finding.line, finding.rule_id)
-                    merged[key] = finding
-            except Exception as exc:
-                errors.append(exc)
-        if not merged and errors and len(errors) == len(self.reviewers):
-            raise errors[0]
-        order = {Severity.CRITICAL: 0, Severity.HIGH: 1, Severity.MEDIUM: 2, Severity.LOW: 3}
-        return sorted(
-            merged.values(), key=lambda item: (order[item.severity], item.path, item.line)
-        )

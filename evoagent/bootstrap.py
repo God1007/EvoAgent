@@ -9,13 +9,6 @@ from .auth import AuthManager
 from .circuit_breaker import CircuitBreaker
 from .config import Settings
 from .evolution import EvolutionEngine
-from .fix_rules import (
-    DebugPrintFixRule,
-    HardcodedSecretFixRule,
-    SafeYamlLoadFixRule,
-    SecureCookieFixRule,
-    SubprocessShellFixRule,
-)
 from .fixer import SafeFixer
 from .github import GitHubClient
 from .model_gateway import (
@@ -34,6 +27,7 @@ from .review_engine import ReviewEngine
 from .review_extensions import ReviewerContribution
 from .reviewer import LocalRuleReviewer
 from .rollout import ReleaseManager
+from .skills import resolve_container_image
 from .verifier import RepairVerifier
 
 
@@ -45,6 +39,7 @@ class ApplicationComponents:
     policies: RepositoryPolicyResolver
     model_gateway: ModelGateway
     proof_executor: ProofExecutorPort
+    repair_container_image: str
     observability: Observability
     review_engine: ReviewEngine
     github: GitHubClient
@@ -57,6 +52,7 @@ class ApplicationComponents:
 
 def build_components(settings: Settings) -> ApplicationComponents:
     """Build the one application graph the service actually runs."""
+    repair_container_image = resolve_container_image(settings.repair_container_image)
     github_breaker = _breaker(settings, "github")
     llm_breaker = _breaker(settings, "llm")
     store = create_store(
@@ -64,12 +60,15 @@ def build_components(settings: Settings) -> ApplicationComponents:
         settings.pg_pool_min,
         settings.pg_pool_max,
         settings.pg_pool_timeout,
+        settings.pg_statement_timeout_seconds,
+        auto_migrate=False,
     )
     model_gateway = None
+    observability = None
     try:
         policies = RepositoryPolicyResolver(store)
         model_gateway = _model_gateway(settings, llm_breaker)
-        proof_executor = _proof_executor(settings)
+        proof_executor = _proof_executor(settings, repair_container_image)
         observability = Observability(settings.otel_service_name, settings.otel_endpoint)
         review_engine = ReviewEngine(
             settings,
@@ -92,23 +91,8 @@ def build_components(settings: Settings) -> ApplicationComponents:
             ),
         )
         fixer = SafeFixer(
-            RepairVerifier(
-                settings.repair_test_command,
-                settings.repair_verify_timeout_seconds,
-                container_image=settings.repair_container_image,
-                memory_mb=settings.repair_memory_mb,
-                pids_limit=settings.repair_pids_limit,
-                cpus=settings.repair_cpus,
-                require_container=settings.repair_require_container,
-                max_output_bytes=settings.repair_max_output_bytes,
-            ),
-            (
-                DebugPrintFixRule(),
-                SubprocessShellFixRule(),
-                HardcodedSecretFixRule(),
-                SafeYamlLoadFixRule(),
-                SecureCookieFixRule(),
-            ),
+            _repair_verifier(settings, settings.repair_test_command, repair_container_image),
+            max_source_bytes=settings.max_diff_bytes * 10,
         )
         auth = AuthManager(
             store,
@@ -117,19 +101,22 @@ def build_components(settings: Settings) -> ApplicationComponents:
             settings.bootstrap_admin_username,
             settings.bootstrap_admin_password,
             settings.default_tenant_id,
+            previous_secret=settings.auth_previous_secret,
         )
-        releases = ReleaseManager(store)
+        releases = ReleaseManager(store, review_engine.execution_revision())
         alerts = AlertManager(store, settings.alert_failure_rate, settings.alert_min_samples)
         evolution = EvolutionEngine(
             store,
             reviewer_factory=(
-                review_engine.build_llm_reviewer if review_engine.llm_available else None
+                review_engine.build_evaluation_reviewer if review_engine.llm_available else None
             ),
             min_cases=settings.eval_min_cases,
             max_cases=settings.eval_max_cases,
             min_improvement=settings.eval_min_improvement,
             min_holdout_cases=settings.eval_min_holdout_cases,
             max_metric_regression=settings.eval_max_metric_regression,
+            timeout_seconds=settings.timeout_seconds,
+            execution_revision=review_engine.execution_revision(),
         )
         return ApplicationComponents(
             github_breaker,
@@ -138,9 +125,14 @@ def build_components(settings: Settings) -> ApplicationComponents:
             policies,
             model_gateway,
             proof_executor,
+            repair_container_image,
             observability,
             review_engine,
-            GitHubClient(settings.github_token, breaker=github_breaker),
+            GitHubClient(
+                settings.github_token,
+                breaker=github_breaker,
+                max_archive_bytes=settings.repair_memory_mb * 1024 * 1024,
+            ),
             fixer,
             auth,
             releases,
@@ -148,23 +140,22 @@ def build_components(settings: Settings) -> ApplicationComponents:
             evolution,
         )
     except Exception:
-        if model_gateway is not None:
+        for resource in (observability, model_gateway, store):
             try:
-                _close(model_gateway)
+                _close(resource)
             except Exception:
                 pass
-        try:
-            _close(store)
-        except Exception:
-            pass
         raise
 
 
 def close_components(components: ApplicationComponents) -> None:
     try:
-        _close(components.model_gateway)
+        _close(components.observability)
     finally:
-        _close(components.store)
+        try:
+            _close(components.model_gateway)
+        finally:
+            _close(components.store)
 
 
 def _close(resource: object) -> None:
@@ -221,16 +212,24 @@ def _model_gateway(
     )
 
 
-def _proof_executor(settings: Settings) -> ProofExecutorPort:
-    return LocalProofExecutor(
-        lambda command: RepairVerifier(
-            command,
-            settings.repair_verify_timeout_seconds,
-            container_image=settings.repair_container_image,
-            memory_mb=settings.repair_memory_mb,
-            pids_limit=settings.repair_pids_limit,
-            cpus=settings.repair_cpus,
-            require_container=True,
-            max_output_bytes=settings.repair_max_output_bytes,
-        )
+def _proof_executor(settings: Settings, container_image: str | None = None) -> ProofExecutorPort:
+    return LocalProofExecutor(lambda command: _repair_verifier(settings, command, container_image))
+
+
+def _repair_verifier(
+    settings: Settings,
+    command: str,
+    container_image: str | None = None,
+) -> RepairVerifier:
+    return RepairVerifier(
+        command,
+        settings.repair_verify_timeout_seconds,
+        container_image=(
+            settings.repair_container_image if container_image is None else container_image
+        ),
+        memory_mb=settings.repair_memory_mb,
+        pids_limit=settings.repair_pids_limit,
+        cpus=settings.repair_cpus,
+        require_container=True,
+        max_output_bytes=settings.repair_max_output_bytes,
     )

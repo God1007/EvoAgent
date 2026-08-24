@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from evoagent.errors import (
     coerce_safe_summary,
@@ -160,6 +161,16 @@ class ObservabilityErrorContractTests(unittest.TestCase):
         self.assertRegex(tracer.span.attributes["error.ref"], r"^[0-9a-f]{16}$")
         self.assertEqual("evoagent.failure", tracer.span.events[0][0])
         self.assertNotIn(secret, str((tracer.span.attributes, tracer.span.events)))
+
+    def test_close_flushes_the_owned_trace_provider_once(self):
+        observability = object.__new__(Observability)
+        provider = mock.Mock()
+        observability._provider = provider
+
+        observability.close()
+        observability.close()
+
+        provider.shutdown.assert_called_once_with()
 
 
 if __name__ == "__main__":

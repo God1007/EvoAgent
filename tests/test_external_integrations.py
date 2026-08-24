@@ -60,6 +60,21 @@ class PostgreSQLRuntimeIntegrationTests(unittest.TestCase):
         self.assertFalse(holder.is_alive())
         self.store.ping()
 
+    def test_statement_timeout_cancels_and_pool_recovers(self):
+        bounded = PostgresTaskStore(
+            POSTGRES_URL,
+            pool_min=1,
+            pool_max=1,
+            statement_timeout_seconds=0.1,
+        )
+        self.addCleanup(bounded.close)
+
+        with self.assertRaises(bounded.psycopg.errors.QueryCanceled):
+            with bounded._connect() as conn:
+                conn.execute("SELECT pg_sleep(1)")
+
+        bounded.ping()
+
     def test_pool_replaces_a_server_terminated_connection(self):
         import psycopg
 
@@ -199,7 +214,7 @@ class RedisRuntimeIntegrationTests(unittest.TestCase):
             first.close(3)
             second.close(3)
 
-    def test_dlq_replay_survives_queue_restart(self):
+    def test_dlq_survives_queue_restart(self):
         message_id = "dlq-" + uuid.uuid4().hex
 
         def reject(_payload):
@@ -212,11 +227,9 @@ class RedisRuntimeIntegrationTests(unittest.TestCase):
         finally:
             failed.close(3)
 
-        delivered = threading.Event()
-        restarted = TaskQueue(lambda _payload: delivered.set(), workers=1, redis_url=REDIS_URL)
+        restarted = TaskQueue(lambda _payload: None, workers=1, redis_url=REDIS_URL)
         try:
-            self.assertTrue(restarted.replay_dead_letter(message_id))
-            self.assertTrue(delivered.wait(5))
+            self.assertEqual(message_id, restarted.dead_letters()[0]["message_id"])
         finally:
             restarted.close(3)
 

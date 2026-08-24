@@ -21,8 +21,9 @@ policy and its audit record is one database transaction.
 
 Application use cases resolve one immutable `RepositoryPolicy` at intake. The
 task persists its versioned snapshot for retry determinism. Current `enabled`
-and comment-publication restrictions are also checked during queued execution
-so emergency revocation takes effect without mutating accepted history.
+and comment-publication restrictions are also checked during queued execution;
+shadow model egress rechecks `enabled` after the primary review, so emergency
+revocation takes effect without mutating accepted history.
 
 The legacy grant behavior remains a compatibility fallback only when an exact
 versioned policy does not exist. The first explicit policy becomes authoritative

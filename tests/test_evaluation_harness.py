@@ -18,6 +18,7 @@ from evoagent.evaluation_harness import (
 )
 from evoagent.evaluation_provenance import audit_dataset_provenance
 from evoagent.models import Finding, Severity
+from scripts.run_e2e_evaluation import reproducibility_metadata
 
 
 class EndToEndEvaluationTests(unittest.TestCase):
@@ -110,6 +111,20 @@ class EndToEndEvaluationTests(unittest.TestCase):
             {item["source"]["kind"] for item in cases},
         )
 
+    def test_report_reproducibility_binds_source_runtime_and_lockfile(self):
+        metadata = reproducibility_metadata()
+
+        self.assertEqual(64, len(metadata["application_source_sha256"]))
+        self.assertEqual(64, len(metadata["requirements_lock_sha256"]))
+        self.assertRegex(metadata["python_version"], r"^\d+\.\d+\.\d+$")
+
+    def test_harness_rejects_truthy_non_boolean_repair_label(self):
+        case = next(item for item in generate_controlled_pr_cases() if item["expected_findings"])
+        case["repair_validation"]["auto_fixable"] = "false"
+
+        with self.assertRaisesRegex(ValueError, "auto_fixable must be a boolean"):
+            EndToEndEvaluationHarness(repairer=FixtureRepairer()).run(candidate_reviewer(), [case])
+
     def test_one_to_one_matching_counts_duplicate_prediction_once(self):
         expected = [
             {
@@ -165,12 +180,12 @@ class EndToEndEvaluationTests(unittest.TestCase):
         self.assertEqual(0.9474, candidate["metrics"]["high_risk_recall"])
         self.assertEqual(0.9167, candidate["metrics"]["clean_accuracy"])
         self.assertEqual(1.0, candidate["metrics"]["execution_success_rate"])
-        self.assertEqual(28, candidate["metrics"]["repair_eligible"])
-        self.assertEqual(28, candidate["metrics"]["repair_attempted"])
-        self.assertEqual(28, candidate["metrics"]["repair_passed"])
-        self.assertEqual(5, candidate["metrics"]["repair_abstained"])
+        self.assertEqual(14, candidate["metrics"]["repair_eligible"])
+        self.assertEqual(14, candidate["metrics"]["repair_attempted"])
+        self.assertEqual(14, candidate["metrics"]["repair_passed"])
+        self.assertEqual(19, candidate["metrics"]["repair_abstained"])
         self.assertEqual(1.0, candidate["metrics"]["safe_fix_rate"])
-        self.assertEqual(0.70, candidate["metrics"]["e2e_security_fix_rate"])
+        self.assertEqual(0.35, candidate["metrics"]["e2e_security_fix_rate"])
         self.assertEqual(100, candidate["by_language"]["Python"]["cases"])
         self.assertEqual(0.825, candidate["by_language"]["Python"]["f1"])
         self.assertEqual(40, candidate["confidence_calibration"]["predictions"])
@@ -179,7 +194,9 @@ class EndToEndEvaluationTests(unittest.TestCase):
         self.assertIn("CWE-95", candidate["by_cwe"])
         self.assertIn("SEC-EVAL", candidate["by_rule"])
         gate = comparison_summary(baseline, candidate)["release_gate"]
-        self.assertTrue(gate["quantitative_passed"])
+        self.assertFalse(gate["quantitative_passed"])
+        self.assertTrue(gate["gates"]["safe_fix_rate"]["passed"])
+        self.assertFalse(gate["gates"]["e2e_security_fix_rate"]["passed"])
         self.assertFalse(gate["production_activation_allowed"])
         self.assertFalse(gate["passed"])
 

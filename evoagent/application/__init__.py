@@ -1,5 +1,6 @@
 """Application use cases composed by the ReviewService compatibility facade."""
 
+from .github_installations import GitHubInstallationUseCases
 from .policies import PolicyUseCases
 from .repairs import RepairOptions, RepairUseCases
 from .reviews import ReviewOptions, ReviewUseCases
@@ -7,6 +8,7 @@ from .sessions import SessionUseCases
 from .webhooks import WebhookOptions, WebhookUseCases
 
 __all__ = [
+    "GitHubInstallationUseCases",
     "PolicyUseCases",
     "RepairOptions",
     "RepairUseCases",

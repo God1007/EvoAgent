@@ -1,11 +1,14 @@
 """Real Docker execution checks, enabled only in the container CI job."""
 
+import hashlib
 import os
 import subprocess
 import tempfile
 import time
 import unittest
 
+from evoagent.diff_parser import parse_unified_diff
+from evoagent.skills import SandboxedSkillReviewer
 from evoagent.verifier import RepairVerifier
 
 CONTAINER_IMAGE = os.getenv("EVOAGENT_TEST_CONTAINER_IMAGE", "")
@@ -13,6 +16,76 @@ CONTAINER_IMAGE = os.getenv("EVOAGENT_TEST_CONTAINER_IMAGE", "")
 
 @unittest.skipUnless(CONTAINER_IMAGE, "EVOAGENT_TEST_CONTAINER_IMAGE is not configured")
 class ContainerVerifierIntegrationTests(unittest.TestCase):
+    def test_real_container_executes_verified_skill_snapshot(self):
+        source = """\
+import os
+
+from evoagent.reviewer import Reviewer
+
+class EmptyReviewer(Reviewer):
+    name = "container-snapshot"
+
+    def review(self, diff, parsed):
+        assert os.geteuid() != 0
+        return []
+
+def create_skill():
+    return EmptyReviewer()
+"""
+        diff = "--- a/app.py\n+++ b/app.py\n@@ -0,0 +1 @@\n+value = 1\n"
+        reviewer = SandboxedSkillReviewer(
+            "container-snapshot",
+            "/skill/skill.py",
+            container_image=CONTAINER_IMAGE,
+            source=source,
+            source_sha256=hashlib.sha256(source.encode()).hexdigest(),
+        )
+
+        self.assertEqual([], reviewer.review(diff, parse_unified_diff(diff)))
+
+    def test_real_container_skill_output_is_bounded_and_cleaned_up(self):
+        source = """\
+from evoagent.reviewer import Reviewer
+
+class NoisyReviewer(Reviewer):
+    name = "noisy"
+
+    def review(self, diff, parsed):
+        while True:
+            print("x" * 65536)
+
+def create_skill():
+    return NoisyReviewer()
+"""
+        reviewer = SandboxedSkillReviewer(
+            "noisy",
+            "/skill/skill.py",
+            timeout_seconds=5,
+            container_image=CONTAINER_IMAGE,
+            source=source,
+            source_sha256=hashlib.sha256(source.encode()).hexdigest(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "output limit"):
+            reviewer.review("", parse_unified_diff(""))
+
+        containers = subprocess.run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                "name=evoagent-skill-",
+                "--format",
+                "{{.Names}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        self.assertEqual("", containers.stdout.strip())
+
     def test_real_container_has_expected_security_boundary(self):
         with tempfile.TemporaryDirectory() as root:
             probe = os.path.join(root, "probe.py")

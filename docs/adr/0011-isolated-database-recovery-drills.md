@@ -22,7 +22,9 @@ Add a standalone `evoagent-dr` operational boundary.
   content fingerprints, database integrity, application adapter reads/writes,
   RPO/RTO objectives, and successful disposable-target cleanup.
 - Artifacts and versioned JSON manifests are created with owner-only mode.
-- Passwords never enter subprocess arguments or evidence.
+- Passwords never enter subprocess arguments or evidence; PostgreSQL tools
+  receive only PostgreSQL and basic runtime environment variables, not
+  application, GitHub, or model secrets.
 - CI performs the real PostgreSQL dump/restore path and retains only manifests,
   not data-bearing dumps.
 

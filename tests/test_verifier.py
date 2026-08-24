@@ -1,3 +1,4 @@
+import hashlib
 import io
 import os
 import sys
@@ -5,8 +6,12 @@ import tempfile
 import time
 import unittest
 import zipfile
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from evoagent import verifier as verifier_module
+from evoagent.bootstrap import _repair_verifier, build_components
+from evoagent.metrics import Metrics
 from evoagent.verifier import RepairVerifier
 
 
@@ -19,6 +24,48 @@ def _zip(files: dict[str, str]) -> bytes:
 
 
 class VerifierContentsTests(unittest.TestCase):
+    def test_resource_limits_cannot_be_disabled(self):
+        for name, value in (
+            ("timeout_seconds", 0),
+            ("memory_mb", 0),
+            ("pids_limit", 0),
+            ("max_output_bytes", 0),
+            ("max_file_mb", 0),
+            ("timeout_seconds", float("nan")),
+            ("memory_mb", True),
+            ("cpus", 0),
+            ("cpus", float("nan")),
+            ("cpus", True),
+            ("cpus", "1"),
+        ):
+            with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                RepairVerifier(**{name: value})
+
+    def test_application_verifier_always_requires_a_container(self):
+        settings = SimpleNamespace(
+            repair_verify_timeout_seconds=10,
+            repair_container_image="",
+            repair_memory_mb=256,
+            repair_pids_limit=32,
+            repair_cpus=0.5,
+            repair_max_output_bytes=1024,
+        )
+
+        verifier = _repair_verifier(settings, "pytest", "sha256:" + "a" * 64)
+        self.assertTrue(verifier.require_container)
+        self.assertEqual("sha256:" + "a" * 64, verifier.container_image)
+
+    def test_application_resolves_repair_image_before_opening_the_store(self):
+        settings = SimpleNamespace(repair_container_image="missing")
+        with (
+            patch("evoagent.bootstrap.resolve_container_image", side_effect=ValueError("missing")),
+            patch("evoagent.bootstrap.create_store") as create_store,
+            self.assertRaisesRegex(ValueError, "missing"),
+        ):
+            build_components(settings)  # type: ignore[arg-type]
+
+        create_store.assert_not_called()
+
     def test_syntax_error_fails_compile_gate(self):
         result = RepairVerifier().verify_contents({"app.py": "def broken(:\n"})
         self.assertFalse(result["passed"])
@@ -39,6 +86,19 @@ class VerifierArchiveTests(unittest.TestCase):
         result = RepairVerifier().verify_archive(archive, {"a.py": "new = 1\n"})
         self.assertTrue(result["passed"])
 
+    def test_archive_preserves_test_attestation(self):
+        archive = _zip({"repo-main/a.py": "old = 1\n"})
+        verifier = RepairVerifier(test_command="pytest")
+        verifier.verify_worktree = lambda _root: {  # type: ignore[method-assign]
+            "passed": True,
+            "checks": [],
+            "attestation": {"test_command_sha256": "digest"},
+        }
+
+        result = verifier.verify_archive(archive, {"a.py": "new = 1\n"})
+
+        self.assertEqual({"test_command_sha256": "digest"}, result["attestation"])
+
     def test_archive_compile_failure_short_circuits(self):
         archive = _zip({"repo-main/a.py": "x = 1\n"})
         result = RepairVerifier().verify_archive(archive, {"a.py": "def broken(:\n"})
@@ -48,6 +108,28 @@ class VerifierArchiveTests(unittest.TestCase):
         archive = _zip({"../evil.py": "x = 1\n"})
         with self.assertRaises(ValueError):
             RepairVerifier().verify_archive(archive, {})
+
+    def test_archive_rejects_excessive_uncompressed_size(self):
+        archive = _zip({"repo-main/a.py": "12345"})
+        with (
+            patch.object(RepairVerifier, "MAX_ARCHIVE_UNCOMPRESSED_BYTES", 4),
+            self.assertRaisesRegex(ValueError, "extraction limits"),
+        ):
+            RepairVerifier().verify_archive(archive, {})
+
+    def test_archive_expansion_cannot_exceed_container_memory_budget(self):
+        archive = _zip({"repo-main/a.py": "x" * (1024 * 1024 + 1)})
+        with self.assertRaisesRegex(ValueError, "extraction limits"):
+            RepairVerifier(memory_mb=1).verify_archive(archive, {})
+
+    def test_archive_type_and_compressed_size_share_the_memory_budget(self):
+        verifier = RepairVerifier(memory_mb=1)
+        for archive in ("not-bytes", b"x" * (1024 * 1024 + 1)):
+            with (
+                self.subTest(type=type(archive).__name__),
+                self.assertRaisesRegex(ValueError, "extraction limits"),
+            ):
+                verifier.verify_archive(archive, {})  # type: ignore[arg-type]
 
     def test_repair_path_cannot_escape_repository(self):
         archive = _zip({"repo-main/a.py": "x = 1\n"})
@@ -145,11 +227,29 @@ class VerifierHostModeTests(unittest.TestCase):
 
 
 class VerifierContainerModeTests(unittest.TestCase):
+    def test_container_cleanup_failure_is_not_ignored(self):
+        verifier = RepairVerifier(test_command="pytest", container_image="img")
+        verifier._execute = lambda *_args, **_kwargs: (0, "", False)  # type: ignore[method-assign]
+
+        def run(command, **_kwargs):
+            return SimpleNamespace(returncode=1 if command[:3] == ["docker", "rm", "-f"] else 0)
+
+        captured = Metrics()
+        with (
+            patch.object(verifier_module.subprocess, "run", side_effect=run),
+            patch("evoagent.verifier.metrics", captured),
+            tempfile.TemporaryDirectory() as root,
+            self.assertRaisesRegex(RuntimeError, "cleanup failed"),
+        ):
+            verifier.verify_worktree(root)
+
+        self.assertIn("evoagent_repair_container_cleanup_failures_total 1.0", captured.prometheus())
+
     def _capture_docker_command(self, verifier: RepairVerifier):
-        captured = {}
+        captured = {"commands": []}
 
         def _fake_run(command, **kwargs):
-            captured["command"] = command
+            captured["commands"].append(command)
 
             class _Result:
                 returncode = 0
@@ -159,18 +259,21 @@ class VerifierContainerModeTests(unittest.TestCase):
             return _Result()
 
         # `_execute` uses Popen; patch it to capture the docker argv instead of running it.
-        def _fake_execute(command, cwd, env):
-            captured["command"] = command
+        def _fake_execute(command, cwd, env, timeout_seconds=None):
+            captured["commands"].append(command)
             return 0, "ok", False
 
         original = verifier._execute
         verifier._execute = _fake_execute  # type: ignore[method-assign]
         try:
-            with tempfile.TemporaryDirectory() as root:
+            with (
+                patch.object(verifier_module.subprocess, "run", side_effect=_fake_run),
+                tempfile.TemporaryDirectory() as root,
+            ):
                 result = verifier.verify_worktree(root)
         finally:
             verifier._execute = original  # type: ignore[method-assign]
-        return result, captured["command"]
+        return result, captured["commands"]
 
     def test_container_command_uses_paired_isolation_flags(self):
         verifier = RepairVerifier(
@@ -180,26 +283,40 @@ class VerifierContainerModeTests(unittest.TestCase):
             pids_limit=64,
             cpus=0.5,
         )
-        result, command = self._capture_docker_command(verifier)
+        result, commands = self._capture_docker_command(verifier)
+        command, copy, execute = commands[:3]
         self.assertTrue(result["passed"])
         self.assertEqual("docker", command[0])
         self.assertEqual("512m", command[command.index("--memory") + 1])
         self.assertEqual("64", command[command.index("--pids-limit") + 1])
         self.assertEqual("0.5", command[command.index("--cpus") + 1])
         self.assertEqual("none", command[command.index("--network") + 1])
+        self.assertEqual("never", command[command.index("--pull") + 1])
         self.assertIn("--read-only", command)
         self.assertEqual("ALL", command[command.index("--cap-drop") + 1])
         self.assertIn("no-new-privileges", command)
         if os.name != "nt":
             self.assertIn("--user", command)
         self.assertIn("python:3.12-slim", command)
-        self.assertEqual(["sh", "-c", "pytest -q"], command[-3:])
+        self.assertNotIn("-v", command)
+        self.assertEqual(["docker", "cp", "--archive"], copy[:3])
+        self.assertEqual("/work", copy[-1].split(":", 1)[1])
+        self.assertEqual(["sh", "-c", "pytest -q"], execute[-3:])
+        self.assertEqual(
+            {
+                "execution_mode": "container",
+                "container_image": "python:3.12-slim",
+                "test_command_sha256": hashlib.sha256(b"pytest -q").hexdigest(),
+            },
+            result["attestation"],
+        )
+        self.assertNotIn("pytest -q", str(result["attestation"]))
 
     def test_container_timeout_force_removes_container(self):
         calls = []
         verifier = RepairVerifier(test_command="pytest", container_image="img", timeout_seconds=1)
 
-        def _fake_execute(command, cwd, env):
+        def _fake_execute(command, cwd, env, timeout_seconds=None):
             calls.append(command)
             return None, "", True
 
@@ -225,6 +342,29 @@ class VerifierContainerModeTests(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertIn("exceeded", result["checks"][0]["detail"])
         self.assertTrue(any(c[:3] == ["docker", "rm", "-f"] for c in calls))
+
+    def test_copy_failure_removes_container_without_running_tests(self):
+        calls = []
+        verifier = RepairVerifier(test_command="pytest", container_image="img")
+
+        def run(command, **_kwargs):
+            calls.append(command)
+            return SimpleNamespace(
+                returncode=1 if command[:3] == ["docker", "cp", "--archive"] else 0
+            )
+
+        def execute(*_args, **_kwargs):
+            raise AssertionError("tests must not run after a failed worktree copy")
+
+        verifier._execute = execute  # type: ignore[method-assign]
+        with (
+            patch.object(verifier_module.subprocess, "run", side_effect=run),
+            tempfile.TemporaryDirectory() as root,
+        ):
+            result = verifier.verify_worktree(root)
+
+        self.assertEqual("error", result["status"])
+        self.assertTrue(any(command[:3] == ["docker", "rm", "-f"] for command in calls))
 
 
 if __name__ == "__main__":

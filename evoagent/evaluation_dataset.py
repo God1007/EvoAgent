@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from .diff_parser import parse_unified_diff
+from .json_boundary import strict_json_loads
 
 SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
@@ -53,6 +54,26 @@ def validate_case(case: dict[str, Any], line_number: int = 0) -> None:
             for path, line in added_locations
         ):
             raise ValueError("%s finding does not cover an added line" % prefix)
+    after_files = case.get("after_files", {})
+    if not isinstance(after_files, dict) or any(
+        not isinstance(path, str) or not isinstance(content, str)
+        for path, content in after_files.items()
+    ):
+        raise ValueError("%s after_files must map string paths to string contents" % prefix)
+    repair = case.get("repair_validation", {})
+    if not isinstance(repair, dict):
+        raise ValueError("%s repair_validation must be an object" % prefix)
+    auto_fixable = repair.get("auto_fixable", False)
+    risk_pattern = repair.get("risk_pattern", "")
+    required_patterns = repair.get("required_after_patterns", [])
+    if type(auto_fixable) is not bool:
+        raise ValueError("%s auto_fixable must be a boolean" % prefix)
+    if not isinstance(risk_pattern, str) or (auto_fixable and not risk_pattern):
+        raise ValueError("%s repair risk_pattern must be a non-empty string" % prefix)
+    if not isinstance(required_patterns, list) or any(
+        not isinstance(pattern, str) for pattern in required_patterns
+    ):
+        raise ValueError("%s required_after_patterns must contain only strings" % prefix)
 
 
 def load_jsonl(path: str) -> list[dict[str, Any]]:
@@ -62,8 +83,8 @@ def load_jsonl(path: str) -> list[dict[str, Any]]:
             if not raw.strip():
                 continue
             try:
-                case = json.loads(raw)
-            except json.JSONDecodeError as exc:
+                case = strict_json_loads(raw)
+            except (ValueError, RecursionError) as exc:
                 raise ValueError("invalid JSON on line %d: %s" % (line_number, exc)) from exc
             if not isinstance(case, dict):
                 raise ValueError("dataset line %d must be a JSON object" % line_number)

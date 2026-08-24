@@ -86,6 +86,7 @@ def build_queue_recovery_plan(store: RecoveryStorePort, max_tasks: int) -> Queue
             {
                 "task_id": str(candidate.get("task_id", "")),
                 "tenant_id": str(candidate.get("tenant_id", "")),
+                "outbox_id": str(candidate.get("outbox_id", "")),
                 "outbox_status": status,
                 "recoverable": is_recoverable,
                 "payload_sha256": payload_sha256,
@@ -112,6 +113,8 @@ class RedisRecoveryTarget:
             raise ValueError("Redis recovery URL must use redis:// or rediss://")
         if parsed.scheme == "redis" and host not in _LOOPBACK:
             raise ValueError("Redis recovery requires TLS outside loopback")
+        if parsed.query:
+            raise ValueError("Redis recovery URL must not contain query parameters")
         if parsed.fragment:
             raise ValueError("Redis recovery URL must not contain a fragment")
         try:
@@ -128,12 +131,17 @@ class RedisRecoveryTarget:
         self._client.ping()
 
     def inspect(self, marker: str) -> str:
-        size = int(self._client.dbsize())
-        if size == 0:
-            return "empty"
-        if size == 1 and self._client.get(RECOVERY_MARKER) == marker:
-            return "reserved"
-        return "nonempty"
+        return str(
+            self._client.eval(
+                "local size=redis.call('DBSIZE'); "
+                "if size==0 then return 'empty' end; "
+                "if size==1 and redis.call('GET',KEYS[1])==ARGV[1] then return 'reserved' end; "
+                "return 'nonempty'",
+                1,
+                RECOVERY_MARKER,
+                marker,
+            )
+        )
 
     def reserve(self, marker: str) -> str:
         result = self._client.eval(

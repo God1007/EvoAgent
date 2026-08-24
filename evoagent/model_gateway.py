@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 import re
 import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Protocol
 
 from .circuit_breaker import CircuitBreaker, CircuitOpenError
 from .errors import AccessDeniedError, ClientInputError
+from .json_boundary import strict_json_loads
 from .metrics import metrics
 
 
@@ -62,9 +67,53 @@ class ModelRoute:
     model: str
     base_url: str
     api_key: str = field(repr=False)
-    headers: dict[str, str] = field(default_factory=dict, repr=False)
+    headers: Mapping[str, str] = field(default_factory=dict, repr=False)
     route_id: str = "default"
     region: str = ""
+
+    def __post_init__(self) -> None:
+        if any(
+            not isinstance(value, str)
+            or not value
+            or value != value.strip()
+            or len(value) > 200
+            or not value.isprintable()
+            for value in (self.provider, self.model)
+        ):
+            raise ValueError("model route provider and model must be bounded printable strings")
+        if not isinstance(self.base_url, str) or not self.base_url:
+            raise ValueError("model route base_url must be a non-empty string")
+        if (
+            not isinstance(self.api_key, str)
+            or not 1 <= len(self.api_key) <= 4096
+            or not self.api_key.isascii()
+            or any(character.isspace() or ord(character) < 33 for character in self.api_key)
+        ):
+            raise ValueError("model route API key must be a bounded ASCII bearer token")
+        if not isinstance(self.route_id, str) or not _ROUTE_ID.fullmatch(self.route_id):
+            raise ValueError("model route id must be a stable identifier")
+        if (
+            not isinstance(self.region, str)
+            or len(self.region) > 100
+            or self.region != self.region.strip()
+            or (self.region and not self.region.isprintable())
+        ):
+            raise ValueError("model route region must be a bounded printable string")
+        if not isinstance(self.headers, Mapping) or len(self.headers) > 32:
+            raise ValueError("model route headers must be a bounded mapping")
+        headers = dict(self.headers)
+        if any(
+            not isinstance(name, str)
+            or not _HEADER_NAME.fullmatch(name)
+            or name.casefold() in {"authorization", "content-type", "accept"}
+            or not isinstance(value, str)
+            or len(value) > 8192
+            or not value.isascii()
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+            for name, value in headers.items()
+        ):
+            raise ValueError("model route contains an invalid or reserved header")
+        object.__setattr__(self, "headers", MappingProxyType(headers))
 
 
 @dataclass(frozen=True)
@@ -96,6 +145,7 @@ class ModelOutputError(RuntimeError):
 
 
 _ROUTE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+_HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,100}$")
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
 _SECRET_ASSIGNMENT = re.compile(
     r"(?i)\b(password|passwd|api[_-]?key|secret|token)\b(\s*[:=]\s*)(['\"])([^'\"\n]+)(['\"])"
@@ -107,6 +157,7 @@ _PRIVATE_KEY = re.compile(
 )
 _ROUTE_FIELDS = frozenset({"id", "provider", "model", "base_url", "api_key_env", "region"})
 _MESSAGE_ROLES = frozenset({"system", "user", "assistant"})
+MAX_MODEL_ROUTE_BYTES = 64 * 1024
 
 
 def _redact_text(value: str, explicit_secrets: tuple[str, ...] = ()) -> tuple[str, int]:
@@ -155,12 +206,22 @@ def load_model_route(path: str) -> ModelRoute:
     """Load exactly one trusted route; secrets remain environment-backed."""
     try:
         with open(path, "rb") as handle:
-            document = tomllib.load(handle)
+            content = handle.read(MAX_MODEL_ROUTE_BYTES + 1)
     except OSError as exc:
         raise ValueError("cannot read EVOAGENT_LLM_ROUTES_FILE: %s" % exc) from exc
-    except tomllib.TOMLDecodeError as exc:
+    if len(content) > MAX_MODEL_ROUTE_BYTES:
+        raise ValueError("EVOAGENT_LLM_ROUTES_FILE exceeds the 64 KiB limit")
+    try:
+        document = tomllib.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise ValueError("EVOAGENT_LLM_ROUTES_FILE is not valid TOML: %s" % exc) from exc
-    if set(document).difference({"version", "routes"}) or document.get("version") != 1:
+    version = document.get("version")
+    if (
+        set(document).difference({"version", "routes"})
+        or isinstance(version, bool)
+        or not isinstance(version, int)
+        or version != 1
+    ):
         raise ValueError("model routes file must use version 1")
     routes = document.get("routes")
     if not isinstance(routes, list) or len(routes) != 1 or not isinstance(routes[0], dict):
@@ -198,17 +259,35 @@ def load_model_route(path: str) -> ModelRoute:
 
 
 def _validated_endpoint(base_url: str, allowed_hosts: tuple[str, ...]) -> str:
+    if base_url != base_url.strip() or any(
+        character.isspace() or ord(character) < 32 or ord(character) == 127
+        for character in base_url
+    ):
+        raise ValueError("model route URL must not contain whitespace or control characters")
     parsed = urllib.parse.urlparse(base_url.rstrip("/"))
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ValueError("model route must use a valid network port") from None
+    if port == 0:
+        raise ValueError("model route must use a valid network port")
     host = (parsed.hostname or "").lower()
     if not host or parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError("model route must be an absolute URL without credentials or query data")
     loopback = host in {"localhost", "127.0.0.1", "::1"}
     if parsed.scheme != "https" and not (parsed.scheme == "http" and loopback):
         raise ValueError("model route must use HTTPS (HTTP is allowed only for loopback)")
+    if not loopback and port not in (None, 443):
+        raise ValueError("model route must use port 443 outside loopback")
     allowed = {item.strip().lower() for item in allowed_hosts if item.strip()} or {host}
     if host not in allowed:
         raise ValueError("model route host is not an allowed EVOAGENT_LLM_ALLOWED_HOSTS entry")
     return base_url.rstrip("/") + "/chat/completions"
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError("model provider redirects are not allowed")
 
 
 class OpenAICompatibleModelProvider:
@@ -219,10 +298,26 @@ class OpenAICompatibleModelProvider:
         max_response_bytes: int = 2 * 1024 * 1024,
         breaker: CircuitBreaker | None = None,
     ):
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("model provider timeout must be positive and finite")
+        if (
+            isinstance(max_response_bytes, bool)
+            or not isinstance(max_response_bytes, int)
+            or max_response_bytes <= 0
+        ):
+            raise ValueError("model provider response limit must be a positive integer")
         self.allowed_hosts = allowed_hosts
         self.timeout_seconds = timeout_seconds
         self.max_response_bytes = max_response_bytes
         self.breaker = breaker
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirectHandler()
+        )
 
     def complete(
         self,
@@ -254,33 +349,55 @@ class OpenAICompatibleModelProvider:
             headers=headers,
             method="POST",
         )
+        if self.breaker is not None:
+            self.breaker.allow()
         try:
-            with self._open(request) as response:
+            with self._opener.open(request, timeout=self.timeout_seconds) as response:
                 raw = response.read(self.max_response_bytes + 1)
             if len(raw) > self.max_response_bytes:
                 raise ValueError("model response exceeds the configured size limit")
-            body = json.loads(raw.decode("utf-8"))
+            body = strict_json_loads(raw)
             content = body["choices"][0]["message"]["content"]
             if not isinstance(content, str):
                 raise TypeError("model content is not text")
-            usage = body.get("usage") or {}
-            return ModelResponse(
+            usage = body.get("usage")
+            usage = {} if usage is None else usage
+            if not isinstance(usage, dict):
+                raise TypeError("model usage is not an object")
+            input_tokens = usage.get("prompt_tokens", 0)
+            output_tokens = usage.get("completion_tokens", 0)
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in (input_tokens, output_tokens)
+            ):
+                raise TypeError("model token usage is not a non-negative integer")
+            request_id = body.get("id", "")
+            if not isinstance(request_id, str):
+                raise TypeError("model request id is not text")
+            result = ModelResponse(
                 content,
                 route.provider,
                 route.model,
-                max(0, int(usage.get("prompt_tokens", 0) or 0)),
-                max(0, int(usage.get("completion_tokens", 0) or 0)),
-                str(body.get("id", "")),
+                input_tokens,
+                output_tokens,
+                request_id,
             )
         except urllib.error.HTTPError as exc:
-            detail = exc.read(1000).decode("utf-8", errors="replace")
-            detail, _ = _redact_text(detail, (route.api_key, *route.headers.values()))
+            try:
+                transient = exc.code in {408, 425, 429} or exc.code >= 500
+                if self.breaker is not None:
+                    if transient:
+                        self.breaker.record_failure()
+                    else:
+                        self.breaker.record_success()
+                detail = exc.read(1000).decode("utf-8", errors="replace")
+                detail, _ = _redact_text(detail, (route.api_key, *route.headers.values()))
+            finally:
+                exc.close()
             raise ModelProviderError(
                 "%s API returned HTTP %d: %s" % (route.provider, exc.code, detail),
-                transient=exc.code in {408, 425, 429} or exc.code >= 500,
+                transient=transient,
             ) from exc
-        except CircuitOpenError:
-            raise
         except (
             TimeoutError,
             urllib.error.URLError,
@@ -288,29 +405,21 @@ class OpenAICompatibleModelProvider:
             KeyError,
             IndexError,
             TypeError,
+            RecursionError,
         ) as exc:
+            if self.breaker is not None:
+                self.breaker.record_failure()
             detail, _ = _redact_text(str(exc), (route.api_key, *route.headers.values()))
             raise ModelProviderError(
                 "%s model request failed: %s" % (route.provider, detail), transient=True
             ) from exc
-
-    def _open(self, request: urllib.request.Request):
-        if self.breaker is None:
-            return urllib.request.urlopen(request, timeout=self.timeout_seconds)
-        self.breaker.allow()
-        try:
-            response = urllib.request.urlopen(request, timeout=self.timeout_seconds)
-        except urllib.error.HTTPError as exc:
-            if exc.code in {408, 425, 429} or exc.code >= 500:
-                self.breaker.record_failure()
-            else:
-                self.breaker.record_success()
-            raise
         except Exception:
-            self.breaker.record_failure()
+            if self.breaker is not None:
+                self.breaker.record_failure()
             raise
-        self.breaker.record_success()
-        return response
+        if self.breaker is not None:
+            self.breaker.record_success()
+        return result
 
 
 class ModelGateway:
@@ -323,6 +432,21 @@ class ModelGateway:
         self.route = route
         self.provider = provider
         self.options = options or ModelGatewayOptions()
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (
+                self.options.max_input_tokens,
+                self.options.max_output_tokens,
+                self.options.max_response_bytes,
+            )
+        ):
+            raise ValueError("model gateway token and response limits must be positive integers")
+        if (route is None) != (provider is None):
+            raise ValueError("model route and provider must be configured together")
+        if route is not None:
+            if not isinstance(route.base_url, str) or not route.base_url:
+                raise ValueError("model route base_url must be a non-empty string")
+            _validated_endpoint(route.base_url, self.options.allowed_hosts)
 
     @property
     def configured(self) -> bool:
@@ -338,6 +462,32 @@ class ModelGateway:
             "region": self.route.region,
         }
 
+    def execution_revision(self) -> str:
+        """Return a secret-free digest of settings that can change model execution."""
+        route = self.route
+        payload = (
+            {
+                "route": {
+                    "provider": route.provider,
+                    "model": route.model,
+                    "base_url": route.base_url,
+                    "route_id": route.route_id,
+                    "region": route.region,
+                    "header_names": sorted(route.headers),
+                },
+                "limits": {
+                    "allowed_hosts": sorted(self.options.allowed_hosts),
+                    "max_input_tokens": self.options.max_input_tokens,
+                    "max_output_tokens": self.options.max_output_tokens,
+                    "max_response_bytes": self.options.max_response_bytes,
+                },
+            }
+            if route
+            else {"route": None}
+        )
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
     @property
     def breaker_state_code(self) -> int:
         breaker = getattr(self.provider, "breaker", None)
@@ -346,6 +496,32 @@ class ModelGateway:
     def complete(self, request: ModelRequest) -> ModelResponse:
         if not self.route or not self.provider:
             raise RuntimeError("model gateway is not configured")
+        if not isinstance(request, ModelRequest):
+            raise ClientInputError("model request must use the governed request schema")
+        if (
+            any(
+                not isinstance(value, str)
+                for value in (
+                    request.tenant_id,
+                    request.repository,
+                    request.task_id,
+                    request.purpose,
+                    request.required_region,
+                )
+            )
+            or not request.tenant_id
+            or not request.repository
+            or not request.purpose
+            or not isinstance(request.allowed_providers, tuple)
+            or any(not isinstance(value, str) for value in request.allowed_providers)
+            or not isinstance(request.allowed_models, tuple)
+            or any(not isinstance(value, str) for value in request.allowed_models)
+        ):
+            raise ClientInputError("model request contains invalid governance metadata")
+        if not isinstance(request.require_json_object, bool):
+            raise ClientInputError("model request JSON mode must be boolean")
+        if not isinstance(request.messages, tuple):
+            raise ClientInputError("model request messages must use the message schema")
         route = self.route
         if request.allowed_providers and route.provider not in request.allowed_providers:
             raise AccessDeniedError("model provider is not allowed by repository policy")
@@ -355,17 +531,31 @@ class ModelGateway:
             raise AccessDeniedError("model route does not satisfy the required region")
         if not request.messages:
             raise ClientInputError("model request messages are required")
-        if any(
-            message.role not in _MESSAGE_ROLES or not isinstance(message.content, str)
-            for message in request.messages
+        input_tokens = 0
+        try:
+            for message in request.messages:
+                if not isinstance(message, ModelMessage):
+                    raise ClientInputError("model request messages must use the message schema")
+                if (
+                    not isinstance(message.role, str)
+                    or message.role not in _MESSAGE_ROLES
+                    or not isinstance(message.content, str)
+                ):
+                    raise ClientInputError("model request contains an invalid message")
+                input_tokens += _estimated_tokens(message.content)
+                if input_tokens > self.options.max_input_tokens:
+                    raise ClientInputError("model input exceeds the configured token limit")
+        except UnicodeEncodeError:
+            raise ClientInputError("model request messages must contain valid UTF-8") from None
+        max_output_tokens = request.max_output_tokens
+        if max_output_tokens is None:
+            max_output_tokens = self.options.max_output_tokens
+        if (
+            isinstance(max_output_tokens, bool)
+            or not isinstance(max_output_tokens, int)
+            or not 1 <= max_output_tokens <= self.options.max_output_tokens
         ):
-            raise ClientInputError("model request contains an invalid message")
-        input_tokens = sum(_estimated_tokens(message.content) for message in request.messages)
-        if input_tokens > self.options.max_input_tokens:
-            raise ClientInputError("model input exceeds the configured token limit")
-        max_output_tokens = request.max_output_tokens or self.options.max_output_tokens
-        if not 1 <= max_output_tokens <= self.options.max_output_tokens:
-            raise ClientInputError("model output limit exceeds the configured maximum")
+            raise ClientInputError("model output limit must be a positive bounded integer")
         secrets = (route.api_key, *route.headers.values())
         messages, redactions = redact_model_messages(request.messages, secrets)
         if redactions:
@@ -383,13 +573,32 @@ class ModelGateway:
             raise ModelProviderError(
                 "%s model request failed: %s" % (route.provider, detail), transient=True
             ) from exc
-        if len(response.content.encode("utf-8")) > self.options.max_response_bytes:
+        if (
+            not isinstance(response, ModelResponse)
+            or not isinstance(response.content, str)
+            or response.provider != route.provider
+            or response.model != route.model
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+                for value in (response.input_tokens, response.output_tokens)
+            )
+            or response.output_tokens > max_output_tokens
+            or not isinstance(response.request_id, str)
+        ):
+            metrics.inc("model_requests_failed_total")
+            raise ModelOutputError("model provider response violates the gateway contract")
+        try:
+            response_bytes = response.content.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            metrics.inc("model_requests_failed_total")
+            raise ModelOutputError("model provider response violates the gateway contract") from exc
+        if len(response_bytes) > self.options.max_response_bytes:
             metrics.inc("model_requests_failed_total")
             raise ModelOutputError("model response exceeds the configured size limit")
         if request.require_json_object:
             try:
-                output = json.loads(response.content)
-            except json.JSONDecodeError as exc:
+                output = strict_json_loads(response.content)
+            except (UnicodeError, ValueError, RecursionError) as exc:
                 metrics.inc("model_requests_failed_total")
                 raise ModelOutputError("model response is not valid JSON") from exc
             if not isinstance(output, dict):

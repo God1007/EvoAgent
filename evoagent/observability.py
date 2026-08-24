@@ -3,6 +3,7 @@
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
+from typing import Any
 
 from .errors import safe_exception_fields
 from .ports import AlertStorePort
@@ -14,21 +15,27 @@ logger = logging.getLogger("evoagent")
 class Observability:
     def __init__(self, service_name: str = "evoagent", endpoint: str = ""):
         self.tracer = None
+        self._provider: Any = None
         try:
-            from opentelemetry import trace
             from opentelemetry.sdk.resources import Resource
             from opentelemetry.sdk.trace import TracerProvider
             from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
             provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
+            self._provider = provider
             if endpoint:
                 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
                 provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
-            trace.set_tracer_provider(provider)
-            self.tracer = trace.get_tracer(service_name)
+            self.tracer = provider.get_tracer(service_name)
         except ImportError:
+            self.close()
             self.tracer = None
+
+    def close(self) -> None:
+        provider, self._provider = self._provider, None
+        if provider is not None:
+            provider.shutdown()
 
     @contextmanager
     def span(self, name: str, trace_id: str = "", **attributes):
@@ -67,8 +74,9 @@ class AlertManager:
 
     def evaluate(self, tenant_id: str) -> None:
         stats = self.store.dashboard_stats(tenant_id)
-        if stats["tasks_total"] >= self.min_samples:
-            rate = stats["tasks_failed"] / stats["tasks_total"]
+        samples = stats["tasks_success"] + stats["tasks_failed"]
+        if samples >= self.min_samples:
+            rate = stats["tasks_failed"] / samples
             if rate > self.failure_rate:
                 self.store.create_alert(
                     tenant_id,
@@ -77,3 +85,5 @@ class AlertManager:
                     "Review failure rate %.1f%% exceeds the %.1f%% threshold."
                     % (rate * 100, self.failure_rate * 100),
                 )
+            else:
+                self.store.clear_alert(tenant_id, "review-failure-rate")

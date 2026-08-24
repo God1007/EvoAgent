@@ -27,6 +27,10 @@ throttle; capacity `503` consumes availability budget. Review and Proof latency
 are histograms. Queue/Outbox oldest age and current DLQ depth detect stuck work
 that a length-only dashboard misses.
 
+Retryable worker failures increment `review_attempts_failed_total`; they enter the
+terminal review-failure series and canary result only once, when queue exhaustion
+releases the task admission into the DLQ.
+
 Ship the catalog, Prometheus recording/multi-window burn alerts, Grafana
 dashboard, and operator runbook as versioned package assets. `evoagent-slo`
 queries one scalar per indicator/sample count using an exact-host, HTTPS,
@@ -40,9 +44,8 @@ and never claim success.
 - The 500 ms production intake threshold is intentionally looser than the
   150 ms per-instance engineering target; the former includes deployment and
   dependency variation while the latter catches code regressions.
-- The metric registry is process-local. Production runs one web worker per pod
-  and scales pods horizontally; `SO_REUSEPORT` multi-worker mode cannot provide
-  a complete scrape without a future multiprocess aggregator.
+- The metric registry is process-local. Production runs one process per pod and
+  scales pods horizontally, so every Prometheus target is complete.
 - SLO compliance still requires adequate Prometheus retention and independent
   production traffic. Synthetic load tests remain regression evidence, not an
   availability claim.

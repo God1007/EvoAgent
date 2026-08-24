@@ -1,14 +1,17 @@
 """Generate/replay the 100-case benchmark and write JSON plus Markdown reports."""
 
 import argparse
+import hashlib
 import json
 import os
+import platform
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from evoagent import __version__  # noqa: E402
 from evoagent.evaluation_benchmark import (  # noqa: E402
     baseline_reviewer,
     candidate_reviewer,
@@ -20,6 +23,8 @@ from evoagent.evaluation_harness import (  # noqa: E402
     FixtureRepairer,
     comparison_summary,
 )
+from evoagent.json_boundary import strict_json_loads  # noqa: E402
+from evoagent.review_engine import _APPLICATION_SOURCE_REVISION  # noqa: E402
 
 
 def write_jsonl(path, cases):
@@ -33,7 +38,18 @@ def percent(value):
     return "%.1f%%" % (100 * value)
 
 
-def markdown_report(baseline, candidate, comparison):
+def reproducibility_metadata():
+    with open(os.path.join(ROOT, "requirements.lock"), "rb") as handle:
+        lock_sha256 = hashlib.sha256(handle.read()).hexdigest()
+    return {
+        "evoagent_version": __version__,
+        "python_version": platform.python_version(),
+        "application_source_sha256": _APPLICATION_SOURCE_REVISION,
+        "requirements_lock_sha256": lock_sha256,
+    }
+
+
+def markdown_report(baseline, candidate, comparison, reproducibility):
     b = baseline["metrics"]
     c = candidate["metrics"]
     dataset = candidate["dataset"]
@@ -55,6 +71,16 @@ def markdown_report(baseline, candidate, comparison):
         "- 仓库：%d 个，按仓库划分 Validation/Holdout" % dataset["repositories"],
         "- 来源标记：`%s`" % ", ".join(dataset["source_kinds"]),
         "- SHA-256：`%s`" % dataset["sha256"],
+        "- EvoAgent：`%s`（源码 SHA-256：`%s`）"
+        % (
+            reproducibility["evoagent_version"],
+            reproducibility["application_source_sha256"],
+        ),
+        "- Python：`%s`；requirements.lock SHA-256：`%s`"
+        % (
+            reproducibility["python_version"],
+            reproducibility["requirements_lock_sha256"],
+        ),
         "",
         source_note,
         "",
@@ -251,8 +277,10 @@ def main():
 
     annotation_evidence = None
     if args.annotation_evidence:
-        with open(args.annotation_evidence, encoding="utf-8") as handle:
-            annotation_evidence = json.load(handle)
+        with open(args.annotation_evidence, "rb") as handle:
+            annotation_evidence = strict_json_loads(handle.read())
+        if not isinstance(annotation_evidence, dict):
+            raise ValueError("annotation evidence must be a JSON object")
 
     baseline = EndToEndEvaluationHarness().run(
         baseline_reviewer(),
@@ -267,8 +295,10 @@ def main():
         annotation_evidence,
     )
     comparison = comparison_summary(baseline, candidate)
+    reproducibility = reproducibility_metadata()
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
+        "reproducibility": reproducibility,
         "baseline": baseline,
         "candidate": candidate,
         "comparison": comparison,
@@ -280,7 +310,7 @@ def main():
         json.dump(report, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\n")
     with open(markdown_path, "w", encoding="utf-8", newline="\n") as handle:
-        handle.write(markdown_report(baseline, candidate, comparison))
+        handle.write(markdown_report(baseline, candidate, comparison, reproducibility))
 
     print("dataset:", args.dataset)
     print("report:", json_path)

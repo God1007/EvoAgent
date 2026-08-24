@@ -15,6 +15,7 @@ from .ports import ServiceStorePort
 @dataclass(frozen=True)
 class RetentionOptions:
     retention_days: int = 0
+    webhook_replay_seconds: int = 600
     interval_seconds: int = 3600
     batch_size: int = 1000
     max_batches_per_run: int = 10
@@ -28,6 +29,20 @@ class RetentionManager:
     service shutdown before the Store capability is closed.
     """
 
+    _COUNT_KEYS = (
+        "trace_events",
+        "execution_tasks",
+        "task_payloads",
+        "checkpoints",
+        "agent_messages",
+        "outbox_messages",
+        "effect_receipts",
+        "webhook_deliveries",
+        "release_observations",
+        "session_turns",
+        "session_findings",
+    )
+
     def __init__(
         self,
         store: ServiceStorePort,
@@ -35,6 +50,36 @@ class RetentionManager:
         *,
         autostart: bool = True,
     ):
+        if any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in (
+                options.retention_days,
+                options.webhook_replay_seconds,
+                options.interval_seconds,
+                options.batch_size,
+                options.max_batches_per_run,
+            )
+        ):
+            raise ValueError("retention limits must be integers")
+        if not 0 <= options.retention_days <= 36_500:
+            raise ValueError("retention days must be between 0 and 36500")
+        if options.webhook_replay_seconds <= 0:
+            raise ValueError("webhook replay window must be positive")
+        if (
+            options.retention_days
+            and options.retention_days * 86_400 <= options.webhook_replay_seconds
+        ):
+            raise ValueError("retention age must exceed the webhook replay window")
+        if options.interval_seconds <= 0 or (
+            options.retention_days and options.interval_seconds < 60
+        ):
+            raise ValueError("retention interval must be positive and at least 60 when enabled")
+        if not 1 <= options.batch_size <= 10_000:
+            raise ValueError("retention batch size must be between 1 and 10000")
+        if options.max_batches_per_run <= 0:
+            raise ValueError("retention batches per run must be positive")
+        if not isinstance(autostart, bool):
+            raise ValueError("retention autostart must be boolean")
         self.store = store
         self.options = options
         self.enabled = options.retention_days > 0
@@ -55,7 +100,7 @@ class RetentionManager:
 
     @staticmethod
     def _empty_counts() -> dict[str, int]:
-        return {"trace_events": 0, "session_turns": 0, "session_findings": 0}
+        return {key: 0 for key in RetentionManager._COUNT_KEYS}
 
     def run_once(self, now: datetime | None = None) -> dict[str, int]:
         if not self.enabled:
@@ -64,26 +109,36 @@ class RetentionManager:
         cutoff = (current - timedelta(days=self.options.retention_days)).isoformat()
         pruned_at = current.isoformat()
         totals = self._empty_counts()
-        for _ in range(max(1, self.options.max_batches_per_run)):
+        for _ in range(self.options.max_batches_per_run):
             result = self.store.prune_operational_history(
                 cutoff,
                 cutoff,
                 self.options.batch_size,
                 pruned_at,
             )
-            batch = {
-                key: max(0, int(result.get(key, 0)))
-                for key in ("trace_events", "session_turns", "session_findings")
-            }
+            batch = {key: max(0, int(result.get(key, 0))) for key in self._COUNT_KEYS}
             for key, value in batch.items():
                 totals[key] += value
             if (
                 batch["trace_events"] < self.options.batch_size
+                and batch["execution_tasks"] < self.options.batch_size
+                and batch["outbox_messages"] < self.options.batch_size
+                and batch["effect_receipts"] < self.options.batch_size
+                and batch["webhook_deliveries"] < self.options.batch_size
+                and batch["release_observations"] < self.options.batch_size
                 and batch["session_turns"] < self.options.batch_size
             ):
                 break
         metrics.inc("retention_runs_total")
         metrics.inc("retention_trace_events_pruned_total", totals["trace_events"])
+        metrics.inc("retention_execution_tasks_pruned_total", totals["execution_tasks"])
+        metrics.inc("retention_task_payloads_pruned_total", totals["task_payloads"])
+        metrics.inc("retention_checkpoints_pruned_total", totals["checkpoints"])
+        metrics.inc("retention_agent_messages_pruned_total", totals["agent_messages"])
+        metrics.inc("retention_outbox_messages_pruned_total", totals["outbox_messages"])
+        metrics.inc("retention_effect_receipts_pruned_total", totals["effect_receipts"])
+        metrics.inc("retention_webhook_deliveries_pruned_total", totals["webhook_deliveries"])
+        metrics.inc("retention_release_observations_pruned_total", totals["release_observations"])
         metrics.inc("retention_session_turns_pruned_total", totals["session_turns"])
         metrics.inc("retention_session_findings_pruned_total", totals["session_findings"])
         with self._lock:

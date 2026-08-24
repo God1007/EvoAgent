@@ -13,10 +13,16 @@ CI starts temporary PostgreSQL and Redis services and covers:
 
 - migrations, concurrent startup and connection pooling;
 - transactional outbox publication and tenant admission;
-- Redis ACK, dedupe, heartbeat, reclaim, retry and DLQ replay;
+- Redis ACK, dedupe, heartbeat, reclaim, retry and durable DLQ storage;
 - local container Proof and repair verification;
+- the serving image under its non-root, read-only, capability-dropped runtime;
 - PostgreSQL restore drills and PostgreSQL-to-Redis reconstruction;
-- wheel installation and console entry points.
+- wheel installation and console entry points;
+- an audited CycloneDX inventory generated from the hash-locked runtime dependencies.
 
-Tests must use disposable databases. `tests/db_support.py` creates an isolated
-schema per test and removes it afterward; do not point it at production.
+Tests must use disposable databases. `tests/db_support.py` truncates application
+tables between tests, so database cases must not run in parallel against the
+same database; never point it at production. CI also fails if its selected
+PostgreSQL, Redis, or container contract suites skip any test. The real-service
+job retains JUnit results and PostgreSQL-adapter coverage XML for boundary-level
+evidence and future coverage-floor calibration.

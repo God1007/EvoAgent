@@ -5,7 +5,8 @@ __pycache__
 .DS_Store
 .git
 .github
-.env
+.env*
+!.env.example
 .mypy_cache
 .pytest_cache
 .ruff_cache

@@ -29,7 +29,7 @@ rejected before persistence.
 | --- | --- |
 | `enabled` | Intake, queued execution, and repair publication |
 | `max_diff_bytes` | API Diff intake and webhook Diff fetch, in addition to the global cap |
-| `allowed_reviewers` | Review execution using the configured reviewer contributions |
+| `allowed_reviewers` | Whole configured review-pipeline identity at intake and execution |
 | `allowed_llm_providers` / `allowed_llm_models` | Intake and queued execution |
 | `llm_region` | Intake route eligibility and every gateway call |
 | `post_review_comments` | GitHub comment publication |
@@ -39,6 +39,12 @@ rejected before persistence.
 `llm_region` can bind sensitive repositories to the configured route's exact
 region identifier. Provider and model allowlists are evaluated at intake and
 again inside the gateway.
+
+`allowed_reviewers` is intentionally pipeline-level: the default value is
+`multi-agent-collaboration`, and unavailable names are rejected when a policy
+is saved. It does not select individual specialists or Skills inside that
+coordinator; production Skill membership is governed by the immutable deployed
+reviewer revision.
 
 ## Version and execution semantics
 
@@ -54,13 +60,18 @@ Review intake stores the selected version and normalized policy in the task
 input. Retries therefore use the same reviewer/model/Diff/publication decision
 even if an administrator later edits the policy. One exception is the emergency
 kill switch: queued execution also reads the current policy and stops when the
-repository is now disabled; current comment publication can likewise turn
-posting off immediately.
+repository is now disabled. Comment publication rechecks comment permission;
+verified repair publication rechecks `enabled`, `auto_fix` and every applied
+rule at the provider write boundary, after any existing-comment scan. Session
+state is checked at the same boundary so closed, draft, or superseded turns do
+not publish.
 
 Existing installations remain backward compatible. If no versioned policy
 exists for a repository, the resolver delegates to `repository_grants` with its
 existing semantics. Saving the first versioned policy takes precedence for that
-exact tenant/repository key.
+tenant/repository key. Repository identity follows GitHub semantics: validated
+`owner/name` values are stored and compared in lowercase, while existing
+mixed-case policy and grant rows remain readable.
 
 ## API
 

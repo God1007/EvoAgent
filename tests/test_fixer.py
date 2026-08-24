@@ -1,7 +1,28 @@
 import ast
 import unittest
 
+from evoagent.errors import AccessDeniedError, ClientInputError
+from evoagent.fix_rules import RuleMutation
 from evoagent.fixer import SafeFixer
+from evoagent.models import MAX_RULE_ID_CHARS
+
+
+class _NamedRule:
+    def __init__(self, rule_id):
+        self.rule_id = rule_id
+
+    def apply_python(self, _tree, _target_lines):
+        return RuleMutation(False)
+
+    def propose_line(self, line):
+        return line
+
+
+class FixRuleRegistrationTests(unittest.TestCase):
+    def test_rule_ids_are_bounded_stable_tokens(self):
+        for rule_id in (None, [], "", " leading", "two words", "x" * (MAX_RULE_ID_CHARS + 1)):
+            with self.subTest(rule_id=rule_id), self.assertRaisesRegex(ValueError, "rule id"):
+                SafeFixer(rules=[_NamedRule(rule_id)])
 
 
 class ProposeLineTests(unittest.TestCase):
@@ -131,39 +152,64 @@ class _FakeClient:
     def __init__(self):
         self.created_commit = None
         self.created_pr = None
+        self.pull_calls = 0
         self.commit_calls = 0
         self.pr_calls = 0
         self.existing_branch = None
         self.existing_pr = None
+        self.file_refs = []
+        self.validated_reuses = 0
 
     def get_pull_request(self, repo, number):
+        self.pull_calls += 1
         return {
+            "state": "open",
+            "draft": False,
             "head": {"ref": "feature", "sha": "abc123", "repo": {"full_name": repo}},
             "base": {"ref": "main"},
         }
 
     def get_file(self, repo, path, ref):
+        self.file_refs.append(ref)
         return {"decoded_content": 'token = "abcdef"\n', "sha": "filesha"}
 
     def download_archive(self, repo, sha):
         return b"zip-bytes"
 
-    def create_atomic_commit(self, repo, branch, parent, files, message):
+    def create_atomic_commit(
+        self, repo, branch, parent, files, message, existing_sha="", before_write=None
+    ):
+        if before_write is not None:
+            before_write()
+        if existing_sha:
+            if existing_sha != "newsha" or files != self.created_commit["files"]:
+                raise RuntimeError("existing repair branch does not match the verified repair")
+            self.validated_reuses += 1
+            return {"sha": existing_sha}
         self.commit_calls += 1
         self.created_commit = {"branch": branch, "files": files}
         self.existing_branch = {"object": {"sha": "newsha"}}
         return {"sha": "newsha"}
 
-    def create_draft_pull_request(self, repo, title, head, base, body):
+    def create_draft_pull_request(self, repo, title, head, base, body, before_write=None):
+        if before_write is not None:
+            before_write()
         self.pr_calls += 1
         self.created_pr = {"title": title, "head": head}
-        self.existing_pr = {"number": 7, "html_url": "https://github.com/o/r/pull/7"}
+        self.existing_pr = {
+            "number": 7,
+            "html_url": "https://github.com/o/r/pull/7",
+            "state": "open",
+            "draft": True,
+            "head": {"ref": head, "repo": {"full_name": repo}},
+            "base": {"ref": base, "repo": {"full_name": repo}},
+        }
         return self.existing_pr
 
     def get_branch(self, repo, branch):
         return self.existing_branch
 
-    def find_pull_request_by_head(self, repo, branch):
+    def find_pull_request_by_head(self, repo, branch, base):
         return self.existing_pr
 
 
@@ -172,6 +218,100 @@ def _report():
 
 
 class CreateFixCommitsTests(unittest.TestCase):
+    def test_missing_pull_source_metadata_blocks_reads_and_writes(self):
+        for field in ("repo", "base"):
+            client = _FakeClient()
+            original = client.get_pull_request
+
+            def malformed_pull(repo, number, _field=field, _original=original):
+                pull = _original(repo, number)
+                if _field == "repo":
+                    pull["head"]["repo"] = None
+                else:
+                    pull.pop("base")
+                return pull
+
+            client.get_pull_request = malformed_pull
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(RuntimeError, "invalid pull request source metadata"),
+            ):
+                SafeFixer(verifier=_FakeVerifier()).create_fix_commits(client, "o/r", 1, _report())
+            self.assertEqual([], client.file_refs)
+            self.assertEqual(0, client.commit_calls)
+            self.assertEqual(0, client.pr_calls)
+
+    def test_invalid_or_oversized_repair_source_never_reaches_ast_or_publication(self):
+        client = _FakeClient()
+        client.get_file = lambda *_args: {"decoded_content": 7}
+        with self.assertRaisesRegex(RuntimeError, "invalid repair source file"):
+            SafeFixer(verifier=_FakeVerifier()).create_fix_commits(client, "o/r", 1, _report())
+
+        client = _FakeClient()
+        result = SafeFixer(verifier=_FakeVerifier(), max_source_bytes=5).create_fix_commits(
+            client, "o/r", 1, _report()
+        )
+        self.assertIsNone(result["branch"])
+        self.assertIn("analysis budget", result["note"])
+        self.assertEqual(0, client.commit_calls)
+        self.assertEqual(0, client.pr_calls)
+
+    def test_pr_closed_or_updated_during_verification_blocks_github_writes(self):
+        for mutation, error in (
+            ("state", "no longer open"),
+            ("draft", "is a draft"),
+            ("head", "head changed"),
+            ("base", "head changed"),
+        ):
+            client = _FakeClient()
+            original = client.get_pull_request
+            calls = 0
+
+            def changing_pull(repo, number, _original=original, _mutation=mutation):
+                nonlocal calls
+                calls += 1
+                pull = _original(repo, number)
+                if calls > 1:
+                    if _mutation == "state":
+                        pull["state"] = "closed"
+                    elif _mutation == "draft":
+                        pull["draft"] = True
+                    elif _mutation == "base":
+                        pull["base"]["ref"] = "release"
+                    else:
+                        pull["head"]["sha"] = "updated-sha"
+                return pull
+
+            client.get_pull_request = changing_pull
+            with self.subTest(mutation=mutation), self.assertRaisesRegex(ClientInputError, error):
+                SafeFixer(verifier=_FakeVerifier()).create_fix_commits(
+                    client,
+                    "o/r",
+                    1,
+                    _report(),
+                )
+            self.assertEqual(0, client.commit_calls)
+            self.assertEqual(0, client.pr_calls)
+
+    def test_policy_recheck_can_stop_verified_repair_before_github_writes(self):
+        client = _FakeClient()
+
+        def disabled_after_verification(applied_rules):
+            self.assertEqual(("SEC-HARDCODED-SECRET",), applied_rules)
+            raise AccessDeniedError("automatic repair was disabled")
+
+        with self.assertRaisesRegex(AccessDeniedError, "disabled"):
+            SafeFixer(verifier=_FakeVerifier()).create_fix_commits(
+                client,
+                "o/r",
+                1,
+                _report(),
+                before_publish=disabled_after_verification,
+            )
+
+        self.assertEqual(0, client.commit_calls)
+        self.assertEqual(0, client.pr_calls)
+
     def test_no_eligible_finding_returns_note(self):
         fixer = SafeFixer(verifier=_FakeVerifier())
         report = {"findings": [{"path": "a.py", "line": 1, "rule_id": "SEC-EVAL"}]}
@@ -207,17 +347,68 @@ class CreateFixCommitsTests(unittest.TestCase):
     def test_successful_repair_opens_draft_pr(self):
         client = _FakeClient()
         fixer = SafeFixer(verifier=_FakeVerifier())
-        result = fixer.create_fix_commits(client, "o/r", 1, _report())
+        result = fixer.create_fix_commits(client, "o/r", 1, _report(), expected_source_sha="abc123")
         self.assertTrue(result["branch"].startswith("evoagent/fix-pr-1-"))
         self.assertEqual(7, result["draft_pull_request"]["number"])
         self.assertEqual(["SEC-HARDCODED-SECRET"], result["commits"][0]["rules"])
         self.assertIsNotNone(client.created_commit)
+        self.assertEqual(["abc123"], client.file_refs)
 
-    def test_archive_gate_skipped_when_no_test_command(self):
+    def test_new_repair_refuses_a_non_draft_provider_response(self):
         client = _FakeClient()
-        fixer = SafeFixer(verifier=_FakeVerifier(test_command=""))
-        result = fixer.create_fix_commits(client, "o/r", 1, _report())
-        self.assertTrue(result["branch"])
+        create_draft = client.create_draft_pull_request
+
+        def create_ready(*args, **kwargs):
+            result = create_draft(*args, **kwargs)
+            result["draft"] = False
+            return result
+
+        client.create_draft_pull_request = create_ready
+        with self.assertRaisesRegex(RuntimeError, "invalid draft pull request"):
+            SafeFixer(verifier=_FakeVerifier()).create_fix_commits(client, "o/r", 1, _report())
+
+        self.assertEqual(1, client.commit_calls)
+        self.assertEqual(1, client.pr_calls)
+
+    def test_incomplete_code_host_receipts_never_report_publication_success(self):
+        fixer = SafeFixer(verifier=_FakeVerifier())
+        client = _FakeClient()
+        client.create_atomic_commit = lambda *_args, **_kwargs: {}
+
+        with self.assertRaisesRegex(RuntimeError, "invalid repair commit"):
+            fixer.create_fix_commits(client, "o/r", 1, _report())
+        self.assertEqual(0, client.pr_calls)
+
+        client = _FakeClient()
+        client.create_draft_pull_request = lambda *_args, **_kwargs: {}
+        with self.assertRaisesRegex(RuntimeError, "invalid draft pull request"):
+            fixer.create_fix_commits(client, "o/r", 1, _report())
+
+    def test_stale_review_head_is_rejected_before_reading_files(self):
+        client = _FakeClient()
+
+        with self.assertRaisesRegex(ClientInputError, "head changed"):
+            SafeFixer(verifier=_FakeVerifier()).create_fix_commits(
+                client, "o/r", 1, _report(), expected_source_sha="reviewed-sha"
+            )
+
+        self.assertEqual([], client.file_refs)
+        self.assertEqual(0, client.commit_calls)
+
+    def test_publication_is_blocked_when_no_test_command(self):
+        for command in ("", " \t "):
+            client = _FakeClient()
+            fixer = SafeFixer(verifier=_FakeVerifier(test_command=command))
+
+            with self.subTest(command=command):
+                result = fixer.create_fix_commits(client, "o/r", 1, _report())
+                self.assertIsNone(result["branch"])
+                self.assertFalse(result["verification"]["passed"])
+                self.assertEqual("skipped", result["verification"]["status"])
+                self.assertEqual(0, client.pull_calls)
+                self.assertEqual([], client.file_refs)
+                self.assertEqual(0, client.commit_calls)
+                self.assertEqual(0, client.pr_calls)
 
     def test_successful_repair_commits_the_fixed_content(self):
         client = _FakeClient()
@@ -240,7 +431,36 @@ class CreateFixCommitsTests(unittest.TestCase):
         self.assertEqual(first["branch"], second["branch"])
         self.assertEqual(1, client.commit_calls)
         self.assertEqual(1, client.pr_calls)
+        self.assertEqual(1, client.validated_reuses)
         self.assertIn("reused", second["note"])
+
+    def test_operation_key_rejects_a_tampered_existing_branch(self):
+        client = _FakeClient()
+        fixer = SafeFixer(verifier=_FakeVerifier())
+        fixer.create_fix_commits(client, "o/r", 1, _report(), operation_key="fix-pr:tenant:task")
+        client.created_commit["files"]["a.py"] = "tampered"
+
+        with self.assertRaisesRegex(RuntimeError, "does not match"):
+            fixer.create_fix_commits(
+                client, "o/r", 1, _report(), operation_key="fix-pr:tenant:task"
+            )
+
+        self.assertEqual(1, client.commit_calls)
+        self.assertEqual(1, client.pr_calls)
+
+    def test_operation_key_rejects_a_non_draft_existing_pull_request(self):
+        client = _FakeClient()
+        fixer = SafeFixer(verifier=_FakeVerifier())
+        fixer.create_fix_commits(client, "o/r", 1, _report(), operation_key="fix-pr:tenant:task")
+        client.existing_pr["draft"] = False
+
+        with self.assertRaisesRegex(RuntimeError, "pull request does not match"):
+            fixer.create_fix_commits(
+                client, "o/r", 1, _report(), operation_key="fix-pr:tenant:task"
+            )
+
+        self.assertEqual(1, client.commit_calls)
+        self.assertEqual(1, client.pr_calls)
 
 
 if __name__ == "__main__":

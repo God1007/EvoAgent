@@ -1,7 +1,34 @@
 import unittest
+from unittest import mock
 
 from evoagent.policy import RepositoryPolicy, RepositoryPolicyResolver
 from tests.db_support import postgres_store
+
+
+class RepositoryIdentityTests(unittest.TestCase):
+    def test_configured_policy_requires_a_persisted_positive_integer_version(self):
+        store = mock.Mock()
+        resolver = RepositoryPolicyResolver(store)
+
+        for version in (True, "1", 0):
+            store.get_repository_policy.return_value = {"version": version, "policy": {}}
+            with (
+                self.subTest(version=version),
+                self.assertRaisesRegex(ValueError, "policy version"),
+            ):
+                resolver.resolve("tenant", "org/repo")
+
+    def test_policy_lookup_uses_case_insensitive_github_identity(self):
+        store = mock.Mock()
+        store.get_repository_policy.return_value = {
+            "version": 1,
+            "policy": {"enabled": False},
+        }
+
+        policy = RepositoryPolicyResolver(store).resolve("tenant", "Owner/Repo")
+
+        self.assertFalse(policy.enabled)
+        store.get_repository_policy.assert_called_once_with("tenant", "owner/repo")
 
 
 class RepositoryPolicyTests(unittest.TestCase):
@@ -25,7 +52,7 @@ class RepositoryPolicyTests(unittest.TestCase):
     def test_save_normalizes_versions_and_audits_policy(self):
         first = self.resolver.save(
             "tenant",
-            "org/repo",
+            "Org/Repo",
             {
                 "auto_fix": True,
                 "allowed_fix_rules": ["SEC-YAML-LOAD", "REL-DEBUG-PRINT"],
@@ -35,7 +62,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         )
         second = self.resolver.save(
             "tenant",
-            "org/repo",
+            "ORG/REPO",
             {"enabled": False, "post_review_comments": False},
             "bob",
         )

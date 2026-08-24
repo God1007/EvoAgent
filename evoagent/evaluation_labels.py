@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .evaluation_dataset import dataset_fingerprint, validate_case
+from .json_boundary import strict_json_loads
 
 ANNOTATION_SCHEMA_VERSION = 1
 COMPILED_CASE_SCHEMA_VERSION = 2
@@ -47,8 +48,8 @@ def load_records(path: str | Path) -> list[dict[str, Any]]:
             if not raw.strip():
                 continue
             try:
-                record = json.loads(raw)
-            except json.JSONDecodeError as exc:
+                record = strict_json_loads(raw)
+            except (ValueError, RecursionError) as exc:
                 raise ValueError("invalid JSON on line %d of %s" % (line_number, path)) from exc
             if not isinstance(record, dict):
                 raise ValueError("line %d of %s must be a JSON object" % (line_number, path))

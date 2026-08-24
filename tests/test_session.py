@@ -178,14 +178,24 @@ class StoreSessionTests(unittest.TestCase):
 
     def test_input_required_lifecycle(self):
         t1, _ = self._turn("sha1", "opened", [_finding(rule_id="A", evidence="a")])
+        self.assertFalse(self.store.resolve_session_input(t1["session_id"], "default"))
         self.store.set_session_input_required(t1["session_id"], "Which config should I assume?")
         session = self.store.get_session("default", REPO, 7)
         self.assertEqual("input-required", session["status"])
         self.assertEqual("Which config should I assume?", session["pending_input"])
-        self.store.resolve_session_input(t1["session_id"])
+        self.assertFalse(self.store.resolve_session_input(t1["session_id"], "another-tenant"))
+        self.assertTrue(self.store.resolve_session_input(t1["session_id"], "default", "alice"))
+        self.assertFalse(self.store.resolve_session_input(t1["session_id"], "default"))
         session = self.store.get_session("default", REPO, 7)
         self.assertEqual("open", session["status"])
         self.assertIsNone(session["pending_input"])
+        audit = next(
+            item
+            for item in self.store.list_audit("default")
+            if item["action"] == "session.input.provided"
+        )
+        self.assertEqual("alice", audit["actor"])
+        self.assertEqual({}, audit["detail"])
 
     def test_out_of_order_completion_diffs_against_earlier_turn(self):
         # Turn 1 completes with A.
@@ -217,6 +227,8 @@ class StoreSessionTests(unittest.TestCase):
         }
         self.assertIn(_finding(rule_id="A", evidence="a").scoped_fingerprint(REPO), prev2)
         self.assertNotIn(_finding(rule_id="B", evidence="b").scoped_fingerprint(REPO), prev2)
+        self.store.complete_session_turn(t2["session_id"], t2["turn_id"], None, [], {}, "sha2")
+        self.assertEqual("sha3", self.store.get_session("default", REPO, 7)["latest_head_sha"])
 
     def test_snapshot_records_finding_status(self):
         t1, _ = self._turn("sha1", "opened", [_finding(rule_id="A", evidence="a")])

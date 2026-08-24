@@ -33,7 +33,8 @@ Before transport, the gateway:
 - enforces input/output token estimates and response byte limits;
 - requires HTTPS outside loopback and an exact allowed hostname;
 - disables ambient proxy use and validates redirects through the same boundary;
-- optionally requires a JSON object response;
+- optionally requires a standards-compliant JSON object response;
+- accepts provider token usage only as non-negative JSON integers;
 - protects repeated transport failures with a local circuit breaker.
 
 Weighted routing, fallback, shadow traffic, GitOps promotion, distributed

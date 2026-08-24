@@ -89,6 +89,32 @@
       },
       "fieldConfig": {
         "defaults": {
+          "unit": "percentunit"
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 62
+      },
+      "id": 16,
+      "targets": [
+        {
+          "expr": "evoagent:ratio:skill_failure_15m",
+          "refId": "A"
+        }
+      ],
+      "title": "Dynamic Skill failure ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
           "unit": "short"
         }
       },
@@ -167,9 +193,14 @@
           "expr": "sum(rate(evoagent_reviews_failed_total[5m]))",
           "legendFormat": "failed",
           "refId": "B"
+        },
+        {
+          "expr": "sum(rate(evoagent_review_attempts_failed_total[5m]))",
+          "legendFormat": "retryable attempt failures",
+          "refId": "C"
         }
       ],
-      "title": "Review terminal rate",
+      "title": "Review outcomes and retries",
       "type": "timeseries"
     },
     {
@@ -327,9 +358,34 @@
           "refId": "B"
         },
         {
+          "expr": "sum(rate(evoagent_retention_task_payloads_pruned_total[30m])) + sum(rate(evoagent_retention_checkpoints_pruned_total[30m])) + sum(rate(evoagent_retention_agent_messages_pruned_total[30m]))",
+          "legendFormat": "execution artifacts",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(rate(evoagent_retention_outbox_messages_pruned_total[30m]))",
+          "legendFormat": "outbox intents",
+          "refId": "E"
+        },
+        {
+          "expr": "sum(rate(evoagent_retention_release_observations_pruned_total[30m]))",
+          "legendFormat": "release observations",
+          "refId": "F"
+        },
+        {
+          "expr": "sum(rate(evoagent_retention_effect_receipts_pruned_total[30m]))",
+          "legendFormat": "effect receipts",
+          "refId": "G"
+        },
+        {
+          "expr": "sum(rate(evoagent_retention_webhook_deliveries_pruned_total[30m]))",
+          "legendFormat": "webhook deliveries",
+          "refId": "H"
+        },
+        {
           "expr": "sum(rate(evoagent_retention_failures_total[30m]))",
           "legendFormat": "failures",
-          "refId": "C"
+          "refId": "D"
         }
       ],
       "title": "Operational history retention",
@@ -412,6 +468,32 @@
         }
       ],
       "title": "Redis lease heartbeat failures",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 71
+      },
+      "id": 18,
+      "targets": [
+        {
+          "expr": "sum(increase(evoagent_review_agent_budget_timeouts_total[15m]))",
+          "refId": "A"
+        }
+      ],
+      "title": "Reviewer budget timeouts",
       "type": "timeseries"
     }
   ],

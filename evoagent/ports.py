@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from .postgres_store import PostgresTaskStore
@@ -43,14 +44,14 @@ class ModelGatewayPort(Protocol):
 
     def route_info(self) -> dict[str, Any]: ...
 
+    def execution_revision(self) -> str: ...
+
     def complete(self, request: ModelRequest) -> ModelResponse: ...
 
 
 @runtime_checkable
 class ProofExecutorPort(Protocol):
     def execute(self, files: dict[str, str], command: str) -> dict[str, Any]: ...
-
-    def health(self) -> dict[str, Any]: ...
 
 
 @runtime_checkable
@@ -64,8 +65,6 @@ class TaskQueuePort(Protocol):
     def submit(self, payload: dict[str, Any], message_id: str = "") -> str: ...
 
     def dead_letters(self, limit: int = 100) -> list: ...
-
-    def replay_dead_letter(self, message_id: str) -> bool: ...
 
     def depth(self) -> int: ...
 
@@ -84,7 +83,13 @@ class TaskQueuePort(Protocol):
 class CodeHostPort(Protocol):
     def fetch_diff(self, url: str, max_bytes: int | None = None) -> str: ...
 
-    def upsert_comment(self, api_url: str, markdown: str, marker: str) -> None: ...
+    def upsert_comment(
+        self,
+        api_url: str,
+        markdown: str,
+        marker: str,
+        before_write: Callable[[], None] | None = None,
+    ) -> None: ...
 
     def ensure_repository_access(self, repository: str) -> None: ...
 
@@ -94,7 +99,7 @@ class CodeHostPort(Protocol):
 
     def get_branch(self, repository: str, branch: str) -> dict | None: ...
 
-    def find_pull_request_by_head(self, repository: str, branch: str) -> dict | None: ...
+    def find_pull_request_by_head(self, repository: str, branch: str, base: str) -> dict | None: ...
 
     def create_atomic_commit(
         self,
@@ -103,6 +108,8 @@ class CodeHostPort(Protocol):
         parent_sha: str,
         files: dict[str, str],
         message: str,
+        existing_sha: str = "",
+        before_write: Callable[[], None] | None = None,
     ) -> dict: ...
 
     def create_draft_pull_request(
@@ -112,6 +119,7 @@ class CodeHostPort(Protocol):
         head: str,
         base: str,
         body: str,
+        before_write: Callable[[], None] | None = None,
     ) -> dict: ...
 
     def download_archive(self, repository: str, ref: str) -> bytes: ...

@@ -32,10 +32,10 @@ EvoAgent 接收 GitHub Pull Request 或 Unified Diff，只审查变更中的新�
 | 可靠投递 | 进程内队列用于单机开发；Redis Streams 提供幂等、ACK、租约回收、重试和 DLQ |
 | 安全模型出口 | 单路由、凭据脱敏、HTTPS、精确主机白名单、仓库策略、结构化输出校验 |
 | 动态 Skill | 内容寻址、签名校验、超时/内存/输出限制与容器沙箱 |
-| 保守修复 | 只执行白名单 AST 转换，在独立分支生成原子提交和 Draft PR |
+| 保守修复 | 只对快照 PR head 执行白名单 AST 转换，在独立分支生成原子提交和 Draft PR |
 | 可执行证明 | 在本地容器中验证“修复前失败、修复后通过”，不执行宿主机回退 |
 | GitHub 自动化 | Webhook 验签和幂等、Diff 拉取、评论 upsert、GitHub App installation token |
-| 治理与观测 | JWT/RBAC、多租户、仓库策略、审计日志、Prometheus、OpenTelemetry、RPO/RTO 演练 |
+| 治理与观测 | 评测审批后再灰度、JWT/RBAC、多租户、仓库策略、审计日志、Prometheus、OpenTelemetry、RPO/RTO 演练 |
 
 ## 运行架构
 
@@ -74,9 +74,11 @@ git clone https://github.com/God1007/EvoAgent.git
 cd EvoAgent
 cp .env.example .env
 
-# 在 .env 中设置至少 32 字节随机密钥和管理员密码
+# 在 .env 中设置至少 32 字节随机密钥、管理员用户名和密码
 docker compose up --build
 ```
+
+Compose 会先运行一次性 `migrate` 服务，成功后才启动应用。
 
 打开 <http://127.0.0.1:8080>。
 
@@ -84,8 +86,12 @@ docker compose up --build
 
 ```dotenv
 EVOAGENT_AUTH_SECRET=replace-with-at-least-32-random-bytes
+EVOAGENT_BOOTSTRAP_ADMIN_USERNAME=admin
 EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD=replace-with-a-strong-password
 ```
+
+首次登录成功后从 `.env` 删除两个 `EVOAGENT_BOOTSTRAP_ADMIN_*` 变量。它们只创建首个账号；
+后续启动不会覆盖已有密码、成员关系或角色。
 
 ### 直接运行 Python
 
@@ -98,7 +104,7 @@ python -m evoagent.migrate
 python -m evoagent
 ```
 
-服务默认只监听 `127.0.0.1:8080`。若绑定非回环地址，必须同时启用认证；异步生产流量应配置 Redis。
+服务默认只监听 `127.0.0.1:8080`。若绑定非回环地址，必须同时启用认证并配置 Redis。
 
 ### 第一次审查
 
@@ -112,7 +118,7 @@ curl -X POST 'http://127.0.0.1:8080/v1/reviews' \
   }'
 ```
 
-异步提交增加 `?async=true`，再查询 `/v1/tasks/<task-id>`。
+异步提交增加唯一的 `?async=true`，再查询 `/v1/tasks/<task-id>`；其余查询参数和 JSON 字段会被拒绝。
 
 ## 内置规则
 
@@ -165,17 +171,29 @@ region = "eu-west"
 
 ## GitHub 接入
 
-生产推荐 GitHub App：
+生产环境开启自动评论时必须使用完整的 GitHub App 安装配置：
 
 ```dotenv
 EVOAGENT_GITHUB_APP_ID=123456
 EVOAGENT_GITHUB_APP_SLUG=evoagent
 EVOAGENT_GITHUB_PRIVATE_KEY_PATH=/run/secrets/github-app.pem
+EVOAGENT_GITHUB_CLIENT_ID=Iv1.example
+EVOAGENT_GITHUB_CLIENT_SECRET=...
+EVOAGENT_GITHUB_OAUTH_CALLBACK_URL=https://review.example.com/github/oauth/callback
 EVOAGENT_GITHUB_WEBHOOK_SECRET=...
 EVOAGENT_AUTO_POST_REVIEW=true
 ```
 
-Webhook 地址为 `/webhooks/github`。服务验证 `X-Hub-Signature-256`、时间窗口、delivery id 和载荷摘要。
+在 GitHub App 中把 Setup URL 配置为
+`https://review.example.com/github/setup`，OAuth Callback URL 配置为上面的精确地址，
+并保持“Request user authorization during installation”关闭。EvoAgent 会在安装完成后发起带
+PKCE 的 OAuth 校验，只有当前 GitHub 用户可访问该 installation 时才绑定租户；用户令牌验证后
+立即丢弃。Webhook 地址为 `/webhooks/github`，服务验证 `X-Hub-Signature-256`、时间窗口、
+delivery id、载荷摘要以及 Diff/评论 URL 的仓库与 PR 绑定；启用上述 OAuth 配置后，缺失或未绑定
+installation 的 Webhook 会被拒绝，队列执行和修复发布也会在使用凭据前重新核对租户绑定。
+草稿 PR 不创建任务；`closed`/`converted_to_draft` 会原子结束会话、取消未完成任务并阻止待发
+评论，`reopened`/`ready_for_review` 会复用原会话开始新的审查轮次。
+会话同时持久化 PR 事件时间，延迟到达的旧 Webhook 只落账，不会逆转较新的生命周期状态。
 
 ## API
 
@@ -185,25 +203,43 @@ Webhook 地址为 `/webhooks/github`。服务验证 `X-Hub-Signature-256`、时�
 | `GET` | `/v1/tasks/<id>` | 查询任务 |
 | `GET` | `/v1/tasks/<id>/report` | 获取 Markdown 报告 |
 | `POST` | `/v1/tasks/<id>/feedback` | 记录反馈 |
-| `POST` | `/v1/tasks/<id>/fix` | 创建保守修复 PR |
+| `POST` | `/v1/tasks/<id>/fix` | 创建保守修复 PR；首次返回 201，幂等重放返回 200 |
+| `POST` | `/v1/github/installations` | 发起租户绑定的 GitHub App 安装 |
 | `POST` | `/v1/proofs` | 在容器中执行修复证明 |
 | `GET/POST` | `/v1/repository-policies` | 查询/更新仓库策略 |
 | `POST` | `/v1/auth/login` | 登录获取 JWT |
+| `POST` | `/v1/auth/password` | 校验当前密码并轮换密码，立即撤销旧 JWT/OAuth state |
+| `POST` | `/v1/users` | 在当前租户创建本地成员；仅平台管理员可授予平台角色 |
+| `POST` | `/v1/users/status` | 平台管理员全局停用/恢复本地账号并撤销旧会话 |
 | `GET` | `/health` | 进程存活 |
 | `GET` | `/ready` | PostgreSQL/队列就绪状态 |
-| `GET` | `/metrics` | Prometheus 指标 |
+| `GET` | `/metrics` | 平台管理员可读的全局 Prometheus 指标 |
+
+异步创建审查时可发送最多 64 字符的 `Idempotency-Key`。同一租户用相同 key 重试相同请求会
+返回原任务及其当前持久化状态；若更换仓库、PR、Diff 或发布上下文则返回 `400`，避免客户端
+超时重试产生重复审查。首次受理返回 `202`；幂等重放返回 `200` 且 `replayed=true`。
 
 ## 关键配置
 
 | 变量 | 说明 |
 | --- | --- |
 | `EVOAGENT_DATABASE_URL` | 必填 PostgreSQL URL |
-| `EVOAGENT_REDIS_URL` | 可选 Redis Streams；生产异步模式推荐 |
+| `EVOAGENT_PG_POOL_TIMEOUT` | 连接池等待及 PostgreSQL 建连超时，默认 10 秒 |
+| `EVOAGENT_PG_STATEMENT_TIMEOUT_SECONDS` | PostgreSQL 单条语句超时，默认 120 秒 |
+| `EVOAGENT_REDIS_URL` | Redis Streams；非回环部署必填，loopback 开发可省略 |
+| `EVOAGENT_ASYNC_WORKERS` | 单进程异步 worker 数，范围 `1..256`；更高吞吐请横向扩容 |
 | `EVOAGENT_AUTH_REQUIRED` | 非回环监听必须为 `true` |
 | `EVOAGENT_AUTH_SECRET` | JWT 密钥，认证启用时至少 32 字节 |
-| `EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS` | 每租户跨副本活动审查上限，`0` 表示不拒绝 |
+| `EVOAGENT_AUTH_PREVIOUS_SECRET` | 认证密钥轮换期间临时接受的上一密钥，旧会话过期后删除 |
+| `EVOAGENT_BOOTSTRAP_ADMIN_USERNAME` | 仅首次启动时创建平台管理员，成功后与密码一并删除 |
+| `EVOAGENT_GITHUB_WEBHOOK_PREVIOUS_SECRET` | Webhook 密钥轮换期间临时接受的上一密钥，切换完成后删除 |
+| `EVOAGENT_RATE_LIMIT_RPS` | 每实例、每客户端请求速率；非回环部署必须大于 `0` |
+| `EVOAGENT_MAX_INFLIGHT_HEAVY` | 每实例同步重型请求并发上限；非回环部署必须大于 `0` |
+| `EVOAGENT_MAX_HTTP_CONNECTIONS` | 每实例 HTTP 连接/处理线程上限，默认 `128` |
+| `EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS` | 每租户跨副本活动审查上限；非回环部署必须大于 `0` |
 | `EVOAGENT_REPAIR_CONTAINER_IMAGE` | Proof/修复验证容器镜像 |
 | `EVOAGENT_SKILL_CONTAINER_IMAGE` | 不可信 Skill 容器镜像 |
+| `EVOAGENT_SKILL_SIGNING_KEY` | Skill 发布签名密钥，至少 32 字节；容器强制模式加载动态 Skill 时必填 |
 | `EVOAGENT_HISTORY_RETENTION_DAYS` | 历史清理天数，默认 `0`（关闭） |
 
 完整模板见 [.env.example](.env.example)。

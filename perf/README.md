@@ -6,8 +6,8 @@ Two interchangeable load tools plus a full-stack rig. Read
 ## 0. One-command baseline capture
 
 [`../scripts/perf_baseline.sh`](../scripts/perf_baseline.sh) orchestrates the
-whole suite (read knee sweep, intake, spike, soak, overload/backpressure,
-multi-worker scaling, micro-benchmarks), boots/tears down servers per scenario,
+whole suite (read knee sweep, intake, spike, soak, overload/backpressure and
+micro-benchmarks), boots/tears down servers per scenario,
 and writes per-run JSON + CSV to `perf/baseline-<timestamp>/`.
 
 ```bash
@@ -42,7 +42,7 @@ k6 run -e DURATION=2h perf/k6/soak.js    # endurance
 Every script uses k6's **arrival-rate** executors (open model) and overridable
 `-e BASE_URL=... -e RATE=...` env vars.
 
-## 3. Full-stack rig (Postgres pool + Redis queue + multi-worker)
+## 3. Full-stack rig (Postgres pool + Redis queue)
 
 ```bash
 docker compose -f docker-compose.perf.yml up --build   # app on :8080
@@ -50,7 +50,9 @@ docker compose -f docker-compose.perf.yml up --build   # app on :8080
 docker compose -f docker-compose.perf.yml --profile k6 run --rm k6 run /perf/steady.js
 ```
 
-> The perf rig disables auth for convenience - never use it as a deployment
-> template. Tune workers/pool via `EVOAGENT_WEB_WORKERS`, `EVOAGENT_ASYNC_WORKERS`,
+> The perf rig uses fixed perf-only credentials (`perf` / `perf-only-password`)
+> and publishes only on loopback; never use it as a deployment template. Probe
+> scenarios need no token. For intake, obtain one from `/v1/auth/login` and pass
+> it to `scripts/loadgen.py --token`. Tune queue workers/pool via `EVOAGENT_ASYNC_WORKERS`,
 > `EVOAGENT_PG_POOL_MAX`, and admission control via `EVOAGENT_RATE_LIMIT_RPS` /
 > `EVOAGENT_MAX_INFLIGHT_HEAVY`.

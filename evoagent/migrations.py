@@ -375,6 +375,139 @@ MIGRATIONS: tuple[Migration, ...] = (
         ),
         "ab544ed9ce4cd4c84b5b60719828ee889cf658589809941fb4101d882ff7acaa",
     ),
+    Migration(
+        16,
+        "single-use-auth-states",
+        (
+            "CREATE TABLE IF NOT EXISTS consumed_auth_states (\n"
+            "                jti TEXT PRIMARY KEY, purpose TEXT NOT NULL,\n"
+            "                expires_at BIGINT NOT NULL, consumed_at TIMESTAMPTZ NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_consumed_auth_states_expiry ON "
+            "consumed_auth_states(expires_at)",
+        ),
+        "36bf6b178e82ae131a1365f5f1f9731590817971af35f84e1eb9ce0090543207",
+    ),
+    Migration(
+        17,
+        "deployment-invariants",
+        (
+            "ALTER TABLE deployments\n"
+            "                ADD COLUMN generation BIGINT NOT NULL DEFAULT 1,\n"
+            "                ADD CONSTRAINT deployments_versions_valid CHECK (\n"
+            "                    (stable_version IS NULL OR stable_version > 0) AND\n"
+            "                    (candidate_version IS NULL OR candidate_version > 0) AND\n"
+            "                    generation > 0),\n"
+            "                ADD CONSTRAINT deployments_percentages_valid CHECK (\n"
+            "                    canary_percent BETWEEN 0 AND 100 AND\n"
+            "                    shadow_percent BETWEEN 0 AND 100),\n"
+            "                ADD CONSTRAINT deployments_rates_valid CHECK (\n"
+            "                    max_error_rate BETWEEN 0 AND 1 AND\n"
+            "                    max_disagreement_rate BETWEEN 0 AND 1),\n"
+            "                ADD CONSTRAINT deployments_samples_valid CHECK (\n"
+            "                    min_samples > 0 AND samples >= 0 AND errors BETWEEN 0 AND samples AND\n"
+            "                    shadow_samples >= 0 AND disagreements BETWEEN 0 AND shadow_samples),\n"
+            "                ADD CONSTRAINT deployments_status_valid CHECK (\n"
+            "                    status IN ('stable','running','rolled_back','promoted')),\n"
+            "                ADD CONSTRAINT deployments_running_candidate_valid CHECK (\n"
+            "                    status <> 'running' OR (\n"
+            "                        candidate_version IS NOT NULL AND\n"
+            "                        candidate_version IS DISTINCT FROM stable_version AND\n"
+            "                        (NOT auto_promote OR shadow_percent > 0)))",
+        ),
+        "9c37baa6e96fde323a55170d1c8fd75ae5e754d75706b7b7739137ba843db4da",
+    ),
+    Migration(
+        18,
+        "skill-version-qualification",
+        (
+            "ALTER TABLE skill_versions\n"
+            "                ADD COLUMN qualification TEXT NOT NULL DEFAULT 'rejected'",
+            "UPDATE skill_versions SET qualification=CASE\n"
+            "                    WHEN active THEN 'legacy' ELSE 'rejected' END",
+            "UPDATE skill_versions AS version SET qualification=CASE run.decision\n"
+            "                    WHEN 'activated' THEN 'approved'\n"
+            "                    WHEN 'approved' THEN 'approved'\n"
+            "                    WHEN 'rejected' THEN 'rejected'\n"
+            "                    WHEN 'deferred' THEN 'deferred' END\n"
+            "                FROM evolution_runs AS run\n"
+            "                WHERE run.skill_name=version.skill_name\n"
+            "                    AND run.candidate_version=version.version\n"
+            "                    AND NOT version.active\n"
+            "                    AND run.decision IN ('activated','approved','rejected','deferred')",
+            "ALTER TABLE skill_versions\n"
+            "                ADD CONSTRAINT skill_versions_qualification_valid CHECK (\n"
+            "                    qualification IN ('legacy','approved','rejected','deferred')),\n"
+            "                ADD CONSTRAINT skill_versions_active_qualification_valid CHECK (\n"
+            "                    NOT active OR qualification='legacy')",
+        ),
+        "e50e95c344d139ae5ab517b09fe4e05990685dfd837ccbb70d5e61318dd95478",
+    ),
+    Migration(
+        19,
+        "credential-version",
+        (
+            "ALTER TABLE users ADD COLUMN credential_version BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE users ADD CONSTRAINT users_credential_version_valid "
+            "CHECK (credential_version >= 0)",
+        ),
+        "05c2cb8a94ab36ee51adb0c45542fdc772822f1a05a962b4bda1fdef6d3b0294",
+    ),
+    Migration(
+        20,
+        "pull-request-event-order",
+        ("ALTER TABLE review_sessions ADD COLUMN last_webhook_at TIMESTAMPTZ",),
+        "3de8650af842c21553e40267ec59ebf521a94caef1a954eb201822b3dca9af2e",
+    ),
+    Migration(
+        21,
+        "idempotent-shadow-observations",
+        (
+            "DELETE FROM release_observations AS duplicate USING release_observations AS kept "
+            "WHERE duplicate.tenant_id=kept.tenant_id "
+            "AND duplicate.skill_name=kept.skill_name "
+            "AND duplicate.task_id=kept.task_id AND duplicate.id>kept.id",
+            "CREATE UNIQUE INDEX idx_release_observations_task ON "
+            "release_observations(tenant_id,skill_name,task_id)",
+            "UPDATE deployments SET shadow_samples=0,disagreements=0 WHERE status='running'",
+        ),
+        "1835d162bbcb1f265d057022fe7499e12cd38fbacd35433c1553f1bb59b2a5cc",
+    ),
+    Migration(
+        22,
+        "release-observation-retention",
+        (
+            "CREATE INDEX idx_release_observations_created_at ON "
+            "release_observations(created_at,id)",
+        ),
+        "c64a17ebbf267c498214cc006a249ab50c94a089138a89ba2ea60f64f5514b02",
+    ),
+    Migration(
+        23,
+        "evolution-revision-lookup",
+        (
+            "CREATE INDEX idx_evolution_runs_skill_candidate_created ON "
+            "evolution_runs(skill_name,candidate_version,created_at DESC,id DESC)",
+        ),
+        "3fcf618219b549bf64b7bd3ae9ac34ddc679a74f4a42417889f81f0665b25468",
+    ),
+    Migration(
+        24,
+        "effect-receipt-retention",
+        (
+            "CREATE INDEX idx_effect_receipts_completed_at ON "
+            "effect_receipts(completed_at,effect_key) WHERE status='completed'",
+        ),
+        "efb22cf02b0e5cadcb1936508d65e3706f8dddfe480ce5adaeb75309757cb923",
+    ),
+    Migration(
+        25,
+        "webhook-delivery-retention",
+        (
+            "CREATE INDEX idx_webhook_deliveries_received_at ON "
+            "webhook_deliveries(received_at,delivery_id)",
+        ),
+        "51408576232f1b9f41e8d9191ebb0771c4e138a45fa0cdcdc21cf624fdcb7f64",
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1].version
@@ -469,5 +602,7 @@ def migrate_postgres(conn: Any, target_version: int = CURRENT_SCHEMA_VERSION) ->
     except SchemaMigrationError:
         raise
     except Exception as exc:
-        raise MigrationApplyError("PostgreSQL schema migration failed: %s" % exc) from exc
+        raise MigrationApplyError(
+            "PostgreSQL schema migration failed (%s)" % type(exc).__name__
+        ) from exc
     return target_version

@@ -24,7 +24,7 @@ export const options = {
   },
 };
 
-const READ_PATHS = ['/health', '/health', '/health', '/ready', '/metrics'];
+const READ_PATHS = ['/health', '/health', '/health', '/ready'];
 
 export default function () {
   const path = READ_PATHS[Math.floor(Math.random() * READ_PATHS.length)];

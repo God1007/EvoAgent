@@ -194,8 +194,26 @@ def _postgres_parts(url: str) -> tuple[dict[str, str], str, dict[str, str]]:
     if not database:
         raise ValueError("PostgreSQL connection string must name a source database")
     command_parts = {key: value for key, value in parts.items() if key != "password"}
-    environment = dict(os.environ)
-    environment.pop("EVOAGENT_DATABASE_URL", None)
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith(("PG", "LC_"))
+        or key
+        in {
+            "HOME",
+            "LANG",
+            "PATH",
+            "SSL_CERT_DIR",
+            "SSL_CERT_FILE",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "TMPDIR",
+            "TZ",
+            "USERPROFILE",
+            "WINDIR",
+        }
+    }
     if "password" in parts:
         environment["PGPASSWORD"] = parts["password"]
     return parts, make_conninfo(**command_parts), environment
@@ -409,7 +427,13 @@ def run_postgres_drill(
     pg_restore: str = "pg_restore",
 ) -> dict[str, Any]:
     """Dump one MVCC snapshot and restore it into a generated database."""
-    if min(max_rpo_seconds, max_rto_seconds, command_timeout_seconds, max_backup_bytes) <= 0:
+    if (
+        not all(
+            math.isfinite(value) and value > 0
+            for value in (max_rpo_seconds, max_rto_seconds, command_timeout_seconds)
+        )
+        or max_backup_bytes <= 0
+    ):
         raise ValueError("DR limits and objectives must be positive")
     try:
         import psycopg
@@ -432,8 +456,17 @@ def run_postgres_drill(
     manifest = os.path.join(output, "evoagent-%s.manifest.json" % drill_id)
     started_at = _now()
     backup_started = time.monotonic()
+    connect_timeout = max(1, min(30, math.ceil(command_timeout_seconds)))
+    statement_options = "-c statement_timeout=%d" % max(
+        1, math.ceil(command_timeout_seconds * 1000)
+    )
 
-    with psycopg.connect(database_url, row_factory=dict_row) as source_connection:
+    with psycopg.connect(
+        database_url,
+        row_factory=dict_row,
+        connect_timeout=connect_timeout,
+        options=statement_options,
+    ) as source_connection:
         source_connection.execute("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
         snapshot_row = source_connection.execute(
             "SELECT pg_export_snapshot() AS snapshot_id"
@@ -468,7 +501,12 @@ def run_postgres_drill(
     validation_error: Exception | None = None
     restored_fingerprint: DatabaseFingerprint | None = None
     try:
-        with psycopg.connect(admin_url, autocommit=True) as admin_connection:
+        with psycopg.connect(
+            admin_url,
+            autocommit=True,
+            connect_timeout=connect_timeout,
+            options=statement_options,
+        ) as admin_connection:
             _create_drill_database(admin_connection, target_database)
             target_created = True
         _run_pg_tool(
@@ -485,7 +523,12 @@ def run_postgres_drill(
             target_environment,
             command_timeout_seconds,
         )
-        with psycopg.connect(target_url, row_factory=dict_row) as target_connection:
+        with psycopg.connect(
+            target_url,
+            row_factory=dict_row,
+            connect_timeout=connect_timeout,
+            options=statement_options,
+        ) as target_connection:
             restored_fingerprint = _postgres_fingerprint(target_connection)
         _compare_fingerprints(source_fingerprint, restored_fingerprint)
         # Avoid background pool threads in the short-lived privileged admin job;
@@ -514,13 +557,24 @@ def run_postgres_drill(
     finally:
         if target_created:
             try:
-                with psycopg.connect(admin_url, autocommit=True) as admin_connection:
+                with psycopg.connect(
+                    admin_url,
+                    autocommit=True,
+                    connect_timeout=connect_timeout,
+                    options=statement_options,
+                ) as admin_connection:
                     _drop_drill_database(admin_connection, target_database)
                 target_removed = True
             except Exception as cleanup_error:
                 if validation_error is None:
                     validation_error = DisasterRecoveryError(
                         "restored database cleanup failed: %s" % cleanup_error
+                    )
+                else:
+                    validation_error = DisasterRecoveryError(
+                        "PostgreSQL recovery validation failed: %s; restored database "
+                        "cleanup failed: %s; manual cleanup required for %s"
+                        % (validation_error, cleanup_error, target_database)
                     )
     if validation_error is not None:
         if isinstance(validation_error, DisasterRecoveryError):

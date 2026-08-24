@@ -8,6 +8,7 @@ All primitives are thread-safe and degrade to no-ops when disabled (limit <= 0),
 so they are safe to leave wired in with default-off configuration.
 """
 
+import math
 import threading
 import time
 from collections import OrderedDict
@@ -136,10 +137,28 @@ class RateLimiter:
     LRU-evicted key table so a flood of distinct keys cannot exhaust memory."""
 
     def __init__(self, rate: float, burst: float | None = None, max_keys: int = 10000):
+        if (
+            isinstance(rate, bool)
+            or not isinstance(rate, (int, float))
+            or not math.isfinite(rate)
+            or rate < 0
+        ):
+            raise ValueError("rate limit must be finite and non-negative")
+        resolved_burst = max(1.0, rate) if burst is None else burst
+        if (
+            isinstance(resolved_burst, bool)
+            or not isinstance(resolved_burst, (int, float))
+            or not math.isfinite(resolved_burst)
+            or resolved_burst < 0
+            or (rate > 0 and resolved_burst == 0)
+        ):
+            raise ValueError("rate limit burst must be finite and positive when enabled")
+        if isinstance(max_keys, bool) or not isinstance(max_keys, int) or max_keys <= 0:
+            raise ValueError("rate limit key capacity must be a positive integer")
         self.rate = float(rate)
-        self.burst = float(burst if burst is not None else max(1.0, rate))
+        self.burst = float(resolved_burst)
         self.enabled = self.rate > 0
-        self.max_keys = max(1, max_keys)
+        self.max_keys = max_keys
         self._buckets: OrderedDict[str, TokenBucket] = OrderedDict()
         self._lock = threading.Lock()
 
@@ -166,7 +185,9 @@ class ConcurrencyLimiter:
     saturated gate sheds immediately rather than queueing work in the server."""
 
     def __init__(self, limit: int):
-        self.limit = int(limit)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("concurrency limit must be a non-negative integer")
+        self.limit = limit
         self.enabled = self.limit > 0
         self._semaphore = threading.BoundedSemaphore(self.limit) if self.enabled else None
         self._in_flight = 0
@@ -185,8 +206,10 @@ class ConcurrencyLimiter:
         if not self.enabled or self._semaphore is None:
             return
         with self._lock:
+            if self._in_flight <= 0:
+                raise RuntimeError("concurrency limiter released without a matching acquire")
+            self._semaphore.release()
             self._in_flight -= 1
-        self._semaphore.release()
 
     def in_flight(self) -> int:
         with self._lock:

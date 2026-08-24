@@ -21,9 +21,11 @@ Add a separate offline `evoagent-recover-queue` boundary.
   unique recovery UUID.
 - The target Redis logical database must be empty. Non-loopback targets require
   TLS.
-- A plan covers only non-terminal, non-cancel-requested tasks. Existing Outbox
+- A plan covers non-terminal, non-cancel-requested tasks plus successful tasks
+  with an explicitly active, incomplete delivery retry. Existing Outbox
   payloads are preserved; a missing Outbox can be reconstructed only when the
-  immutable Diff still exists.
+  immutable Diff still exists, while a missing successful-delivery Outbox is
+  reported as unrecoverable rather than replaying the review.
 - The plan contains payload hashes, counts, and a digest, never raw Diffs.
 - Apply requires that exact digest, so an operator cannot accidentally approve
   one candidate set and execute another after database state changes.

@@ -90,7 +90,15 @@ def _risk_scenarios() -> list[dict]:
             )
 
     # 19 high/critical cases: baseline finds 16, candidate finds another 2.
-    add("SEC-EVAL", "critical", "result = eval(value)", r"\beval\s*\(", r"json\.loads", 4)
+    add(
+        "SEC-EVAL",
+        "critical",
+        "result = eval(value)",
+        r"\beval\s*\(",
+        r"json\.loads",
+        4,
+        False,
+    )
     add(
         "SEC-SUBPROCESS-SHELL",
         "high",
@@ -114,6 +122,7 @@ def _risk_scenarios() -> list[dict]:
         r"cursor\.execute\(.+\+",
         r"\(value,\)",
         4,
+        False,
     )
     add(
         "SEC-PATH-TRAVERSAL",
@@ -122,6 +131,7 @@ def _risk_scenarios() -> list[dict]:
         r"open\(base\s*/\s*user_path\)",
         r"read_under_base",
         1,
+        False,
     )
     add(
         "SEC-YAML-LOAD",
@@ -149,6 +159,7 @@ def _risk_scenarios() -> list[dict]:
         r"except Exception:",
         r"except ValueError:",
         5,
+        False,
     )
     add(
         "REL-DEBUG-PRINT",

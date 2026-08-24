@@ -104,7 +104,7 @@ jobs:
           PY
       - name: Retain synthetic evaluation evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: synthetic-evaluation-evidence
           path: output/evaluation/evaluation-report.*
@@ -120,7 +120,7 @@ jobs:
           python -c "import json; d=json.load(open('evoagent-runtime.cdx.json')); c={x['name'].lower() for x in d.get('components',[])}; assert d['bomFormat']=='CycloneDX' and {'psycopg','redis','pyjwt'} <= c"
       - name: Retain the runtime dependency SBOM
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: runtime-dependency-sbom
           path: evoagent-runtime.cdx.json
@@ -274,7 +274,7 @@ jobs:
           python -c "import xml.etree.ElementTree as ET; r=ET.parse('external-contracts.xml').getroot(); n=sum(int(x.attrib.get('skipped',0)) for x in r.iter('testsuite')); assert n == 0, f'{n} external contracts were skipped'"
       - name: Retain infrastructure contract evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: infrastructure-contract-evidence
           path: |
@@ -295,7 +295,7 @@ jobs:
           python -c "import json; d=json.load(open('recovery-report.json')); assert d['status']=='pass'; assert d['integrity']['source_fingerprint']==d['integrity']['restored_fingerprint']; assert d['cleanup']['restored_database_removed']"
       - name: Retain non-sensitive recovery evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: database-recovery-evidence
           path: |
@@ -411,7 +411,7 @@ jobs:
             --report queue-recovery-report.json
       - name: Retain queue recovery evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: queue-recovery-evidence
           path: |

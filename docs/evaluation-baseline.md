@@ -10,7 +10,7 @@ Reproducible snapshot of the end-to-end evaluation harness. Regenerate with
 | --- | --- |
 | EvoAgent version | 0.30.0 |
 | Python | 3.12.13 |
-| Application source SHA-256 | `c85d849f97687c76852fc046ba6926e8abd72eefe17a683da2e4a844b9953132` |
+| Application source SHA-256 | `1888605e211c10174ef2ea51897c6e396fea60aba3ab2df8ee8d53b4763cb3d3` |
 | Dependencies | `requirements.lock` SHA-256 `dd3a30c26aa196e7afcc88a1d16336ee391ce408fcebcc3bd996a0f80537ac0e` |
 | Dataset | `evaluation_data/pr_diff_100.jsonl` |
 | Dataset semantic SHA-256 | `8d2271ec666dcbc96b0c8a13e05adcf71c08f33bf17da5d1c102fe9a3434af38` |

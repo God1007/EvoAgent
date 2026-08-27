@@ -33,6 +33,21 @@ class PostgreSQLRuntimeIntegrationTests(unittest.TestCase):
     def tearDown(self):
         self.store.close()
 
+    def test_pooled_and_direct_connections_pin_timestamp_output_to_utc(self):
+        for pool_max in (0, 1):
+            with self.subTest(pool_max=pool_max):
+                store = PostgresTaskStore(POSTGRES_URL, pool_min=0, pool_max=pool_max)
+                try:
+                    with store._connect() as conn:
+                        row = conn.execute(
+                            "SELECT current_setting('TimeZone') AS zone,"
+                            "TIMESTAMPTZ '2030-01-01T00:00:00+00:00' AS instant"
+                        ).fetchone()
+                    self.assertEqual("UTC", row["zone"])
+                    self.assertEqual("2030-01-01T00:00:00+00:00", row["instant"].isoformat())
+                finally:
+                    store.close()
+
     def test_real_pool_exhaustion_is_bounded_and_recovers(self):
         from psycopg_pool import PoolTimeout
 

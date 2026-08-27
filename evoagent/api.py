@@ -10,11 +10,13 @@ import threading
 import time
 import urllib.parse
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from . import __version__
+from .agents import WorkflowFactory
 from .application.webhooks import github_pull_request_updated_at
 from .auth import Principal
 from .backpressure import ClientIdentity, ConcurrencyLimiter
@@ -33,11 +35,13 @@ from .json_boundary import strict_json_loads
 from .metrics import metrics
 from .report import to_markdown
 from .repository import canonical_repository
+from .review_extensions import ReviewerContribution
 from .service import ReviewService
 
 RESOURCE_ID = r"(?:[0-9a-f]{32}|[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})"
 TASK = re.compile(r"^/v1/tasks/(%s)$" % RESOURCE_ID)
 REPORT = re.compile(r"^/v1/tasks/(%s)/report$" % RESOURCE_ID)
+WORKFLOW = re.compile(r"^/v1/tasks/(%s)/workflow$" % RESOURCE_ID)
 FIX = re.compile(r"^/v1/tasks/(%s)/fix$" % RESOURCE_ID)
 FEEDBACK = re.compile(r"^/v1/tasks/(%s)/feedback$" % RESOURCE_ID)
 CANCEL = re.compile(r"^/v1/tasks/(%s)/cancel$" % RESOURCE_ID)
@@ -703,6 +707,16 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, timeline)
             return
+        workflow_match = WORKFLOW.match(path)
+        if workflow_match:
+            snapshot = self.service.store.workflow_status(
+                workflow_match.group(1), principal.tenant_id
+            )
+            if snapshot is None:
+                self._send_json(404, {"error": "task not found"})
+                return
+            self._send_json(200, snapshot)
+            return
         report_match = REPORT.match(path)
         task_match = TASK.match(path)
         if report_match:
@@ -1174,9 +1188,18 @@ def _print_banner(settings: Settings, service: ReviewService) -> None:
         )
 
 
-def run() -> None:
+def run(
+    *,
+    workflow_factory: WorkflowFactory | None = None,
+    reviewer_contributions: Sequence[ReviewerContribution] | None = None,
+) -> None:
+    """Serve a trusted deployment using the normal auth, queue and shutdown lifecycle."""
     settings = Settings.from_env()
-    service = ReviewService(settings)
+    service = ReviewService(
+        settings,
+        workflow_factory=workflow_factory,
+        reviewer_contributions=reviewer_contributions,
+    )
     server: EvoAgentHTTPServer | None = None
     try:
         server = _make_server(settings, service)

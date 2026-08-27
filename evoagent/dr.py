@@ -71,6 +71,8 @@ def _canonical(value: Any) -> Any:
         return value if math.isfinite(value) else str(value)
     if isinstance(value, Decimal):
         return str(value)
+    if isinstance(value, datetime) and value.utcoffset() is not None:
+        value = value.astimezone(UTC)
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     if isinstance(value, (bytes, bytearray, memoryview)):

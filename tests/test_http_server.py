@@ -95,16 +95,21 @@ class LifecycleTests(unittest.TestCase):
         order = mock.Mock()
         order.attach_mock(server.server_close, "server_close")
         order.attach_mock(service.close, "service_close")
+        workflow_factory = mock.Mock()
+        contributions = (mock.Mock(),)
 
         with (
             mock.patch.object(api.Settings, "from_env", return_value=settings),
-            mock.patch.object(api, "ReviewService", return_value=service),
+            mock.patch.object(api, "ReviewService", return_value=service) as service_type,
             mock.patch.object(api, "_make_server", return_value=server),
             mock.patch.object(api, "_print_banner"),
             mock.patch.object(api, "_install_drain_on_sigterm") as install_drain,
         ):
-            api.run()
+            api.run(workflow_factory=workflow_factory, reviewer_contributions=contributions)
 
+        service_type.assert_called_once_with(
+            settings, workflow_factory=workflow_factory, reviewer_contributions=contributions
+        )
         install_drain.assert_called_once_with(server, 2.5)
         self.assertEqual([mock.call.server_close(), mock.call.service_close()], order.mock_calls)
 

@@ -1,6 +1,7 @@
 import json
 import unittest
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from unittest import mock
 
 from evoagent.metrics import Metrics
@@ -72,7 +73,7 @@ def _store_with_pool(pool):
     store.pool_timeout = 5.0
     store._connect_timeout = 5
     store.statement_timeout_seconds = 120.0
-    store._connection_options = "-c statement_timeout=120000"
+    store._connection_options = "-c statement_timeout=120000 -c timezone=UTC"
     store._pool = pool
     return store
 
@@ -93,6 +94,123 @@ class AlertPersistenceTests(unittest.TestCase):
         self.assertIn("DO UPDATE SET", sql)
         self.assertIn("updated_at=EXCLUDED.updated_at", sql)
         self.assertEqual(parameters[-2], parameters[-1])
+
+
+class WorkflowReadTests(unittest.TestCase):
+    def store(self, rows):
+        connection = mock.Mock()
+        connection.execute.return_value.fetchall.return_value = rows
+        manager = mock.MagicMock()
+        manager.__enter__.return_value = connection
+        store = object.__new__(PostgresTaskStore)
+        store._connect = mock.Mock(return_value=manager)
+        return store, connection
+
+    def test_checkpoint_reads_can_filter_by_exact_node(self):
+        now = datetime.now(UTC)
+        row = {
+            "node": "workflow:first",
+            "status": "completed",
+            "attempt": 1,
+            "state_json": {"outputs": {"value": 2}},
+            "error": None,
+            "updated_at": now,
+        }
+        for node in (None, "workflow:first"):
+            with self.subTest(node=node):
+                store, connection = self.store([row])
+                result = store.load_checkpoints("task", node)
+                sql, parameters = connection.execute.call_args.args
+                self.assertEqual(node is not None, "AND node=%s" in sql)
+                self.assertEqual(("task", node) if node else ("task",), parameters)
+                self.assertEqual(row["state_json"], result[row["node"]]["state"])
+                self.assertEqual(now.isoformat(), result[row["node"]]["updated_at"])
+
+    def test_workflow_status_projects_metadata_with_a_tenant_predicate(self):
+        now = datetime.now(UTC)
+        steps = [
+            {
+                "id": name,
+                "agent": "agent",
+                "revision": "a" * 64,
+                "inputs": {"value": "number@1"},
+                "outputs": {"value": "number@1"},
+                "sources": {"value": source},
+                "credentials": "private-step-data",
+            }
+            for name, source in (("first", "$input.value"), ("second", "first.value"))
+        ]
+        manifest = {
+            "task_id": "task",
+            "task_state": "EXECUTING",
+            "artifacts_pruned_at": None,
+            "node": "workflow",
+            "definition": {
+                "name": "numbers",
+                "protocol_version": 1,
+                "steps": steps,
+                "credentials": "private-manifest-data",
+            },
+            "workflow_revision": "b" * 64,
+            "execution_revision": "c" * 64,
+        }
+        for status in ("running", "failed", "completed"):
+            with self.subTest(status=status):
+                store, connection = self.store(
+                    [
+                        manifest,
+                        {
+                            "node": "workflow:first",
+                            "status": status,
+                            "attempt": 2,
+                            "generation": 3,
+                            "idempotency_key": "d" * 64,
+                            "input_sha256": "e" * 64,
+                            "output_sha256": "f" * 64 if status == "completed" else None,
+                            "updated_at": now,
+                            "error": "private-error-text" if status == "failed" else None,
+                            "state_json": {"outputs": {"secret": "private-code-body"}},
+                        },
+                    ]
+                )
+                snapshot = store.workflow_status("task", "tenant-a")
+                sql, parameters = connection.execute.call_args.args
+                self.assertEqual(("workflow:%", "task", "tenant-a"), parameters)
+                self.assertIn("checkpoint.node LIKE %s", sql)
+                self.assertIn("task.id=%s AND task.tenant_id=%s", sql)
+                self.assertIn("LEFT JOIN checkpoints", sql)
+                for raw_projection in ("checkpoint.state_json,", "->'inputs'", "->'outputs'"):
+                    self.assertNotIn(raw_projection, sql)
+                self.assertEqual("recorded", snapshot["availability"])
+                self.assertEqual("b" * 64, snapshot["workflow"]["revision"])
+                first, second = snapshot["steps"]
+                self.assertEqual(status, first["status"])
+                self.assertEqual(2, first["attempt"])
+                self.assertEqual(3, first["generation"])
+                self.assertEqual(now.isoformat(), first["updated_at"])
+                self.assertEqual("pending", second["status"])
+                self.assertEqual([] if status == "completed" else ["first"], second["blocked_by"])
+                self.assertNotIn("private-", json.dumps(snapshot))
+
+    def test_workflow_status_distinguishes_missing_unrecorded_and_pruned(self):
+        store, _ = self.store([])
+        self.assertIsNone(store.workflow_status("missing", "tenant-a"))
+        for pruned in (None, "2030-01-01T00:00:00+00:00"):
+            store, _ = self.store(
+                [
+                    {
+                        "task_id": "task",
+                        "task_state": "SUCCESS",
+                        "artifacts_pruned_at": pruned,
+                        "node": None,
+                    }
+                ]
+            )
+            snapshot = store.workflow_status("task", "tenant-a")
+            self.assertEqual("pruned" if pruned else "not_recorded", snapshot["availability"])
+            self.assertEqual(pruned, snapshot["artifacts_pruned_at"])
+            self.assertIsNone(snapshot["workflow"])
+            self.assertEqual([], snapshot["steps"])
 
 
 class PoolCheckoutTests(unittest.TestCase):
@@ -974,7 +1092,7 @@ class FallbackTests(unittest.TestCase):
         self.assertIs(store.psycopg.sentinel, result)
         self.assertEqual(1, store.psycopg.connect_calls)
         self.assertEqual(5, store.psycopg.connect_timeout)
-        self.assertEqual("-c statement_timeout=120000", store.psycopg.options)
+        self.assertEqual("-c statement_timeout=120000 -c timezone=UTC", store.psycopg.options)
 
     def test_pool_stats_none_without_pool(self):
         store = _store_with_pool(None)
@@ -992,6 +1110,10 @@ class FallbackTests(unittest.TestCase):
 
         initialize.assert_not_called()
         self.assertEqual(10, backend.call_args.kwargs["kwargs"]["connect_timeout"])
+        self.assertEqual(
+            "-c statement_timeout=120000 -c timezone=UTC",
+            backend.call_args.kwargs["kwargs"]["options"],
+        )
 
         with self.assertRaisesRegex(ValueError, "EVOAGENT_PG_POOL_TIMEOUT"):
             PostgresTaskStore("postgresql://example/db", pool_timeout=float("inf"))

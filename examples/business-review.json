@@ -1,0 +1,35 @@
+{
+  "name": "business-review",
+  "steps": [
+    {"id": "plan", "agent": "planner", "sources": {"parsed": "$input.parsed"}},
+    {
+      "id": "specialists", "agent": "specialists",
+      "sources": {"diff": "$input.diff", "parsed": "$input.parsed", "plan": "plan.plan"}
+    },
+    {
+      "id": "critic", "agent": "critic",
+      "sources": {"parsed": "$input.parsed", "specialist_findings": "specialists.specialist_findings"}
+    },
+    {
+      "id": "test", "agent": "test",
+      "sources": {"parsed": "$input.parsed", "specialist_findings": "specialists.specialist_findings"}
+    },
+    {
+      "id": "synthesize", "agent": "synthesizer",
+      "sources": {
+        "specialist_findings": "specialists.specialist_findings",
+        "critiques": "critic.critiques", "reproductions": "test.reproductions"
+      }
+    },
+    {"id": "fix", "agent": "fix", "sources": {"synthesized": "synthesize.synthesized"}},
+    {
+      "id": "verify", "agent": "verifier",
+      "sources": {
+        "synthesized": "synthesize.synthesized",
+        "reproductions": "test.reproductions", "fix_ready": "fix.fix_ready"
+      }
+    },
+    {"id": "business", "agent": "business-policy", "sources": {"findings": "verify.verified"}}
+  ],
+  "outputs": {"verified": "business.findings"}
+}

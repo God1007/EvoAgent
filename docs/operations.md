@@ -127,9 +127,38 @@ an Outbox `dead` row or queue DLQ transition reopens the task for an operator re
 
 ## Review failures
 
+In **Task Center**, select a task to inspect **Agent handoff records** above its
+JSON report. Each node shows its persisted status, attempt count, update time and
+uncompleted upstream dependencies. Expand **Handoff contracts and identifiers**
+to inspect input sources, versioned input/output types, Agent revision, generation,
+idempotency key and payload digests; payload bodies are not displayed in this panel.
+Use the top refresh button to reload the list and both detail panes. The panes load
+independently: a workflow API failure does not hide the task report, and switching
+tasks or logging out invalidates older detail responses. The overview's built-in
+role examples are illustrative, not a live execution graph. This is a read-only
+inspector, not a workflow editor or a worker-liveness monitor.
+
+The dependency-free frontend regression check runs in CI and locally with Node.js
+18 or newer: `node --test tests/web.test.cjs`. It covers escaped metadata, absent
+and pruned records, request failures, out-of-order responses, refresh, logout and
+fix-action isolation; browser checks are still required for layout/accessibility.
+
+Use `GET /v1/tasks/<task-id>/workflow` to locate a failed or blocked custom Agent.
+The read-authenticated, tenant-scoped snapshot includes contract/wiring metadata,
+attempts, generations, digests and safe error references, not input/output bodies.
+`running` records dispatch, not a live worker or exclusive lease: inspect task state
+and queue health before resuming through the existing task-resume endpoint.
+`availability=not_recorded` means no definition snapshot was stored yet (including
+legacy tasks); `pruned` means execution artifacts were removed by retention.
+Handoff contract/revision failures go directly to the existing DLQ, without retrying
+the same invalid graph. Check the failure reference and deploy a corrected, verified
+revision; do not manually copy checkpoints between revisions. Factories used by
+canary/shadow/evaluation must return the startup graph, not reload mutable wiring.
+See [Agent handoff contracts](agent-workflows.md) for retry and idempotency semantics.
+
 Separate policy rejection, reviewer failure, model transport and Skill failure.
 Do not weaken evidence gates to restore throughput.
-`evoagent_review_attempts_failed_total` counts retryable worker attempts; compare
+`evoagent_review_attempts_failed_total` counts failed worker execution attempts; compare
 it with terminal failures in the Review dashboard before changing retry policy.
 The dashboard excludes failed attempts whose admission is still active from its
 failure count and calculates success rate from completed success/failure outcomes.
@@ -254,6 +283,15 @@ exact generation is still running, so delayed queue work cannot roll back or
 promote a replacement rollout—even when an operator retries the same candidate.
 Repeated delivery of one task is also counted once, so retries cannot inflate
 the canary error budget or sample size used for automatic promotion.
+If a rollback changes the Prompt selected for an interrupted task, its existing
+workflow snapshot cannot be resumed under that replacement Prompt. The same check
+applies when all Agent work and outer harness results were cached before the
+final task commit failed, including a concurrently completed cache entry. This is
+a permanent handoff failure, not a reason to edit snapshots or increase retries.
+Resume only while the original execution is still permitted by rollout policy;
+otherwise submit a new review. Tasks that have not begun Agent execution may
+still use the existing stable-lane fallback. Already-successful reports remain
+historical results and are not recomputed for delivery retries.
 Automatic rollback and promotion update the deployment and append their metrics
 to the operator audit in one transaction; alerts are notification, not history.
 `evoagent_release_alert_failures_total` means that durable rollout state and

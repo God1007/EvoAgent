@@ -7,9 +7,10 @@ import json
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 from . import __version__
-from .agents import MAX_REVIEW_AGENTS, MultiAgentCoordinator
+from .agents import MAX_REVIEW_AGENTS, MultiAgentCoordinator, WorkflowFactory
 from .config import Settings
 from .harness import ReviewHarness
 from .model_gateway import ModelGovernanceContext
@@ -19,6 +20,7 @@ from .ports import ModelGatewayPort, ReviewWorkflowStorePort
 from .review_extensions import ReviewerContribution
 from .reviewer import GatewayReviewer, Reviewer
 from .skills import SkillRegistry
+from .workflow import HandoffError
 
 
 def _source_revision(root: Path) -> str:
@@ -46,11 +48,14 @@ class ReviewEngine:
         observability: Observability,
         model_gateway: ModelGatewayPort,
         reviewer_contributions: Sequence[ReviewerContribution],
+        *,
+        workflow_factory: WorkflowFactory | None = None,
     ):
         self.settings = settings
         self.store = store
         self.observability = observability
         self.model_gateway = model_gateway
+        self.workflow_factory = workflow_factory
         self.llm_config = model_gateway.route_info()
         if len(reviewer_contributions) + int(model_gateway.configured) > MAX_REVIEW_AGENTS:
             raise ValueError("review graph accepts at most %d agents" % MAX_REVIEW_AGENTS)
@@ -92,11 +97,19 @@ class ReviewEngine:
     def build_coordinator(
         self, reviewers: list[Reviewer], *, persist_messages: bool = True
     ) -> MultiAgentCoordinator:
-        return MultiAgentCoordinator(
+        execution = getattr(self, "_execution", None)
+        coordinator = MultiAgentCoordinator(
             reviewers,
             store=self.store if persist_messages else None,
             timeout_seconds=self.settings.timeout_seconds,
+            workflow_factory=getattr(self, "workflow_factory", None),
+            checkpoint_revision=execution[0] if execution is not None else "",
         )
+        if execution is not None:
+            original = cast(MultiAgentCoordinator, execution[2].reviewer)
+            if coordinator.workflow.revision != original.workflow.revision:
+                raise HandoffError("workflow factory changed since startup; deploy a new revision")
+        return coordinator
 
     def build_evaluation_reviewer(self, prompt: str) -> Reviewer:
         return self.build_coordinator(
@@ -165,10 +178,12 @@ class ReviewEngine:
                     },
                     "model_gateway": self.model_gateway.execution_revision(),
                     "skills": registry.revision(),
+                    "workflow": reviewer.workflow.revision,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
         self.registry = registry
+        reviewer.checkpoint_revision = revision
         self._execution = (revision, tuple(reviewers), harness)

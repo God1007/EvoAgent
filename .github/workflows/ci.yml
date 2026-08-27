@@ -54,6 +54,10 @@ jobs:
           bash -n scripts/deploy.sh
       - name: Type check
         run: python -m mypy
+      - name: Web regression checks
+        run: |
+          node --check web/app.js
+          node --test tests/web.test.cjs
       - name: Validate Prometheus recording and alert rules
         run: |
           docker run --rm --entrypoint=/bin/promtool \
@@ -130,7 +134,7 @@ jobs:
         run: |
           wheel_env="${RUNNER_TEMP}/evoagent-wheel"
           python -m venv --system-site-packages "$wheel_env"
-          "$wheel_env/bin/python" -m pip install --no-deps dist/*.whl
+          "$wheel_env/bin/python" -m pip install --no-deps --force-reinstall dist/*.whl
           cd "$RUNNER_TEMP"
           EVOAGENT_DATABASE_URL="${EVOAGENT_TEST_POSTGRES_URL}" \
             "$wheel_env/bin/evoagent-migrate" | "$wheel_env/bin/python" -c \
@@ -160,6 +164,40 @@ jobs:
           "$wheel_env/bin/evoagent-recover-queue" --help >/dev/null
           "$wheel_env/bin/evoagent-eval-labels" --help >/dev/null
           "$wheel_env/bin/python" -c "from evoagent.review_extensions import ReviewerContribution"
+          "$wheel_env/bin/python" -I - "$GITHUB_WORKSPACE/dist" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import sysconfig
+          import tarfile
+
+          import evoagent
+          from evoagent.review_engine import _APPLICATION_SOURCE_REVISION, _source_revision
+
+          assert Path(evoagent.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+          source = Path(os.environ["GITHUB_WORKSPACE"]) / "examples"
+          assert _APPLICATION_SOURCE_REVISION == _source_revision(source.parent / "evoagent")
+          installed = Path(sysconfig.get_path("data")) / "share/evoagent/examples"
+          with tarfile.open(next(Path(sys.argv[1]).glob("*.tar.gz"))) as archive:
+              prefix = archive.getnames()[0].split("/")[0]
+              for name in ("custom_review_workflow.py", "business-review.json"):
+                  expected = (source / name).read_bytes()
+                  assert (installed / name).read_bytes() == expected
+                  assert archive.extractfile(f"{prefix}/examples/{name}").read() == expected
+          command = [
+              sys.executable, "-I", str(installed / "custom_review_workflow.py"),
+              "--workflow", str(installed / "business-review.json"),
+          ]
+          checked = json.loads(subprocess.check_output([*command, "--check"], timeout=15))
+          executed = json.loads(subprocess.check_output(command, timeout=15))
+          assert checked["valid"] is True
+          assert checked["revision"] == executed["revision"]
+          assert len(executed["workflow"]["steps"]) == 8
+          assert executed["findings"][0]["rule_id"] == "SEC-EVAL"
+          print("Installed workflow: eight stages, matching revision and verified example finding")
+          PY
           kill -TERM "$wheel_pid"
           wait "$wheel_pid"
           trap - EXIT
@@ -265,6 +303,9 @@ jobs:
             tests/test_adapter_contracts.py \
             tests/test_external_integrations.py \
             tests/test_github_http_fixture.py \
+            tests/test_workflow.py \
+            tests/test_workflow_delivery.py \
+            tests/test_dr.py \
             --cov=evoagent.postgres_store \
             --cov-config=/dev/null \
             --cov-report=term-missing \

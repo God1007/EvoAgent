@@ -4,6 +4,13 @@
 - Date: 2026-08-17
 - Updated: 2026-08-21
 
+2026-08-27 amendment: the fixed-coordinator restriction below is superseded by
+the explicit requirement for composable agent workflows. See
+[Agent workflows](../agent-workflows.md). Trusted agent stages now expose versioned
+ports and pinned implementations; the stdlib DAG runner uses existing durable
+checkpoints for handoffs. This does not add plugin discovery, hot loading, or
+in-process execution of untrusted Skills; the snapshot/isolation decisions remain.
+
 ## Context
 
 Reviewer and fix-rule extension points are useful; a general in-process plugin

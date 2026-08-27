@@ -27,6 +27,7 @@ EvoAgent 接收 GitHub Pull Request 或 Unified Diff，只审查变更中的新�
 | 能力 | 实现 |
 | --- | --- |
 | 多角色审查 | Planner 分派 Security、Reliability、LLM 与 Skill；Critic、Test、Synthesizer、Verifier 过滤结果 |
+| 可插拔流程 | 版本化 Agent 输入/输出契约，显式 DAG 连线，逐节点 checkpoint 与可恢复交接 |
 | 精确定位 | 发现必须落在 Unified Diff 的新增行上 |
 | 可靠任务 | PostgreSQL 状态机、Checkpoint、事务 Outbox、租户容量门禁 |
 | 可靠投递 | 进程内队列用于单机开发；Redis Streams 提供幂等、ACK、租约回收、重试和 DLQ |
@@ -61,7 +62,7 @@ PENDING → PLANNING → EXECUTING → REVIEWING → SUCCESS
                   ↘ FAILED / CANCELLED
 ```
 
-代码结构保持直接：`bootstrap.py` 负责一次性装配；`ReviewService` 协调用例；`ReviewHarness` 执行普通循环；PostgreSQL 是唯一持久化后端。没有插件微内核、LangGraph、远程 Proof 控制面、模型路由控制面或 Redis Cluster 协议。
+代码结构保持直接：`bootstrap.py` 负责一次性装配；`ReviewService` 协调用例；`ReviewHarness` 管理任务生命周期，`Workflow` 按显式数据连线执行可替换 Agent；PostgreSQL 是唯一持久化后端。没有插件自动发现、LangGraph 或 Agent 间 RPC。[可插拔 Agent 与交接设计](docs/agent-workflows.md)包含无需 Docker 的组装示例；可编辑 [JSON 流程配置](examples/business-review.json)，使用 `--workflow ... --check` 预检，或以 `--serve` 启动完整服务。
 
 ## 快速开始
 
@@ -201,6 +202,7 @@ installation 的 Webhook 会被拒绝，队列执行和修复发布也会在使�
 | --- | --- | --- |
 | `POST` | `/v1/reviews` | 同步/异步创建审查 |
 | `GET` | `/v1/tasks/<id>` | 查询任务 |
+| `GET` | `/v1/tasks/<id>/workflow` | 租户隔离的节点状态、连线与版本摘要；不返回交接正文 |
 | `GET` | `/v1/tasks/<id>/report` | 获取 Markdown 报告 |
 | `POST` | `/v1/tasks/<id>/feedback` | 记录反馈 |
 | `POST` | `/v1/tasks/<id>/fix` | 创建保守修复 PR；首次返回 201，幂等重放返回 200 |
@@ -263,6 +265,7 @@ CI 会创建临时 PostgreSQL 和 Redis，并额外验证迁移、连接池、St
 ## 文档
 
 - [架构](docs/architecture.md)
+- [可插拔 Agent、流程组装与交接协议](docs/agent-workflows.md)
 - [模型网关](docs/model-gateway.md)
 - [仓库策略](docs/repository-policies.md)
 - [事务 Outbox](docs/transactional-outbox.md)

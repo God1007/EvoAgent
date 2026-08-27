@@ -392,6 +392,7 @@ class AdvancedFeatureTests(unittest.TestCase):
 
     def test_async_multi_agent_review(self):
         service = ReviewService(settings(self.database_url))
+        self.addCleanup(service.close)
         diff = (
             "--- a/a.py\n+++ b/a.py\n@@ -1 +1,2 @@\n-old\n+eval(data)\n+# TODO finish validation\n"
         )
@@ -402,7 +403,6 @@ class AdvancedFeatureTests(unittest.TestCase):
             if task["state"] in {"SUCCESS", "FAILED"}:
                 break
             time.sleep(0.02)
-        service.close()
         self.assertEqual("SUCCESS", task["state"])
         self.assertEqual(
             {"SEC-EVAL", "QUALITY-UNFINISHED"},

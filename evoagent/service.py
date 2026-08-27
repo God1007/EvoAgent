@@ -1,7 +1,9 @@
 import threading
 import time
+from collections.abc import Sequence
 from typing import Any
 
+from .agents import WorkflowFactory
 from .application import (
     GitHubInstallationUseCases,
     PolicyUseCases,
@@ -26,15 +28,26 @@ from .outbox import OutboxDispatcher
 from .ports import CodeHostPort
 from .retention import RetentionManager, RetentionOptions
 from .review_engine import ReviewEngine
+from .review_extensions import ReviewerContribution
 from .reviewer import GatewayReviewer, Reviewer
 from .task_queue import PermanentTaskError, TaskQueue
 
 
 class ReviewService:
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        workflow_factory: WorkflowFactory | None = None,
+        reviewer_contributions: Sequence[ReviewerContribution] | None = None,
+    ):
         self.settings = settings
         settings.validate_evolution()
-        self.components = build_components(settings)
+        self.components = build_components(
+            settings,
+            workflow_factory=workflow_factory,
+            reviewer_contributions=reviewer_contributions,
+        )
         self._closed = False
         try:
             self.github_breaker = self.components.github_breaker

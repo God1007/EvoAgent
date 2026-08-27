@@ -374,6 +374,7 @@ main { min-width: 0; padding: 0 32px 48px; }
 }
 .task-row:last-child { border-bottom: 0; }
 .task-row:hover { background: var(--surface-hover); }
+.task-row[aria-pressed="true"] { background: var(--accent-soft); }
 .task-row:hover .task-name { color: var(--accent-text); }
 .task-main { display: flex; align-items: center; gap: 11px; min-width: 0; }
 .task-glyph {
@@ -508,7 +509,26 @@ textarea {
   gap: 14px;
   align-items: start;
 }
-.report-panel { position: sticky; top: 16px; }
+.task-detail { display: grid; gap: 14px; min-width: 0; }
+.task-detail > .workflow-note { margin: 0; }
+.workflow-content { color: var(--muted); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.workflow-heading, .handoff-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.workflow-heading strong, .handoff-heading strong { color: var(--text-strong); font-size: 14px; }
+.workflow-note { margin: 8px 0; color: var(--muted); font-size: 11px; line-height: 1.7; overflow-wrap: anywhere; }
+.handoff-list { list-style: none; margin: 20px 0 0; padding: 0; }
+.handoff-step { padding: 16px 0; border-top: 1px solid var(--line); }
+.handoff-heading > div { min-width: 0; }
+.handoff-heading code { display: block; margin-top: 2px; font-size: 11px; }
+.handoff-blocked { margin: 8px 0; color: var(--warning); }
+.handoff-error { margin: 10px 0; padding: 10px; border-left: 3px solid var(--danger); background: var(--danger-soft); color: var(--danger); }
+.workflow-content summary { width: fit-content; padding: 5px 0; color: var(--accent-text); cursor: pointer; }
+.workflow-content summary:focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; border-radius: 3px; }
+.handoff-metadata { display: grid; grid-template-columns: minmax(80px, .4fr) minmax(0, 1fr); gap: 10px 14px; margin: 10px 0; padding: 12px; border-radius: var(--radius-control); background: var(--surface-muted); }
+.handoff-metadata dt { color: var(--muted); }
+.handoff-metadata dd { min-width: 0; margin: 0; color: var(--text); }
+.handoff-metadata small { display: block; margin-top: 4px; color: var(--muted); }
+.handoff-metadata code { font-size: 11px; }
+.workflow-version { padding-top: 12px; border-top: 1px solid var(--line); }
 .report-panel pre, .status-panel pre {
   min-height: 280px;
   max-height: 570px;
@@ -632,7 +652,6 @@ textarea {
   .sidebar-foot { justify-content: center; padding-inline: 0; }
   main { padding-inline: 24px; }
   .dashboard-grid, .form-layout, .tasks-layout, .evolution-grid { grid-template-columns: 1fr; }
-  .report-panel { position: static; }
   .hero { grid-template-columns: 1fr; }
   .hero-facts { grid-template-columns: repeat(3, 1fr); border-top: 1px solid rgba(255, 255, 255, .10); border-left: 0; }
   .hero-facts div { padding: 10px 14px; border-top: 0; border-left: 1px solid rgba(255, 255, 255, .10); }

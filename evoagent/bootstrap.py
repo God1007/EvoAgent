@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
-from .agents import FilteredAgent
+from .agents import FilteredAgent, WorkflowFactory
 from .auth import AuthManager
 from .circuit_breaker import CircuitBreaker
 from .config import Settings
@@ -50,8 +51,13 @@ class ApplicationComponents:
     evolution: EvolutionEngine
 
 
-def build_components(settings: Settings) -> ApplicationComponents:
-    """Build the one application graph the service actually runs."""
+def build_components(
+    settings: Settings,
+    *,
+    workflow_factory: WorkflowFactory | None = None,
+    reviewer_contributions: Sequence[ReviewerContribution] | None = None,
+) -> ApplicationComponents:
+    """Compose trusted agents at startup; PRs cannot select Python providers."""
     repair_container_image = resolve_container_image(settings.repair_container_image)
     github_breaker = _breaker(settings, "github")
     llm_breaker = _breaker(settings, "llm")
@@ -75,7 +81,9 @@ def build_components(settings: Settings) -> ApplicationComponents:
             store,
             observability,
             model_gateway,
-            (
+            reviewer_contributions
+            if reviewer_contributions is not None
+            else (
                 ReviewerContribution(
                     "security-review",
                     FilteredAgent("security-agent", LocalRuleReviewer(), ("SEC-",)),
@@ -89,6 +97,7 @@ def build_components(settings: Settings) -> ApplicationComponents:
                     source="evoagent.reviewer.reliability",
                 ),
             ),
+            workflow_factory=workflow_factory,
         )
         fixer = SafeFixer(
             _repair_verifier(settings, settings.repair_test_command, repair_container_image),

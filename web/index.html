@@ -93,8 +93,8 @@
 
           <article class="panel agent-panel">
             <div class="panel-head">
-              <h3>Agent 协作链</h3>
-              <span class="status status-online"><i></i>运行中</span>
+              <h3>内置 Agent 角色示例</h3>
+              <span class="status status-neutral">非实时状态</span>
             </div>
             <div class="agent-flow">
               <div class="agent-step">
@@ -112,6 +112,7 @@
                 <em class="done">汇总</em>
               </div>
             </div>
+            <button class="link-button" data-jump="tasks">查看任务的真实交接记录 →</button>
           </article>
         </div>
       </section>
@@ -164,13 +165,20 @@
             </div>
             <div id="all-tasks" class="task-list"><div class="list-loading"></div></div>
           </article>
-          <article class="panel report-panel">
-            <div class="panel-head">
-              <h3>任务报告</h3>
-              <button class="button danger hidden" id="create-fix">创建修复分支</button>
-            </div>
-            <pre id="task-report">请选择一个已完成的任务。</pre>
-          </article>
+          <div class="task-detail">
+            <p id="task-selection" class="workflow-note" role="status">选择任务查看交接记录与报告</p>
+            <article class="panel workflow-panel">
+              <div class="panel-head"><h3>Agent 交接记录</h3><span class="status status-neutral">只读快照</span></div>
+              <div id="task-workflow" class="workflow-content" aria-live="polite" aria-busy="false">请选择一个任务。</div>
+            </article>
+            <article class="panel report-panel">
+              <div class="panel-head">
+                <h3>任务报告 · JSON</h3>
+                <button class="button danger hidden" id="create-fix">创建修复分支</button>
+              </div>
+              <pre id="task-report">请选择一个任务。</pre>
+            </article>
+          </div>
         </div>
       </section>
 

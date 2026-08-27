@@ -56,7 +56,8 @@ class PostgresTaskStore:
         if not math.isfinite(statement_timeout_seconds) or statement_timeout_seconds <= 0:
             raise ValueError("EVOAGENT_PG_STATEMENT_TIMEOUT_SECONDS must be positive")
         self.statement_timeout_seconds = float(statement_timeout_seconds)
-        self._connection_options = "-c statement_timeout=%d" % max(
+        # Stable timestamp serialization across database hosts and connection modes.
+        self._connection_options = "-c statement_timeout=%d -c timezone=UTC" % max(
             1, math.ceil(self.statement_timeout_seconds * 1000)
         )
         self.auto_migrate = bool(auto_migrate)
@@ -2087,12 +2088,15 @@ class PostgresTaskStore:
             )
         return True
 
-    def load_checkpoints(self, task_id: str) -> dict[str, dict[str, Any]]:
+    def load_checkpoints(self, task_id: str, node: str | None = None) -> dict[str, dict[str, Any]]:
+        # A DAG node needs only its own artifact, not every earlier payload.
+        node_filter = " AND node=%s" if node is not None else ""
+        params = (task_id, node) if node is not None else (task_id,)
         with self._connect() as conn:
             rows = conn.execute(
                 "SELECT node,status,attempt,state_json,error,updated_at FROM checkpoints "
-                "WHERE task_id=%s ORDER BY updated_at",
-                (task_id,),
+                "WHERE task_id=%s" + node_filter + " ORDER BY updated_at",
+                params,
             ).fetchall()
         result = {}
         for row in rows:
@@ -2100,6 +2104,84 @@ class PostgresTaskStore:
             item["state"] = item.pop("state_json")
             item["updated_at"] = item["updated_at"].isoformat()
             result[item.pop("node")] = item
+        return result
+
+    def workflow_status(self, task_id: str, tenant_id: str) -> dict[str, Any] | None:
+        """Read one tenant-scoped snapshot; never select node inputs or outputs."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT task.id AS task_id,task.state AS task_state,"
+                "task.input_json->>'execution_artifacts_pruned_at' AS artifacts_pruned_at,"
+                "checkpoint.node,checkpoint.status,checkpoint.attempt,checkpoint.error,"
+                "checkpoint.updated_at,"
+                "checkpoint.state_json->'definition' AS definition,"
+                "checkpoint.state_json->>'workflow_revision' AS workflow_revision,"
+                "checkpoint.state_json->>'execution_revision' AS execution_revision,"
+                "checkpoint.state_json->'generation' AS generation,"
+                "checkpoint.state_json->>'idempotency_key' AS idempotency_key,"
+                "checkpoint.state_json#>>'{handoff,input_sha256}' AS input_sha256,"
+                "checkpoint.state_json->>'output_sha256' AS output_sha256 "
+                "FROM tasks AS task LEFT JOIN checkpoints AS checkpoint "
+                "ON checkpoint.task_id=task.id AND "
+                "(checkpoint.node='workflow' OR checkpoint.node LIKE %s) "
+                "WHERE task.id=%s AND task.tenant_id=%s ORDER BY checkpoint.node",
+                ("workflow:%", task_id, tenant_id),
+            ).fetchall()
+        if not rows:
+            return None
+        task = rows[0]
+        manifest = next((row for row in rows if row["node"] == "workflow"), None)
+        definition = (manifest or {}).get("definition")
+        recorded = isinstance(definition, dict) and isinstance(definition.get("steps"), list)
+        pruned = task["artifacts_pruned_at"]
+        result: dict[str, Any] = {
+            "task_id": task_id,
+            "task_state": task["task_state"],
+            "availability": "recorded" if recorded else "pruned" if pruned else "not_recorded",
+            "artifacts_pruned_at": pruned,
+            "workflow": None,
+            "steps": [],
+        }
+        if not recorded or not manifest or not isinstance(definition, dict):
+            return result
+        result["workflow"] = {
+            "name": definition["name"],
+            "protocol_version": definition["protocol_version"],
+            "revision": manifest["workflow_revision"],
+            "execution_revision": manifest["execution_revision"],
+        }
+        by_node = {row["node"]: row for row in rows}
+        for step in definition["steps"]:
+            row = by_node.get("workflow:" + step["id"], {})
+            status = row.get("status", "pending")
+            parents = {ref.split(".")[0] for ref in step["sources"].values()} - {"$input"}
+            result["steps"].append(
+                {
+                    "id": step["id"],
+                    "agent_id": step["agent"],
+                    "agent_revision": step["revision"],
+                    "sources": step["sources"],
+                    "inputs": step["inputs"],
+                    "outputs": step["outputs"],
+                    "status": status,
+                    "attempt": row.get("attempt", 0),
+                    "generation": row.get("generation"),
+                    "idempotency_key": row.get("idempotency_key"),
+                    "input_sha256": row.get("input_sha256"),
+                    "output_sha256": row.get("output_sha256"),
+                    "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+                    "error": preserve_safe_summary(row["error"], "review node failed")
+                    if row.get("error")
+                    else None,
+                    "blocked_by": sorted(
+                        parent
+                        for parent in parents
+                        if by_node.get("workflow:" + parent, {}).get("status") != "completed"
+                    )
+                    if status == "pending"
+                    else [],
+                }
+            )
         return result
 
     def request_cancel(self, task_id: str, tenant_id: str, actor: str = "system") -> bool:

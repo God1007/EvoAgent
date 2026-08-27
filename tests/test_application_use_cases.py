@@ -26,6 +26,7 @@ from evoagent.policy import RepositoryPolicy, RepositoryPolicyResolver
 from evoagent.rollout import ReleaseManager
 from evoagent.task_queue import PermanentTaskError
 from evoagent.time_utils import utc_now
+from evoagent.workflow import HandoffError
 from tests.db_support import postgres_store
 
 
@@ -1180,7 +1181,7 @@ class QueueTaskBindingTests(unittest.TestCase):
         self.assertIn("evoagent_queue_terminal_duplicates_total 1.0", output)
         self.assertNotIn("evoagent_reviews_failed_total", output)
 
-    def test_only_dead_letter_counts_an_async_terminal_failure(self):
+    def test_transient_and_contract_errors_only_count_terminal_failure_at_dead_letter(self):
         task = {
             "state": "PENDING",
             "tenant_id": "tenant-a",
@@ -1238,6 +1239,16 @@ class QueueTaskBindingTests(unittest.TestCase):
         self.assertNotIn("evoagent_reviews_failed_total", output)
         releases.observe.assert_not_called()
         alerts.evaluate.assert_not_called()
+
+        reviews.execute_review.side_effect = HandoffError("private input must not appear in DLQ")
+        with (
+            mock.patch("evoagent.application.reviews.metrics", captured),
+            self.assertRaisesRegex(PermanentTaskError, "handoff contract or revision") as rejected,
+        ):
+            reviews.process_queued(payload)
+        self.assertNotIn("private input", str(rejected.exception))
+        self.assertIn("evoagent_review_attempts_failed_total 2.0", captured.prometheus())
+        self.assertNotIn("evoagent_reviews_failed_total", captured.prometheus())
 
         task["state"] = "FAILED"
         with mock.patch("evoagent.application.reviews.metrics", captured):

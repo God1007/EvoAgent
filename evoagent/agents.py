@@ -11,12 +11,14 @@ import json
 import math
 import threading
 import time
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, TypedDict, cast
 
-from .diff_parser import ParsedDiff
+from .diff_parser import ParsedDiff, parse_unified_diff
 from .errors import safe_exception_summary
 from .metrics import metrics
 from .models import Finding, Severity
@@ -27,6 +29,7 @@ from .reviewer import (
     Reviewer,
     valid_reviewer_name,
 )
+from .workflow import AgentSpec, Handoff, HandoffError, PayloadType, Step, Workflow
 
 # ponytail: fixed graph ceiling; raise only when 64 active specialists prove insufficient.
 MAX_REVIEW_AGENTS = 64
@@ -90,6 +93,7 @@ class CollaborationState(TypedDict, total=False):
     parsed: ParsedDiff
     task_id: str
     admission_generation: int | None
+    deadline: float
     plan: ReviewPlan
     specialist_findings: list[Finding]
     critiques: dict[str, Critique]
@@ -307,6 +311,163 @@ class VerifierAgent:
         return True
 
 
+def _findings_payload(value: Any) -> None:
+    if not isinstance(value, list) or len(value) > MAX_REVIEWER_FINDINGS:
+        raise ValueError("expected a bounded findings list")
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("finding must be an object")
+        finding = Finding.from_dict(item)
+        canonical = asdict(finding)
+        if "fingerprint" in item:
+            canonical["fingerprint"] = finding.fingerprint()
+        if item != canonical:
+            raise ValueError("finding handoff must use canonical fields and severity")
+
+
+def _strings(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _plan_payload(value: Any) -> None:
+    if (
+        not isinstance(value, dict)
+        or value.keys() != {"languages", "changed_files", "risk_level", "assignments"}
+        or not _strings(value["languages"])
+        or not _strings(value["changed_files"])
+        or value["risk_level"] not in {"high", "normal"}
+        or not isinstance(value["assignments"], list)
+        or len(value["assignments"]) > MAX_REVIEW_AGENTS
+    ):
+        raise ValueError("invalid review plan")
+    for item in value["assignments"]:
+        if (
+            not isinstance(item, dict)
+            or item.keys() != {"agent", "objective", "files", "risk_domains"}
+            or not valid_reviewer_name(item["agent"])
+            or not isinstance(item["objective"], str)
+            or not _strings(item["files"])
+            or not _strings(item["risk_domains"])
+        ):
+            raise ValueError("invalid review assignment")
+
+
+def _decisions_payload(value: Any, kind: str) -> None:
+    if not isinstance(value, dict) or len(value) > MAX_REVIEWER_FINDINGS:
+        raise ValueError("expected bounded decision map")
+    for key, item in value.items():
+        if len(key) != 16 or any(char not in "0123456789abcdef" for char in key):
+            raise ValueError("invalid finding correlation key")
+        if kind == "fix":
+            if type(item) is not bool:
+                raise ValueError("invalid fix decision")
+        elif kind == "critic":
+            decision = Critique(**item)
+            if (
+                decision.finding_key != key
+                or type(decision.accepted) is not bool
+                or not _strings(decision.objections)
+                or type(decision.confidence_adjustment) not in (float, int)
+                or not -1 <= decision.confidence_adjustment <= 1
+            ):
+                raise ValueError("invalid critique")
+        else:
+            reproduction = Reproduction(**item)
+            if (
+                reproduction.finding_key != key
+                or type(reproduction.reproducible) is not bool
+                or not isinstance(reproduction.method, str)
+                or not isinstance(reproduction.evidence, str)
+            ):
+                raise ValueError("invalid reproduction")
+
+
+def _diff_payload(value: Any) -> None:
+    if not isinstance(value, str):
+        raise ValueError("diff must be text")
+
+
+FINDINGS_TYPE = PayloadType("review-findings", 1, _findings_payload)
+REVIEW_INPUTS = {
+    "diff": PayloadType("unified-diff", 1, _diff_payload),
+    "parsed": PayloadType("parsed-diff", 1, ParsedDiff.from_dict),
+}
+_REVIEW_TYPES = {
+    **REVIEW_INPUTS,
+    "plan": PayloadType("review-plan", 1, _plan_payload),
+    "specialist_findings": FINDINGS_TYPE,
+    "critiques": PayloadType(
+        "review-critiques", 1, lambda value: _decisions_payload(value, "critic")
+    ),
+    "reproductions": PayloadType(
+        "review-reproductions", 1, lambda value: _decisions_payload(value, "test")
+    ),
+    "synthesized": FINDINGS_TYPE,
+    "fix_ready": PayloadType(
+        "review-fix-decisions", 1, lambda value: _decisions_payload(value, "fix")
+    ),
+    "verified": FINDINGS_TYPE,
+}
+
+WorkflowFactory = Callable[[Mapping[str, AgentSpec]], Workflow]
+
+
+def review_workflow(agents: Mapping[str, AgentSpec]) -> Workflow:
+    """The default policy is data: deployments may replace agents or rewire it."""
+    return Workflow(
+        "review",
+        REVIEW_INPUTS,
+        (
+            Step("plan", agents["planner"], {"parsed": "$input.parsed"}),
+            Step(
+                "specialists",
+                agents["specialists"],
+                {
+                    "diff": "$input.diff",
+                    "parsed": "$input.parsed",
+                    "plan": "plan.plan",
+                },
+            ),
+            Step(
+                "critic",
+                agents["critic"],
+                {
+                    "parsed": "$input.parsed",
+                    "specialist_findings": "specialists.specialist_findings",
+                },
+            ),
+            Step(
+                "test",
+                agents["test"],
+                {
+                    "parsed": "$input.parsed",
+                    "specialist_findings": "specialists.specialist_findings",
+                },
+            ),
+            Step(
+                "synthesize",
+                agents["synthesizer"],
+                {
+                    "specialist_findings": "specialists.specialist_findings",
+                    "critiques": "critic.critiques",
+                    "reproductions": "test.reproductions",
+                },
+            ),
+            Step("fix", agents["fix"], {"synthesized": "synthesize.synthesized"}),
+            Step(
+                "verify",
+                agents["verifier"],
+                {
+                    "synthesized": "synthesize.synthesized",
+                    "reproductions": "test.reproductions",
+                    "fix_ready": "fix.fix_ready",
+                },
+            ),
+        ),
+        {"verified": "verify.verified"},
+    )
+
+
 class MultiAgentCoordinator(Reviewer):
     """Planner/specialist/critic/test/synthesis/fix/verifier collaboration graph."""
 
@@ -318,6 +479,9 @@ class MultiAgentCoordinator(Reviewer):
         max_workers: int = 4,
         store: AgentMessageStorePort | None = None,
         timeout_seconds: float = 120,
+        *,
+        workflow_factory: WorkflowFactory | None = None,
+        checkpoint_revision: str = "",
     ):
         if not agents:
             raise ValueError("at least one review agent is required")
@@ -361,9 +525,116 @@ class MultiAgentCoordinator(Reviewer):
         self._worker_slots = threading.BoundedSemaphore(self.max_workers)
         self.store = store
         self.timeout_seconds = timeout_seconds
+        self.checkpoint_revision = checkpoint_revision
+        self.workflow = (workflow_factory or review_workflow)(self.workflow_agents())
+        if {key: value.key for key, value in self.workflow.inputs.items()} != {
+            key: value.key for key, value in REVIEW_INPUTS.items()
+        } or {key: value.key for key, value in self.workflow.output_types.items()} != {
+            "verified": FINDINGS_TYPE.key
+        }:
+            raise ValueError("review workflow must accept diff/parsed and return verified findings")
+
+    def workflow_agents(self) -> dict[str, AgentSpec]:
+        revision = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        nodes = (
+            ("planner", self._plan_node, ("parsed",), "plan"),
+            (
+                "specialists",
+                self._specialist_node,
+                ("diff", "parsed", "plan"),
+                "specialist_findings",
+            ),
+            ("critic", self._critic_node, ("parsed", "specialist_findings"), "critiques"),
+            ("test", self._test_node, ("parsed", "specialist_findings"), "reproductions"),
+            (
+                "synthesizer",
+                self._synthesize_node,
+                ("specialist_findings", "critiques", "reproductions"),
+                "synthesized",
+            ),
+            ("fix", self._fix_node, ("synthesized",), "fix_ready"),
+            (
+                "verifier",
+                self._verify_node,
+                ("synthesized", "reproductions", "fix_ready"),
+                "verified",
+            ),
+        )
+        return {
+            name: AgentSpec(
+                name,
+                revision,
+                {key: _REVIEW_TYPES[key] for key in inputs},
+                {output: _REVIEW_TYPES[output]},
+                self._adapt_node(callback),
+            )
+            for name, callback, inputs, output in nodes
+        }
+
+    @staticmethod
+    def _adapt_node(callback) -> Callable[[Handoff], dict[str, Any]]:
+        def run(handoff: Handoff) -> dict[str, Any]:
+            state = dict(handoff.inputs)
+            if "parsed" in state:
+                state["parsed"] = ParsedDiff.from_dict(state["parsed"])
+            if "plan" in state:
+                plan = state["plan"]
+                state["plan"] = ReviewPlan(
+                    **{
+                        **plan,
+                        "assignments": [ReviewAssignment(**item) for item in plan["assignments"]],
+                    }
+                )
+            for key in ("specialist_findings", "synthesized"):
+                if key in state:
+                    state[key] = [Finding.from_dict(item) for item in state[key]]
+            for key, record in (("critiques", Critique), ("reproductions", Reproduction)):
+                if key in state:
+                    state[key] = {name: record(**item) for name, item in state[key].items()}
+            state.update(
+                task_id=handoff.task_id,
+                admission_generation=handoff.generation,
+                deadline=handoff.deadline,
+            )
+            return json.loads(json.dumps(callback(cast(CollaborationState, state)), default=asdict))
+
+        return run
 
     def review(self, diff: str, parsed: ParsedDiff) -> list[Finding]:
         return self.review_with_context("", diff, parsed)
+
+    def execution_revision(self) -> str:
+        # Prompt versions can differ within one application release (canary/stable).
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "execution": self.checkpoint_revision,
+                    "reviewers": [
+                        [
+                            agent.name,
+                            str(getattr(agent, "source_sha256", "")),
+                            hashlib.sha256(
+                                str(getattr(agent, "system_prompt", "")).encode()
+                            ).hexdigest(),
+                        ]
+                        for agent in self.agents
+                    ],
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+
+    def validate_resume(self, task_id: str, diff: str) -> None:
+        """An outer cached result must not bypass the workflow's pinned identity."""
+        if not self.checkpoint_revision or self.store is None:
+            return
+        saved = self.store.load_checkpoints(task_id, "workflow").get("workflow", {})
+        expected = self.workflow.execution_snapshot(
+            {"diff": diff, "parsed": parse_unified_diff(diff).to_dict()},
+            self.execution_revision(),
+        )
+        if saved.get("status") != "completed" or saved.get("state") != expected:
+            raise HandoffError("workflow revision or original input changed; start a new task")
 
     def review_with_context(
         self,
@@ -372,24 +643,15 @@ class MultiAgentCoordinator(Reviewer):
         parsed: ParsedDiff,
         admission_generation: int | None = None,
     ) -> list[Finding]:
-        state: CollaborationState = {
-            "task_id": task_id,
-            "diff": diff,
-            "parsed": parsed,
-            "admission_generation": admission_generation,
-        }
-        result: dict[str, Any] = dict(state)
-        for node in (
-            self._plan_node,
-            self._specialist_node,
-            self._critic_node,
-            self._test_node,
-            self._synthesize_node,
-            self._fix_node,
-            self._verify_node,
-        ):
-            result.update(node(cast(CollaborationState, result)))
-        return result["verified"]
+        result = self.workflow.run(
+            {"diff": diff, "parsed": parsed.to_dict()},
+            task_id=task_id,
+            store=self.store if task_id and self.checkpoint_revision else None,
+            generation=admission_generation,
+            execution_revision=self.execution_revision(),
+            timeout_seconds=self.timeout_seconds,
+        )
+        return [Finding.from_dict(item) for item in result["verified"]]
 
     def _emit(
         self,
@@ -433,7 +695,7 @@ class MultiAgentCoordinator(Reviewer):
 
         pool = ThreadPoolExecutor(max_workers=self.max_workers)
         futures = {}
-        deadline = time.monotonic() + self.timeout_seconds
+        deadline = min(time.monotonic() + self.timeout_seconds, state.get("deadline", float("inf")))
         try:
             for agent in self.agents:
                 if not self._worker_slots.acquire(timeout=max(0.0, deadline - time.monotonic())):

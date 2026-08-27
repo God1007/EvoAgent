@@ -20,6 +20,7 @@ Examples:
 import argparse
 import http.client
 import json
+import math
 import queue
 import statistics
 import sys
@@ -69,6 +70,8 @@ class Results:
     sent: int = 0
     completed: int = 0
     errors: int = 0
+    dropped: int = 0
+    elapsed_seconds: float = 0.0
     status_counts: dict[int, int] = field(default_factory=dict)
 
 
@@ -128,6 +131,7 @@ class _Worker(threading.Thread):
         while True:
             job = self._jobs.get()
             if job is None:
+                conn.close()
                 self._jobs.task_done()
                 break
             scheduled, method, path, body = job
@@ -154,8 +158,8 @@ class _Worker(threading.Thread):
             conn.request(method, path, body=payload, headers=headers)
             response = conn.getresponse()
             response.read()
-            # 5xx and 429/503 count as errors for SLO purposes.
-            error = response.status >= 500 or response.status in (429, 503)
+            # Redirects and rejected/auth-failed work are not successful measurements.
+            error = not 200 <= response.status < 300
             return response.status, error
         except Exception:
             return 0, True
@@ -181,64 +185,67 @@ def generate(
         worker.start()
 
     start = time.monotonic()
-    end = start + duration
     index = 0
     while True:
-        now = time.monotonic()
-        if now >= end:
-            break
-        # Effective arrival rate (constant, ramped, or spiking).
+        # Invert cumulative arrivals. A rate change must not reschedule prior slots.
         if config.get("ramp"):
-            current_rate = max(1.0, rate * (now - start) / duration)
+            offset = math.sqrt(2 * index / (rate * duration)) * duration
         elif config.get("spike"):
-            # First 20% at 10% rate, then jump to full rate.
-            current_rate = rate if (now - start) > 0.2 * duration else max(1.0, rate * 0.1)
+            low_duration, low_rate = 0.2 * duration, 0.1 * rate
+            low_count = low_duration * low_rate
+            offset = (
+                index / low_rate if index < low_count else low_duration + (index - low_count) / rate
+            )
         else:
-            current_rate = rate
-        interval = 1.0 / current_rate
-        method, path, body = plan[index % len(plan)]
-        index += 1
-        scheduled = time.monotonic()
-        try:
-            jobs.put((scheduled, method, path, body), timeout=1.0)
-            with lock:
-                results.sent += 1
-        except queue.Full:
-            # Backlog: the system under test cannot keep up. Record a dropped
-            # sample so this shows up as latency/error rather than being omitted.
-            with lock:
-                results.samples.append(Sample(scheduled, timeout, 0, True))
-                results.sent += 1
-                results.errors += 1
-        # Sleep until the next scheduled send (coordinated-omission-safe cadence).
-        target = start + index * interval
-        sleep_for = target - time.monotonic()
+            offset = index / rate
+        scheduled = start + min(offset, duration)
+        sleep_for = scheduled - time.monotonic()
         if sleep_for > 0:
             time.sleep(sleep_for)
+        if offset >= duration:
+            break
+        method, path, body = plan[index % len(plan)]
+        index += 1
+        with lock:
+            results.sent += 1
+        try:
+            jobs.put_nowait((scheduled, method, path, body))
+        except queue.Full:
+            # Never slow the arrival clock to match worker capacity. Drops count
+            # against the error budget, but have no fabricated HTTP latency sample.
+            with lock:
+                results.dropped += 1
+                results.errors += 1
+                results.status_counts[0] = results.status_counts.get(0, 0) + 1
 
     jobs.join()
     for _ in workers:
         jobs.put(None)
+    for worker in workers:
+        worker.join()
+    results.elapsed_seconds = time.monotonic() - start
     return results
 
 
 def summarize(results: Results, duration: float) -> dict:
     latencies = [s.latency * 1000.0 for s in results.samples]  # ms
-    wall = duration if duration > 0 else 1.0
-    error_rate = (results.errors / results.completed) if results.completed else 0.0
+    wall = results.elapsed_seconds or (duration if duration > 0 else 1.0)
+    error_rate = results.errors / results.sent if results.sent else 0.0
     return {
         "sent": results.sent,
         "completed": results.completed,
         "errors": results.errors,
-        "error_rate": round(error_rate, 6),
-        "throughput_rps": round(results.completed / wall, 2),
+        "dropped": results.dropped,
+        "elapsed_seconds": wall,
+        "error_rate": error_rate,
+        "throughput_rps": results.completed / wall,
         "latency_ms": {
-            "p50": round(_percentile(latencies, 50), 2),
-            "p95": round(_percentile(latencies, 95), 2),
-            "p99": round(_percentile(latencies, 99), 2),
-            "p99_9": round(_percentile(latencies, 99.9), 2),
-            "max": round(max(latencies), 2) if latencies else 0.0,
-            "mean": round(statistics.fmean(latencies), 2) if latencies else 0.0,
+            "p50": _percentile(latencies, 50),
+            "p95": _percentile(latencies, 95),
+            "p99": _percentile(latencies, 99),
+            "p99_9": _percentile(latencies, 99.9),
+            "max": max(latencies) if latencies else 0.0,
+            "mean": statistics.fmean(latencies) if latencies else 0.0,
         },
         "status_counts": {str(k): v for k, v in sorted(results.status_counts.items())},
     }
@@ -249,10 +256,11 @@ def _render_text(summary: dict, scenario: str, rate: float) -> str:
     return "\n".join(
         [
             "EvoAgent load test - scenario=%s target_rate=%.0f/s" % (scenario, rate),
-            "  requests: sent=%d completed=%d errors=%d (%.3f%%)"
+            "  requests: offered=%d completed=%d dropped=%d errors=%d (%.3f%%)"
             % (
                 summary["sent"],
                 summary["completed"],
+                summary["dropped"],
                 summary["errors"],
                 summary["error_rate"] * 100,
             ),
@@ -282,6 +290,39 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-error-rate", type=float, default=1.0, help="fail if exceeded")
     parser.add_argument("--json", default="", help="write JSON summary to this path")
     args = parser.parse_args(argv)
+
+    if (
+        any(
+            not math.isfinite(value) or value <= 0
+            for value in (args.duration, args.rate, args.timeout, args.duration * args.rate)
+        )
+        or args.concurrency <= 0
+        or any(not math.isfinite(value) or value < 0 for value in (args.warmup, args.p99_ms))
+        or not math.isfinite(args.warmup * args.rate)
+        or not math.isfinite(args.max_error_rate)
+        or not 0 <= args.max_error_rate <= 1
+    ):
+        parser.error(
+            "duration/rate/timeout/concurrency must be positive; warmup/p99 nonnegative; "
+            "error rate in [0,1]; numeric limits finite"
+        )
+    try:
+        target = urllib.parse.urlsplit(args.base_url)
+        if (
+            target.scheme not in {"http", "https"}
+            or not target.hostname
+            or target.username is not None
+            or target.password is not None
+            or target.path not in {"", "/"}
+            or target.query
+            or target.fragment
+            or target.port == 0
+        ):
+            raise ValueError("invalid origin")
+        # Validate the host/port without opening a socket or starting worker threads.
+        http.client.HTTPConnection(target.hostname, target.port).close()
+    except (ValueError, http.client.InvalidURL):
+        parser.error("base-url must be a valid HTTP(S) origin without credentials or a path")
 
     headers = {"Accept": "application/json"}
     if args.token:
@@ -317,6 +358,8 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     breached = []
+    if not results.completed:
+        breached.append("no HTTP requests completed")
     if args.p99_ms and summary["latency_ms"]["p99"] > args.p99_ms:
         breached.append("p99 %.1fms > %.1fms" % (summary["latency_ms"]["p99"], args.p99_ms))
     if summary["error_rate"] > args.max_error_rate:

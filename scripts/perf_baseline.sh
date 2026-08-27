@@ -64,22 +64,19 @@ ok()   { printf "\033[32m✓\033[0m %s\n" "$*"; }
 warn() { printf "\033[33m!\033[0m %s\n" "$*"; }
 
 # --- server lifecycle -------------------------------------------------------
-# Guarantee the port is empty so a leaked instance cannot pollute results.
-free_port() {
-  local pids i=1
-  while [ "$i" -le 20 ]; do
-    pids=$(lsof -ti "tcp:${PORT}" 2>/dev/null || true)
-    [ -z "$pids" ] && return 0
-    # shellcheck disable=SC2086
-    kill -9 $pids 2>/dev/null || true
-    sleep 0.2; i=$((i + 1))
-  done
-}
-
 boot_server() {
   # Args: label + KEY=VALUE env overrides. Boots a fresh server on $PORT.
   local label="$1"; shift
-  free_port
+  # Refuse an occupied port; its listener is not owned by this benchmark.
+  "$PYTHON" - "$PORT" <<'PY' || return 1
+import socket, sys
+with socket.socket() as probe:
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        probe.bind(("127.0.0.1", int(sys.argv[1])))
+    except OSError:
+        raise SystemExit("benchmark port 127.0.0.1:%s is unavailable" % sys.argv[1]) from None
+PY
   info "Booting server [${label}] on :${PORT} ($*)"
   # `exec` replaces the subshell with the interpreter so $! is the real Python
   # process (not a throwaway shell), making teardown reliable.
@@ -92,11 +89,11 @@ boot_server() {
   SERVER_PID=$!
   local i=1
   while [ "$i" -le 40 ]; do
-    if curl -fsS "${BASE_URL}/ready" >/dev/null 2>&1; then
-      ok "server ready (pid ${SERVER_PID})"; return 0
-    fi
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
       warn "server process died; see ${SERVER_LOG}"; return 1
+    fi
+    if curl -fsS "${BASE_URL}/ready" >/dev/null 2>&1; then
+      ok "server ready (pid ${SERVER_PID})"; return 0
     fi
     sleep 0.5; i=$((i + 1))
   done
@@ -110,7 +107,6 @@ stop_server() {
   while [ "$i" -le 10 ] && kill -0 "$SERVER_PID" 2>/dev/null; do sleep 0.3; i=$((i + 1)); done
   kill -9 "$SERVER_PID" 2>/dev/null || true
   wait "$SERVER_PID" 2>/dev/null || true
-  free_port
   SERVER_PID=""
 }
 trap stop_server EXIT

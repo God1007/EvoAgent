@@ -22,6 +22,7 @@ const stateLabels = {
 };
 
 let selectedTask = null;
+let taskRequest = 0;
 let accessToken = localStorage.getItem("evoagent_token") || "";
 let currentRole = localStorage.getItem("evoagent_role") || "";
 let toastTimer = null;
@@ -122,7 +123,7 @@ function taskRows(tasks) {
     const repository = escapeHtml(task.repository || "未命名仓库");
     const pr = task.pull_request ? `PR #${escapeHtml(task.pull_request)}` : "手动审查";
     return `
-      <button class="task-row" data-task="${escapeHtml(task.id)}" type="button">
+      <button class="task-row" data-task="${escapeHtml(task.id)}" type="button" aria-pressed="${task.id === selectedTask}">
         <span class="task-main">
           <span class="task-glyph">PR</span>
           <span class="task-copy">
@@ -177,26 +178,98 @@ async function loadTasks() {
     const data = await api("/api/tasks");
     root.innerHTML = taskRows(data.tasks || []);
     bindTasks(root);
+    return true;
   } catch (error) {
     root.innerHTML = '<div class="empty-state"><span>任务加载失败</span></div>';
     toast(error.message);
+    return false;
   }
 }
 
-async function openTask(id) {
-  show("tasks");
-  $("#task-report").textContent = "正在加载任务报告…";
-  try {
-    const task = await api(`/v1/tasks/${encodeURIComponent(id)}`);
-    selectedTask = id;
-    $("#task-report").textContent = formatJson(task);
-    $("#create-fix").classList.toggle(
-      "hidden",
-      !(task.report && task.pull_request && task.input?.head_sha),
-    );
-  } catch (error) {
-    $("#task-report").textContent = error.message;
+function workflowMarkup(data) {
+  if (data.availability === "pruned") {
+    return `<p class="workflow-note">交接记录已按保留策略清理，无法还原节点状态。清理时间：${escapeHtml(formatTime(data.artifacts_pruned_at))}</p>`;
   }
+  if (data.availability === "not_recorded") {
+    return '<p class="workflow-note">尚无交接记录：任务可能未开始执行，或来自未记录流程快照的旧版本。</p>';
+  }
+  if (data.availability !== "recorded" || !data.workflow || !Array.isArray(data.steps)) {
+    throw new Error("交接状态格式异常");
+  }
+  const states = {
+    pending: ["未派发", "status-neutral"],
+    running: ["已派发", "state-executing"],
+    completed: ["已完成", "state-success"],
+    failed: ["失败", "state-failed"],
+  };
+  const completed = data.steps.filter((step) => step.status === "completed").length;
+  const metadata = (items) => items.map(([label, value]) =>
+    `<dt>${label}</dt><dd><code>${escapeHtml(value ?? "尚未记录")}</code></dd>`).join("");
+  return `
+    <div class="workflow-heading"><strong>${escapeHtml(data.workflow.name)}</strong>
+      <span class="status status-neutral">任务：${escapeHtml(stateLabels[data.task_state] || data.task_state)}</span></div>
+    <p class="workflow-note">${completed} / ${data.steps.length} 个节点完成 · 持久化快照，点击顶部刷新获取最新记录。</p>
+    <p class="workflow-note">“已派发”仅表示最后一次派发，不代表 Worker 在线。任务取消或失败后，也可能保留此状态。</p>
+    <ul class="handoff-list">${data.steps.map((step) => {
+      const [label, style] = states[step.status] || ["未知状态", "status-neutral"];
+      return `<li class="handoff-step">
+        <div class="handoff-heading"><div><strong>${escapeHtml(step.id)}</strong><code>${escapeHtml(step.agent_id)}</code></div>
+          <span class="status ${style}">${label}</span></div>
+        <p class="workflow-note">尝试 ${escapeHtml(step.attempt)} 次 · ${step.updated_at ? `更新于 ${escapeHtml(formatTime(step.updated_at))}` : "尚未执行"}</p>
+        ${step.blocked_by?.length ? `<p class="handoff-blocked">等待上游：${escapeHtml(step.blocked_by.join("、"))}</p>` : ""}
+        ${step.error ? `<p class="handoff-error">${escapeHtml(step.error)}</p>` : ""}
+        <details><summary>交接契约与标识</summary><dl class="handoff-metadata">
+          ${Object.entries(step.sources).map(([port, source]) => `<dt>输入 <code>${escapeHtml(port)}</code></dt>
+            <dd><code>${escapeHtml(source)}</code><small>${escapeHtml(step.inputs[port])}</small></dd>`).join("")}
+          ${Object.entries(step.outputs).map(([port, type]) => `<dt>输出 <code>${escapeHtml(port)}</code></dt><dd><code>${escapeHtml(type)}</code></dd>`).join("")}
+          ${metadata([["Agent 版本", step.agent_revision], ["执行代次", step.generation], ["幂等键", step.idempotency_key], ["输入摘要", step.input_sha256], ["输出摘要", step.output_sha256]])}
+        </dl></details>
+      </li>`;
+    }).join("")}</ul>
+    <details class="workflow-version"><summary>流程版本</summary><dl class="handoff-metadata">
+      ${metadata([["交接协议", data.workflow.protocol_version], ["流程版本", data.workflow.revision], ["执行版本", data.workflow.execution_revision]])}
+    </dl></details>`;
+}
+
+function resetTask(id = null) {
+  selectedTask = id;
+  taskRequest += 1;
+  $("#task-selection").textContent = id ? `任务 ${id}` : "选择任务查看交接记录与报告";
+  $("#task-report").textContent = id ? "正在加载任务报告…" : "请选择一个任务。";
+  $("#task-workflow").textContent = id ? "正在加载交接状态…" : "请选择一个任务。";
+  $("#task-workflow").setAttribute("aria-busy", String(Boolean(id)));
+  $("#create-fix").classList.add("hidden");
+  $$("[data-task]").forEach((row) => row.setAttribute("aria-pressed", String(row.dataset.task === id)));
+}
+
+async function openTask(id) {
+  if (location.hash !== "#tasks") show("tasks");
+  resetTask(id);
+  const request = taskRequest;
+  const path = `/v1/tasks/${encodeURIComponent(id)}`;
+  // Each request owns both panes; an older response must never change a new selection.
+  const results = await Promise.all([
+    api(path).then((task) => {
+      if (request !== taskRequest) return false;
+      $("#task-report").textContent = formatJson(task);
+      $("#create-fix").classList.toggle("hidden", !(task.report && task.pull_request && task.input?.head_sha));
+      return true;
+    }).catch((error) => {
+      if (request === taskRequest) $("#task-report").textContent = error.message;
+      return false;
+    }),
+    api(`${path}/workflow`).then((data) => {
+      if (request !== taskRequest) return false;
+      $("#task-workflow").innerHTML = workflowMarkup(data);
+      return true;
+    }).catch((error) => {
+      if (request === taskRequest) $("#task-workflow").textContent = `交接状态加载失败：${error.message}。可点击顶部刷新重试，任务报告仍可独立查看。`;
+      return false;
+    }).finally(() => {
+      if (request === taskRequest) $("#task-workflow").setAttribute("aria-busy", "false");
+    }),
+  ]);
+  return results.every(Boolean);
 }
 
 async function loadSkills() {
@@ -286,19 +359,23 @@ $("#review-form").addEventListener("submit", async (event) => {
 });
 
 $("#create-fix").addEventListener("click", async () => {
-  if (!selectedTask) return;
   const button = $("#create-fix");
+  if (!selectedTask || button.disabled || button.classList.contains("hidden")) return;
+  const id = selectedTask;
+  const request = taskRequest;
   setButtonBusy(button, true, "正在创建…");
   try {
-    const data = await api(`/v1/tasks/${encodeURIComponent(selectedTask)}/fix`, {
+    const data = await api(`/v1/tasks/${encodeURIComponent(id)}/fix`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
     });
-    $("#task-report").textContent = formatJson(data);
-    toast("修复分支已创建");
+    if (request === taskRequest) {
+      $("#task-report").textContent = formatJson(data);
+      toast("修复分支已创建");
+    }
   } catch (error) {
-    toast(error.message);
+    if (request === taskRequest) toast(error.message);
   } finally {
     setButtonBusy(button, false);
   }
@@ -366,8 +443,11 @@ $("#auto-evolve").addEventListener("click", async () => {
 $("#refresh").addEventListener("click", async () => {
   const view = location.hash.slice(1) || "overview";
   if (view === "overview") await loadDashboard();
-  else if (view === "tasks") await loadTasks();
-  else if (view === "skills") await loadSkills();
+  else if (view === "tasks") {
+    const results = await Promise.all([loadTasks(), selectedTask ? openTask(selectedTask) : true]);
+    toast(results.every(Boolean) ? "数据已刷新" : "部分数据未能刷新，请查看提示");
+    return;
+  } else if (view === "skills") await loadSkills();
   else if (view === "evolution") await loadFailures();
   else await loadDashboard();
   toast("数据已刷新");
@@ -393,11 +473,13 @@ $("#login-form").addEventListener("submit", async (event) => {
     currentRole = data.role;
     localStorage.setItem("evoagent_token", accessToken);
     localStorage.setItem("evoagent_role", currentRole);
+    resetTask();
     applyRole();
     $("#login-overlay").classList.add("hidden");
     $("#logout").classList.remove("hidden");
     $("#login-error").textContent = "";
     await loadDashboard();
+    if (location.hash === "#tasks") await loadTasks();
   } catch (error) {
     $("#login-error").textContent = error.message;
   } finally {
@@ -410,6 +492,7 @@ $("#logout").addEventListener("click", () => {
   currentRole = "";
   localStorage.removeItem("evoagent_token");
   localStorage.removeItem("evoagent_role");
+  resetTask();
   applyRole();
   $("#login-overlay").classList.remove("hidden");
   $("#logout").classList.add("hidden");

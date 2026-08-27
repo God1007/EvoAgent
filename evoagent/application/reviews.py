@@ -33,6 +33,7 @@ from ..report import to_markdown
 from ..repository import canonical_repository
 from ..task_queue import PermanentTaskError
 from ..time_utils import utc_now
+from ..workflow import HandoffError
 
 _QUEUE_CONTEXT_FIELDS = (
     "diff_url",
@@ -545,7 +546,7 @@ class ReviewUseCases:
                     execution_generation,
                 )
             self._run_shadow_safely(task_id, tenant_id, diff, report)
-        except Exception:
+        except Exception as exc:
             latest = self.store.get(task_id, tenant_id) or {}
             if latest.get("state") == TaskState.SUCCESS.value:
                 self._deliver_review_result(
@@ -562,6 +563,8 @@ class ReviewUseCases:
                 metrics.inc("review_admission_releases_total")
                 return
             metrics.inc("review_attempts_failed_total")
+            if isinstance(exc, HandoffError):
+                raise PermanentTaskError("agent handoff contract or revision was rejected") from exc
             raise
         self._review_succeeded(task_id, tenant_id)
         self._deliver_review_result(

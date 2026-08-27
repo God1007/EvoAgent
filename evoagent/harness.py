@@ -15,6 +15,7 @@ from .models import Finding, ReviewReport, Severity, TaskState, TraceEvent
 from .ports import ReviewExecutionStorePort
 from .reviewer import Reviewer
 from .time_utils import utc_now
+from .workflow import BudgetExceeded, TaskCancelled
 
 ALLOWED = {
     TaskState.PENDING: {TaskState.PLANNING, TaskState.FAILED, TaskState.CANCELLED},
@@ -32,14 +33,6 @@ class RuntimeState(TypedDict, total=False):
     parsed: dict[str, Any]
     findings: list
     report: dict[str, Any]
-
-
-class BudgetExceeded(RuntimeError):
-    pass
-
-
-class TaskCancelled(RuntimeError):
-    pass
 
 
 class ReviewHarness:
@@ -104,6 +97,8 @@ class ReviewHarness:
         if checkpoints.get("reviewing", {}).get("status") == "completed":
             self._ctx.state = TaskState.REVIEWING
         try:
+            self._ctx.diff = diff
+            self._check_budget(task_id)
             result: dict[str, Any] = dict(state)
             for node in (self._planning, self._executing, self._reviewing):
                 result.update(node(cast(RuntimeState, result)))
@@ -161,6 +156,8 @@ class ReviewHarness:
             except Exception:
                 metrics.inc("failure_case_persistence_failures_total")
             raise
+        finally:
+            self._ctx.diff = ""
 
     def _planning(self, state: RuntimeState) -> dict[str, Any]:
         def work():
@@ -214,9 +211,10 @@ class ReviewHarness:
 
     def _run_node(self, task_id: str, node: str, callback) -> dict[str, Any]:
         last_error: Exception | None = None
-        existing = self.store.load_checkpoints(task_id).get(node, {})
-        if existing.get("status") == "completed":
-            return existing["state"]
+        existing = self.store.load_checkpoints(task_id, node).get(node, {})
+        completed = self._completed(task_id, node, existing)
+        if completed is not None:
+            return completed
         start_attempt = int(existing.get("attempt", 0))
         for offset in range(1, self.node_retries + 2):
             attempt = start_attempt + offset
@@ -277,9 +275,15 @@ class ReviewHarness:
             raise RuntimeError("review node failed without an exception")
         raise last_error
 
-    def _completed(self, task_id: str, node: str) -> dict[str, Any] | None:
-        checkpoint = self.store.load_checkpoints(task_id).get(node)
+    def _completed(
+        self, task_id: str, node: str, checkpoint: dict | None = None
+    ) -> dict[str, Any] | None:
+        if checkpoint is None:
+            checkpoint = self.store.load_checkpoints(task_id, node).get(node)
         if checkpoint and checkpoint["status"] == "completed":
+            validate_resume = getattr(self.reviewer, "validate_resume", None)
+            if node in {"executing", "reviewing"} and callable(validate_resume):
+                validate_resume(task_id, self._ctx.diff)
             return checkpoint["state"]
         return None
 

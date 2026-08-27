@@ -2,8 +2,8 @@
 
 EvoAgent is a PostgreSQL-backed review service with one optional Redis queue
 and one optional model route. `bootstrap.py` composes concrete components
-directly; extension points exist only where the repository has more than one
-real implementation.
+directly; trusted agent implementations and explicit dataflow wiring can be
+supplied at that composition root without dynamic plugin discovery.
 
 ## Components
 
@@ -12,6 +12,7 @@ real implementation.
 | HTTP | `api.py`, `auth.py`, `backpressure.py` | REST, GitHub webhooks, JWT/RBAC and bounded admission |
 | Use cases | `application/`, `service.py` | Review, webhook, session, policy and repair workflows |
 | Review | `review_engine.py`, `agents.py`, `reviewer.py` | Plan, run reviewers, gate evidence and synthesize findings |
+| Agent handoff | `workflow.py` | Versioned ports, bounded DAG, isolated inputs and durable output handoffs |
 | Extensions | `review_extensions.py`, `fix_rules.py`, `skills.py` | Reviewer/fix-rule seams and sandboxed dynamic Skills |
 | Model | `model_gateway.py` | One redacted, allowlisted OpenAI-compatible route |
 | State | `postgres_store.py`, `migrations.py` | Tasks, checkpoints, audit, policy, outbox and tenant admission |
@@ -87,11 +88,20 @@ apply the same bounded exponential retry backoff on both delivery backends.
   digest, model route and executable reviewer/Skill inventory. Workers compare
   that revision before loading checkpoints, so a retry cannot silently continue
   under different application code or a different reviewer graph.
-- Built-in reviewers and fix rules are direct dependencies, not plugins.
+- Built-in agent stages are trusted `AgentSpec` implementations; their contracts
+  and wiring are replaceable at startup. Untrusted code remains sandboxed.
+- The standard `api.run()` entrypoint accepts trusted workflow/reviewer contributions.
+  Canary, shadow and evaluation rebuilds must retain the startup workflow revision;
+  a stateful factory cannot replace the graph under an existing qualification.
 
-The review loop is ordinary Python. Its fixed node order does not require a
-workflow framework. Checkpoints provide restartability independently of how
-the nodes are invoked.
+The review loop is ordinary Python using stdlib topological ordering. Agent
+handoffs are validated on both sides, copied as bounded JSON and committed before
+dependants execute. A pinned flow/implementation/input manifest prevents mixed
+revision recovery; the existing generation-fenced, first-write-wins checkpoints
+now cover each agent stage as well as the outer task phases. Branches currently
+run serially, with the existing specialist pool retaining bounded parallelism.
+See [agent composition and handoff semantics](agent-workflows.md), including
+at-least-once side effects and the trusted-handler timeout boundary.
 
 Replay evaluation runs each Prompt candidate through the same evidence graph as
 production, without persisting evaluation collaboration messages, and only
@@ -121,6 +131,9 @@ stable reviewer and records both in baseline-to-candidate order.
   admission is active instead of creating a false DLQ incident.
 - A worker whose node callback loses that race reuses the durable completed
   checkpoint instead of continuing with divergent output or retrying a stale failure.
+- Contract/revision handoff errors are permanent queue failures; temporary provider
+  errors retain bounded retries. An already successful or cancelled task wins over
+  a late handoff error before the queue failure is classified.
 - Success is immutable: late checkpoints, transitions, failures and duplicate
   successes are locked out without replacing the first report or trace.
 - Active task progress is monotonic under the same row lock; duplicate or stale

@@ -66,6 +66,10 @@ evoagent = ["py.typed"]
 
 [tool.setuptools.data-files]
 "share/evoagent/web" = ["web/*.css", "web/*.html", "web/*.js"]
+"share/evoagent/examples" = [
+  "examples/custom_review_workflow.py",
+  "examples/business-review.json",
+]
 "share/evoagent/skills/code-quality" = [
   "skills/code-quality/SKILL.md",
   "skills/code-quality/skill.json",

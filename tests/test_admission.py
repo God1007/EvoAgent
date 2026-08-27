@@ -128,6 +128,40 @@ class RequestTargetBoundaryTests(unittest.TestCase):
         handler._send_json.assert_called_once_with(404, {"error": "not found"})
 
 
+class WorkflowReadBoundaryTests(unittest.TestCase):
+    def handler(self):
+        handler = object.__new__(ApiHandler)
+        handler.path = "/v1/tasks/" + "a" * 32 + "/workflow"
+        handler.service = mock.Mock()
+        handler._authenticate_or_send = mock.Mock(
+            return_value=Principal("user-1", "alice", "tenant-a", "reviewer")
+        )
+        handler._send_json = mock.Mock()
+        return handler
+
+    def test_workflow_endpoint_uses_authenticated_tenant_and_metadata_query(self):
+        handler = self.handler()
+        snapshot = {"task_id": "a" * 32, "workflow": None, "steps": []}
+        handler.service.store.workflow_status.return_value = snapshot
+        handler._do_GET()
+        handler._authenticate_or_send.assert_called_once_with("read")
+        handler.service.store.workflow_status.assert_called_once_with("a" * 32, "tenant-a")
+        handler.service.store.get.assert_not_called()
+        handler._send_json.assert_called_once_with(200, snapshot)
+
+    def test_unknown_or_other_tenant_workflow_is_not_found(self):
+        handler = self.handler()
+        handler.service.store.workflow_status.return_value = None
+        handler._do_GET()
+        handler._send_json.assert_called_once_with(404, {"error": "task not found"})
+
+    def test_unauthenticated_workflow_never_reaches_store(self):
+        handler = self.handler()
+        handler._authenticate_or_send.return_value = None
+        handler._do_GET()
+        handler.service.store.workflow_status.assert_not_called()
+
+
 class RequestJsonBoundaryTests(unittest.TestCase):
     def test_rejects_nonstandard_numeric_constants(self):
         for constant in ("NaN", "Infinity", "-Infinity"):

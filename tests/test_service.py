@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest import mock
 
-from evoagent.agents import MAX_REVIEW_AGENTS
+from evoagent.agents import MAX_REVIEW_AGENTS, review_workflow
 from evoagent.config import Settings
 from evoagent.diff_parser import parse_unified_diff
 from evoagent.errors import ClientInputError
@@ -18,6 +18,7 @@ from evoagent.reviewer import GatewayReviewer, LocalRuleReviewer, Reviewer
 from evoagent.service import ReviewService
 from evoagent.task_queue import PermanentTaskError
 from evoagent.time_utils import utc_now
+from evoagent.workflow import HandoffError
 from tests.db_support import postgres_url, reset_postgres
 
 
@@ -154,6 +155,31 @@ class ReadinessCacheTests(unittest.TestCase):
 
 
 class ShutdownBudgetTests(unittest.TestCase):
+    def test_real_service_fixtures_do_not_leak_outbox_dispatchers(self):
+        postgres_url(self)
+        instances = []
+        constructor = ReviewService
+
+        def track(*args, **kwargs):
+            service = constructor(*args, **kwargs)
+            instances.append(service)
+            self.addCleanup(service.close)
+            return service
+
+        cases = (
+            ServiceTests("test_end_to_end_review"),
+            ServiceTests("test_rejects_large_diff"),
+            ServiceSessionTests("test_first_turn_produces_no_continuity_note"),
+        )
+        with mock.patch(__name__ + ".ReviewService", side_effect=track):
+            for case in cases:
+                with self.subTest(case=case.id()):
+                    result = unittest.TestResult()
+                    case.run(result)
+                    self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+                    self.assertTrue(instances[-1]._closed, "fixture left a live service")
+                    self.assertFalse(instances[-1].outbox._thread.is_alive())
+
     @staticmethod
     def service():
         service = ReviewService.__new__(ReviewService)
@@ -308,6 +334,50 @@ class OperationalMutationTests(unittest.TestCase):
 
 
 class ExecutionSourceRevisionTests(unittest.TestCase):
+    def test_rebuilt_flows_keep_the_startup_revision_across_execution_lanes(self):
+        revision = "a" * 64
+
+        def factory(catalog):
+            return review_workflow(
+                {**catalog, "critic": replace(catalog["critic"], revision=revision)}
+            )
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.dict("os.environ", {}, clear=True),
+        ):
+            store = mock.Mock()
+            reviewer = LocalRuleReviewer()
+            reviewer.review = mock.Mock(wraps=reviewer.review)
+            engine = ReviewEngine(
+                replace(Settings.from_env(), skills_dir=temporary),
+                store,
+                mock.Mock(),
+                ModelGateway(None, None),
+                (ReviewerContribution("local", reviewer),),
+                workflow_factory=factory,
+            )
+            snapshot = engine.execution_snapshot()
+            original = snapshot[2].reviewer.workflow.revision
+            for persist in (True, False):
+                rebuilt = engine.build_coordinator([reviewer], persist_messages=persist)
+                self.assertEqual(original, rebuilt.workflow.revision)
+                self.assertIs(store if persist else None, rebuilt.store)
+            revision = "b" * 64
+            with mock.patch.object(engine, "build_llm_reviewer", return_value=reviewer):
+                callers = (
+                    lambda: engine.build_coordinator([reviewer]),
+                    lambda: engine.build_coordinator([reviewer], persist_messages=False),
+                    lambda: engine.build_evaluation_reviewer("new prompt"),
+                )
+                for call in callers:
+                    with self.subTest(call=call), self.assertRaisesRegex(HandoffError, "startup"):
+                        call()
+            self.assertIs(snapshot, engine.execution_snapshot())
+            reviewer.review.assert_not_called()
+            store.save_checkpoint.assert_not_called()
+            store.record_agent_message.assert_not_called()
+
     def test_evaluation_reviewer_reuses_the_production_evidence_gate(self):
         class UnanchoredReviewer(Reviewer):
             name = "unanchored-reviewer"
@@ -410,18 +480,29 @@ class ExecutionSourceRevisionTests(unittest.TestCase):
                 skills_dir=temporary,
             )
 
-            def revision(config):
+            def revision(config, factory=None):
                 return ReviewEngine(
                     config,
                     mock.Mock(),
                     mock.Mock(),
                     ModelGateway(None, None),
                     (ReviewerContribution("local", LocalRuleReviewer()),),
+                    workflow_factory=factory,
                 ).execution_revision()
 
             original = revision(settings)
             self.assertNotEqual(original, revision(replace(settings, max_steps=9)))
             self.assertNotEqual(original, revision(replace(settings, timeout_seconds=11)))
+
+            def changed_agent(catalog):
+                return review_workflow(
+                    {
+                        **catalog,
+                        "critic": replace(catalog["critic"], revision="b" * 64),
+                    }
+                )
+
+            self.assertNotEqual(original, revision(settings, changed_agent))
 
 
 class TenantDeadLetterTests(unittest.TestCase):
@@ -915,12 +996,15 @@ class ServiceTests(unittest.TestCase):
 
     def test_end_to_end_review(self):
         diff = "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+eval(data)\n"
-        result = ReviewService(self.settings).create_review("org/repo", diff, 1)
+        service = ReviewService(self.settings)
+        self.addCleanup(service.close)
+        result = service.create_review("org/repo", diff, 1)
         self.assertEqual("SUCCESS", result["state"])
         self.assertEqual("SEC-EVAL", result["report"]["findings"][0]["rule_id"])
 
     def test_rejects_large_diff(self):
         service = ReviewService(self.settings)
+        self.addCleanup(service.close)
         with self.assertRaises(ValueError):
             service.create_review("org/repo", "x" * 10001)
 
@@ -945,6 +1029,7 @@ class ServiceSessionTests(unittest.TestCase):
                 database_url=database_url,
             )
         )
+        self.addCleanup(self.service.close)
 
     def _turn(self, head_sha, trigger, findings):
         turn = self.service.store.start_session_turn("default", "org/repo", 7, head_sha, trigger)

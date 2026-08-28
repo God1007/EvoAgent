@@ -44,11 +44,18 @@ def _token(value: str) -> None:
 
 
 def _json(value: Any) -> bytes:
+    remaining = MAX_HANDOFF_BYTES
+
     def check(item: Any) -> None:
+        nonlocal remaining
+        # A lower bound on encoded bytes also bounds traversal of shared subtrees.
+        remaining -= max(1, len(item)) if isinstance(item, str) else 1
+        if remaining < 0:
+            raise HandoffError("handoff exceeds the payload size limit")
         if isinstance(item, dict):
-            if any(type(key) is not str for key in item):
-                raise ValueError("non-string JSON key")
             for key, nested in item.items():
+                if type(key) is not str:
+                    raise ValueError("non-string JSON key")
                 check(key)
                 check(nested)
         elif isinstance(item, list):
@@ -61,14 +68,20 @@ def _json(value: Any) -> bytes:
 
     try:
         check(value)
-        encoded = json.dumps(
-            value, sort_keys=True, separators=(",", ":"), allow_nan=False, ensure_ascii=False
-        ).encode()
+        encoded = bytearray()
+        encoder = json.JSONEncoder(
+            sort_keys=True, separators=(",", ":"), allow_nan=False, ensure_ascii=False
+        )
+        for chunk in encoder.iterencode(value):
+            block = chunk.encode("utf-8")
+            if len(encoded) + len(block) > MAX_HANDOFF_BYTES:
+                raise HandoffError("handoff exceeds the payload size limit")
+            encoded.extend(block)
+    except HandoffError:
+        raise
     except (TypeError, ValueError, RecursionError, UnicodeError):
         raise HandoffError("handoff must contain finite, serializable JSON data") from None
-    if len(encoded) > MAX_HANDOFF_BYTES:
-        raise HandoffError("handoff exceeds the payload size limit")
-    return encoded
+    return bytes(encoded)
 
 
 def _digest(value: Any) -> str:
@@ -375,8 +388,19 @@ class Workflow:
         def resolve(refs: Mapping[str, str]) -> dict[str, Any]:
             return {key: values[ref.split(".")[0]][ref.split(".")[1]] for key, ref in refs.items()}
 
-        for step in self._order:
+        last_use = {}
+        for index, step in enumerate(self._order):
+            for ref in step.sources.values():
+                last_use[ref.split(".")[0]] = index
+        for ref in self.outputs.values():
+            last_use[ref.split(".")[0]] = len(self._order)
+
+        for index, step in enumerate(self._order):
             active()
+            # Keep later consumers and final outputs; checkpoints retain the full history.
+            values = {
+                node: value for node, value in values.items() if last_use.get(node, -1) >= index
+            }
             incoming = resolve(step.sources)
             identity = {
                 **manifest,

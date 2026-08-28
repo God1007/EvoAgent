@@ -29,9 +29,9 @@ rejected before persistence.
 | --- | --- |
 | `enabled` | Intake, queued execution, and repair publication |
 | `max_diff_bytes` | API Diff intake and webhook Diff fetch, in addition to the global cap |
-| `allowed_reviewers` | Whole configured review-pipeline identity at intake and execution |
-| `allowed_llm_providers` / `allowed_llm_models` | Intake and queued execution |
-| `llm_region` | Intake route eligibility and every gateway call |
+| `allowed_reviewers` | Whole configured review-pipeline identity at Studio activation, intake and execution |
+| `allowed_llm_providers` / `allowed_llm_models` | Studio activation, intake and queued execution |
+| `llm_region` | Studio activation, intake route eligibility and every gateway call |
 | `post_review_comments` | GitHub comment publication |
 | `auto_fix` | Repair publication |
 | `allowed_fix_rules` | Findings eligible for deterministic repair |
@@ -45,6 +45,14 @@ again inside the gateway.
 is saved. It does not select individual specialists or Skills inside that
 coordinator; production Skill membership is governed by the immutable deployed
 reviewer revision.
+
+Studio activation reuses the intake check against the current repository policy;
+it does not run the workflow, call a model or create a review task. A rejection
+leaves the previous binding and its revision unchanged. This is a point-in-time
+configuration check, not approval or a guarantee about later policy/route changes.
+Restoring the default still requires an enabled repository and `manage` permission,
+but is not blocked by an incompatible model policy. Ordinary intake and execution
+checks remain in force after that reset.
 
 ## Version and execution semantics
 

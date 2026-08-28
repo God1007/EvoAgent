@@ -1187,11 +1187,13 @@ class _StoreBehaviorContract:
         self.assertEqual(TaskState.FAILED.value, self.store.get(first, tenant)["state"])
         listed = next(item for item in self.store.list_tasks(10, tenant) if item["id"] == first)
         self.assertTrue(listed["retrying"])
+        self.assertTrue(self.store.get(first, tenant)["retrying"])
         self.assertTrue(self.store.release_review_admission(first, "dead-letter", 1))
         self.assertEqual(0, self.store.tenant_review_admission_stats(tenant)["active"])
         self.assertEqual(1, self.store.dashboard_stats(tenant)["tasks_failed"])
         listed = next(item for item in self.store.list_tasks(10, tenant) if item["id"] == first)
         self.assertFalse(listed["retrying"])
+        self.assertFalse(self.store.get(first, tenant)["retrying"])
         self.assertFalse(self.store.review_admission_active(first, 1))
         self.assertFalse(self.store.review_admission_active(first))
 

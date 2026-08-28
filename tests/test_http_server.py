@@ -1,11 +1,17 @@
 import http.client
+import json
+import runpy
 import socket
 import threading
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
+from io import StringIO
 from unittest import mock
 
 from evoagent import api
 from evoagent.api import DRAINING, _make_server
+from evoagent.auth import Principal
 from evoagent.config import Settings
 from evoagent.service import ReviewService
 from tests.db_support import postgres_url, reset_postgres
@@ -47,10 +53,10 @@ class ReadinessTests(unittest.TestCase):
         self.addCleanup(self.server.shutdown)
         self.host, self.port = self.server.server_address
 
-    def _get(self, path):
+    def _get(self, path, headers=None):
         conn = http.client.HTTPConnection(self.host, self.port, timeout=5)
         try:
-            conn.request("GET", path)
+            conn.request("GET", path, headers=headers or {})
             response = conn.getresponse()
             return response.status, response.read()
         finally:
@@ -71,8 +77,161 @@ class ReadinessTests(unittest.TestCase):
         status, _ = self._get("/health")
         self.assertEqual(200, status)  # liveness stays up during drain
 
+    def test_console_capabilities_and_fix_blockers_are_safe_read_only_hints(self):
+        headers = {"X-EvoAgent-View": "console"}
+        status, raw = self._get("/api/dashboard", headers)
+        self.assertEqual(200, status)
+        self.assertEqual(
+            dict(
+                role="platform_admin",
+                review=True,
+                manage=True,
+                platform=True,
+                github_install_configured=False,
+            ),
+            json.loads(raw)["capabilities"],
+        )
+        for role, review, manage, platform in (
+            ("auditor", False, False, False),
+            ("maintainer", True, False, False),
+            ("admin", True, True, False),
+            ("platform_admin", True, True, True),
+        ):
+            principal = Principal("user", "user", "default", role)
+            caps = self.service.console_capabilities(principal)
+            self.assertEqual(
+                (review, manage, platform), tuple(caps[k] for k in ("review", "manage", "platform"))
+            )
+        original_settings = self.service.settings
+        required = dict(
+            auth_required=True,
+            auth_secret="private-secret",
+            github_app_slug="app",
+            github_app_id="1",
+            github_private_key_path="private-key-path",
+            github_client_id="client",
+            github_client_secret="private-client-secret",
+            github_oauth_callback_url="https://example.invalid/callback",
+            github_webhook_secret="private-webhook-secret",
+        )
+        self.service.settings = replace(original_settings, **required)
+        self.assertTrue(self.service.console_capabilities(principal)["github_install_configured"])
+        for key in required:
+            with self.subTest(missing=key):
+                self.service.settings = replace(
+                    original_settings, **(required | {key: False if key == "auth_required" else ""})
+                )
+                self.assertFalse(
+                    self.service.console_capabilities(principal)["github_install_configured"]
+                )
+        self.service.settings = original_settings
+        principal = Principal("user", "user", "default", "maintainer")
+        task = {
+            "id": "a" * 32,
+            "state": "SUCCESS",
+            "repository": "demo/repo",
+            "pull_request": 1,
+            "report": {"findings": []},
+            "input": {"head_sha": "private-head"},
+        }
+
+        def blocker():
+            return self.service.console_fix_blocker(task, principal)
+
+        self.service.policies.save("default", "demo/repo", {"auto_fix": False}, "test")
+        self.assertEqual("policy", blocker())
+        self.service.policies.save("default", "demo/repo", {"auto_fix": True}, "test")
+        self.assertEqual("github", blocker())
+        self.service.settings = replace(self.service.settings, github_token="private-token")
+        self.assertEqual("sandbox", blocker())
+        self.service.repair_container_image = "fixture-resolved-image"
+        self.assertEqual("tests", blocker())
+        self.service.settings = replace(self.service.settings, repair_test_command="pytest")
+        self.assertEqual("", blocker())
+        # No GitHub/model call or test process is launched by the hint endpoint.
+        with (
+            mock.patch.object(
+                self.service.github, "get_pull_request", side_effect=AssertionError("external call")
+            ),
+            mock.patch.object(self.service.store, "get", return_value=task),
+        ):
+            status, raw = self._get("/v1/tasks/" + task["id"], headers)
+            self.assertEqual(200, status)
+            self.assertTrue(json.loads(raw)["can_fix"])
+            self.assertNotIn(b"private-", raw)
+        task["input"]["installation_id"] = True
+        self.assertEqual("installation", blocker())
+        task["input"] = {}
+        self.assertEqual("pr_snapshot", blocker())
+        self.assertEqual(
+            "permission",
+            self.service.console_fix_blocker(task, Principal("u", "u", "default", "auditor")),
+        )
+        self.assertEqual([], self.service.store.list_tasks())
+
+    def test_unavailable_console_logging_does_not_break_http_responses(self):
+        for failure in (
+            BrokenPipeError(),
+            OSError("output unavailable"),
+            ValueError("closed stream"),
+        ):
+            with (
+                self.subTest(failure=type(failure).__name__),
+                mock.patch.object(api, "print", side_effect=failure, create=True),
+                mock.patch.object(api.metrics, "inc") as counter,
+            ):
+                for path, expected in (
+                    ("/health", 200),
+                    ("/", 200),
+                    ("/assets/studio.js", 200),
+                    ("/missing", 404),
+                ):
+                    status, body = self._get(path)
+                    self.assertEqual(expected, status)
+                    self.assertTrue(body)
+                with mock.patch.object(
+                    self.service, "readiness", side_effect=RuntimeError("private failure")
+                ):
+                    status, body = self._get("/ready")
+                    self.assertEqual(500, status)
+                    self.assertNotIn(b"private failure", body)
+                counter.assert_any_call("http_log_failures_total")
+
 
 class LifecycleTests(unittest.TestCase):
+    def test_cli_help_and_invalid_arguments_never_start_the_service(self):
+        for arguments, code in (
+            (["--help"], 0),
+            (["--dry-run"], 2),
+            (["--port", "18081"], 2),
+            (["unexpected"], 2),
+        ):
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch("sys.argv", ["evoagent", *arguments]),
+                mock.patch.object(
+                    api.Settings, "from_env", side_effect=AssertionError("read configuration")
+                ) as settings,
+                mock.patch.object(api, "ReviewService") as service,
+                mock.patch.object(api, "_make_server") as server,
+                redirect_stdout(StringIO()),
+                redirect_stderr(StringIO()),
+            ):
+                with self.assertRaises(SystemExit) as result:
+                    runpy.run_module("evoagent", run_name="__main__")
+                self.assertEqual(code, result.exception.code)
+                settings.assert_not_called()
+                service.assert_not_called()
+                server.assert_not_called()
+
+    def test_cli_without_arguments_uses_the_normal_service_lifecycle(self):
+        with mock.patch.object(api, "run") as serve:
+            api.main([])
+        serve.assert_called_once_with()
+        with mock.patch("sys.argv", ["evoagent"]), mock.patch.object(api, "run") as serve:
+            runpy.run_module("evoagent", run_name="__main__")
+        serve.assert_called_once_with()
+
     def test_bind_failure_closes_started_service(self):
         service = mock.Mock()
         settings = mock.Mock()
@@ -99,6 +258,7 @@ class LifecycleTests(unittest.TestCase):
         contributions = (mock.Mock(),)
 
         with (
+            mock.patch("sys.argv", ["custom-workflow", "--serve"]),
             mock.patch.object(api.Settings, "from_env", return_value=settings),
             mock.patch.object(api, "ReviewService", return_value=service) as service_type,
             mock.patch.object(api, "_make_server", return_value=server),

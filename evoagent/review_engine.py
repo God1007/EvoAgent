@@ -20,6 +20,7 @@ from .ports import ModelGatewayPort, ReviewWorkflowStorePort
 from .review_extensions import ReviewerContribution
 from .reviewer import GatewayReviewer, Reviewer
 from .skills import SkillRegistry
+from .studio import compile_workflow, definition_digest
 from .workflow import HandoffError
 
 
@@ -134,6 +135,22 @@ class ReviewEngine:
 
     def execution_revision(self) -> str:
         return self.execution_snapshot()[0]
+
+    def build_studio_harness(self, snapshot: dict) -> ReviewHarness:
+        bundle = snapshot.get("bundle")
+        if not isinstance(bundle, dict) or definition_digest(bundle) != snapshot.get("digest"):
+            raise HandoffError("published workflow snapshot digest mismatch")
+        revision, reviewers, _harness = self.execution_snapshot()
+        coordinator = MultiAgentCoordinator(
+            list(reviewers),
+            store=self.store,
+            timeout_seconds=self.settings.timeout_seconds,
+            checkpoint_revision=revision,
+            workflow_factory=lambda catalog: compile_workflow(
+                bundle, catalog, self.model_gateway, self._task_context
+            ),
+        )
+        return self.build_harness(coordinator)
 
     def _load(self) -> None:
         registry = SkillRegistry(

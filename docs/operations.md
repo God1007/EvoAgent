@@ -61,8 +61,34 @@ are inspected during startup, resolved to immutable local image IDs and fail
 closed if the CLI, daemon or image is unavailable. The Skill image must contain the EvoAgent runtime at
 `/app/evoagent`; startup resolves its local immutable image ID, and execution
 mounts no application or Skill source from the Docker host.
-Repair/Proof worktrees are copied through the Docker client into a bounded
-container tmpfs; they also require no shared host path.
+Repair/Proof stream the client-side worktree through `docker exec -i` into the
+existing `/work` tmpfs, without mounting a source path from the daemon host.
+A separate isolated Python process produces the tar stream; the image must
+provide `tar` supporting `--no-same-owner`, in addition to its test runtime.
+Extraction runs as the same user as the tests and preserves file modes without
+requiring source UID/GID ownership. The application neither buffers the complete
+archive nor writes an intermediate archive file. Both processes must succeed within the
+shared verification deadline; a valid partial archive is not accepted when its
+producer fails. Producer failures, transfer failures and timeouts prevent test
+execution and enter the existing container cleanup path.
+Producer teardown has a separate five-second bound; container removal retains
+its separate ten-second bound.
+
+All Linux sandbox containers, including Skills, explicitly use UID/GID
+`65534:65534`, regardless of the Docker client's OS, host UID/GID or image `USER`.
+Repair/Proof gives `/work` the same ownership and mode `0700`; extraction and test
+execution use that identity too. Images and test dependencies must be readable
+without root, and tests must write inside the provided tmpfs. Incompatible images
+fail verification; execution never retries as root. This does not change the
+application process identity or the trusted direct-library host fallback.
+
+This follows Docker's documented [tar-stream workaround](https://docs.docker.com/reference/cli/docker/container/cp/#corner-cases)
+for mounts such as tmpfs while retaining the read-only root filesystem. The
+shared-path dependency is removed in code, but actual Docker and remote/nested
+deployment compatibility still require the container contracts on the target
+runtime; local tar-process checks do not prove container isolation. Operators
+must provision the Docker client, authorized daemon connection and preloaded
+image; this change does not install them or expose a daemon socket to PR code.
 
 Every response carries `X-Request-ID`. Unexpected HTTP errors return a generic
 message; correlate the identifier with structured logs. Persisted operational
@@ -125,26 +151,131 @@ publishes only the missing delivery effect and never recomputes the review.
 Repeated delivery resumes coalesce while that Outbox/queue attempt is active;
 an Outbox `dead` row or queue DLQ transition reopens the task for an operator retry.
 
+Task Center exposes these same operations to users with `review` permission
+(maintainer, admin or platform admin), including after a Studio tab is closed.
+Select **从失败节点续跑** for a failed execution, **取消任务** for pending/running
+work, or **重试结果回写** when the review succeeded but session/GitHub delivery has
+not been confirmed complete. State hints do not authorize an operation: the API
+still checks the current tenant, role and durable state. The page does not expose
+Outbox identifiers or delivery credentials.
+
+The task list, details and Studio distinguish a delivery-managed retry from a
+terminal failure, and show cancellation-in-progress until the worker records the
+terminal state. Cancellation is cooperative: an in-flight external call may still
+finish, and completed external effects are not rolled back. Cancelled tasks cannot
+resume. Missing source payloads, incompatible execution revisions or deterministic
+contract errors require a new task after the cause is fixed.
+
+Each operation requires confirmation and refreshes the persisted result. Switching
+tasks or logging out closes stale confirmations; old responses cannot update the
+new selection or trigger follow-up reads under a different session. An unconfirmed
+or timed-out response is not treated as success and is not retried automatically;
+refresh task state before deciding whether to repeat it. A retry acknowledgement
+is not proof of eventual review or delivery success.
+
 ## Review failures
 
-In **Task Center**, select a task to inspect **Agent handoff records** above its
-JSON report. Each node shows its persisted status, attempt count, update time and
-uncompleted upstream dependencies. Expand **Handoff contracts and identifiers**
-to inspect input sources, versioned input/output types, Agent revision, generation,
-idempotency key and payload digests; payload bodies are not displayed in this panel.
+In **Task Center**, select a task to read its risk summary, issue cards, changed-line
+evidence, and repair/test suggestions. The processing history below the report uses
+readable Agent names and shows persisted status, retries and upstream dependencies.
+Expand **查看处理内容与结果** for readable input/output artifacts. Raw task JSON,
+Prompt snapshots, hashes, generations and idempotency keys are not rendered. Browser
+requests use `X-EvoAgent-View: console`: the server returns allowlisted fields and
+typed artifact summaries, not full internal records. The published Agent palette
+omits Prompt/config; explicitly opening the definition editor still returns authored
+configuration. Unknown artifact types never fall back to raw JSON. Unsupported
+console endpoints are rejected before business side effects. JSON responses vary by
+this header and remain `Cache-Control: no-store`.
+
+Console errors return only an allowlisted `error_code`. The browser translates
+known codes into actionable messages (for example, preserve edits and reload a
+conflicting draft, or correct incompatible connections). Unknown errors fall back
+to the HTTP status without displaying exception text, response fragments, or proxy
+HTML. Admission errors use the same response boundary and retain `Retry-After`;
+the browser does not automatically retry mutations. A 401 clears the current
+session even when the response body cannot be parsed. The `X-Request-ID` response
+header remains available for operator correlation, outside the user-facing report.
+
+The server also enforces a separate data-access boundary. Full Studio drafts and
+the deployment catalog require `manage`, with or without the view header. Raw task
+details, workflow status/artifacts, and published Studio definitions require
+`manage`; `read` users may request their allowlisted console views instead.
+`admin` and `platform_admin` have `manage`; `maintainer` and `auditor` do not.
+Permission checks run before resource lookup and use current tenant membership,
+not the role cached by the browser. Administrators remain tenant-scoped.
+If loading the Studio catalog is denied, the browser clears cached Studio
+configuration and unsaved edits rather than continuing to render the old editor.
+Previously viewed/downloaded information cannot be recalled by a role change.
+
+Compatibility: non-admin clients previously reading raw diagnostic endpoints now
+receive 403. Send `X-EvoAgent-View: console` for the limited representation, or use
+`GET /v1/tasks/<id>/report` for Markdown. Definition lists and repository binding
+discovery remain readable. The header never grants access to full configuration.
+This is not secret detection in source code or other user-authored text, and does
+not replace the separate permissions for audit logs or operational endpoints.
 Use the top refresh button to reload the list and both detail panes. The panes load
 independently: a workflow API failure does not hide the task report, and switching
 tasks or logging out invalidates older detail responses. The overview's built-in
 role examples are illustrative, not a live execution graph. This is a read-only
-inspector, not a workflow editor or a worker-liveness monitor.
+inspector, not a worker-liveness monitor. Use the separate **Workflow Studio** to
+create Agents, connect typed ports, trial a draft, publish versions and bind repositories.
+Publication does not change a repository binding. Read its current configuration,
+then explicitly select a published version to activate or roll back. A concurrent
+change returns 409 and requires rereading; existing tasks retain their snapshots.
+Before activating a custom version, the API also applies the same current repository
+pipeline/provider/model/region policy used by review intake. An incompatible route
+returns 403 without changing the binding or appending a successful binding audit;
+the check runs no Agents or model calls and creates no review task. Restoring the
+default remains available for an enabled repository even when its model policy is
+incompatible. This is a point-in-time preflight, not a policy lock: later intake and
+execution still enforce policy, and no Diff-dependent size/budget or quality claim
+is made. This is manual version switching, not Studio-specific approval or automatic
+canary rollback.
+
+Browser review submissions (manual and Studio) always use the existing asynchronous
+intake with `Idempotency-Key`; the synchronous API remains available to API clients.
+A 30-second acknowledgement timeout does **not** cancel a task. After a lost response,
+retry unchanged in the same login session to recover the original task while its
+record is retained. Each form keeps one pending key and a SHA-256 fingerprint in
+tab-scoped `sessionStorage`, never the Diff, repository, token or workflow body.
+Reloading the tab preserves that receipt, not the form: re-enter the exact input.
+A confirmed run, changed input/version, or login change starts a new intent; check
+Task Center before submitting again after closing the tab or switching accounts.
+Login/logout clears pending receipts and private form content; stale responses cannot
+populate the new review result. A storage-cleanup failure may recover the same task
+once more, not duplicate it. HTTPS or loopback and usable session storage are required;
+blocked/corrupt receipt storage stops submission before any review HTTP write.
+There is no automatic client retry. This deduplicates intake, not arbitrary external
+effects: worker delivery retains its existing at-least-once semantics. Accepted and
+replayed submissions are both audited while sharing one task and one Outbox message.
+
+Console login changes invalidate all pending page reads and action responses, not
+only the selected task. Logout or a current-session 401 clears lists, reports,
+prompts, form credentials, trial receipts and Studio dialogs; the background shell
+becomes inert and focus moves to login. A late old response cannot refill a view,
+unlock a new action, begin follow-up reads, overwrite a new login or redirect to an
+old GitHub installation. Failed logins remain editable; 403 permission denials do
+not sign the user out. Confirmed server-side work may still finish after logout.
+
+The existing login token is shared through same-origin `localStorage`. A token
+change in another tab invalidates this tab instead of silently adopting the new
+account. The browser checks storage events, focus/page restoration, and request
+boundaries; already-open tabs require reauthentication, and a fresh page uses the
+stored login as before. This is browser data isolation, **not** server-side logout
+revocation, remote token theft protection or task cancellation. JWT expiry and
+existing password/user/membership checks still govern authenticated API access;
+keep production authentication and HTTPS enabled.
 
 The dependency-free frontend regression check runs in CI and locally with Node.js
-18 or newer: `node --test tests/web.test.cjs`. It covers escaped metadata, absent
-and pruned records, request failures, out-of-order responses, refresh, logout and
-fix-action isolation; browser checks are still required for layout/accessibility.
+18 or newer: `node --test tests/web.test.cjs`. It covers escaped user content,
+non-rendering of internal metadata, report/empty/failure states, graph mutations,
+absent/pruned records, request failures, out-of-order responses, refresh, logout and
+fix-action isolation, plus lost-acknowledgement/reload retries and console-wide
+login, expiry and cross-tab isolation. Browser checks are still required for
+layout/accessibility and native storage/dialog behavior.
 
 Use `GET /v1/tasks/<task-id>/workflow` to locate a failed or blocked custom Agent.
-The read-authenticated, tenant-scoped snapshot includes contract/wiring metadata,
+The manage-authorized, tenant-scoped diagnostic snapshot includes contract/wiring metadata,
 attempts, generations, digests and safe error references, not input/output bodies.
 `running` records dispatch, not a live worker or exclusive lease: inspect task state
 and queue health before resuming through the existing task-resume endpoint.
@@ -200,6 +331,12 @@ container runtime, inspect exact `evoagent-skill-*` leftovers, preserve incident
 metadata and remove those containers before resuming the affected Skill set.
 `EvoAgentRepairContainerCleanupFailing` applies the same response to
 `evoagent-verify-*` repair containers.
+Repair/Proof attempts exact-name removal even when the startup command times out,
+exits nonzero or raises an exception: a missing acknowledgement does not prove
+that the daemon created nothing. Cleanup has a separate 10-second bound; failure
+raises the existing cleanup alert metric and prevents a successful verification.
+An unavailable daemon still requires operator reconciliation of leftover
+containers; the application cannot guarantee their removal while it is unreachable.
 Growth in `evoagent_github_comment_truncations_total` means complete reports no
 longer fit comfortably in PR comments; use the task report until a measured need
 justifies publishing authenticated report artifacts.
@@ -347,6 +484,15 @@ tasks remain terminal and are not replayed.
 Run one EvoAgent process per container and scale containers horizontally.
 PostgreSQL pools are capped at 256 connections per process; increase replicas
 rather than removing this database protection.
+Budget the **sum** of replica pool maxima, plus migration/backup/monitoring
+connections, below the database connection limit. Replicas must share PostgreSQL
+and Redis and use matching application/Skill/model revisions, authentication
+configuration and tenant admission limits. On one host, assign distinct listening
+ports; published host ports in the supplied Compose file cannot be duplicated by
+blindly increasing its replica count. Production ingress and process supervision
+remain deployment responsibilities. The [controlled Studio baseline](performance.md#studio-completion-and-replica-baseline--2026-08-28)
+compares threads with replicas and distinguishes task completion from HTTP 202;
+use representative workload measurements before choosing a replica count.
 Set the orchestrator termination grace above
 `EVOAGENT_SHUTDOWN_GRACE_SECONDS + EVOAGENT_QUEUE_SHUTDOWN_TIMEOUT_SECONDS`;
 the built-in Compose files use 40 seconds for the default 30-second drain budget.

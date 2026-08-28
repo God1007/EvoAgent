@@ -300,10 +300,8 @@ class SandboxedSkillReviewer(Reviewer):
                     "%dm" % self.memory_mb,
                     "--cpus",
                     "0.5",
-                ]
-                if os.name != "nt":
-                    command += ["--user", "65534:65534"]
-                command += [
+                    "--user",
+                    "65534:65534",
                     self.container_image,
                     "python",
                     "-I",

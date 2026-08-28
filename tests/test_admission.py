@@ -22,7 +22,12 @@ from evoagent.api import (
 )
 from evoagent.auth import Principal
 from evoagent.config import Settings
-from evoagent.errors import ClientInputError, ResourceNotFoundError, StateConflictError
+from evoagent.errors import (
+    AccessDeniedError,
+    ClientInputError,
+    ResourceNotFoundError,
+    StateConflictError,
+)
 from evoagent.harness import TaskCancelled
 from evoagent.metrics import Metrics
 from evoagent.migrations import CURRENT_SCHEMA_VERSION
@@ -91,6 +96,7 @@ class RequestFramingTests(unittest.TestCase):
 class RequestExceptionBoundaryTests(unittest.TestCase):
     def test_cancelled_review_is_a_conflict_without_internal_error_details(self):
         handler = object.__new__(ApiHandler)
+        handler.headers = http.client.HTTPMessage()
         handler._request_id_value = mock.Mock(return_value="request-id")
         handler._dispatch_with_admission = mock.Mock(
             side_effect=TaskCancelled("password=internal-cancellation-detail")
@@ -132,9 +138,10 @@ class WorkflowReadBoundaryTests(unittest.TestCase):
     def handler(self):
         handler = object.__new__(ApiHandler)
         handler.path = "/v1/tasks/" + "a" * 32 + "/workflow"
+        handler._console_view = True
         handler.service = mock.Mock()
         handler._authenticate_or_send = mock.Mock(
-            return_value=Principal("user-1", "alice", "tenant-a", "reviewer")
+            return_value=Principal("user-1", "alice", "tenant-a", "maintainer")
         )
         handler._send_json = mock.Mock()
         return handler
@@ -159,6 +166,13 @@ class WorkflowReadBoundaryTests(unittest.TestCase):
         handler = self.handler()
         handler._authenticate_or_send.return_value = None
         handler._do_GET()
+        handler.service.store.workflow_status.assert_not_called()
+
+    def test_raw_workflow_requires_manage_before_lookup(self):
+        handler = self.handler()
+        handler._console_view = False
+        with self.assertRaises(AccessDeniedError):
+            handler._do_GET()
         handler.service.store.workflow_status.assert_not_called()
 
 
@@ -200,6 +214,39 @@ class RequestJsonBoundaryTests(unittest.TestCase):
 
 
 class SecurityHeaderBoundaryTests(unittest.TestCase):
+    def test_console_view_is_opt_in_and_rejected_before_dispatch_when_invalid(self):
+        cases = (
+            ([], "/api/tasks", True, False),
+            (["console"], "/api/tasks", True, True),
+            (["raw"], "/api/tasks", False, True),
+            (["console", "console"], "/api/tasks", False, False),
+            (["console"], "/v1/proofs", False, True),
+        )
+        for values, path, allowed, projected in cases:
+            with self.subTest(values=values, path=path):
+                handler = object.__new__(ApiHandler)
+                handler.headers = http.client.HTTPMessage()
+                for value in values:
+                    handler.headers.add_header("X-EvoAgent-View", value)
+                handler.path = path
+                handler._console_view = True
+                handler._request_id_value = mock.Mock(return_value="request-id")
+                handler._dispatch_with_admission = mock.Mock()
+                handler._send_json = mock.Mock()
+                handler._send_internal_error = mock.Mock()
+                action = mock.Mock()
+
+                handler._dispatch("GET", action)
+
+                self.assertEqual(projected, handler._console_view)
+                handler._send_internal_error.assert_not_called()
+                if allowed:
+                    handler._dispatch_with_admission.assert_called_once_with("GET", action)
+                    handler._send_json.assert_not_called()
+                else:
+                    handler._dispatch_with_admission.assert_not_called()
+                    self.assertEqual(400, handler._send_json.call_args.args[0])
+
     def test_duplicate_request_ids_are_replaced(self):
         handler = object.__new__(ApiHandler)
         handler.headers = http.client.HTTPMessage()
@@ -1426,6 +1473,69 @@ class AdmissionControlTests(unittest.TestCase):
         self.assertEqual(400, response.status)
         self.assertEqual({"error": "limit must be an integer between 1 and 1000"}, payload)
 
+    def test_console_errors_are_public_codes_on_reads_writes_and_admission(self):
+        host, port = self._serve(self._settings())
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        self.addCleanup(conn.close)
+        headers = {"X-EvoAgent-View": "console", "Content-Type": "application/json"}
+
+        def request(method, path, body=None, console=True):
+            conn.request(method, path, body=body, headers=headers if console else {})
+            response = conn.getresponse()
+            payload = json.loads(response.read())
+            self.assertEqual("X-EvoAgent-View", response.getheader("Vary"))
+            self.assertEqual("no-store", response.getheader("Cache-Control"))
+            self.assertTrue(response.getheader("X-Request-ID"))
+            return response, payload
+
+        private = 'private-prompt={"credential":"must-not-display"}'
+        with mock.patch.object(
+            self.service.store, "dashboard_stats", side_effect=ClientInputError(private)
+        ):
+            response, payload = request("GET", "/api/dashboard")
+            self.assertEqual(400, response.status)
+            self.assertEqual({"error_code": "invalid_request"}, payload)
+            self.assertEqual({"error": private}, request("GET", "/api/dashboard", console=False)[1])
+        with mock.patch.object(self.service.studio, "save", side_effect=ClientInputError(private)):
+            response, payload = request("POST", "/v1/studio/agents", "{}")
+            self.assertEqual(400, response.status)
+            self.assertEqual({"error_code": "invalid_request"}, payload)
+
+        for error, status, code in (
+            (StateConflictError("published workflow digest mismatch"), 409, "invalid_version"),
+            (StateConflictError("draft changed; save and retry"), 409, "draft_conflict"),
+            (RuntimeError(private), 500, "internal_error"),
+        ):
+            with mock.patch.object(self.service.store, "dashboard_stats", side_effect=error):
+                response, payload = request("GET", "/api/dashboard")
+                self.assertEqual(status, response.status)
+                self.assertEqual({"error_code": code}, payload)
+
+        response, payload = request(
+            "POST",
+            "/v1/studio/validate",
+            json.dumps({"definition": {"name": "Empty", "steps": [], "outputs": {}}}),
+        )
+        self.assertEqual(400, response.status)
+        self.assertEqual({"error_code": "workflow_steps"}, payload)
+        response, payload = request("POST", "/v1/users", "{}")
+        self.assertEqual(400, response.status)
+        self.assertEqual({"error_code": "unsupported_view"}, payload)
+
+        with mock.patch.object(self.service.rate_limiter, "check", return_value=(False, 7)):
+            response, payload = request("GET", "/api/dashboard")
+            self.assertEqual(429, response.status)
+            self.assertEqual("7", response.getheader("Retry-After"))
+            self.assertEqual({"error_code": "rate_limited"}, payload)
+        DRAINING.set()
+        try:
+            response, payload = request("GET", "/api/dashboard")
+            self.assertEqual(503, response.status)
+            self.assertEqual("1", response.getheader("Retry-After"))
+            self.assertEqual({"error_code": "unavailable"}, payload)
+        finally:
+            DRAINING.clear()
+
     def test_repository_policy_api_versions_and_reads_tenant_policy(self):
         host, port = self._serve(self._settings())
         conn = http.client.HTTPConnection(host, port, timeout=5)
@@ -1542,6 +1652,68 @@ class AdmissionControlTests(unittest.TestCase):
         self.assertEqual(400, conflict.status)
         self.assertIn("different review", conflict_body["error"])
         self.assertEqual(1, len(self.service.store.list_tasks(10, "default")))
+
+    def test_async_review_retry_recovers_a_committed_task_after_response_loss(self):
+        host, port = self._serve(self._settings())
+        headers = {
+            "Content-Type": "application/json",
+            "X-EvoAgent-View": "console",
+            "Idempotency-Key": "lost-review-ack",
+        }
+        payload = json.dumps(
+            {
+                "repository": "org/repo",
+                "diff": "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+new\n",
+            }
+        )
+        original_send = ApiHandler._send_json
+        committed = []
+
+        def lose_ack(handler, status, value):
+            if (
+                handler.command == "POST"
+                and handler.path == "/v1/reviews?async=true"
+                and status == 202
+            ):
+                committed.append(value["task_id"])
+                handler.close_connection = True
+                return  # Simulate disconnect after task/outbox/audit commit, before any response.
+            original_send(handler, status, value)
+
+        with mock.patch.object(ApiHandler, "_send_json", lose_ack):
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            try:
+                conn.request("POST", "/v1/reviews?async=true", body=payload, headers=headers)
+                with self.assertRaises(http.client.RemoteDisconnected):
+                    conn.getresponse()
+            finally:
+                conn.close()
+        self.assertEqual(1, len(committed))
+        retry = http.client.HTTPConnection(host, port, timeout=5)
+        try:
+            retry.request("POST", "/v1/reviews?async=true", body=payload, headers=headers)
+            response = retry.getresponse()
+            recovered = json.loads(response.read())
+        finally:
+            retry.close()
+        self.assertEqual(200, response.status)
+        self.assertEqual(committed[0], recovered["task_id"])
+        self.assertTrue(recovered["replayed"])
+        self.assertEqual({"task_id", "state", "replayed"}, recovered.keys())
+        self.assertEqual(1, len(self.service.store.list_tasks(10, "default")))
+        with self.service.store._connect() as conn:
+            outbox = conn.execute(
+                "SELECT count(*) AS count FROM outbox_messages WHERE message_key=%s",
+                (committed[0],),
+            ).fetchone()
+            audits = conn.execute(
+                "SELECT count(*) AS count FROM audit_log WHERE action='review.create' AND resource=%s",
+                ("org/repo",),
+            ).fetchone()
+        self.assertEqual(1, outbox["count"])
+        self.assertEqual(
+            2, audits["count"]
+        )  # Both HTTP attempts remain audited; only one task is created.
 
     def test_disabled_rate_limit_allows_burst(self):
         host, port = self._serve(self._settings())  # rate_limit_rps defaults to 0

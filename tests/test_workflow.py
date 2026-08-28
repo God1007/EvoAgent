@@ -4,6 +4,7 @@ import io
 import json
 import tempfile
 import threading
+import tracemalloc
 import unittest
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
@@ -16,6 +17,7 @@ from evoagent.diff_parser import parse_unified_diff
 from evoagent.harness import ReviewHarness
 from evoagent.model_gateway import ModelGovernanceContext
 from evoagent.models import Finding, Severity, TaskState, TraceEvent
+from evoagent.postgres_store import PostgresTaskStore
 from evoagent.reviewer import GatewayReviewer, LocalRuleReviewer
 from evoagent.service import ReviewService
 from evoagent.time_utils import utc_now
@@ -28,6 +30,7 @@ from evoagent.workflow import (
     Step,
     TaskCancelled,
     Workflow,
+    _json,
 )
 from tests.db_support import postgres_store
 
@@ -209,13 +212,44 @@ class WorkflowTests(unittest.TestCase):
                 {"id": "left", "agent": "mutate", "sources": {"value": "$input.value"}},
                 {"id": "right", "agent": "observe", "sources": {"value": "$input.value"}},
             ],
-            "outputs": {"value": "join.value"},
+            "outputs": {"value": "join.value", "branch": "left.value", "original": "$input.value"},
         }
         flow = Workflow.from_dict(definition, agents, {"value": data})
         definition["steps"][0]["sources"]["right"] = "missing.value"
         original = {"value": {"items": ["original"]}}
-        self.assertEqual({"value": 3}, flow.run(original))
+        self.assertEqual(
+            {"value": 3, "branch": 2, "original": {"items": ["original"]}}, flow.run(original)
+        )
         self.assertEqual({"value": {"items": ["original"]}}, original)
+
+    def test_chain_memory_does_not_retain_consumed_outputs(self):
+        text = PayloadType("text", 1, lambda value: None)
+        echo = AgentSpec("echo", REVISION, {"text": text}, {"text": text}, lambda h: dict(h.inputs))
+        payload = {"text": "x" * (512 * 1024)}
+
+        def peak(length):
+            flow = Workflow(
+                "chain",
+                {"text": text},
+                [
+                    Step(
+                        "node%d" % index,
+                        echo,
+                        {"text": "$input.text" if index == 0 else "node%d.text" % (index - 1)},
+                    )
+                    for index in range(length)
+                ],
+                {"text": "node%d.text" % (length - 1)},
+            )
+            tracemalloc.start()
+            try:
+                self.assertEqual(payload, flow.run(payload))
+                return tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+
+        short = peak(4)
+        self.assertLess(peak(32), short + 4 * len(payload["text"]))
 
     def test_invalid_graphs_fail_before_execution(self):
         value = agent()
@@ -303,6 +337,79 @@ class WorkflowTests(unittest.TestCase):
             self.assertRaisesRegex(HandoffError, "size"),
         ):
             flow.run({"value": "x" * 200})
+
+        store, receiver = Checkpoints(), mock.Mock()
+        with (
+            mock.patch("evoagent.workflow.MAX_HANDOFF_BYTES", 4096),
+            self.assertRaisesRegex(HandoffError, "size"),
+        ):
+            durable(
+                chain(agent(handler=lambda h: {"value": "x" * 5000}), agent(handler=receiver)),
+                store,
+            )
+        self.assertEqual("failed", store.records["workflow:first"]["status"])
+        self.assertNotIn("outputs", store.records["workflow:first"]["state"])
+        self.assertNotIn("workflow:second", store.records)
+        receiver.assert_not_called()
+
+    def test_json_encoding_preserves_bytes_and_stops_before_full_expansion(self):
+        for value in (
+            None,
+            True,
+            False,
+            0,
+            -1,
+            0.0,
+            -0.0,
+            1e-20,
+            1e30,
+            [],
+            {},
+            {"z": 'é😀\n\t\\"', "a": [1, None, {"control": "\x01"}]},
+        ):
+            expected = json.dumps(
+                value, sort_keys=True, separators=(",", ":"), allow_nan=False, ensure_ascii=False
+            ).encode()
+            with (
+                self.subTest(value=value),
+                mock.patch("evoagent.workflow.MAX_HANDOFF_BYTES", len(expected)),
+            ):
+                self.assertEqual(expected, _json(value))
+            with (
+                mock.patch("evoagent.workflow.MAX_HANDOFF_BYTES", len(expected) - 1),
+                self.assertRaisesRegex(HandoffError, "size"),
+            ):
+                _json(value)
+
+        # Escapes expand beyond the byte limit even though raw characters fit.
+        value = {"port%d" % i: "\x01" * (10 * 1024) for i in range(16)}
+        limit = 256 * 1024
+        with mock.patch("evoagent.workflow.MAX_HANDOFF_BYTES", limit):
+            tracemalloc.start()
+            try:
+                with self.assertRaisesRegex(HandoffError, "size"):
+                    _json(value)
+                self.assertLess(tracemalloc.get_traced_memory()[1], 4 * limit)
+            finally:
+                tracemalloc.stop()
+
+    def test_json_preflight_bounds_shared_subtrees_before_encoding(self):
+        value = [0]
+        for _ in range(16):
+            value = [value, value]
+        with (
+            mock.patch("evoagent.workflow.MAX_HANDOFF_BYTES", 1024),
+            mock.patch(
+                "evoagent.workflow.json.dumps",
+                side_effect=AssertionError("must reject before encoding"),
+            ),
+            mock.patch(
+                "evoagent.workflow.json.JSONEncoder.iterencode",
+                side_effect=AssertionError("must reject before encoding"),
+            ),
+            self.assertRaisesRegex(HandoffError, "size"),
+        ):
+            _json(value)
 
     def test_receiver_revalidates_even_when_contract_ids_match(self):
         def stricter(value):
@@ -667,6 +774,81 @@ class WorkflowTests(unittest.TestCase):
 
 
 class WorkflowPostgresTests(unittest.TestCase):
+    def test_numeric_handoffs_survive_persistence_and_receiver_restart_without_rehashing(self):
+        store = postgres_store(self)
+        task_id = "numeric-handoff"
+        store.create(task_id, "demo/repo", 7, {})
+        payload = {
+            "negative_zero": -0.0,
+            "large_float": 1e20,
+            "large_integer": 10**100,
+            "values": [0.0, 1.0, 0.95, 1e100, 1.7976931348623157e308, 5e-324, 1e-300],
+        }
+        expected = _json(payload)
+        contract = PayloadType("numeric-json", 1, lambda value: None)
+        producer = mock.Mock(side_effect=lambda h: dict(h.inputs))
+        receipts = []
+
+        def receive(handoff):
+            self.assertEqual(expected, _json(handoff.inputs["value"]))
+            receipts.append(handoff.idempotency_key)
+            if len(receipts) == 1:
+                raise RuntimeError("receiver interrupted")
+            return dict(handoff.inputs)
+
+        spec = AgentSpec("producer", REVISION, {"value": contract}, {"value": contract}, producer)
+        flow = Workflow(
+            "numeric",
+            spec.inputs,
+            (
+                Step("first", spec, {"value": "$input.value"}),
+                Step(
+                    "second",
+                    replace(spec, agent_id="receiver", run=receive),
+                    {"value": "first.value"},
+                ),
+            ),
+            {"value": "second.value"},
+        )
+        with self.assertRaisesRegex(RuntimeError, "receiver interrupted"):
+            flow.run({"value": payload}, task_id=task_id, store=store, execution_revision=REVISION)
+        original = store.load_checkpoints(task_id, "workflow:first")["workflow:first"]
+        self.assertEqual(expected, _json(original["state"]["outputs"]["value"]))
+        store.close()
+        restored = PostgresTaskStore(store.url, pool_min=0, pool_max=0, auto_migrate=False)
+        self.addCleanup(restored.close)
+        result = flow.run(
+            {"value": payload}, task_id=task_id, store=restored, execution_revision=REVISION
+        )
+        self.assertEqual(expected, _json(result["value"]))
+        self.assertIs(type(result["value"]["large_float"]), float)
+        self.assertIs(type(result["value"]["large_integer"]), int)
+        self.assertEqual(
+            original, restored.load_checkpoints(task_id, "workflow:first")["workflow:first"]
+        )
+        self.assertEqual([receipts[0], receipts[0]], receipts)
+        producer.assert_called_once()
+        artifact = restored.workflow_artifact("default", task_id, "first")
+        self.assertEqual(expected, _json(artifact["outputs"]["value"]))
+        snapshot = restored.workflow_status(task_id, "default")
+        self.assertEqual(["completed", "completed"], [step["status"] for step in snapshot["steps"]])
+        self.assertEqual([1, 2], [step["attempt"] for step in snapshot["steps"]])
+
+        # Even a sign-only change must still fail; do not normalize or recompute hashes.
+        tampered = copy.deepcopy(original["state"])
+        tampered["outputs"]["value"]["negative_zero"] = 0.0
+        with restored._connect() as conn:
+            conn.execute(
+                "UPDATE checkpoints SET state_json=%s::json WHERE task_id=%s AND node='workflow:first'",
+                (json.dumps(tampered), task_id),
+            )
+        with self.assertRaisesRegex(HandoffError, "digest mismatch"):
+            flow.run(
+                {"value": payload}, task_id=task_id, store=restored, execution_revision=REVISION
+            )
+        producer.assert_called_once()
+        self.assertEqual(2, len(receipts))
+
     def test_outer_harness_cache_cannot_hide_a_changed_prompt(self):
         store = postgres_store(self)
         task_id = "interrupted-canary"

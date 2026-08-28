@@ -1,5 +1,6 @@
 """Dedicated schema migration entry point for deployment jobs/init containers."""
 
+import argparse
 import json
 import sys
 
@@ -8,7 +9,13 @@ from .migrations import SchemaMigrationError
 from .postgres_store import create_store
 
 
-def run() -> None:
+def run(argv: list[str] | None = None) -> None:
+    # Reject typos (especially --dry-run) before reading deployment configuration.
+    argparse.ArgumentParser(
+        prog="evoagent-migrate",
+        description="Apply forward-only migrations to EVOAGENT_DATABASE_URL.",
+        allow_abbrev=False,
+    ).parse_args(argv)
     store = None
     try:
         settings = Settings.from_env()

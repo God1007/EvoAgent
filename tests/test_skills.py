@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from evoagent import skill_runner
@@ -734,27 +735,28 @@ class SkillRegistryLifecycleTests(unittest.TestCase):
             source=SOURCE,
             source_sha256=hashlib.sha256(SOURCE.encode()).hexdigest(),
         )
-        command = []
-
-        def run(value, *_args, **_kwargs):
-            command.extend(value)
-            return 0, b"[]", b"", False, False
-
-        with (
-            mock.patch("evoagent.skills._run_bounded", side_effect=run),
-            mock.patch(
-                "evoagent.skills.subprocess.run", return_value=mock.Mock(returncode=0)
-            ) as rm,
-        ):
-            reviewer.review(DIFF, parse_unified_diff(DIFF))
-
-        self.assertEqual("never", command[command.index("--pull") + 1])
-        self.assertIn("--name", command)
-        self.assertNotIn("-v", command)
-        if os.name != "nt":
-            self.assertEqual("65534:65534", command[command.index("--user") + 1])
-        self.assertIn("sha256:" + "a" * 64, command)
-        self.assertEqual(["docker", "rm", "-f"], rm.call_args.args[0][:3])
+        for platform in ("posix", "nt"):
+            with (
+                self.subTest(platform=platform),
+                mock.patch(
+                    "evoagent.skills.os",
+                    SimpleNamespace(name=platform, path=os.path, environ=os.environ),
+                ),
+                mock.patch(
+                    "evoagent.skills._run_bounded", return_value=(0, b"[]", b"", False, False)
+                ) as run,
+                mock.patch(
+                    "evoagent.skills.subprocess.run", return_value=mock.Mock(returncode=0)
+                ) as rm,
+            ):
+                reviewer.review(DIFF, parse_unified_diff(DIFF))
+                command = run.call_args.args[0]
+                self.assertEqual("never", command[command.index("--pull") + 1])
+                self.assertIn("--name", command)
+                self.assertNotIn("-v", command)
+                self.assertEqual("65534:65534", command[command.index("--user") + 1])
+                self.assertIn("sha256:" + "a" * 64, command)
+                self.assertEqual(["docker", "rm", "-f"], rm.call_args.args[0][:3])
 
     def test_container_cleanup_failure_fails_closed_and_is_observable(self):
         reviewer = SandboxedSkillReviewer(

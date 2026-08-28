@@ -508,6 +508,50 @@ MIGRATIONS: tuple[Migration, ...] = (
         ),
         "51408576232f1b9f41e8d9191ebb0771c4e138a45fa0cdcdc21cf624fdcb7f64",
     ),
+    Migration(
+        26,
+        "user-authored-agent-workflows",
+        (
+            "CREATE TABLE studio_documents (tenant_id TEXT NOT NULL,kind TEXT NOT NULL "
+            "CHECK (kind IN ('agents','workflows')),id TEXT NOT NULL,revision INTEGER NOT NULL "
+            "CHECK (revision>0),definition_json JSONB NOT NULL,active_version INTEGER,"
+            "updated_at TIMESTAMPTZ NOT NULL,PRIMARY KEY(tenant_id,kind,id))",
+            "CREATE TABLE studio_versions (tenant_id TEXT NOT NULL,kind TEXT NOT NULL,"
+            "document_id TEXT NOT NULL,version INTEGER NOT NULL CHECK (version>0),"
+            "draft_revision INTEGER NOT NULL,definition_json JSONB NOT NULL,digest TEXT NOT NULL,"
+            "created_at TIMESTAMPTZ NOT NULL,PRIMARY KEY(tenant_id,kind,document_id,version),"
+            "UNIQUE(tenant_id,kind,document_id,draft_revision),"
+            "FOREIGN KEY(tenant_id,kind,document_id) REFERENCES studio_documents(tenant_id,kind,id))",
+            "CREATE TABLE studio_bindings (tenant_id TEXT NOT NULL,repository TEXT NOT NULL,"
+            "kind TEXT NOT NULL DEFAULT 'workflows' CHECK (kind='workflows'),workflow_id TEXT NOT NULL,"
+            "updated_at TIMESTAMPTZ NOT NULL,PRIMARY KEY(tenant_id,repository),"
+            "FOREIGN KEY(tenant_id,kind,workflow_id) REFERENCES studio_documents(tenant_id,kind,id))",
+        ),
+        "ce24b6f5bac0a081e63f97a7873354cd941fcda778a2d04b6c68a5437913208b",
+    ),
+    Migration(
+        27,
+        "pinned-studio-repository-bindings",
+        (
+            "ALTER TABLE studio_bindings ADD COLUMN workflow_version INTEGER,"
+            "ADD COLUMN revision INTEGER NOT NULL DEFAULT 1 CHECK (revision>0)",
+            "UPDATE studio_bindings b SET workflow_version=d.active_version "
+            "FROM studio_documents d WHERE (d.tenant_id,d.kind,d.id)="
+            "(b.tenant_id,b.kind,b.workflow_id)",
+            "ALTER TABLE studio_bindings ALTER COLUMN workflow_id DROP NOT NULL,"
+            "ADD CHECK ((workflow_id IS NULL)=(workflow_version IS NULL)),"
+            "ADD CHECK (workflow_version IS NULL OR workflow_version>0),"
+            "ADD FOREIGN KEY(tenant_id,kind,workflow_id,workflow_version) "
+            "REFERENCES studio_versions(tenant_id,kind,document_id,version)",
+        ),
+        "29c9c24bc8d7ce252479d17217d29fd3d6f679cdf12319fad1909c4bae6ec403",
+    ),
+    Migration(
+        28,
+        "lossless-checkpoint-json",
+        ("ALTER TABLE checkpoints ALTER COLUMN state_json TYPE JSON USING state_json::json",),
+        "bd0231848173eb15408d7dc8c485f4739d30e5109f5124683b1cf926c2e6ab0b",
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = MIGRATIONS[-1].version

@@ -3,7 +3,7 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
-from .agents import WorkflowFactory
+from .agents import MultiAgentCoordinator, WorkflowFactory
 from .application import (
     GitHubInstallationUseCases,
     PolicyUseCases,
@@ -20,7 +20,7 @@ from .backpressure import ConcurrencyLimiter, RateLimiter, TrustedProxyResolver
 from .bootstrap import build_components, close_components
 from .config import Settings
 from .diff_parser import parse_unified_diff
-from .errors import ClientInputError, coerce_safe_summary, safe_exception_summary
+from .errors import AccessDeniedError, ClientInputError, coerce_safe_summary, safe_exception_summary
 from .github import GitHubAppAuthenticator, GitHubClient, GitHubInstallationOAuthClient
 from .harness import ReviewHarness
 from .metrics import metrics
@@ -30,10 +30,70 @@ from .retention import RetentionManager, RetentionOptions
 from .review_engine import ReviewEngine
 from .review_extensions import ReviewerContribution
 from .reviewer import GatewayReviewer, Reviewer
+from .studio import WorkflowStudio
 from .task_queue import PermanentTaskError, TaskQueue
 
 
 class ReviewService:
+    def console_capabilities(self, principal: Principal) -> dict[str, Any]:
+        """Configuration hints only; never probe external services or expose credentials."""
+        settings = self.settings
+        return {
+            "role": principal.role,
+            "review": principal.can("review"),
+            "manage": principal.can("manage"),
+            "platform": principal.can("platform"),
+            "github_install_configured": bool(
+                settings.auth_required
+                and settings.auth_secret
+                and settings.github_app_slug
+                and settings.github_app_id
+                and settings.github_private_key_path
+                and settings.github_client_id
+                and settings.github_client_secret
+                and settings.github_oauth_callback_url
+                and settings.github_webhook_secret
+            ),
+        }
+
+    def console_fix_blocker(self, task: dict, principal: Principal) -> str:
+        """Explain known blockers without authorizing publication or touching GitHub."""
+        if not principal.can("fix"):
+            return "permission"
+        task_input = task.get("input") or {}
+        if (
+            task.get("state") != "SUCCESS"
+            or not task.get("report")
+            or not task.get("pull_request")
+            or not task_input.get("head_sha")
+        ):
+            return "pr_snapshot"
+        policy = self.policies.resolve(principal.tenant_id, task["repository"])
+        try:
+            self.policies.authorize_fix(policy, tuple(getattr(self.fixer, "rule_ids", ())))
+        except AccessDeniedError:
+            return "policy"
+        except ValueError:
+            return "rules"
+        installation = task_input.get("installation_id")
+        if installation is not None:
+            if (
+                type(installation) is not int
+                or installation < 1
+                or self.store.installation_tenant(installation) != principal.tenant_id
+            ):
+                return "installation"
+            credentials = self.settings.github_app_id and self.settings.github_private_key_path
+        else:
+            credentials = self.settings.github_token
+        if not credentials:
+            return "github"
+        if not self.repair_container_image:
+            return "sandbox"
+        if not self.settings.repair_test_command.strip():
+            return "tests"
+        return ""
+
     def __init__(
         self,
         settings: Settings,
@@ -66,6 +126,16 @@ class ReviewService:
             self.releases = self.components.releases
             self.alerts = self.components.alerts
             self.evolution = self.components.evolution
+            self.studio = WorkflowStudio(
+                self.store,
+                lambda: (
+                    self.reviewer.workflow_agents()
+                    if isinstance(self.reviewer, MultiAgentCoordinator)
+                    else {}
+                ),
+                self.model_gateway,
+                self.review_engine._task_context,
+            )
             self.github_installations = GitHubInstallationUseCases(
                 self.store,
                 self.auth,
@@ -131,6 +201,7 @@ class ReviewService:
                     (self.model_gateway.route_info(),) if self.model_gateway.configured else None
                 ),
                 lambda: self.review_engine.execution_revision(),
+                self.studio.select,
             )
             self.webhook_use_cases = WebhookUseCases(
                 self.store,
@@ -481,6 +552,13 @@ class ReviewService:
                 {"expected": expected_revision, "current": revision},
             )
             raise PermanentTaskError("assigned reviewer revision is unavailable")
+        if "studio_workflow" in task_input:
+            snapshot = task_input["studio_workflow"]
+            if not isinstance(snapshot, dict):
+                raise PermanentTaskError("assigned workflow snapshot is invalid")
+            return self.review_engine.build_studio_harness(snapshot).run(
+                task_id, repository, pull_request, diff, admission_generation
+            )
         lane = task_input.get("release_lane", "stable")
         shadow = task_input.get("shadow")
         stable_version = task_input.get("release_stable_version")
@@ -558,6 +636,8 @@ class ReviewService:
     ) -> None:
         task = self.store.get(task_id, tenant_id) or {}
         task_input = task.get("input") or {}
+        if task_input.get("studio_workflow"):
+            return
         if task_input.get("shadow") is not True:
             return
         if not self.policies.resolve(tenant_id, str(task.get("repository") or "")).enabled:
@@ -723,9 +803,10 @@ class ReviewService:
         source: str = "api",
         tenant_id: str = "default",
         actor: str = "",
+        workflow_selection: dict | None = None,
     ) -> dict[str, Any]:
         return self.review_use_cases.create_review(
-            repository, diff, pull_request, source, tenant_id, actor
+            repository, diff, pull_request, source, tenant_id, actor, workflow_selection
         )
 
     def enqueue_review(
@@ -739,6 +820,7 @@ class ReviewService:
         tenant_id: str = "default",
         idempotency_key: str = "",
         actor: str = "",
+        workflow_selection: dict | None = None,
     ) -> dict[str, Any]:
         return self.review_use_cases.enqueue_review(
             repository,
@@ -750,6 +832,7 @@ class ReviewService:
             tenant_id,
             idempotency_key,
             actor,
+            workflow_selection,
         )
 
     def _process_queued(self, payload: dict[str, Any]) -> None:

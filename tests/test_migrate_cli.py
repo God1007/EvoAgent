@@ -9,6 +9,25 @@ from evoagent.migrations import CURRENT_SCHEMA_VERSION, SchemaTooNewError
 
 
 class MigrationCliTests(unittest.TestCase):
+    def test_help_and_unknown_arguments_never_open_the_database(self):
+        for arguments, code in ((["--help"], 0), (["--dry-run"], 2), (["unexpected"], 2)):
+            with self.subTest(arguments=arguments):
+                with (
+                    patch("sys.argv", ["evoagent-migrate", *arguments]),
+                    patch(
+                        "evoagent.migrate.Settings.from_env",
+                        side_effect=AssertionError("read configuration"),
+                    ) as settings,
+                    patch("evoagent.migrate.create_store") as create,
+                    redirect_stdout(StringIO()),
+                    redirect_stderr(StringIO()),
+                    self.assertRaises(SystemExit) as result,
+                ):
+                    run()
+                self.assertEqual(code, result.exception.code)
+                settings.assert_not_called()
+                create.assert_not_called()
+
     def test_prints_machine_readable_postgres_status(self):
         store = unittest.mock.Mock()
         store.schema_version.return_value = CURRENT_SCHEMA_VERSION
@@ -17,7 +36,7 @@ class MigrationCliTests(unittest.TestCase):
             patch("evoagent.migrate.create_store", return_value=store) as create,
             redirect_stdout(output),
         ):
-            run()
+            run([])
         payload = json.loads(output.getvalue())
         self.assertEqual("migrated", payload["status"])
         self.assertEqual("postgresql", payload["backend"])
@@ -33,7 +52,7 @@ class MigrationCliTests(unittest.TestCase):
             redirect_stderr(stderr),
             self.assertRaisesRegex(SystemExit, "2"),
         ):
-            run()
+            run([])
         payload = json.loads(stderr.getvalue())
         self.assertEqual("error", payload["status"])
         self.assertIn("newer", payload["error"])
@@ -48,7 +67,7 @@ class MigrationCliTests(unittest.TestCase):
             redirect_stderr(stderr),
             self.assertRaisesRegex(SystemExit, "2"),
         ):
-            run()
+            run([])
 
         payload = json.loads(stderr.getvalue())
         self.assertEqual("error", payload["status"])
@@ -65,7 +84,7 @@ class MigrationCliTests(unittest.TestCase):
             redirect_stderr(stderr),
             self.assertRaisesRegex(SystemExit, "2"),
         ):
-            run()
+            run([])
 
         self.assertEqual(
             {

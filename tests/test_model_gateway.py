@@ -122,6 +122,58 @@ class ModelGatewayTests(unittest.TestCase):
         self.assertNotIn("secret-key", sent)
         self.assertEqual("upstream-1", response.request_id)
 
+    def test_structured_messages_redact_decoded_values_without_corrupting_json(self):
+        original = {
+            "inputs": {
+                "diff": '+password = "qa-password-value"\n+print("visible")\n',
+                "notes": ['api_key = "qa-tool-secret"', True, 7, None],
+            },
+            "tool_results": {"password": 'qa-json-secret "quoted" \\ value'},
+            "secret-key": "a credential also used as a JSON field name",
+        }
+        encoded = json.dumps(original, ensure_ascii=False)
+        for content in (
+            encoded,
+            encoded.replace("secret-key", "\\u0073ecret-key"),
+            json.dumps(encoded),
+        ):
+            provider = FakeProvider()
+            with self.subTest(content=content[:50]):
+                self.gateway(provider).complete(self.request(content))
+                sent = provider.calls[0][1][0].content
+                for secret in (
+                    "qa-password-value",
+                    "qa-tool-secret",
+                    "qa-json-secret",
+                    "secret-key",
+                ):
+                    self.assertNotIn(secret, sent)
+                decoded = json.loads(sent)
+                if isinstance(decoded, str):
+                    decoded = json.loads(decoded)
+                self.assertEqual("<redacted>", decoded["tool_results"]["password"])
+                self.assertEqual([True, 7, None], decoded["inputs"]["notes"][1:])
+                self.assertEqual(2, decoded["inputs"]["diff"].count("\n"))
+                self.assertIn('print("visible")', decoded["inputs"]["diff"])
+                self.assertIn("<redacted>", decoded)
+        self.assertEqual(encoded, json.dumps(original, ensure_ascii=False))
+        safe = ' { "nested": [true, 1, "ordinary text"] } '
+        self.assertEqual(safe, redact_model_messages((ModelMessage("user", safe),))[0][0].content)
+
+    def test_structured_redaction_cannot_exceed_budget_or_silently_merge_fields(self):
+        cases = (
+            ('{"password":"x"}', 4),
+            ('{"secret-key":1,"<redacted>":2}', 1000),
+            ("[" * 80 + '"ordinary"' + "]" * 80, 1000),
+            ('{"password":"first","password":"second"}', 1000),
+            ('{"text":"\\ud800"}', 1000),
+        )
+        for content, budget in cases:
+            provider = FakeProvider()
+            with self.subTest(content=content[:40]), self.assertRaises(ClientInputError):
+                self.gateway(provider, max_input_tokens=budget).complete(self.request(content))
+            self.assertEqual([], provider.calls)
+
     def test_rejects_invalid_json_and_oversized_output(self):
         invalid = (
             "not-json",

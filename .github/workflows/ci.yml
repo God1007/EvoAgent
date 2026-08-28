@@ -57,6 +57,7 @@ jobs:
       - name: Web regression checks
         run: |
           node --check web/app.js
+          node --check web/studio.js
           node --test tests/web.test.cjs
       - name: Validate Prometheus recording and alert rules
         run: |
@@ -116,6 +117,22 @@ jobs:
           retention-days: 14
       - name: Build distributions
         run: python -m build
+      - name: Test the source distribution outside the checkout
+        run: |
+          sdist_dir="$(mktemp -d "$RUNNER_TEMP/evoagent-sdist.XXXXXX")"
+          python - "$sdist_dir" <<'PY'
+          from pathlib import Path
+          import sys
+          import tarfile
+
+          with tarfile.open(next(Path("dist").glob("*.tar.gz"))) as archive:
+              assert all(not Path(name).name.startswith(".env") or Path(name).name == ".env.example" for name in archive.getnames())
+              archive.extractall(sys.argv[1], filter="data")
+          PY
+          cd "$sdist_dir"/evoagent_pr_review-*
+          python -c "from pathlib import Path; import evoagent, tests.db_support; assert all(Path(m.__file__).resolve().is_relative_to(Path.cwd()) for m in (evoagent, tests.db_support))"
+          python -m pytest -q
+          node --test tests/web.test.cjs
       - name: Generate and audit the runtime dependency SBOM
         run: |
           python -m pip_audit -r requirements.lock --require-hashes --disable-pip \
@@ -163,6 +180,8 @@ jobs:
           "$wheel_env/bin/evoagent-dr" --help >/dev/null
           "$wheel_env/bin/evoagent-recover-queue" --help >/dev/null
           "$wheel_env/bin/evoagent-eval-labels" --help >/dev/null
+          "$wheel_env/bin/evoagent-sign-skill" --help >/dev/null
+          "$wheel_env/bin/evoagent-migrate" --help >/dev/null
           "$wheel_env/bin/python" -c "from evoagent.review_extensions import ReviewerContribution"
           "$wheel_env/bin/python" -I - "$GITHUB_WORKSPACE/dist" <<'PY'
           import json
@@ -174,18 +193,40 @@ jobs:
           import tarfile
 
           import evoagent
+          from evoagent.api import WEB_ROOT
           from evoagent.review_engine import _APPLICATION_SOURCE_REVISION, _source_revision
 
           assert Path(evoagent.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+          for command in (
+              [str(Path(sys.executable).with_name("evoagent"))],
+              [sys.executable, "-I", "-m", "evoagent"],
+          ):
+              for argument, code, marker in (
+                  ("--help", 0, "usage:"),
+                  ("--dry-run", 2, "unrecognized arguments:"),
+              ):
+                  result = subprocess.run(
+                      [*command, argument], capture_output=True, text=True, timeout=15,
+                      env={**os.environ, "EVOAGENT_PORT": "invalid-before-argparse"},
+                  )
+                  assert result.returncode == code, (command, argument, result.stderr)
+                  assert marker in result.stdout + result.stderr
           source = Path(os.environ["GITHUB_WORKSPACE"]) / "examples"
           assert _APPLICATION_SOURCE_REVISION == _source_revision(source.parent / "evoagent")
           installed = Path(sysconfig.get_path("data")) / "share/evoagent/examples"
+          installed_web = installed.parent / "web"
+          assert Path(WEB_ROOT).resolve() == installed_web.resolve()
           with tarfile.open(next(Path(sys.argv[1]).glob("*.tar.gz"))) as archive:
               prefix = archive.getnames()[0].split("/")[0]
               for name in ("custom_review_workflow.py", "business-review.json"):
                   expected = (source / name).read_bytes()
                   assert (installed / name).read_bytes() == expected
                   assert archive.extractfile(f"{prefix}/examples/{name}").read() == expected
+              for asset in (source.parent / "web").iterdir():
+                  if asset.is_file() and not asset.name.startswith("."):
+                      expected = asset.read_bytes()
+                      assert (installed_web / asset.name).read_bytes() == expected
+                      assert archive.extractfile(f"{prefix}/web/{asset.name}").read() == expected
           command = [
               sys.executable, "-I", str(installed / "custom_review_workflow.py"),
               "--workflow", str(installed / "business-review.json"),
@@ -305,6 +346,7 @@ jobs:
             tests/test_github_http_fixture.py \
             tests/test_workflow.py \
             tests/test_workflow_delivery.py \
+            tests/test_studio.py \
             tests/test_dr.py \
             --cov=evoagent.postgres_store \
             --cov-config=/dev/null \

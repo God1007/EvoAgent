@@ -1,6 +1,7 @@
 # EvoAgent Baseline Evaluation Report
 
-Reproducible snapshot of the end-to-end evaluation harness. Regenerate with
+Reproduced on 2026-08-28 against the local working tree. This is an offline
+evaluation snapshot, not a remote CI or production qualification. Regenerate with
 `python scripts/run_e2e_evaluation.py --reuse-dataset` (see
 [`evaluation.md`](evaluation.md)).
 
@@ -10,7 +11,7 @@ Reproducible snapshot of the end-to-end evaluation harness. Regenerate with
 | --- | --- |
 | EvoAgent version | 0.30.0 |
 | Python | 3.12.13 |
-| Application source SHA-256 | `5c6b41daaf8a289d7fb238d77fbaaf41ff169fa31e078079b763fc36c107fb5f` |
+| Application source SHA-256 | `826d8bc92a4f028d36266f050694b1708d3a612e9c517861b8b326a707a6d683` |
 | Dependencies | `requirements.lock` SHA-256 `dd3a30c26aa196e7afcc88a1d16336ee391ce408fcebcc3bd996a0f80537ac0e` |
 | Dataset | `evaluation_data/pr_diff_100.jsonl` |
 | Dataset semantic SHA-256 | `8d2271ec666dcbc96b0c8a13e05adcf71c08f33bf17da5d1c102fe9a3434af38` |
@@ -63,8 +64,8 @@ end-to-end. Benchmark-only semantic rewrites are not used.
 
 ## Release gate
 
-- Quantitative gate: **FAIL** — production repair coverage remains below the
-  declared thresholds.
+- Quantitative gate: **FAIL** — E2E security-fix rate is 35.0%, below the
+  declared 60.0% minimum.
 - Production activation: **BLOCKED** — requires a real, independently-labeled
   public-PR dataset (`production_data_provenance` fails by design on synthetic
   data).

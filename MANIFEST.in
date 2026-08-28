@@ -1,0 +1,11 @@
+# Ship the inputs needed to run the bundled tests and deployment examples.
+include requirements.lock requirements-dev.lock
+include Dockerfile docker-compose.yml docker-compose.perf.yml .dockerignore .gitignore
+recursive-include tests *.py *.cjs
+recursive-include scripts *.py *.sh
+recursive-include .github *.yml
+recursive-include evaluation_data *.jsonl
+recursive-include examples *.py *.json *.toml
+recursive-include docs *.md *.jpg
+global-exclude .env*
+include .env.example

@@ -24,6 +24,7 @@ import math
 import os
 import selectors
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -266,7 +267,7 @@ class RepairVerifier:
         name = "evoagent-verify-%s" % uuid.uuid4().hex[:12]
         file_bytes = self.max_file_mb * 1024 * 1024
         deadline = time.monotonic() + self.timeout_seconds
-        work_tmpfs = "/work:rw,nosuid,nodev,size=%dm" % self.memory_mb
+        work_tmpfs = "/work:rw,nosuid,nodev,size=%dm,uid=65534,gid=65534,mode=0700" % self.memory_mb
         command = [
             "docker",
             "run",
@@ -296,42 +297,38 @@ class RepairVerifier:
             "nofile=1024:1024",
             "--workdir",
             "/work",
-            "--mount",
-            "type=bind,src=%s,dst=/source,readonly" % root,
+            "--user",
+            "65534:65534",
         ]
-        if os.name != "nt":
-            user = "%d:%d" % (os.getuid(), os.getgid())
-            work_tmpfs += ",uid=%d,gid=%d,mode=0700" % (os.getuid(), os.getgid())
-            command += ["--user", user]
         command += ["--tmpfs", work_tmpfs, self.container_image, "sh", "-c", "sleep 2147483647"]
-        copy = ["docker", "exec", "--workdir", "/work"]
-        if os.name != "nt":
-            copy += ["--user", user]
-        copy += [name, "sh", "-c", "cp -R /source/. /work"]
-        created = False
+        copy = ["docker", "exec", "-i", "--workdir", "/work", "--user", "65534:65534"]
+        copy += [name, "tar", "-xf", "-", "--no-same-owner"]
+        cleanup_required = False
         try:
             for setup in (command, copy):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return "timeout", "verification exceeded %d seconds" % self.timeout_seconds
                 try:
-                    result = subprocess.run(
-                        setup,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=remaining,
-                        check=False,
-                    )
+                    # The daemon may create the container before the CLI reports success.
+                    cleanup_required = True
+                    if setup is copy:
+                        returncode = self._copy_worktree(root, copy, deadline)
+                    else:
+                        returncode = subprocess.run(
+                            setup,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=remaining,
+                            check=False,
+                        ).returncode
                 except subprocess.TimeoutExpired:
                     return "timeout", "verification exceeded %d seconds" % self.timeout_seconds
                 except OSError as exc:
                     return "error", safe_exception_summary(exc, "container preparation failed")
-                if result.returncode:
+                if returncode:
                     return "error", "container preparation failed"
-                created = True
-            execute = ["docker", "exec", "--workdir", "/work"]
-            if os.name != "nt":
-                execute += ["--user", user]
+            execute = ["docker", "exec", "--workdir", "/work", "--user", "65534:65534"]
             execute += [name, "sh", "-c", self.test_command]
             returncode, detail, timed_out = self._execute(
                 execute,
@@ -345,7 +342,7 @@ class RepairVerifier:
                 return "error", detail
             return ("passed" if returncode == 0 else "failed"), detail
         finally:
-            if created:
+            if cleanup_required:
                 try:
                     cleanup = subprocess.run(
                         ["docker", "rm", "-f", name],
@@ -360,6 +357,44 @@ class RepairVerifier:
                 if cleanup.returncode:
                     metrics.inc("repair_container_cleanup_failures_total")
                     raise RuntimeError("repair container cleanup failed")
+
+    def _copy_worktree(self, root: str, command: list[str], deadline: float) -> int:
+        # Stream from the client: docker cp cannot reliably write to read-only-rootfs tmpfs.
+        source = subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                "import sys, tarfile\n"
+                "with tarfile.open(fileobj=sys.stdout.buffer, mode='w|') as archive:\n"
+                "    archive.add(sys.argv[1], arcname='.')\n",
+                root,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=os.name != "nt",
+        )
+        assert source.stdout is not None
+        try:
+            result = subprocess.run(
+                command,
+                stdin=source.stdout,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=max(0.0, deadline - time.monotonic()),
+                check=False,
+            )
+            if result.returncode:
+                return result.returncode
+            # A valid partial archive can extract successfully after its producer fails.
+            return source.wait(timeout=max(0.0, deadline - time.monotonic()))
+        finally:
+            try:
+                if source.poll() is None:
+                    self._terminate(source)
+                source.wait(timeout=5)
+            finally:
+                source.stdout.close()
 
     def verify_archive(self, archive: bytes, files: dict[str, str]) -> dict:
         """Verify changed files inside an isolated copy of the complete repository."""

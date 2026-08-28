@@ -10,6 +10,8 @@ from typing import Any
 from .errors import (
     AccessDeniedError,
     ClientInputError,
+    ResourceNotFoundError,
+    StateConflictError,
     TenantReviewCapacityError,
     preserve_safe_summary,
 )
@@ -1363,7 +1365,11 @@ class PostgresTaskStore:
 
     def get(self, task_id: str, tenant_id: str | None = None) -> dict[str, Any] | None:
         with self._connect() as conn:
-            query = "SELECT * FROM tasks WHERE id=%s"
+            query = (
+                "SELECT tasks.*,(state='FAILED' AND EXISTS (SELECT 1 FROM task_admissions AS admission "
+                "WHERE admission.task_id=tasks.id AND admission.active=TRUE)) AS retrying "
+                "FROM tasks WHERE id=%s"
+            )
             params = [task_id]
             if tenant_id is not None:
                 query += " AND tenant_id=%s"
@@ -1703,7 +1709,7 @@ class PostgresTaskStore:
             where = " WHERE tenant_id=%s" if tenant_id is not None else ""
             params = ([tenant_id] if tenant_id is not None else []) + [max(1, min(limit, 200))]
             rows = conn.execute(
-                "SELECT id,state,repository,pull_request,error,created_at,updated_at,tenant_id,"
+                "SELECT id,state,repository,pull_request,error,created_at,updated_at,tenant_id,cancel_requested,"
                 "(state='FAILED' AND EXISTS (SELECT 1 FROM task_admissions AS admission WHERE "
                 "admission.task_id=tasks.id AND admission.active=TRUE)) AS retrying "
                 "FROM tasks" + where + " ORDER BY created_at DESC LIMIT %s",
@@ -2069,9 +2075,10 @@ class PostgresTaskStore:
                 return False
             if task["state"] == TaskState.SUCCESS.value:
                 return True
+            # JSONB rewrites negative zero/exponents, invalidating handoff hashes.
             conn.execute(
                 "INSERT INTO checkpoints(task_id,node,status,attempt,state_json,error,updated_at) "
-                "VALUES (%s,%s,%s,%s,%s::jsonb,%s,%s) ON CONFLICT(task_id,node) DO UPDATE SET "
+                "VALUES (%s,%s,%s,%s,%s::json,%s,%s) ON CONFLICT(task_id,node) DO UPDATE SET "
                 "status=EXCLUDED.status,attempt=EXCLUDED.attempt,state_json=EXCLUDED.state_json,"
                 "error=EXCLUDED.error,updated_at=EXCLUDED.updated_at "
                 "WHERE checkpoints.status<>'completed' AND "
@@ -2183,6 +2190,265 @@ class PostgresTaskStore:
                 }
             )
         return result
+
+    @staticmethod
+    def _studio_record(row: Any) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        result = dict(row)
+        if "definition_json" in result:
+            result["definition"] = result.pop("definition_json")
+        for key in ("updated_at", "created_at"):
+            if key in result:
+                result[key] = result[key].isoformat()
+        return result
+
+    def list_studio_documents(
+        self,
+        tenant_id: str,
+        kind: str,
+        *,
+        limit: int = 100,
+        before: tuple[datetime, str] | None = None,
+    ) -> list[dict]:
+        boundary = " AND (updated_at<%s OR (updated_at=%s AND id>%s))" if before else ""
+        params = (tenant_id, kind) + ((before[0], before[0], before[1]) if before else ())
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id,revision,active_version,definition_json->>'name' AS name,updated_at "
+                "FROM studio_documents WHERE tenant_id=%s AND kind=%s"
+                + boundary
+                + " ORDER BY updated_at DESC,id LIMIT %s",
+                (*params, max(1, min(limit, 101))),
+            ).fetchall()
+        return [self._studio_record(row) for row in rows]  # type: ignore[misc]
+
+    def get_studio_document(self, tenant_id: str, kind: str, key: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id,revision,active_version,definition_json,updated_at FROM studio_documents "
+                "WHERE tenant_id=%s AND kind=%s AND id=%s",
+                (tenant_id, kind, key),
+            ).fetchone()
+            versions = (
+                conn.execute(
+                    "SELECT version,draft_revision,digest,created_at FROM studio_versions "
+                    "WHERE tenant_id=%s AND kind=%s AND document_id=%s ORDER BY version DESC LIMIT 100",
+                    (tenant_id, kind, key),
+                ).fetchall()
+                if row
+                else []
+            )
+        result = self._studio_record(row)
+        if result is not None:
+            result["versions"] = [self._studio_record(version) for version in versions]
+        return result
+
+    def save_studio_draft(
+        self, tenant_id: str, kind: str, key: str, revision: int, definition: dict, actor: str
+    ) -> dict:
+        now = utc_now()
+        with self._connect() as conn:
+            if revision == 0:
+                row = conn.execute(
+                    "INSERT INTO studio_documents(tenant_id,kind,id,revision,definition_json,updated_at) "
+                    "VALUES (%s,%s,%s,1,%s::jsonb,%s) ON CONFLICT DO NOTHING RETURNING *",
+                    (tenant_id, kind, key, json.dumps(definition, ensure_ascii=False), now),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "UPDATE studio_documents SET definition_json=%s::jsonb,revision=revision+1,updated_at=%s "
+                    "WHERE tenant_id=%s AND kind=%s AND id=%s AND revision=%s RETURNING *",
+                    (
+                        json.dumps(definition, ensure_ascii=False),
+                        now,
+                        tenant_id,
+                        kind,
+                        key,
+                        revision,
+                    ),
+                ).fetchone()
+            if row is None:
+                raise StateConflictError("draft changed or does not exist; reload before saving")
+            self._audit_studio(
+                conn,
+                tenant_id,
+                actor,
+                "studio.draft_saved",
+                key,
+                {"kind": kind, "revision": row["revision"]},
+                now,
+            )
+        return self._studio_record(row)  # type: ignore[return-value]
+
+    def publish_studio_document(
+        self,
+        tenant_id: str,
+        kind: str,
+        key: str,
+        revision: int,
+        definition: dict,
+        digest: str,
+        actor: str,
+    ) -> dict:
+        now = utc_now()
+        with self._connect() as conn:
+            draft = conn.execute(
+                "SELECT revision,active_version FROM studio_documents WHERE tenant_id=%s AND kind=%s AND id=%s FOR UPDATE",
+                (tenant_id, kind, key),
+            ).fetchone()
+            if draft is None:
+                raise ResourceNotFoundError("draft not found")
+            if draft["revision"] != revision:
+                raise StateConflictError("draft changed; reload before publishing")
+            existing = conn.execute(
+                "SELECT * FROM studio_versions WHERE tenant_id=%s AND kind=%s AND document_id=%s AND draft_revision=%s",
+                (tenant_id, kind, key, revision),
+            ).fetchone()
+            if existing is not None:
+                return self._studio_record(existing)  # type: ignore[return-value]
+            version = (draft["active_version"] or 0) + 1
+            row = conn.execute(
+                "INSERT INTO studio_versions(tenant_id,kind,document_id,version,draft_revision,definition_json,digest,created_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s::jsonb,%s,%s) RETURNING *",
+                (
+                    tenant_id,
+                    kind,
+                    key,
+                    version,
+                    revision,
+                    json.dumps(definition, ensure_ascii=False),
+                    digest,
+                    now,
+                ),
+            ).fetchone()
+            conn.execute(
+                "UPDATE studio_documents SET active_version=%s WHERE tenant_id=%s AND kind=%s AND id=%s",
+                (version, tenant_id, kind, key),
+            )
+            self._audit_studio(
+                conn,
+                tenant_id,
+                actor,
+                "studio.published",
+                key,
+                {"kind": kind, "version": version, "digest": digest},
+                now,
+            )
+        return self._studio_record(row)  # type: ignore[return-value]
+
+    def get_studio_version(self, tenant_id: str, kind: str, key: str, version: int) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT document_id,version,draft_revision,definition_json,digest,created_at FROM studio_versions "
+                "WHERE tenant_id=%s AND kind=%s AND document_id=%s AND version=%s",
+                (tenant_id, kind, key, version),
+            ).fetchone()
+        return self._studio_record(row)
+
+    def bind_studio_workflow(
+        self,
+        tenant_id: str,
+        repository: str,
+        key: str | None,
+        actor: str,
+        *,
+        version: int | None,
+        expected_revision: int,
+    ) -> dict:
+        now = utc_now()
+        with self._connect() as conn:
+            previous = conn.execute(
+                "SELECT workflow_id,workflow_version AS version,revision FROM studio_bindings "
+                "WHERE tenant_id=%s AND repository=%s FOR UPDATE",
+                (tenant_id, repository),
+            ).fetchone()
+            if (previous["revision"] if previous else 0) != expected_revision:
+                raise StateConflictError("仓库配置已变化，请重新读取后再切换。")
+            name = None
+            if key is not None:
+                published = conn.execute(
+                    "SELECT definition_json->'definition'->>'name' AS name FROM studio_versions "
+                    "WHERE tenant_id=%s AND kind='workflows' AND document_id=%s AND version=%s",
+                    (tenant_id, key, version),
+                ).fetchone()
+                if published is None:
+                    raise ResourceNotFoundError("published workflow version not found")
+                name = published["name"]
+            # Keep unbound rows: deleting them would let stale revision 0 overwrite a rebind.
+            if previous is None:
+                row = conn.execute(
+                    "INSERT INTO studio_bindings(tenant_id,repository,workflow_id,workflow_version,updated_at) "
+                    "VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING "
+                    "RETURNING workflow_id,workflow_version AS version,revision,updated_at",
+                    (tenant_id, repository, key, version, now),
+                ).fetchone()
+                if row is None:
+                    raise StateConflictError("仓库配置已变化，请重新读取后再切换。")
+            else:
+                row = conn.execute(
+                    "UPDATE studio_bindings SET workflow_id=%s,workflow_version=%s,"
+                    "revision=revision+1,updated_at=%s WHERE tenant_id=%s AND repository=%s "
+                    "RETURNING workflow_id,workflow_version AS version,revision,updated_at",
+                    (key, version, now, tenant_id, repository),
+                ).fetchone()
+            self._audit_studio(
+                conn,
+                tenant_id,
+                actor,
+                "studio.repository_bound",
+                repository,
+                {
+                    "previous": dict(previous) if previous else None,
+                    "workflow_id": key,
+                    "version": version,
+                    "revision": row["revision"],
+                },
+                now,
+            )
+            row["name"] = name
+        return self._studio_record(row)  # type: ignore[return-value]
+
+    def get_studio_binding(self, tenant_id: str, repository: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT b.workflow_id,b.workflow_version AS version,b.revision,b.updated_at,"
+                "v.definition_json->'definition'->>'name' AS name "
+                "FROM studio_bindings b LEFT JOIN studio_versions v "
+                "ON (v.tenant_id,v.kind,v.document_id,v.version)="
+                "(b.tenant_id,b.kind,b.workflow_id,b.workflow_version) "
+                "WHERE b.tenant_id=%s AND b.repository=%s",
+                (tenant_id, repository),
+            ).fetchone()
+        return self._studio_record(row)
+
+    @staticmethod
+    def _audit_studio(
+        conn: Any, tenant: str, actor: str, action: str, resource: str, detail: dict, now: str
+    ) -> None:
+        conn.execute(
+            "INSERT INTO audit_log(tenant_id,actor,action,resource,detail_json,created_at) VALUES (%s,%s,%s,%s,%s::jsonb,%s)",
+            (tenant, actor, action, resource, json.dumps(detail), now),
+        )
+
+    def workflow_artifact(self, tenant_id: str, task_id: str, step_id: str) -> dict | None:
+        """Read actual committed output on demand, with tenant ownership in the SQL join."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT c.status,c.state_json FROM checkpoints c JOIN tasks t ON t.id=c.task_id "
+                "WHERE t.id=%s AND t.tenant_id=%s AND c.node=%s",
+                (task_id, tenant_id, "workflow:" + step_id),
+            ).fetchone()
+        if row is None:
+            return None
+        state = row["state_json"]
+        return {
+            "step_id": step_id,
+            "status": row["status"],
+            "outputs": state.get("outputs"),
+            "sources": state.get("handoff", {}).get("sources", {}),
+            "output_sha256": state.get("output_sha256"),
+        }
 
     def request_cancel(self, task_id: str, tenant_id: str, actor: str = "system") -> bool:
         now = utc_now()

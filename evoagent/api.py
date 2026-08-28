@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import json
 import math
@@ -21,6 +22,7 @@ from .application.webhooks import github_pull_request_updated_at
 from .auth import Principal
 from .backpressure import ClientIdentity, ConcurrencyLimiter
 from .config import Settings
+from .console_view import console_error, console_response
 from .errors import (
     AccessDeniedError,
     ClientInputError,
@@ -37,11 +39,19 @@ from .report import to_markdown
 from .repository import canonical_repository
 from .review_extensions import ReviewerContribution
 from .service import ReviewService
+from .studio import compile_workflow, document_id, draft_definition, revision_number
 
 RESOURCE_ID = r"(?:[0-9a-f]{32}|[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})"
 TASK = re.compile(r"^/v1/tasks/(%s)$" % RESOURCE_ID)
 REPORT = re.compile(r"^/v1/tasks/(%s)/report$" % RESOURCE_ID)
 WORKFLOW = re.compile(r"^/v1/tasks/(%s)/workflow$" % RESOURCE_ID)
+WORKFLOW_ARTIFACT = re.compile(
+    r"^/v1/tasks/(%s)/workflow/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})$" % RESOURCE_ID
+)
+STUDIO_DOCUMENT = re.compile(r"^/v1/studio/(agents|workflows)/([0-9a-f]{32})(/publish)?$")
+STUDIO_VERSION = re.compile(
+    r"^/v1/studio/(agents|workflows)/([0-9a-f]{32})/versions/([1-9][0-9]{0,8})$"
+)
 FIX = re.compile(r"^/v1/tasks/(%s)/fix$" % RESOURCE_ID)
 FEEDBACK = re.compile(r"^/v1/tasks/(%s)/feedback$" % RESOURCE_ID)
 CANCEL = re.compile(r"^/v1/tasks/(%s)/cancel$" % RESOURCE_ID)
@@ -177,7 +187,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             "forwarded_hops": identity.forwarded_hops,
             **fields,
         }
-        print(json.dumps(record, ensure_ascii=False, sort_keys=True), flush=True)
+        encoded = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        try:
+            print(encoded, flush=True)
+        except (OSError, ValueError):
+            # A detached/closed console must not abort the HTTP response. Database
+            # audit writes keep their existing failure policy; this is console I/O only.
+            metrics.inc("http_log_failures_total")
 
     def _client_identity_value(self) -> ClientIdentity:
         cached = getattr(self, "_client_identity_cache", None)
@@ -265,9 +281,24 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send_json(401, {"error": str(exc)})
             return None
 
-    def _send_json(self, status: int, value: dict[str, Any]) -> None:
+    def _send_json(
+        self, status: int, value: dict[str, Any], *, retry_after: float | None = None
+    ) -> None:
+        if getattr(self, "_console_view", False):
+            if status >= 400:
+                value = console_error(status, value)
+            elif 200 <= status < 300:
+                projected = console_response(self.command, self._safe_request_path(), value)
+                assert projected is not None
+                value = projected
         body = json.dumps(value, ensure_ascii=False, default=str, allow_nan=False).encode("utf-8")
-        self._headers(status, "application/json; charset=utf-8", len(body))
+        self.send_response(status)
+        self.send_header("Vary", "X-EvoAgent-View")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        if retry_after is not None:
+            self.send_header("Retry-After", str(max(1, math.ceil(retry_after))))
+        self.end_headers()
         self.wfile.write(body)
 
     def _send_text(
@@ -367,8 +398,15 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._response_started = False
         self._metric_counted = False
         self._metric_response_recorded = False
+        self._console_view = False
         self._request_id_value()
         try:
+            view = self._single_header("X-EvoAgent-View")
+            if view:
+                self._console_view = True
+                if view != "console":
+                    raise ClientInputError("X-EvoAgent-View must be console")
+                console_response(method, _request_target(self.path).path)
             self._dispatch_with_admission(method, handler)
         except TenantReviewCapacityError:
             if not self._response_started:
@@ -488,13 +526,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         # retain a worker by slowly sending its declared body.
         if drain_body and self._declared_body_length():
             self.close_connection = True
-        body = json.dumps({"error": message}, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Retry-After", str(max(1, math.ceil(retry_after))))
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_json(status, {"error": message}, retry_after=retry_after)
 
     def _do_GET(self) -> None:
         parsed_url = _request_target(self.path)
@@ -511,6 +543,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         if path == "/assets/app.js":
             self._serve_file("app.js")
+            return
+        if path in {"/assets/studio.js", "/assets/studio.css"}:
+            self._serve_file(path.rsplit("/", 1)[1])
             return
         if path == "/health":
             self._send_json(200, {"status": "ok"})
@@ -540,6 +575,90 @@ class ApiHandler(BaseHTTPRequestHandler):
         principal = self._authenticate_or_send("read")
         if principal is None:
             return
+        # A view header selects less data, never more authority. Authoring data
+        # and raw execution snapshots require manage before any resource lookup.
+        if not principal.can("manage") and (
+            path == "/v1/studio/catalog"
+            or STUDIO_DOCUMENT.fullmatch(path)
+            or (
+                not getattr(self, "_console_view", False)
+                and (
+                    STUDIO_VERSION.fullmatch(path)
+                    or TASK.fullmatch(path)
+                    or WORKFLOW.fullmatch(path)
+                    or WORKFLOW_ARTIFACT.fullmatch(path)
+                )
+            )
+        ):
+            raise AccessDeniedError("permission denied")
+        if path == "/v1/studio/catalog":
+            self._send_json(200, self.service.studio.catalog())
+            return
+        if path in {"/v1/studio/agents", "/v1/studio/workflows"}:
+            if any(len(query.get(key, [])) > 1 for key in ("limit", "cursor")):
+                raise ClientInputError("Studio pagination parameters must be unique")
+            self._send_json(
+                200,
+                self.service.studio.list_documents(
+                    principal.tenant_id,
+                    path.rsplit("/", 1)[1],
+                    limit=self._query_limit(query, 100),
+                    cursor=query.get("cursor", [""])[0],
+                ),
+            )
+            return
+        studio_match = STUDIO_DOCUMENT.fullmatch(path)
+        version_match = STUDIO_VERSION.fullmatch(path)
+        if version_match:
+            kind, key, version = version_match.groups()
+            document = self.service.store.get_studio_version(
+                principal.tenant_id, kind, key, int(version)
+            )
+            if document is None:
+                raise ResourceNotFoundError("version not found")
+            self._send_json(200, document)
+            return
+        if studio_match and not studio_match.group(3):
+            kind, key, _action = studio_match.groups()
+            document = self.service.store.get_studio_document(principal.tenant_id, kind, key)
+            if document is None:
+                raise ResourceNotFoundError("draft not found")
+            if getattr(self, "_console_view", False):
+                # Normalize a copy for older sparse drafts, never migrate on GET.
+                try:
+                    document["definition"] = draft_definition(kind, document["definition"])
+                except ClientInputError:
+                    raise ClientInputError("草稿结构暂不受编辑器支持，原始内容未修改。") from None
+            self._send_json(200, document)
+            return
+        if path == "/v1/studio/binding":
+            repository = canonical_repository(query.get("repository", [""])[0])
+            self.service.review_use_cases.authorize_repository(principal.tenant_id, repository)
+            self._send_json(
+                200,
+                {"binding": self.service.store.get_studio_binding(principal.tenant_id, repository)},
+            )
+            return
+        artifact_match = WORKFLOW_ARTIFACT.fullmatch(path)
+        if artifact_match:
+            artifact = self.service.studio.artifact(principal.tenant_id, *artifact_match.groups())
+            if artifact is None:
+                raise ResourceNotFoundError("workflow artifact not found or expired")
+            if self._console_view:
+                artifact_workflow = (
+                    self.service.store.workflow_status(artifact_match.group(1), principal.tenant_id)
+                    or {}
+                )
+                artifact["port_types"] = next(
+                    (
+                        step
+                        for step in artifact_workflow.get("steps", [])
+                        if step["id"] == artifact_match.group(2)
+                    ),
+                    {},
+                )
+            self._send_json(200, artifact)
+            return
         if path in {
             "/metrics",
             "/v1/evaluation/cases",
@@ -559,6 +678,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "tasks": self.service.store.list_tasks(10, principal.tenant_id),
                     "queue": self.service.queue.backend,
                     "orchestrator": self.service.reviewer.name,
+                    "capabilities": self.service.console_capabilities(principal),
                 },
             )
             return
@@ -731,6 +851,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not task:
                 self._send_json(404, {"error": "task not found"})
                 return
+            if getattr(self, "_console_view", False):
+                task = {**task, "fix_blocker": self.service.console_fix_blocker(task, principal)}
             self._send_json(200, task)
             return
         self._send_json(404, {"error": "not found"})
@@ -741,6 +863,82 @@ class ApiHandler(BaseHTTPRequestHandler):
         query = _query_parameters(parsed_url.query)
         try:
             body = self._read_body()
+            if path.startswith("/v1/studio/"):
+                principal = self._principal("manage")
+                payload = self._read_json(body)
+                if path in {"/v1/studio/agents", "/v1/studio/workflows"}:
+                    self._send_json(
+                        201,
+                        self.service.studio.save(
+                            principal.tenant_id, path.rsplit("/", 1)[1], payload, principal.username
+                        ),
+                    )
+                    return
+                studio_match = STUDIO_DOCUMENT.fullmatch(path)
+                if studio_match and studio_match.group(3):
+                    if payload.keys() != {"revision"}:
+                        raise ClientInputError("publish requires only the saved draft revision")
+                    self._send_json(
+                        201,
+                        self.service.studio.publish(
+                            principal.tenant_id,
+                            studio_match.group(1),
+                            studio_match.group(2),
+                            payload["revision"],
+                            principal.username,
+                        ),
+                    )
+                    return
+                if path == "/v1/studio/validate":
+                    if payload.keys() != {"definition"}:
+                        raise ClientInputError("validation requires only definition")
+                    bundle = self.service.studio.resolve(principal.tenant_id, payload["definition"])
+                    workflow = compile_workflow(
+                        bundle,
+                        self.service.studio.builtins(),
+                        self.service.model_gateway,
+                        self.service.studio.context,
+                    )
+                    self._send_json(200, {"valid": True, "workflow": workflow.describe()})
+                    return
+                if path == "/v1/studio/binding":
+                    if payload.keys() != {"repository", "workflow_id", "version", "revision"}:
+                        raise ClientInputError(
+                            "binding requires repository, workflow_id, version and revision; "
+                            "workflow_id and version must both be null to unbind"
+                        )
+                    binding_repository = canonical_repository(payload["repository"])
+                    policy = self.service.review_use_cases.authorize_repository(
+                        principal.tenant_id, binding_repository
+                    )
+                    key = (
+                        document_id(payload["workflow_id"])
+                        if payload["workflow_id"] is not None
+                        else None
+                    )
+                    revision = revision_number(payload["revision"], zero=True)
+                    version = revision_number(payload["version"]) if key is not None else None
+                    if key is None and payload["version"] is not None:
+                        raise ClientInputError("version must be null when unbinding")
+                    if key is not None:
+                        self.service.review_use_cases.authorize_runtime(
+                            principal.tenant_id, binding_repository, policy
+                        )
+                        self.service.studio.select(
+                            principal.tenant_id, binding_repository, {"id": key, "version": version}
+                        )
+                    binding = self.service.store.bind_studio_workflow(
+                        principal.tenant_id,
+                        binding_repository,
+                        key,
+                        principal.username,
+                        version=version,
+                        expected_revision=revision,
+                    )
+                    self._send_json(200, {"binding": binding})
+                    return
+                self._send_json(404, {"error": "not found"})
+                return
             if path == "/v1/auth/login":
                 if not self.settings.auth_required:
                     self._send_json(409, {"error": "authentication is disabled"})
@@ -824,9 +1022,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             if path == "/v1/reviews":
                 principal = self._principal("review")
                 payload = self._read_json(body)
-                if set(payload).difference({"repository", "diff", "pull_request"}):
+                if set(payload).difference({"repository", "diff", "pull_request", "workflow"}):
                     raise ClientInputError(
-                        "review request accepts only repository, diff and pull_request"
+                        "review request accepts only repository, diff, pull_request and workflow"
                     )
                 repository = payload.get("repository")
                 diff = payload.get("diff")
@@ -834,6 +1032,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not isinstance(repository, str) or not isinstance(diff, str):
                     raise ClientInputError("repository and diff must be strings")
                 repository = canonical_repository(repository)
+                selection = payload.get("workflow")
+                if "workflow" in payload:
+                    if not isinstance(selection, dict):
+                        raise ClientInputError("workflow must be a version selection object")
+                    if "draft_revision" in selection and not principal.can("manage"):
+                        raise AccessDeniedError("draft trial runs require manage permission")
                 if pr is not None and (
                     not isinstance(pr, int) or isinstance(pr, bool) or not 1 <= pr <= 2**31 - 1
                 ):
@@ -856,12 +1060,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                         tenant_id=principal.tenant_id,
                         idempotency_key=idempotency_key,
                         actor=principal.username,
+                        **({"workflow_selection": selection} if selection is not None else {}),
                     )
                 else:
                     result = self.service.create_review(
                         *args,
                         tenant_id=principal.tenant_id,
                         actor=principal.username,
+                        **({"workflow_selection": selection} if selection is not None else {}),
                     )
                 status = 200 if async_requested and result.get("replayed") else 202
                 self._send_json(status if async_requested else 201, result)
@@ -1186,6 +1392,15 @@ def _print_banner(settings: Settings, service: ReviewService) -> None:
             "delivery; otherwise pending/in-flight/dead-letter tasks are lost on restart."
             % service.queue.backend
         )
+
+
+def main(argv: list[str] | None = None) -> None:
+    argparse.ArgumentParser(
+        prog="evoagent",
+        description="Serve the EvoAgent API using EVOAGENT_* environment variables.",
+        allow_abbrev=False,
+    ).parse_args(argv)
+    run()
 
 
 def run(

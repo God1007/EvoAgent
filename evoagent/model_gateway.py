@@ -147,8 +147,10 @@ class ModelOutputError(RuntimeError):
 _ROUTE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 _HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,100}$")
 _ENV_NAME = re.compile(r"^[A-Z][A-Z0-9_]{1,127}$")
+_SECRET_NAME = r"password|passwd|api[_-]?key|secret|token"
+_SECRET_FIELD = re.compile(r"(?i)^(?:%s)$" % _SECRET_NAME)
 _SECRET_ASSIGNMENT = re.compile(
-    r"(?i)\b(password|passwd|api[_-]?key|secret|token)\b(\s*[:=]\s*)(['\"])([^'\"\n]+)(['\"])"
+    r"(?i)(\b(?:%s)\b['\"]?\s*[:=]\s*)(['\"])([^'\"\n]+)(['\"])" % _SECRET_NAME
 )
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}")
 _PRIVATE_KEY = re.compile(
@@ -158,14 +160,13 @@ _PRIVATE_KEY = re.compile(
 _ROUTE_FIELDS = frozenset({"id", "provider", "model", "base_url", "api_key_env", "region"})
 _MESSAGE_ROLES = frozenset({"system", "user", "assistant"})
 MAX_MODEL_ROUTE_BYTES = 64 * 1024
+MAX_MODEL_JSON_DEPTH = 64
 
 
 def _redact_text(value: str, explicit_secrets: tuple[str, ...] = ()) -> tuple[str, int]:
     redactions = 0
     content, count = _SECRET_ASSIGNMENT.subn(
-        lambda match: (
-            "%s%s%s<redacted>%s" % (match.group(1), match.group(2), match.group(3), match.group(5))
-        ),
+        lambda match: "%s%s<redacted>%s" % (match.group(1), match.group(2), match.group(4)),
         value,
     )
     redactions += count
@@ -190,11 +191,54 @@ def redact_model_messages(
     messages: tuple[ModelMessage, ...], explicit_secrets: tuple[str, ...] = ()
 ) -> tuple[tuple[ModelMessage, ...], int]:
     redactions = 0
+
+    def redact_content(content: str, depth: int) -> str:
+        nonlocal redactions
+        if content.lstrip()[:1] in {"{", "[", '"'}:
+            try:
+                value = strict_json_loads(content)
+            except json.JSONDecodeError:
+                pass  # Ordinary prose/source fragments still use the text rules.
+            except (ValueError, UnicodeError, RecursionError):
+                raise ClientInputError("model JSON input is invalid or too deeply nested") from None
+            else:
+                before = redactions
+                value = redact_value(value, depth + 1)
+                return json.dumps(value, ensure_ascii=False) if redactions != before else content
+        value, count = _redact_text(content, explicit_secrets)
+        redactions += count
+        return value
+
+    def redact_value(value: Any, depth: int) -> Any:
+        nonlocal redactions
+        if depth > MAX_MODEL_JSON_DEPTH:
+            raise ClientInputError("model JSON input exceeds the redaction depth limit")
+        if isinstance(value, str):
+            return redact_content(value, depth)
+        if isinstance(value, list):
+            return [redact_value(item, depth + 1) for item in value]
+        if isinstance(value, dict):
+            output = {}
+            for key, item in value.items():
+                safe_key, count = _redact_text(key, explicit_secrets)
+                redactions += count
+                if safe_key in output:
+                    raise ClientInputError("model JSON field names collide after redaction")
+                if (
+                    _SECRET_FIELD.fullmatch(key)
+                    and isinstance(item, str)
+                    and item not in {"", "<redacted>"}
+                ):
+                    output[safe_key] = "<redacted>"
+                    redactions += 1
+                else:
+                    output[safe_key] = redact_value(item, depth + 1)
+            return output
+        return value
+
     output = []
     for message in messages:
-        content, count = _redact_text(message.content, explicit_secrets)
-        redactions += count
-        output.append(ModelMessage(message.role, content))
+        output.append(ModelMessage(message.role, redact_content(message.content, 0)))
     return tuple(output), redactions
 
 
@@ -558,6 +602,11 @@ class ModelGateway:
             raise ClientInputError("model output limit must be a positive bounded integer")
         secrets = (route.api_key, *route.headers.values())
         messages, redactions = redact_model_messages(request.messages, secrets)
+        if (
+            sum(_estimated_tokens(message.content) for message in messages)
+            > self.options.max_input_tokens
+        ):
+            raise ClientInputError("redacted model input exceeds the configured token limit")
         if redactions:
             metrics.inc("model_redactions_total", redactions)
         try:

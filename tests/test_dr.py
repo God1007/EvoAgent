@@ -31,6 +31,7 @@ from evoagent.dr import (
 from evoagent.harness import ReviewHarness
 from evoagent.postgres_store import PostgresTaskStore
 from evoagent.reviewer import LocalRuleReviewer
+from evoagent.workflow import AgentSpec, PayloadType, Step, _json
 from examples.custom_review_workflow import build_workflow, business_policy
 from tests.db_support import postgres_url
 
@@ -171,8 +172,13 @@ class PostgresWorkflowRecoveryTests(unittest.TestCase):
         diff = "--- a/app.py\n+++ b/app.py\n@@ -0,0 +1 @@\n+eval(user_input)\n"
         source.create(task_id, "dr/fixture", 7, {})
         handoffs = []
+        numbers = {"negative_zero": -0.0, "large_float": 1e20, "large_integer": 10**100}
+        numeric_type = PayloadType("numeric-json", 1, lambda value: None)
+        producer = unittest.mock.Mock(return_value={"value": numbers})
+        numeric_agent = AgentSpec("numbers", "b" * 64, {}, {"value": numeric_type}, producer)
 
         def receiver(handoff):
+            self.assertEqual(_json(numbers), _json(handoff.inputs["numbers"]))
             handoffs.append(handoff)
             if len(handoffs) == 1:
                 raise RuntimeError("receiver interrupted")
@@ -183,7 +189,19 @@ class PostgresWorkflowRecoveryTests(unittest.TestCase):
             last = flow.steps[-1]
             return replace(
                 flow,
-                steps=(*flow.steps[:-1], replace(last, agent=replace(last.agent, run=receiver))),
+                steps=(
+                    *flow.steps[:-1],
+                    Step("numbers", numeric_agent, {}),
+                    replace(
+                        last,
+                        agent=replace(
+                            last.agent,
+                            inputs={**last.agent.inputs, "numbers": numeric_type},
+                            run=receiver,
+                        ),
+                        sources={**last.sources, "numbers": "numbers.value"},
+                    ),
+                ),
             )
 
         def harness(store, reviewer):
@@ -200,7 +218,7 @@ class PostgresWorkflowRecoveryTests(unittest.TestCase):
         before = source.load_checkpoints(task_id)
         self.assertEqual("failed", before["workflow:business"]["status"])
         self.assertEqual(
-            7,
+            8,
             sum(
                 key.startswith("workflow:") and value["status"] == "completed"
                 for key, value in before.items()
@@ -265,6 +283,7 @@ class PostgresWorkflowRecoveryTests(unittest.TestCase):
             self.assertEqual("SEC-EVAL", restored.findings[0].rule_id)
             self.assertEqual("SUCCESS", target.get(task_id)["state"])
             reviewer.review.assert_not_called()
+            producer.assert_called_once()
             after = target.load_checkpoints(task_id)
             for node, checkpoint in before.items():
                 if checkpoint["status"] == "completed":

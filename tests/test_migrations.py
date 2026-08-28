@@ -137,6 +137,57 @@ class PostgreSQLMigrationTests(unittest.TestCase):
         with self.assertRaises(SchemaHistoryError):
             PostgresTaskStore(self.url, pool_min=0, pool_max=0)
 
+    def test_checkpoint_json_migration_preserves_history_and_new_numeric_values(self):
+        import psycopg
+        from psycopg.rows import dict_row
+
+        state = {
+            "outputs": {"negative_zero": -0.0, "large_float": 1e20},
+            "output_sha256": "legacy-digest",
+        }
+        with psycopg.connect(self.url, row_factory=dict_row) as conn:
+            migrate_postgres(conn, 27)
+            conn.execute(
+                "INSERT INTO tasks(id,state,repository,input_json,created_at,updated_at) "
+                "VALUES ('legacy','EXECUTING','demo/repo','{}',%s,%s)",
+                (utc_now(), utc_now()),
+            )
+            conn.execute(
+                "INSERT INTO checkpoints(task_id,node,status,attempt,state_json,updated_at) "
+                "VALUES ('legacy','workflow:first','completed',3,%s::jsonb,%s)",
+                (json.dumps(state), utc_now()),
+            )
+            before = conn.execute("SELECT * FROM checkpoints").fetchone()
+            before_json = json.dumps(before["state_json"], sort_keys=True)
+            self.assertNotEqual(json.dumps(state, sort_keys=True), before_json)
+            migrate_postgres(conn)
+            self.assertEqual(
+                "json",
+                conn.execute(
+                    "SELECT pg_typeof(state_json)::text AS kind FROM checkpoints"
+                ).fetchone()["kind"],
+            )
+            after = conn.execute("SELECT * FROM checkpoints").fetchone()
+            self.assertEqual(before, after)
+            self.assertEqual(before_json, json.dumps(after["state_json"], sort_keys=True))
+            migrate_postgres(conn)
+            self.assertEqual(
+                1, conn.execute("SELECT count(*) AS n FROM checkpoints").fetchone()["n"]
+            )
+        store = PostgresTaskStore(self.url, pool_min=0, pool_max=0, auto_migrate=False)
+        self.addCleanup(store.close)
+        store.save_checkpoint("legacy", "workflow:second", state)
+        saved = store.load_checkpoints("legacy", "workflow:second")["workflow:second"]["state"]
+        self.assertEqual(json.dumps(state, sort_keys=True), json.dumps(saved, sort_keys=True))
+        # Migration cannot recover values already normalized by JSONB, and must not
+        # replace an old digest or overwrite a completed first-write-wins record.
+        store.save_checkpoint("legacy", "workflow:first", state, attempt=99)
+        with store._connect() as conn:
+            self.assertEqual(
+                before,
+                conn.execute("SELECT * FROM checkpoints WHERE node='workflow:first'").fetchone(),
+            )
+
     def test_newer_schema_fails_closed(self):
         store = PostgresTaskStore(self.url, pool_min=0, pool_max=0)
         with store._connect() as conn:
@@ -194,6 +245,69 @@ class PostgreSQLMigrationTests(unittest.TestCase):
                     "UPDATE deployments SET errors=samples+1 "
                     "WHERE tenant_id='tenant-a' AND skill_name='review-skill'"
                 )
+
+    def test_studio_binding_migration_pins_versions_and_fails_closed_on_invalid_legacy_rows(self):
+        import psycopg
+        from psycopg.rows import dict_row
+
+        with psycopg.connect(self.url, row_factory=dict_row) as conn:
+            migrate_postgres(conn, 26)
+            for tenant, versions in (("tenant-a", (1, 2)), ("tenant-b", (3,))):
+                conn.execute(
+                    "INSERT INTO studio_documents(tenant_id,kind,id,revision,definition_json,updated_at) "
+                    "VALUES (%s,'workflows','flow',2,'{}',%s)",
+                    (tenant, utc_now()),
+                )
+                for version in versions:
+                    conn.execute(
+                        "INSERT INTO studio_versions(tenant_id,kind,document_id,version,draft_revision,"
+                        "definition_json,digest,created_at) VALUES (%s,'workflows','flow',%s,%s,'{}','fixture',%s)",
+                        (tenant, version, version, utc_now()),
+                    )
+            conn.execute(
+                "INSERT INTO studio_bindings(tenant_id,repository,workflow_id,updated_at) "
+                "VALUES ('tenant-a','demo/repo','flow',%s)",
+                (utc_now(),),
+            )
+        for invalid_version in (None, 99):
+            with psycopg.connect(self.url, row_factory=dict_row) as conn:
+                conn.execute(
+                    "UPDATE studio_documents SET active_version=%s WHERE tenant_id='tenant-a'",
+                    (invalid_version,),
+                )
+            with self.assertRaises(MigrationApplyError):
+                with psycopg.connect(self.url, row_factory=dict_row) as conn:
+                    migrate_postgres(conn)
+            with psycopg.connect(self.url, row_factory=dict_row) as conn:
+                self.assertEqual(
+                    26,
+                    conn.execute("SELECT max(version) AS v FROM schema_migrations").fetchone()["v"],
+                )
+                self.assertNotIn(
+                    "workflow_version", conn.execute("SELECT * FROM studio_bindings").fetchone()
+                )
+        with psycopg.connect(self.url, row_factory=dict_row) as conn:
+            conn.execute("UPDATE studio_documents SET active_version=2 WHERE tenant_id='tenant-a'")
+            migrate_postgres(conn)
+            conn.execute("UPDATE studio_documents SET active_version=1 WHERE tenant_id='tenant-a'")
+        store = PostgresTaskStore(self.url, pool_min=0, pool_max=0, auto_migrate=False)
+        self.addCleanup(store.close)
+        pinned = store.get_studio_binding("tenant-a", "demo/repo")
+        self.assertEqual((2, 1), (pinned["version"], pinned["revision"]))
+        for key, version, revision, error in (
+            ("flow", 3, 1, psycopg.errors.ForeignKeyViolation),
+            ("flow", 99, 1, psycopg.errors.ForeignKeyViolation),
+            ("flow", None, 1, psycopg.errors.CheckViolation),
+            (None, 2, 1, psycopg.errors.CheckViolation),
+            ("flow", 0, 1, psycopg.errors.CheckViolation),
+            ("flow", 2, 0, psycopg.errors.CheckViolation),
+        ):
+            with self.assertRaises(error), store._connect() as conn:
+                conn.execute(
+                    "UPDATE studio_bindings SET workflow_id=%s,workflow_version=%s,revision=%s",
+                    (key, version, revision),
+                )
+        self.assertEqual(pinned, store.get_studio_binding("tenant-a", "demo/repo"))
 
     def test_old_writer_cannot_activate_an_unqualified_skill_version(self):
         import psycopg

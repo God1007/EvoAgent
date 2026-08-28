@@ -8,6 +8,7 @@
   <meta name="description" content="EvoAgent 多智能体代码审查、自动修复与 Skill 演进控制台">
   <link rel="stylesheet" href="/assets/app.css">
   <link rel="stylesheet" href="/assets/login.css">
+  <link rel="stylesheet" href="/assets/studio.css">
 </head>
 <body>
   <div class="app-shell">
@@ -21,14 +22,17 @@
         <button class="nav-item active" data-view="overview" data-icon="OV" aria-label="运行总览">
           <span>运行总览</span>
         </button>
+        <button class="nav-item" data-view="studio" data-icon="AG" aria-label="Agent 搭建">
+          <span>Agent 搭建</span>
+        </button>
         <button class="nav-item" data-view="review" data-icon="RV" aria-label="发起审查">
           <span>发起审查</span>
         </button>
         <button class="nav-item" data-view="tasks" data-icon="TS" aria-label="任务中心">
           <span>任务中心</span>
         </button>
-        <button class="nav-item" data-view="skills" data-icon="SK" aria-label="Skill 注册中心">
-          <span>Skills</span>
+        <button class="nav-item" data-view="skills" data-icon="SK" aria-label="基础能力">
+          <span>基础能力</span>
         </button>
         <button class="nav-item" data-view="evolution" data-icon="EV" aria-label="演进实验室">
           <span>演进实验室</span>
@@ -61,11 +65,11 @@
         <div class="hero">
           <div class="hero-copy">
             <span class="tag">Review control plane</span>
-            <h2>把代码审查，变成可治理的工程流程。</h2>
-            <p>统一编排审查、修复、回放与版本门禁，让每次 PR 都可追踪、可复现。</p>
+            <h2>组装你的 Agent，让 PR 按你的流程审查。</h2>
+            <p>自己定义检查规则与提示词，连接多个 Agent，再用真实代码变更验证结果。</p>
             <div class="hero-actions">
-              <button class="button accent" data-jump="review">新建 PR 审查 <span>→</span></button>
-              <button class="text-button" data-jump="tasks">查看任务记录</button>
+              <button class="button accent" data-jump="studio">开始搭建 Agent <span>→</span></button>
+              <button class="text-button" data-jump="review">使用已有流程审查</button>
             </div>
           </div>
           <dl class="hero-facts">
@@ -112,18 +116,23 @@
                 <em class="done">汇总</em>
               </div>
             </div>
-            <button class="link-button" data-jump="tasks">查看任务的真实交接记录 →</button>
+            <button class="link-button" data-jump="studio">搭建自己的审查组合 →</button>
           </article>
         </div>
       </section>
 
       <section class="view" id="view-review" aria-labelledby="page-title">
         <div class="section-heading">
-          <div><h2>提交 Pull Request Diff</h2><p>提供仓库信息与统一格式的 diff，交由多个 Agent 并行审查。</p></div>
+          <div><h2>选择流程，开始 PR 审查</h2><p>使用自己发布的 Agent 组合，或沿用仓库配置。这里只审查你提供的 Diff，不会自动获取 PR 代码。</p></div>
         </div>
         <div class="form-layout">
           <article class="panel form-panel">
             <form id="review-form">
+              <label>审查流程
+                <select id="review-workflow" name="workflow" aria-describedby="review-workflow-note"><option value="">沿用仓库配置（未绑定时使用默认流程）</option></select>
+              </label>
+              <div class="review-flow-actions"><button class="link-button" id="review-more-workflows" type="button">刷新流程列表</button><button class="link-button" type="button" data-jump="studio">＋ 搭建新流程</button></div>
+              <p id="review-workflow-note" class="workflow-note" role="status">选择一个已发布版本；不会改变仓库后续 PR 的配置。</p>
               <div class="field-row">
                 <label>仓库地址
                   <input name="repository" placeholder="owner/repository" autocomplete="off" required>
@@ -136,18 +145,18 @@
                 <textarea name="diff" rows="15" spellcheck="false" required placeholder="--- a/app.py&#10;+++ b/app.py&#10;@@ -1 +1 @@&#10;-old_value&#10;+new_value"></textarea>
               </label>
               <div class="form-footer">
-                <label class="check"><input name="async" type="checkbox" checked><span>放入异步队列</span></label>
-                <button class="button" type="submit">开始多 Agent 审查 <span>→</span></button>
+                <span class="workflow-note" id="review-access-note" role="status">正在确认操作权限…</span>
+                <button class="button" type="submit" disabled aria-describedby="review-access-note">开始多 Agent 审查 <span>→</span></button>
               </div>
             </form>
           </article>
           <aside class="panel strategy-panel">
-            <h3>执行策略</h3>
+            <h3>这次审查如何执行</h3>
             <ol>
               <li><b>01</b><span><strong>解析变更</strong><small>只定位新增代码与新文件行号</small></span></li>
-              <li><b>02</b><span><strong>并行判断</strong><small>专职 Agent 独立评估风险</small></span></li>
-              <li><b>03</b><span><strong>质量门禁</strong><small>过滤无定位、无修复方案的结论</small></span></li>
-              <li><b>04</b><span><strong>经验沉淀</strong><small>反馈自动进入失败案例库</small></span></li>
+              <li><b>02</b><span><strong>固定流程版本</strong><small>草稿修改不影响这次任务</small></span></li>
+              <li><b>03</b><span><strong>按连线交接</strong><small>Agent 接收上游内容，再交付结果</small></span></li>
+              <li><b>04</b><span><strong>查看报告</strong><small>问题、依据与逐步交接记录</small></span></li>
             </ol>
             <div id="review-result" class="result empty" aria-live="polite">审查结果将在这里显示</div>
           </aside>
@@ -156,7 +165,7 @@
 
       <section class="view" id="view-tasks" aria-labelledby="page-title">
         <div class="section-heading">
-          <div><h2>审查任务</h2><p>跟踪任务状态，查看报告并创建安全修复分支。</p></div>
+          <div><h2>审查任务</h2><p>查看报告、取消执行或按原版本续跑，并创建安全修复分支。</p></div>
         </div>
         <div class="tasks-layout">
           <article class="panel">
@@ -167,24 +176,37 @@
           </article>
           <div class="task-detail">
             <p id="task-selection" class="workflow-note" role="status">选择任务查看交接记录与报告</p>
-            <article class="panel workflow-panel">
-              <div class="panel-head"><h3>Agent 交接记录</h3><span class="status status-neutral">只读快照</span></div>
-              <div id="task-workflow" class="workflow-content" aria-live="polite" aria-busy="false">请选择一个任务。</div>
-            </article>
+            <div id="task-controls" class="task-actions hidden" role="group" aria-label="任务操作">
+              <button id="resume-task" class="button secondary hidden" type="button">从失败节点续跑</button>
+              <button id="cancel-task" class="button danger hidden" type="button">取消任务</button>
+            </div>
+            <p id="task-control-result" class="operation-result" role="status" aria-live="polite"></p>
             <article class="panel report-panel">
               <div class="panel-head">
-                <h3>任务报告 · JSON</h3>
-                <button class="button danger hidden" id="create-fix">创建修复分支</button>
+                <h3>审查结论</h3>
+                <button class="button danger hidden" id="create-fix" disabled aria-describedby="fix-note">创建修复分支</button>
               </div>
-              <pre id="task-report">请选择一个任务。</pre>
+              <p id="fix-note" class="workflow-note" role="status"></p>
+              <div id="task-report" class="report-content" aria-live="polite">请选择一个任务。</div>
+              <div id="fix-result" class="operation-result" aria-live="polite"></div>
+            </article>
+            <article class="panel workflow-panel">
+              <div class="panel-head"><h3>处理过程</h3><span class="status status-neutral">按步骤查看</span></div>
+              <div id="task-workflow" class="workflow-content" aria-live="polite" aria-busy="false">请选择一个任务。</div>
             </article>
           </div>
         </div>
       </section>
 
+      <section class="view" id="view-studio" aria-labelledby="page-title">
+        <div class="section-heading"><h2>你的 Agent，你的审查流程</h2><p>从左侧选择或创建 Agent，在画布上组合；每条连线决定下一个 Agent 能收到什么。</p></div>
+        <div id="studio-root"><p class="workflow-note">正在读取工作室…</p></div>
+      </section>
+
       <section class="view" id="view-skills" aria-labelledby="page-title">
         <div class="section-heading inline">
-          <div><h2>Skill 注册中心</h2><p>查看已加载能力、版本来源与沙箱状态。当前 revision：<code id="skill-revision">正在读取…</code></p></div>
+          <div><h2>基础能力 · Skills</h2><p>这里是服务已安装的底层能力，不是 Agent 编辑器。要自定义职责和组合流程，请进入 Agent 搭建。</p></div>
+          <button class="button" data-jump="studio">创建 Agent 与搭建流程 →</button>
         </div>
         <div class="cards" id="skill-list"><div class="skill-card loading"></div><div class="skill-card loading"></div></div>
       </section>
@@ -192,11 +214,11 @@
       <section class="view" id="view-evolution" aria-labelledby="page-title">
         <div class="section-heading inline">
           <div><h2>演进实验室</h2><p>用真实失败案例回放候选提示词，守住质量基线。</p></div>
-          <button class="button secondary" id="auto-evolve">从反馈生成候选</button>
+          <button class="button secondary" id="auto-evolve" disabled aria-describedby="evolution-status">从反馈生成候选</button>
         </div>
         <article class="panel status-panel">
           <div class="panel-head"><h3>评测就绪状态</h3><span class="status status-neutral">实时状态</span></div>
-          <pre id="evolution-status">正在读取模型与评测集状态…</pre>
+          <div id="evolution-status" class="readiness-content">正在读取模型与评测集状态…</div>
         </article>
         <div class="evolution-grid">
           <article class="panel form-panel">
@@ -204,7 +226,7 @@
             <form id="evolution-form">
               <label>Skill 名称<input name="skill_name" value="llm-review" required></label>
               <label>候选提示词<textarea name="prompt" rows="11" required>Review the unified diff. Return JSON findings with severity, fix and test. Report only actionable defects introduced by added lines.</textarea></label>
-              <button class="button" type="submit">运行新旧版本回放评测 <span>→</span></button>
+              <button class="button" type="submit" disabled aria-describedby="evolution-status">运行新旧版本回放评测 <span>→</span></button>
             </form>
           </article>
           <article class="panel">
@@ -221,7 +243,8 @@
             <p class="github-kicker">Repository integration</p>
             <h2>把 EvoAgent 接入开发流程</h2>
             <p>安装后，PR 创建或更新会自动进入异步审查队列；自动修复始终写入独立的 <code>evoagent/fix-*</code> 分支。</p>
-            <button class="button accent" id="install-github" type="button">安装 GitHub App <span>→</span></button>
+            <p id="github-status" class="workflow-note" role="status">正在检查 GitHub 接入配置…</p>
+            <button class="button accent" id="install-github" type="button" disabled aria-describedby="github-status">安装 GitHub App <span>→</span></button>
           </div>
         </div>
         <article class="panel permissions">
@@ -237,13 +260,13 @@
     </main>
   </div>
 
-  <div class="login-overlay hidden" id="login-overlay">
+  <div class="login-overlay hidden" id="login-overlay" role="dialog" aria-modal="true" aria-labelledby="login-title">
     <form class="login-card" id="login-form">
       <div class="login-brand">
         <span class="brand-mark">E</span>
         <span>EvoAgent<small>REVIEW CONTROL</small></span>
       </div>
-      <h2>登录控制台</h2>
+      <h2 id="login-title">登录控制台</h2>
       <p class="login-lead">使用你的工作区凭据继续。</p>
       <label>用户名<input name="username" autocomplete="username" required></label>
       <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
@@ -255,5 +278,6 @@
 
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script src="/assets/app.js"></script>
+  <script src="/assets/studio.js"></script>
 </body>
 </html>

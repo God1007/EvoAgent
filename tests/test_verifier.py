@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -227,11 +228,50 @@ class VerifierHostModeTests(unittest.TestCase):
 
 
 class VerifierContainerModeTests(unittest.TestCase):
+    def test_uncertain_container_launch_still_removes_its_exact_name(self):
+        for failure in ("timeout", "nonzero", "oserror"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
+                verifier = RepairVerifier(test_command="pytest", container_image="img")
+                containers = {"unrelated-container"}
+                calls = []
+
+                def run(command, *, failure=failure, calls=calls, containers=containers, **kwargs):
+                    calls.append(command)
+                    if command[:2] == ["docker", "run"]:
+                        containers.add(command[command.index("--name") + 1])
+                        if failure == "timeout":
+                            raise verifier_module.subprocess.TimeoutExpired(
+                                command, kwargs["timeout"]
+                            )
+                        if failure == "oserror":
+                            raise OSError("launch acknowledgement unavailable")
+                        return SimpleNamespace(returncode=125)
+                    self.assertEqual(["docker", "rm", "-f"], command[:3])
+                    self.assertEqual(10, kwargs["timeout"])
+                    containers.remove(command[3])
+                    return SimpleNamespace(returncode=0)
+
+                with (
+                    patch.object(verifier_module.subprocess, "run", side_effect=run),
+                    patch.object(verifier, "_execute") as execute,
+                    patch.object(verifier, "_run_on_host") as host,
+                ):
+                    result = verifier.verify_worktree(root)
+
+                self.assertEqual("timeout" if failure == "timeout" else "error", result["status"])
+                self.assertFalse(result["passed"])
+                self.assertEqual({"unrelated-container"}, containers)
+                self.assertEqual(2, len(calls))
+                execute.assert_not_called()
+                host.assert_not_called()
+
     def test_container_cleanup_failure_is_not_ignored(self):
         verifier = RepairVerifier(test_command="pytest", container_image="img")
         verifier._execute = lambda *_args, **_kwargs: (0, "", False)  # type: ignore[method-assign]
 
-        def run(command, **_kwargs):
+        def run(command, **kwargs):
+            if kwargs.get("stdin") is not None:
+                kwargs["stdin"].read()
             return SimpleNamespace(returncode=1 if command[:3] == ["docker", "rm", "-f"] else 0)
 
         captured = Metrics()
@@ -250,6 +290,8 @@ class VerifierContainerModeTests(unittest.TestCase):
 
         def _fake_run(command, **kwargs):
             captured["commands"].append(command)
+            if kwargs.get("stdin") is not None:
+                kwargs["stdin"].read()
 
             class _Result:
                 returncode = 0
@@ -295,13 +337,14 @@ class VerifierContainerModeTests(unittest.TestCase):
         self.assertIn("--read-only", command)
         self.assertEqual("ALL", command[command.index("--cap-drop") + 1])
         self.assertIn("no-new-privileges", command)
-        if os.name != "nt":
-            self.assertIn("--user", command)
+        self.assertEqual("65534:65534", command[command.index("--user") + 1])
         self.assertIn("python:3.12-slim", command)
         self.assertNotIn("-v", command)
-        self.assertTrue(command[command.index("--mount") + 1].endswith(",dst=/source,readonly"))
-        self.assertEqual(["docker", "exec", "--workdir", "/work"], copy[:4])
-        self.assertEqual(["sh", "-c", "cp -R /source/. /work"], copy[-3:])
+        self.assertNotIn("--mount", command)
+        self.assertFalse(any("/source" in argument for argument in command + copy))
+        self.assertEqual(["docker", "exec", "-i", "--workdir", "/work"], copy[:5])
+        self.assertEqual(["tar", "-xf", "-", "--no-same-owner"], copy[-4:])
+        self.assertEqual(command[command.index("--user") + 1], copy[copy.index("--user") + 1])
         self.assertEqual(["sh", "-c", "pytest -q"], execute[-3:])
         self.assertEqual(
             {
@@ -313,6 +356,28 @@ class VerifierContainerModeTests(unittest.TestCase):
         )
         self.assertNotIn("pytest -q", str(result["attestation"]))
 
+    def test_container_identity_never_inherits_the_client_user(self):
+        for platform, uid, gid in (("posix", 0, 0), ("posix", 501, 20), ("nt", None, None)):
+            client_os = SimpleNamespace(
+                name=platform,
+                path=os.path,
+                getuid=lambda uid=uid: uid,
+                getgid=lambda gid=gid: gid,
+            )
+            with (
+                self.subTest(platform=platform, uid=uid),
+                patch.object(verifier_module, "os", client_os),
+            ):
+                result, commands = self._capture_docker_command(
+                    RepairVerifier(test_command="pytest", container_image="img")
+                )
+                self.assertTrue(result["passed"])
+                for command in commands[:3]:
+                    self.assertEqual("65534:65534", command[command.index("--user") + 1])
+                self.assertIn(
+                    "/work:rw,nosuid,nodev,size=1024m,uid=65534,gid=65534,mode=0700", commands[0]
+                )
+
     def test_container_timeout_force_removes_container(self):
         calls = []
         verifier = RepairVerifier(test_command="pytest", container_image="img", timeout_seconds=1)
@@ -323,6 +388,8 @@ class VerifierContainerModeTests(unittest.TestCase):
 
         def _fake_run(command, **kwargs):
             calls.append(command)
+            if kwargs.get("stdin") is not None:
+                kwargs["stdin"].read()
 
             class _Result:
                 returncode = 0
@@ -350,7 +417,7 @@ class VerifierContainerModeTests(unittest.TestCase):
 
         def run(command, **_kwargs):
             calls.append(command)
-            return SimpleNamespace(returncode=1 if "cp -R /source/. /work" in command else 0)
+            return SimpleNamespace(returncode=1 if command[:3] == ["docker", "exec", "-i"] else 0)
 
         def execute(*_args, **_kwargs):
             raise AssertionError("tests must not run after a failed worktree copy")
@@ -364,6 +431,101 @@ class VerifierContainerModeTests(unittest.TestCase):
 
         self.assertEqual("error", result["status"])
         self.assertTrue(any(command[:3] == ["docker", "rm", "-f"] for command in calls))
+
+
+@unittest.skipIf(os.name == "nt", "POSIX archive transfer checks")
+class VerifierWorktreeTransferTests(unittest.TestCase):
+    def test_stream_copies_private_nested_files_without_changing_the_source(self):
+        with tempfile.TemporaryDirectory(prefix="evoagent transfer,中文:") as temporary:
+            root, target = Path(temporary, "source"), Path(temporary, "target")
+            root.mkdir(mode=0o700)
+            target.mkdir(mode=0o700)
+            source = root / "nested" / ".private.txt"
+            source.parent.mkdir(mode=0o700)
+            content = "test data\n" * 300_000
+            source.write_text(content)
+            source.chmod(0o600)
+            (root / "link").symlink_to("nested/.private.txt")
+            verifier = RepairVerifier()
+
+            result = verifier._copy_worktree(
+                str(root),
+                ["tar", "-xf", "-", "--no-same-owner", "-C", str(target)],
+                time.monotonic() + 10,
+            )
+
+            self.assertEqual(0, result)
+            received = target / "nested" / ".private.txt"
+            self.assertEqual(content, received.read_text())
+            self.assertEqual(0o600, received.stat().st_mode & 0o777)
+            self.assertEqual(os.getuid(), received.stat().st_uid)
+            self.assertEqual("nested/.private.txt", os.readlink(target / "link"))
+            received.write_text("changed only in the sandbox")
+            self.assertEqual(content, source.read_text())
+
+    def test_successful_extraction_does_not_hide_a_failed_archive_producer(self):
+        actual_run = verifier_module.subprocess.run
+        receiver_codes = []
+
+        def receive(*args, **kwargs):
+            result = actual_run(*args, **kwargs)
+            receiver_codes.append(result.returncode)
+            return result
+
+        with (
+            tempfile.TemporaryDirectory() as target,
+            patch.object(verifier_module.subprocess, "run", side_effect=receive),
+        ):
+            result = RepairVerifier()._copy_worktree(
+                os.path.join(target, "missing-source"),
+                ["tar", "-xf", "-", "--no-same-owner", "-C", target],
+                time.monotonic() + 10,
+            )
+        self.assertNotEqual(0, result)
+        self.assertEqual([0], receiver_codes)
+
+    def test_receiver_failures_reap_the_archive_producer(self):
+        actual_popen = verifier_module.subprocess.Popen
+        for failure in ("nonzero", "timeout", "missing-runtime"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
+                Path(root, "large.txt").write_bytes(b"x" * 4_000_000)
+                processes = []
+
+                def launch(*args, processes=processes, **kwargs):
+                    process = actual_popen(*args, **kwargs)
+                    processes.append(process)
+                    return process
+
+                command = (
+                    ["evoagent-missing-copy-runtime"]
+                    if failure == "missing-runtime"
+                    else [
+                        sys.executable,
+                        "-I",
+                        "-c",
+                        "import time; time.sleep(30)"
+                        if failure == "timeout"
+                        else "import sys; sys.exit(7)",
+                    ]
+                )
+                started = time.monotonic()
+                with patch.object(verifier_module.subprocess, "Popen", side_effect=launch):
+                    if failure == "nonzero":
+                        self.assertEqual(
+                            7, RepairVerifier()._copy_worktree(root, command, started + 2)
+                        )
+                    else:
+                        expected = (
+                            verifier_module.subprocess.TimeoutExpired
+                            if failure == "timeout"
+                            else OSError
+                        )
+                        with self.assertRaises(expected):
+                            RepairVerifier()._copy_worktree(root, command, started + 0.2)
+                self.assertLess(time.monotonic() - started, 10)
+                self.assertTrue(processes)
+                self.assertTrue(all(process.poll() is not None for process in processes))
+                self.assertTrue(processes[0].stdout.closed)
 
 
 if __name__ == "__main__":

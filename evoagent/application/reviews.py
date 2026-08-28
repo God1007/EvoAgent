@@ -85,6 +85,7 @@ class ReviewUseCases:
         options: ReviewOptions,
         model_routes: Callable[[str, str], tuple[dict[str, str], ...] | None] | None = None,
         reviewer_revision: Callable[[], str] | None = None,
+        workflow_snapshot: Callable[[str, str, dict | None], dict | None] | None = None,
     ):
         self.store = store
         self.policies = policies
@@ -101,6 +102,9 @@ class ReviewUseCases:
         self.options = options
         self.model_routes = model_routes or (lambda _tenant_id, _repository: None)
         self.reviewer_revision = reviewer_revision or (lambda: "")
+        self.workflow_snapshot = workflow_snapshot or (
+            lambda _tenant, _repository, _selection: None
+        )
 
     def validate(self, repository: str, diff: str) -> None:
         canonical_repository(repository)
@@ -140,16 +144,26 @@ class ReviewUseCases:
     def authorize_review(self, tenant_id: str, repository: str, diff: str) -> RepositoryPolicy:
         self.validate(repository, diff)
         policy = self.policies.resolve(tenant_id, repository)
+        self.authorize_runtime(tenant_id, repository, policy, len(diff.encode("utf-8")))
+        return policy
+
+    def authorize_runtime(
+        self,
+        tenant_id: str,
+        repository: str,
+        policy: RepositoryPolicy,
+        diff_bytes: int = 0,
+    ) -> None:
+        """Use the same pipeline/route policy for activation, intake and execution."""
         reviewer, provider, model = self.reviewer_identity()
         self.policies.authorize_review(
             policy,
-            len(diff.encode("utf-8")),
+            diff_bytes,
             reviewer,
             provider,
             model,
             self.model_routes(tenant_id, repository),
         )
-        return policy
 
     def authorize_repository(self, tenant_id: str, repository: str) -> RepositoryPolicy:
         policy = self.policies.resolve(tenant_id, repository)
@@ -168,6 +182,7 @@ class ReviewUseCases:
         policy: RepositoryPolicy | None = None,
         idempotency_key: str = "",
         actor: str = "",
+        workflow_selection: dict | None = None,
     ) -> tuple[str, bool]:
         repository = canonical_repository(repository)
         self.validate_pull_request(pull_request)
@@ -210,6 +225,11 @@ class ReviewUseCases:
                         "pull_request": pull_request,
                         "source": source,
                         "diff_sha256": diff_sha256,
+                        **(
+                            {"workflow": workflow_selection}
+                            if workflow_selection is not None
+                            else {}
+                        ),
                         "context": {
                             key: outbox_payload[key]
                             for key in _QUEUE_CONTEXT_FIELDS
@@ -221,6 +241,18 @@ class ReviewUseCases:
                     sort_keys=True,
                 ).encode("utf-8")
             ).hexdigest()
+        existing = self.store.get(task_id, tenant_id) if idempotency_key else None
+        if existing is not None:
+            existing_input = existing.get("input") or {}
+            if existing_input.get("idempotency_fingerprint") != task_payload.get(
+                "idempotency_fingerprint"
+            ):
+                raise ClientInputError("Idempotency-Key was already used with a different review")
+            snapshot = existing_input.get("studio_workflow")
+        else:
+            snapshot = self.workflow_snapshot(tenant_id, repository, workflow_selection)
+        if snapshot is not None:
+            task_payload["studio_workflow"] = snapshot
         try:
             created = (
                 self.store.create_review_task(
@@ -289,6 +321,7 @@ class ReviewUseCases:
         repository = canonical_repository(repository)
         task_id = str(uuid.uuid4())
         assignment = self.releases.assignment(tenant_id, "llm-review", task_id)
+        snapshot = self.workflow_snapshot(tenant_id, repository, None)
         return (
             task_id,
             {
@@ -300,6 +333,7 @@ class ReviewUseCases:
                     policy or self.policies.resolve(tenant_id, repository)
                 ),
                 **payload,
+                **({"studio_workflow": snapshot} if snapshot is not None else {}),
             },
         )
 
@@ -329,11 +363,19 @@ class ReviewUseCases:
         source: str = "api",
         tenant_id: str = "default",
         actor: str = "",
+        workflow_selection: dict | None = None,
     ) -> dict[str, Any]:
         repository = canonical_repository(repository)
         policy = self.authorize_review(tenant_id, repository, diff)
         task_id, _created = self.create_task(
-            repository, diff, pull_request, source, tenant_id, policy=policy, actor=actor
+            repository,
+            diff,
+            pull_request,
+            source,
+            tenant_id,
+            policy=policy,
+            actor=actor,
+            workflow_selection=workflow_selection,
         )
         try:
             with (
@@ -380,6 +422,7 @@ class ReviewUseCases:
         tenant_id: str = "default",
         idempotency_key: str = "",
         actor: str = "",
+        workflow_selection: dict | None = None,
     ) -> dict[str, Any]:
         repository = canonical_repository(repository)
         policy = self.authorize_review(tenant_id, repository, diff)
@@ -399,6 +442,7 @@ class ReviewUseCases:
             policy,
             idempotency_key,
             actor,
+            workflow_selection,
         )
         self.notify_outbox()
         if created:
@@ -510,15 +554,7 @@ class ReviewUseCases:
         if diff is None:
             raise PermanentTaskError("task payload no longer exists")
         self.validate(repository, diff)
-        reviewer, provider, model = self.reviewer_identity()
-        self.policies.authorize_review(
-            policy,
-            len(diff.encode("utf-8")),
-            reviewer,
-            provider,
-            model,
-            self.model_routes(tenant_id, repository),
-        )
+        self.authorize_runtime(tenant_id, repository, policy, len(diff.encode("utf-8")))
         if fetched_diff:
             encoded = diff.encode("utf-8")
             self.store.save_task_payload(task_id, diff)
@@ -727,6 +763,8 @@ class ReviewUseCases:
         try:
             task = self.store.get(task_id, tenant_id) or {}
             task_input = task.get("input") or {}
+            if task_input.get("studio_workflow"):
+                return
             self.releases.observe(
                 tenant_id,
                 "llm-review",

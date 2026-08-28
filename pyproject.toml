@@ -43,7 +43,7 @@ dev = [
 ]
 
 [project.scripts]
-evoagent = "evoagent.api:run"
+evoagent = "evoagent.api:main"
 evoagent-migrate = "evoagent.migrate:run"
 evoagent-slo = "evoagent.slo:run"
 evoagent-dr = "evoagent.dr:run"

@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -130,6 +131,15 @@ class DependencyLockConsistencyTests(unittest.TestCase):
                     image == "scratch" or re.search(r"@sha256:[0-9a-f]{64}$", image),
                     "%s uses mutable base image %s" % (dockerfile.name, image),
                 )
+
+    def test_docker_python_version_matches_supported_runtime(self):
+        versions = re.findall(
+            r"^FROM python:([0-9.]+)-", (ROOT / "Dockerfile").read_text(), re.MULTILINE
+        )
+        self.assertTrue(versions, "Dockerfile must declare its Python version")
+        supported = SpecifierSet(self.pyproject["project"]["requires-python"])
+        for version in versions:
+            self.assertIn(Version(version), supported, "Docker Python is outside requires-python")
 
     def test_compose_images_are_pinned_by_digest(self):
         for compose_file in ROOT.glob("*compose*.yml"):

@@ -48,8 +48,10 @@ Verified on macOS arm64 and Python 3.12.13 with private, loopback-only PostgreSQ
 - [Redis 7.4.11 official checksums](https://github.com/redis/redis-hashes):
   SHA-256 `3c266ece0abd54ed3b1c912c6eb86b7508cf382cb690ee6649d3843f018f6357`.
 
-Application source SHA-256: `5c6b41daaf8a289d7fb238d77fbaaf41ff169fa31e078079b763fc36c107fb5f`
-(the same revision as the [controlled evaluation](evaluation-baseline.md)).
+Application source SHA-256 for this historical run:
+`5c6b41daaf8a289d7fb238d77fbaaf41ff169fa31e078079b763fc36c107fb5f`.
+Later follow-up results below and the [controlled evaluation](evaluation-baseline.md)
+have their own verification scope; they do not reassign this run to newer source.
 
 - Workflow suite: **29 passed, 0 skipped**, plus 54 passing subtests. Real SQL
   covers committed handoffs, failed-node replay, retention, tenant isolation and
@@ -220,16 +222,265 @@ is included in CI's zero-skip infrastructure selection. Reproduce it with
 This proves a fresh logical backup's local restore/resume path, not historical
 backup retention, point-in-time recovery, regional failover or production RPO/RTO.
 
+### Repair/Proof startup acknowledgement loss
+
+The shared verifier now takes cleanup responsibility before invoking `docker run`,
+not only after its successful return. Fault injection first reproduced leaked
+container names for startup timeouts, nonzero exits and exceptions; the regression
+now verifies exact-name removal, no repository execution and no host fallback.
+Cleanup failures still fail closed through the existing metric and error path.
+
+Local verification with the disposable PostgreSQL database passed **177 tests and
+103 subtests** across `test_verifier`, `test_proof`, `test_fixer`, `test_skills` and
+`test_application_use_cases`; Ruff and mypy also passed. **Five container tests
+remain skipped** because this host has no Docker CLI/image. The added CI contract
+starts a real container, injects loss of its startup acknowledgement, and checks
+that this exact container is gone; it has not yet run here or on CI for this diff.
+This is not evidence of real container isolation or daemon-outage cleanup.
+
+### Client-side worktree transfer
+
+The verifier's daemon-side `/source` bind mount has now been removed. An isolated
+stdlib Python producer streams an archive to `docker exec -i ... tar`; extraction
+runs as the test user in the existing bounded tmpfs. The source path is never a
+Docker mount argument, and the application creates no intermediate archive file.
+
+Real local Python/tar subprocess checks cover a multi-megabyte private file,
+nested and hidden paths, spaces/commas/Unicode/colons, preserved modes and symlinks,
+and unchanged source files after destination edits. A separate case verifies that
+successful extraction cannot mask a failed producer. Receiver failure, timeout
+and missing executable cases assert that the producer is reaped and its pipe
+closed. The related suite now passes **181 tests and 111 subtests** with the
+disposable PostgreSQL database; Ruff and mypy pass.
+
+Argument-level fixtures simulate root/non-root POSIX and non-POSIX clients.
+They reproduce and prevent host UID `0:0` inheritance and omission of the Skill
+user flag: both sandbox launches and all Repair/Proof execs explicitly use
+`65534:65534`, with matching private worktree ownership. This is not a real
+Windows-client or container-runtime qualification.
+
+The five Docker contracts remain unexecuted locally. Both execution probes require
+UID/GID `65534:65534`; the Repair probe also checks readable/writable copied `0600` files, an actual
+`/work` tmpfs, no `/source` mount, and an unchanged client file, in addition to
+the existing network/root-filesystem/environment checks. Their syntax was checked
+locally, not its isolation behavior. Remote-daemon and nested-container deployment
+remain unqualified until these contracts run in those environments; they are not
+proved by the absence of a bind-mount argument.
+
+### Console availability acceptance — 2026-08-28
+
+“The page loads” is not acceptance of every action. The console now starts write
+buttons disabled until the server supplies the current account's capabilities.
+`/api/dashboard` exposes only role/permission flags and GitHub configuration
+presence, never credentials. This is not a live provider health check; the POST
+handlers still enforce current permissions, policy, immutable versions and limits.
+
+| UI path | Automated evidence | Remaining deployment acceptance |
+| --- | --- | --- |
+| Agent authoring, publication, typed connections, workflow versions and repository binding | `tests/test_studio.py` with disposable PostgreSQL; `tests/web.test.cjs` covers draft preservation, incompatible connections, pagination and exact-version selection | Recheck the current visual interface in a permitted browser |
+| Manual Diff review and draft/published trial | Real HTTP/SQL Studio contracts; browser-script tests cover submission receipts, failed acknowledgements and session changes | A live model-backed workflow needs its configured provider and repository policy |
+| Reports and handoff inspection | Explicit response allowlists, escaped readable output, per-task stale-response and partial-failure tests | Unknown artifact types intentionally show an explanatory message, not raw JSON |
+| Cancel/resume and repair confirmation | Browser-script confirmation/target tests; backend lifecycle contracts | Remote review delivery and repair publication still require real GitHub qualification |
+| Model Agent publication | Missing/removed models disable publication before any draft write; saving a draft remains possible | Configured routing does not prove provider credentials, budget or availability |
+| GitHub installation | Missing authentication, App/OAuth or Webhook setup disables installation; permission/configuration matrix covered | OAuth consent, installation binding, reachable Webhook and real PR processing not tested locally |
+| Evolution evaluation | Disabled until model/dataset status is ready; failed or stale reads cannot unlock actions | Live evaluation, independent holdout provenance and release gates remain required; a deferred result is not reported as a completed evaluation |
+| Repair branch creation | Server checks role, PR snapshot, policy/rules, installation binding, credentials, isolated runtime configuration and test command; unknown conditions fail closed | Actual container tests and GitHub writes remain unqualified; a button permits an attempt, not guaranteed repair coverage |
+
+The latest availability slice passed the HTTP/Studio/projection group with
+**27 tests and 83 subtests**, and all **6 browser-script test groups**. These are
+real PostgreSQL/HTTP tests plus a minimal DOM harness, not a new full-browser run.
+The full Python suite passed **897 tests and 820 subtests**, with **15 skips**:
+nine Redis contracts, five container contracts and one missing PostgreSQL-client
+restore contract. Supplying the existing private PostgreSQL client binaries then
+passed all **7 disaster-recovery tests**, including that restore contract. Redis
+and container contracts were not rerun with their required services in this slice.
+Repository-wide Ruff, mypy (63 source files), JavaScript syntax and diff checks pass.
+The in-app browser rejected navigation under its URL policy; it was not bypassed
+with another browser or page-fetch mechanism. Current visual/browser interaction
+acceptance remains outstanding. No model credentials were supplied, no Docker
+runtime was installed and no GitHub installation or write was performed.
+
+Repeat the automated slice against a **disposable** PostgreSQL database:
+
+```bash
+python -m pytest -q tests/test_http_server.py tests/test_studio.py tests/test_console_view.py
+node --test tests/web.test.cjs
+```
+
+### Studio cross-process handoff qualification — 2026-08-28
+
+An independent loopback Redis instance and the disposable PostgreSQL database
+were used to run the same seven-file infrastructure selection as CI:
+**95 tests and 126 subtests passed, with zero skips**, also checked in the JUnit
+report. This includes Redis heartbeat, reconnect, pending-message reclaim,
+deduplication, DLQ, recovery CLI and database restore contracts that were skipped
+in the preceding console-only slice. No original deployment service or preview
+database was changed.
+
+The added Studio case publishes a three-Agent graph in a non-default tenant,
+terminates its worker process after both rule outputs commit and the merge is
+marked running, then publishes and binds a different Agent/workflow v2. A new
+service in another process reclaims the pending Redis message. It invokes only
+the unfinished merge, retains all completed checkpoints and the original bundle,
+and preserves the receiver's handoff/idempotency identity while advancing its
+attempt from 1 to 2. A fresh task uses v2 and produces its different expected
+report. Both tasks ACK, release admission and leave no DLQ item; another tenant
+cannot read the first task.
+
+This exercises the real authoring component, task intake, SQL checkpoints,
+Outbox and Redis worker. Test-only wrappers pause the merge and observe actual
+Agent calls; they do not supply simulated rule results, checkpoints or queues.
+The existing scheduler passed without production changes. The case is included
+in the existing CI file selection, but this local result is not a GitHub Actions
+result. It does not qualify Redis server power loss, live providers, GitHub
+effects, Docker isolation or current browser interactions.
+
+The subsequent full run passed **908 tests and 820 subtests**, with only the
+**5 container contracts skipped** because no Docker runtime/image was configured.
+All six browser-script test groups, repository-wide Ruff and mypy passed. Fresh
+wheel and sdist builds succeeded; the wheel contains all **63 Python modules and
+6 web assets**, byte-identical to the working tree, including Studio and console
+projections. This was package-content verification, not a new installed-service
+or browser smoke test. The private test Redis was stopped after verification;
+the user's running preview and its existing Agent/workflow data were preserved.
+
+### Source-distribution and installed-package qualification — 2026-08-28
+
+Extracting the previous sdist outside the checkout reproduced collection errors:
+the archive included test modules but omitted `tests/db_support.py`, the tests
+package marker, scripts and lock files. `MANIFEST.in` now explicitly includes the
+test/deployment inputs, frontend tests and synthetic evaluation fixture. Only
+`.env.example` is included; real environment-file variants remain excluded.
+CI now asserts imports originate in the extracted tree, runs its Python and
+browser-script suites, and compares installed web assets and examples with both
+the checkout and sdist. This catches missing Studio resources as well as missing
+Python modules without relying on the editable checkout installation.
+
+The initial fixed archive passed **908 tests and 820 subtests**, with only five
+Docker contracts skipped, plus all six frontend-script groups. Rebuilding its
+wheel from the extracted tree produced identical contents for all **84 wheel
+entries**; this compares entry bytes, not ZIP timestamps or archive hashes.
+A new virtual environment installed that wheel offline while reusing the existing
+local dependency packages. Its default web path resolves inside the installed
+prefix, and the packaged eight-stage example executes with the expected finding.
+This verifies package isolation and resources, not a fresh dependency download,
+live browser, or live-provider deployment.
+
+The installed CLI check additionally exposed that `evoagent-migrate` ignored
+arguments: even `--help` attempted configuration/database initialization. Argument
+parsing now precedes configuration and rejects unsupported options (especially
+`--dry-run`) without opening a store. A regression check verifies that help and
+invalid arguments never read settings or connect, while the existing no-argument
+migration and JSON-error contracts remain intact. Installed CLI help checks are
+also part of CI.
+
+After the CLI fix, the rebuilt sdist passed **909 tests and 823 subtests** from
+its own extracted directory with real disposable PostgreSQL/Redis; the only
+**5 skips** were Docker contracts. Its six frontend-script groups passed. The
+final wheel loads all seven entry points from the installation prefix, all six
+management CLI help commands pass, and `evoagent-migrate --dry-run` is rejected.
+Rebuilding that source archive again preserves all 84 wheel-entry contents.
+Ruff, mypy, YAML parsing and the CI shell syntax checks pass locally. The temporary
+Redis was stopped afterward; no original deployment migration, GitHub push or
+external-service action was performed. Current changes still await a real CI run
+and the previously listed deployment qualification.
+
+### API command-line startup boundary — 2026-08-28
+
+The API command had the same argument-handling defect as the migration command:
+`python -m evoagent --help`, `--dry-run` and unsupported port/positional arguments
+reached deployment configuration instead of exiting. A regression reproduced
+this before the fix without opening a store or starting workers. Both the module
+and installed console script now route through one standard-library parser before
+`api.run()`. The programmatic `run(workflow_factory=..., reviewer_contributions=...)`
+entrypoint remains unchanged so custom deployment scripts retain their own CLI.
+
+The five-file HTTP/workflow/Studio/migration/dependency selection passed **73 tests
+and 143 subtests, with zero skips**, both in the checkout and in a freshly extracted
+sdist using disposable PostgreSQL. All six frontend-script groups, Ruff, mypy and
+dependency checks passed. A fresh wheel installation outside the checkout passed
+the exact CI Python smoke block: both API CLI forms exit correctly even with
+deliberately invalid deployment configuration, packaged resources match, and the
+eight-stage custom workflow executes. CI bounds these CLI subprocesses by a timeout.
+The project virtualenv's console script was regenerated with an offline editable
+install; the running preview process and original deployment were not restarted.
+This targeted run is not a new full-suite, live-browser or production qualification.
+
+### Cancellation while a Studio Agent is running — 2026-08-28
+
+`tests/test_workflow_delivery.py` now covers the HTTP cancellation boundary with
+real PostgreSQL, Redis and a separate worker process. It publishes a rule Agent
+and a downstream merge, lets the rule compute an actual finding, then pauses its
+return before checkpoint commit. The parent submits `POST /v1/tasks/{id}/cancel`
+through a real loopback HTTP server, verifies the persisted cancellation flag,
+and only then releases the computed result.
+
+The worker exits cleanly with the task `CANCELLED`, no report, unchanged
+checkpoints and no merge invocation. Admission is released and the Redis message
+is ACKed without a dead letter. Delivering the original intent again through
+Redis does not enter the review executor or change the task/checkpoints. The
+test uses the normal local-development principal in an explicit fixture tenant;
+it is not a fresh authentication or browser acceptance test. Fault injection
+delays the real rule result; it does not fabricate storage or queue outcomes.
+The production runner needed no change. This qualifies cooperative cancellation
+of a returning Agent, not forcibly terminating arbitrary code or undoing remote
+effects. The existing infrastructure CI selection already includes this test.
+
+The seven-file infrastructure selection passed **96 tests and 126 subtests with
+zero skips**, confirmed in JUnit. The full checkout suite then passed **912 tests
+and 827 subtests**; its only **5 skips** were unconfigured Docker isolation
+contracts. All six frontend-script groups, Ruff and mypy passed. The independent
+test Redis was empty and stopped after verification. The running preview and its
+data were preserved; no production code change, restart, commit or push was needed
+for this cancellation qualification. These are local results, not a remote CI run.
+
+### Release-evidence audit — 2026-08-28
+
+Replaying the CI evaluation-evidence assertions found that the baseline document
+still named an older application source fingerprint. The unchanged 100-case
+dataset was rerun against source SHA-256
+`826d8bc92a4f028d36266f050694b1708d3a612e9c517861b8b326a707a6d683`;
+the [snapshot](evaluation-baseline.md) now records that run. The same CI assertions
+pass with only the report output path substituted. Candidate F1 remains 82.5%
+and E2E security-fix rate remains 35.0%, below its unchanged 60.0% minimum; neither
+the repair-coverage nor production-data provenance gate was relaxed.
+
+The current checkout's full suite with disposable PostgreSQL, Redis and PostgreSQL
+client tools passed **912 tests and 827 subtests**, with only the **5 unconfigured
+Docker tests skipped**. Coverage is **90.17%**, above the configured 70% floor;
+the existing exclusions for `__main__`, the PostgreSQL adapter and Skill runner
+still apply, so this is not adapter or sandbox coverage. All six frontend-script
+groups, Ruff, mypy and `pip check` passed. This is local evidence for the working
+tree, not proof that its unpublished changes passed remote CI.
+
+### Live documentation walkthrough — 2026-08-28
+
+Normal in-app browser access became available for the documentation pass. Against
+the running local API and PostgreSQL preview, the browser opened the saved
+three-Agent workflow, submitted a new `local/readme-demo` task against published
+v1, refreshed its completed state, and opened the report and merge handoff.
+The UI showed two findings (one high, one medium), three completed nodes, and two
+upstream inputs containing one finding each. The manual-Diff repair action stayed
+disabled with its missing-GitHub-snapshot explanation. Draft and repository
+binding state were not changed. Five unmodified screenshots and the exact Diff
+are in the [demo walkthrough](demo.md).
+
+This supersedes the earlier browser-access blocker for this narrow normal-path
+walkthrough, not the unexecuted authenticated, destructive, provider, GitHub,
+mobile or container acceptance cases. It does not establish that every console
+control has been exercised against a live production dependency.
+
 ### Remaining release qualification
 
 The architectural and handoff evidence above does not establish a production
-release. On 2026-08-28, the [main CI run](https://github.com/God1007/EvoAgent/actions/runs/32702890236)
-passed for `150c4324f69a4f4aef925c8db4940c98f5537f67`; current uncommitted changes
+release. On 2026-08-28, the [main CI run](https://github.com/God1007/EvoAgent/actions/runs/33100828640)
+passed for `46927e5424379169dbe2386874d505a46fe6084c`; current uncommitted changes
 have not run there. Local container isolation checks remain unexecuted, and live
 provider/GitHub behavior and deployment SLOs are not qualified. The controlled
 evaluation still fails repair-coverage and independent-data provenance gates.
 The [performance audit](performance.md) records the corrected generator timing
-and accounting, including real HTTP failure/backlog checks. Representative
+and accounting, real HTTP failure/backlog checks, and a controlled three-Agent
+completion/replica comparison with reconciled task and checkpoint counts. Representative
 end-to-end Agent load and deployment SLO qualification still remain; local
 toolchain checks do not replace them. These are outstanding requirements, not
 waived gates.

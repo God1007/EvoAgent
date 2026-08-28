@@ -2,113 +2,215 @@
 
 # EvoAgent
 
-### 可视化组装 Agent，按版本运行 PR 审查，追踪每一步交接
+### 面向 Pull Request 的可组合代码审查 Agent 平台
 
-在 Workflow Studio 中组合规则、模型和汇总节点；默认审查流程保留 Diff 定位、证据与安全修复门禁。
+定义 Agent，连接审查流程，让每一条结论都有来源。
 
 [![CI](https://github.com/God1007/EvoAgent/actions/workflows/ci.yml/badge.svg)](https://github.com/God1007/EvoAgent/actions/workflows/ci.yml)
 [![Security](https://github.com/God1007/EvoAgent/actions/workflows/security.yml/badge.svg)](https://github.com/God1007/EvoAgent/actions/workflows/security.yml)
 [![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![PostgreSQL](https://img.shields.io/badge/Storage-PostgreSQL-4169E1?logo=postgresql&logoColor=white)](#运行架构)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[实机演示](#实机演示) · [快速开始](#快速开始) · [运行架构](#运行架构) · [配置模型](#配置模型) · [文档](#文档)
+[架构设计](#运行架构) · [Agent 内部设计](#agent-内部设计) · [实机演示](#实机演示) · [快速开始](#快速开始) · [文档](#文档)
 
 </div>
 
-## 它解决什么问题
+EvoAgent 将代码审查拆成可复用的 Agent：安全检查、业务规则、模型分析、结果汇总。你可以直接使用默认审查流程，也可以在浏览器中定义 Agent、连接输入与输出，为不同仓库组装自己的审查流程。
 
-EvoAgent 接收 GitHub Pull Request 或 Unified Diff，只审查变更中的新增行，输出带文件位置、风险等级、证据、修复建议和测试建议的结构化报告。
-
-默认只运行确定性规则，不需要模型 API Key，也不会把代码发给外部服务。配置一个 OpenAI-compatible 模型后，EvoAgent 会先脱敏，再通过严格的 HTTPS/主机白名单发送请求，并限制输入、输出与响应大小。
-
-## 实机演示
-
-下面是 **2026-08-28 本机运行的真实界面**：浏览器连接 Python API 和 PostgreSQL，使用进程内队列执行已发布的规则流程。不是静态原型或生成图片；本次没有配置模型、Docker 或 GitHub App。
-
-### 1. 把审查职责组装成流程
-
-两个检查 Agent 接收同一份 Diff，再通过命名输入把结果交给汇总 Agent。可以更换组件、重新连接上下游、保存草稿和发布版本；右侧明确显示每个输入来自谁。
-
-![实机：安全检查与业务检查连接到报告汇总 Agent](docs/images/studio-composition.jpg)
-
-### 2. 运行后直接阅读结论
-
-这次发布版 v1 的真实任务完成了 **3 / 3 个节点**，产出 **2 个问题：1 个高风险、1 个中风险**。报告展示位置、原因和修复/验证建议；查看交接时展示上下游的实际产物，不把内部 metadata 或整段 JSON 直接堆给使用者。
-
-![实机：手动 Diff 审查的风险摘要与问题卡片](docs/images/review-report.jpg)
-
-「创建修复分支」在这张图中不可用，因为手动 Diff 没有可核验的 GitHub PR 快照。界面会说明缺少的前提，不以按钮可点击冒充功能已接通。
-
-完整的 **组装 → 发布版试运行 → 报告 → 执行轨迹 → 交接内容** 五张实拍，以及相同 Diff 的复现方法，见 [实机演示与当前进度](docs/demo.md)。
+输入一份 Unified Diff，或接入 GitHub PR 事件，EvoAgent 会执行选定流程，生成包含问题位置、风险等级、依据和修复建议的报告，并保留各节点的执行状态与交接记录。默认规则模式无需模型 API Key，适合先在本地体验，再逐步接入模型和 GitHub。
 
 ## 核心能力
 
-| 能力 | 实现 |
+| 能力 | 你可以做什么 |
 | --- | --- |
-| 多角色审查 | Planner 分派 Security、Reliability、LLM 与 Skill；Critic、Test、Synthesizer、Verifier 过滤结果 |
-| 可插拔流程 | 版本化 Agent 输入/输出契约，显式 DAG 连线，逐节点 checkpoint 与可恢复交接 |
-| 流程工作室 | 浏览器创建规则/提示词/汇总 Agent，连线、保存草稿、试运行、发布版本和绑定仓库 |
-| 精确定位 | 发现必须落在 Unified Diff 的新增行上 |
-| 可靠任务 | PostgreSQL 状态机、Checkpoint、事务 Outbox、租户容量门禁 |
-| 可靠投递 | 进程内队列用于单机开发；Redis Streams 提供幂等、ACK、租约回收、重试和 DLQ |
-| 安全模型出口 | 单路由、凭据脱敏、HTTPS、精确主机白名单、仓库策略、结构化输出校验 |
-| 动态 Skill | 内容寻址、签名校验、超时/内存/输出限制与容器沙箱 |
-| 保守修复 | 只对快照 PR head 执行白名单 AST 转换，在独立分支生成原子提交和 Draft PR |
-| 可执行证明 | 在本地容器中验证“修复前失败、修复后通过”，不执行宿主机回退 |
-| GitHub 自动化 | Webhook 验签和幂等、Diff 拉取、评论 upsert、GitHub App installation token |
-| 治理与观测 | 评测审批后再灰度、JWT/RBAC、多租户、仓库策略、审计日志、Prometheus、OpenTelemetry、RPO/RTO 演练 |
+| 可视化组装 | 在 Workflow Studio 中创建规则、提示词和汇总 Agent，连接上下游，保存草稿、试运行并发布版本 |
+| 定制审查标准 | 组合内置安全规则与自定义文本规则；配置 OpenAI-compatible 模型，补充语义分析 |
+| 可读的审查结果 | 按风险查看问题，定位 Diff 新增行，阅读依据、修复建议和验证方法 |
+| 可追踪的 Agent 交接 | 查看每个节点收到了什么、产出了什么；任务固定流程版本，支持失败后按检查点恢复 |
+| GitHub 工作流 | 通过 GitHub App 接收 PR 事件、更新审查评论；满足验证条件的白名单修复可生成 Draft PR |
+| 团队协作与运维 | 按租户隔离数据，以角色控制权限，配置仓库策略，并通过审计、指标和链路追踪排查问题 |
 
 ## 运行架构
 
+EvoAgent 采用模块化单体架构：**Agent 负责局部判断，Workflow 负责数据流，Harness 负责执行生命周期，应用层负责权限和外部操作。** 这些职责在同一服务内明确分开，扩展审查逻辑时，不必重新实现任务队列、认证或恢复机制。
+
+### 分层与职责
+
 ```mermaid
-flowchart LR
-    INPUT[GitHub Webhook / REST API] --> APP[EvoAgent]
-    APP --> OUTBOX[PostgreSQL + Outbox]
-    OUTBOX --> QUEUE[Memory / Redis Streams]
-    QUEUE --> REVIEW[Review Loop]
-    REVIEW --> RULES[Rules]
-    REVIEW --> LLM[Single Model Route]
-    REVIEW --> SKILLS[Sandbox Skills]
-    RULES --> GATE[Evidence Gate]
-    LLM --> GATE
-    SKILLS --> GATE
-    GATE --> RESULT[Report / PR Comment / Fix PR]
+flowchart TD
+    ENTRY[浏览器 / REST / GitHub Webhook] --> APP[应用用例：校验、授权与任务受理]
+    APP --> STORE[PostgreSQL：任务、输入快照与 Outbox]
+    STORE --> QUEUE[Redis Streams / 本地队列]
+    QUEUE --> HARNESS[ReviewHarness：任务状态、预算与恢复]
+    HARNESS --> FLOW[Workflow：契约、依赖与交接]
+    FLOW --> AGENTS[Agent：规则、模型与证据处理]
+    FLOW -. 节点检查点与产物 .-> STORE
+    HARNESS --> RESULT[生成审查报告]
+    RESULT --> PUBLISH[应用用例：结果展示 / 按策略回写 GitHub]
 ```
 
-任务状态：
+| 层次 | 主要实现 | 职责与设计目的 |
+| --- | --- | --- |
+| 组合入口 | [bootstrap.py](evoagent/bootstrap.py) | 启动时显式装配组件，将依赖选择与业务逻辑分开 |
+| 应用用例 | [application/](evoagent/application/)、[service.py](evoagent/service.py) | 处理审查受理、仓库策略、租户容量、PR 会话和结果发布 |
+| 任务运行时 | [harness.py](evoagent/harness.py) | 管理任务级状态转换、预算、重试和阶段检查点，不决定某个检查规则如何实现 |
+| 流程执行器 | [workflow.py](evoagent/workflow.py) | 校验 Agent 连线，按依赖执行并提交节点产物，不内置 PR 审查规则 |
+| 审查能力 | [agents.py](evoagent/agents.py)、[studio.py](evoagent/studio.py) | 实现默认审查角色，以及使用者定义的规则、模型和汇总 Agent |
+| 外部依赖 | [ports.py](evoagent/ports.py) | 用窄接口隔离模型、代码托管、队列和验证执行器；数据库统一采用 PostgreSQL |
+
+这里区分两种检查点：Harness 保存「解析、执行、生成报告」等任务阶段；Workflow 保存阶段内部每个 Agent 的交接结果。节点失败时可以复用已完成的上游产物，而不是从头重新调用所有 Agent。
+
+### 为什么选择这些传输方式
+
+| 边界 | 方式 | 原因 |
+| --- | --- | --- |
+| 用户或外部系统 → 服务 | HTTP + JSON | 统一浏览器、REST 和 Webhook 入口，在进入执行流程前完成校验与授权 |
+| 任务 → Worker | Redis Streams；本地开发可用进程内队列 | 以整项审查任务为投递单位，处理排队、消费确认和失败重试 |
+| 同一 Worker 内的 Agent → Agent | 受约束的 JSON 数据副本 + 函数调用 | 保留明确的数据契约和隔离，不为每条流程连线增加一次网络调用 |
+
+PostgreSQL 是持久化状态的唯一事实来源。任务与 Outbox 事件在同一事务提交，避免「任务已保存，但还没入队就宕机」造成任务丢失；Redis 负责投递，不是审查结果的唯一保存位置。详见 [事务 Outbox](docs/transactional-outbox.md)。
+
+目前不把每个 Agent 部署成微服务：流程分支按确定顺序调度，默认 `specialists` 节点内部另有有界并行池。未来若确实需要某类 Agent 独立扩缩容或跨语言运行，可在其执行函数后接远程服务，并继续遵守同一交接契约；当前并不提供分布式 DAG 调度。
+
+## Agent 内部设计
+
+在 EvoAgent 中，一个 Agent 是 **身份与版本 + 输入输出契约 + 执行函数**。执行函数可以是确定性规则，也可以调用模型；不是每个 Agent 都需要一段 Prompt 或一次 LLM 请求。
+
+### 1. 身份：区分组件、流程位置和执行版本
+
+| 标识 | 回答的问题 | 为什么需要 |
+| --- | --- | --- |
+| `agent_id` | 使用的是哪个 Agent 组件？ | 区分可复用的能力，不依赖界面上的展示名称 |
+| `agent_revision` | 使用的是哪一版 Agent 定义？ | 以 SHA-256 摘要绑定组件实现 / 行为配置；Studio 从定义生成，Python 扩展由提供者绑定 |
+| `step_id` | 这个组件位于流程中的哪个节点？ | 同一个 Agent 可以被多次复用，每个节点仍有独立的连线、状态和产物 |
+| `task_id`、`workflow_revision` | 属于哪次任务、哪一版流程？ | 将执行和结果绑定到原始任务，防止跨任务、跨版本混用 |
+| `execution_revision` | 本次执行使用哪套运行配置？ | 将应用源码、能力清单、模型配置和实际 Prompt 等纳入恢复校验，补足单个组件版本之外的依赖 |
+
+身份不等于权限。用户与租户身份由服务端认证确定，模型出口策略从任务绑定的仓库策略解析；给 Agent 起名「管理员」，或在 Prompt、上游输出中写入 `permissions`，都不会获得额外权限。受信任的 Python 扩展则属于部署代码，不能把这种接口约束误认为代码沙箱。
+
+`AgentSpec` 固定组件定义，`Step` 固定一次使用及其连线，`Workflow` 固定整张图。组件、节点和流程分开定义，才能做到「换一个检查实现」「复用同一个 Agent」「调整执行流程」互不混淆。
+
+### 2. 上下文：按需传入，而不是共享全部历史
+
+| 上下文 | 内容与来源 | 谁使用 |
+| --- | --- | --- |
+| 任务快照 | 原始 Diff、仓库与 PR 信息、仓库策略、选定流程及执行版本 | 应用层与恢复逻辑；不会整包自动传给每个 Agent |
+| 节点输入 | `Handoff.inputs` 中明确连线的原始输入或上游产物；`sources` 记录真实来源 | 当前 Agent |
+| 执行控制 | 当前任务、节点、尝试次数、幂等键、执行代次、截止时间 | 执行器与 Agent 的执行函数，不作为模型自行授予的权限 |
+| 模型消息 | 配置的 Prompt、输出格式要求、已连线输入和预先选定工具的结果 | 通过受控模型网关发送给模型 |
+
+例如，默认 `critic` 只接收解析后的变更与候选问题；`synthesize` 只接收候选问题、质疑结论和静态验证结果，不接收原始 Diff。需要什么由端口和连线声明，而不是让每个 Agent 从全局字典中自行找数据。
+
+上下文管理包含三个具体约束：
+
+- **数据隔离**：交接时通过 JSON 序列化生成独立副本。`inputs` 顶层只读，嵌套数据属于当前接收方；修改自己的列表不会污染上游或其他分支。
+- **内存与长度控制**：执行器按最后使用位置释放不再需要的内存产物，数据库检查点仍按保留策略保存。单份交接数据上限为 8 MiB，这不是进程总内存上限；模型网关另行检查输入 token 估算、输出 token 与响应大小。超过预算会拒绝，不静默截断证据。
+- **出站保护**：模型只收到当前请求构造的消息；凭据模式脱敏作用于出站副本，不改写保存的原始证据。脱敏不是完整 DLP，仍需遵守仓库数据策略。
+
+这里的「上下文管理」是显式选择、隔离、限额和恢复，不是自动摘要或长期记忆系统；当前没有自动压缩聊天历史、向量记忆或全仓库 RAG。
+
+### 3. 接口契约：先确认能接，再允许执行
+
+Agent 的执行入口是 `run(handoff: Handoff) -> dict[str, Any]`。每个命名输入、输出端口都声明 `PayloadType(name, version, validate)`，例如 `unified-diff@1`、`review-findings@1`。
+
+以 Studio 中的双检查流程为例，两条连接可以写成：
 
 ```text
-PENDING → PLANNING → EXECUTING → REVIEWING → SUCCESS
-                  ↘ FAILED / CANCELLED
+security.findings  → merge.security  : review-findings@1
+business.findings  → merge.business  : review-findings@1
 ```
 
-代码结构保持直接：`bootstrap.py` 负责一次性装配；`ReviewService` 协调用例；`ReviewHarness` 管理任务生命周期，`Workflow` 按显式数据连线执行可替换 Agent；PostgreSQL 是唯一持久化后端。没有插件自动发现、LangGraph 或 Agent 间 RPC。
+端口名称可以不同，类型名称和版本必须精确匹配。`merge` 只有收到两个完整输入才会执行，不能把一段普通文本直接当成问题列表。
 
-使用者可在「流程工作室」创建 Agent、组装审查流程，无需改 Python 或重启服务；[操作步骤与交接设计](docs/agent-workflows.md)说明草稿、发布和版本隔离。开发者仍可编辑 [JSON 流程配置](examples/business-review.json)，使用 `--workflow ... --check` 预检，或以 `--serve` 启动受信任的自定义部署。
+契约检查分三步：
 
-启用认证后，流程设计和完整诊断快照需要管理员的 `manage` 权限。普通账号仍可查看审查报告和可读交接记录；API 调用任务、流程或发布版本详情时须带 `X-EvoAgent-View: console`，不带时返回 403。完整草稿与部署目录不会因添加该请求头而开放。
+1. **组装时**：检查节点与来源是否存在、输入是否齐全、类型是否兼容、是否形成环路。
+2. **发布产物时**：检查输出端口集合、字段类型、JSON 可序列化性和大小；校验函数不能悄悄修改数据。
+3. **接收产物时**：下游用自己的校验器再检查一遍，恢复时还要核对身份和内容摘要，不能仅凭「类型名相同」就信任数据。
+
+`review-findings@1` 约束问题位置、风险级别、证据、建议和置信度等字段；但结构正确不等于结论正确，证据质量仍由审查角色负责。路由权也属于执行器：Agent 输出一个 `next_agent` 或 `recipient` 字段，不能改变流程走向。
+
+### 4. 交接：提交产物后，下游才开始
+
+交接的单位是可验证的产物，不是「上一位 Agent 说自己完成了」。持久化执行遵循以下顺序：
+
+```text
+核对流程、实现与原始输入快照
+  → 从明确来源重建并校验本节点输入
+  → 保存 running 状态与交接身份
+  → 调用 Agent
+  → 校验输出，原子提交本节点全部产物
+  → 读取数据库中已提交的结果
+  → 下游重新校验后继续
+```
+
+- **失败恢复**：已完成节点读取检查点，失败或中断节点重新执行；输入、实现或流程版本不匹配时拒绝续跑旧任务。
+- **并发与取消**：以先提交的完整结果为准，后到的 Worker 不能覆盖它；执行代次 `generation` 防止旧 Worker 在任务恢复或取消后提交过期结果。
+- **副作用幂等**：`idempotency_key` 绑定任务、版本、节点和输入，不随重试次数变化。它用于外部系统去重，但不意味着任意外部操作天然只执行一次。
+- **日志与状态分离**：`AgentMessage` 用于解释审查过程，检查点才是交接和恢复依据。日志中出现「完成」不能替代产物提交。
+
+这解决的是「哪个版本的谁，把哪些输入处理成了什么，接收方能否安全继续」。完整字段和恢复语义见 [交接协议](docs/agent-workflows.md#3-关键交接不是把聊天记录拼接给下一个-agent)。
+
+### 5. 默认审查：将发现问题与判断证据分开
+
+默认流程并不让单个模型同时承担发现、裁决与执行修复，而是将职责拆成以下节点：
+
+| 角色 | 接收与处理 | 交付 |
+| --- | --- | --- |
+| Planner | 根据变更文件整理语言、风险域与审查分工 | 审查计划 |
+| Specialists | 运行安全、可靠性规则，以及配置的模型 / Skill 检查 | 带源码依据的候选问题 |
+| Critic | 检查问题是否落在新增行，证据是否匹配，解释和建议是否具体 | 接受 / 质疑意见 |
+| Test | 对照变更行检查静态复现依据 | 静态验证结果 |
+| Synthesizer | 结合问题、质疑和验证结果，筛选、去重并排序 | 汇总后的问题 |
+| Fix | 对修复建议做保守的文本检查，排除部分危险建议 | 建议可接受性标记 |
+| Verifier | 根据置信度、静态验证和建议标记做最终筛选 | 可进入报告的问题 |
+
+这里的 Test 是静态证据检查，Fix 不是写代码，Verifier 也不是容器测试。实际修改仓库由独立修复用例处理，需要核验 PR 快照和权限；可执行验证走容器化的修复 / Proof 路径。自定义流程可以复用这些角色，但不会自动继承所有默认门禁，发布者需要保留所需的检查步骤。
+
+### 6. 可插拔的范围：行为、连线和工具分开配置
+
+- **使用者定制**：在 Studio 中定义规则、Prompt、输入输出和汇总逻辑；保存草稿、试运行、发布不可变版本，再绑定仓库。每个任务固定使用选中的版本，后续改草稿不改变旧任务。
+- **开发者扩展**：用 `AgentSpec` 提供新的受信任执行函数，再通过 `Step` 接入流程；模型、队列、代码托管和验证环境在各自接口边界替换，不依赖修改流程执行器。
+- **工具能力**：当前 Studio 模型 Agent 使用预先选定的 `local-rules`、`diff-summary` 工具结果，并由网关检查模型和仓库策略；模型不能临时要求执行任意 Shell、导入 Python 或改换下游 Agent。
+
+当前是有限无环流程，支持分支、汇合和组件复用，不支持循环或人审挂起。Python handler 的截止时间与取消检查是合作式约束；不可信代码仍需走受限 Skill / 容器执行路径。
+
+安装 Python 依赖后，可以运行 [自定义流程示例](examples/custom_review_workflow.py)：它保留默认审查链，在末尾接入业务规则 Agent，无需数据库、Docker 或模型凭据。
+
+```bash
+python examples/custom_review_workflow.py --check
+python examples/custom_review_workflow.py
+```
+
+## 实机演示
+
+### 在画布上搭建审查流程
+
+左侧选择或创建 Agent，中间连接审查步骤，右侧配置输入来源。下图将安全检查和业务检查的结果交给同一个汇总 Agent。
+
+![Workflow Studio：组合检查 Agent 并配置交接关系](docs/images/studio-composition.jpg)
+
+### 从报告追溯到执行过程
+
+报告集中展示风险摘要和问题卡片；展开任务后，可以查看节点状态，以及上下游实际交接的内容。
+
+![审查报告：风险摘要、问题位置与修复建议](docs/images/review-report.jpg)
+
+以上截图来自本地规则流程的实际运行。完整的组装、试运行、报告和交接演示见 [操作演示](docs/demo.md)。
 
 ## 快速开始
 
-### Docker Compose（推荐）
+### 1. 启动服务
 
-要求：Docker 与 Docker Compose。
+准备 Docker 与 Docker Compose，然后获取项目：
 
 ```bash
 git clone https://github.com/God1007/EvoAgent.git
 cd EvoAgent
 cp .env.example .env
-
-# 在 .env 中设置至少 32 字节随机密钥、管理员用户名和密码
-docker compose up --build
 ```
 
-Compose 会先运行一次性 `migrate` 服务，成功后才启动应用。
-
-打开 <http://127.0.0.1:8080>。
-
-`.env` 至少需要：
+编辑 `.env`，将下面三个值替换为自己的配置。认证密钥需为至少 32 字节的随机值：
 
 ```dotenv
 EVOAGENT_AUTH_SECRET=replace-with-at-least-32-random-bytes
@@ -116,207 +218,80 @@ EVOAGENT_BOOTSTRAP_ADMIN_USERNAME=admin
 EVOAGENT_BOOTSTRAP_ADMIN_PASSWORD=replace-with-a-strong-password
 ```
 
-首次登录成功后从 `.env` 删除两个 `EVOAGENT_BOOTSTRAP_ADMIN_*` 变量。它们只创建首个账号；
-后续启动不会覆盖已有密码、成员关系或角色。
-
-### 直接运行 Python
-
-要求：Python 3.11/3.12 与 PostgreSQL 16+。
+启动应用、PostgreSQL 和 Redis：
 
 ```bash
+docker compose up --build
+```
+
+Compose 会自动完成数据库迁移。打开 [本地控制台](http://127.0.0.1:8080)，使用刚设置的管理员账号登录。首次登录成功后，从 `.env` 移除两个 `EVOAGENT_BOOTSTRAP_ADMIN_*` 变量；已创建的账号会保留。
+
+<details>
+<summary>不使用 Docker：直接运行 Python</summary>
+
+准备 Python 3.11 / 3.12 和 PostgreSQL 16+，预先创建数据库及有权访问它的账号：
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
 python -m pip install --require-hashes -r requirements.lock
 export EVOAGENT_DATABASE_URL='postgresql://evoagent:password@127.0.0.1:5432/evoagent'
 python -m evoagent.migrate
 python -m evoagent
 ```
 
-服务默认只监听 `127.0.0.1:8080`。若绑定非回环地址，必须同时启用认证并配置 Redis。
-`python -m evoagent --help`（安装包命令为 `evoagent --help`）仅显示帮助，不读取部署配置或启动服务。
-监听地址、端口等通过 `EVOAGENT_*` 环境变量设置；未知命令行参数会报错退出，不会被静默忽略。
+将示例连接串替换为自己的数据库地址。此方式通过环境变量配置服务，不自动加载 `.env`。默认监听 `127.0.0.1:8080`，使用进程内队列，不启用登录；本地规则审查不需要 Redis、Docker 或模型凭据。对外部署需启用认证并配置 Redis，详见 [运行手册](docs/operations.md)。
 
-### 第一次审查
+</details>
 
-```bash
-curl -X POST 'http://127.0.0.1:8080/v1/reviews' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "repository": "demo/api",
-    "pull_request": 12,
-    "diff": "diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n+password = \"secret\"\n+eval(user_input)"
-  }'
+### 2. 完成第一次审查
+
+进入「发起审查」，仓库填写 `local/demo`，PR 编号留空，保留默认流程，并粘贴以下 Diff：
+
+```diff
+diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -0,0 +1,2 @@
++payload = yaml.load(raw)
++eval(user_input)
 ```
 
-异步提交增加唯一的 `?async=true`，再查询 `/v1/tasks/<task-id>`；其余查询参数和 JSON 字段会被拒绝。
+点击「开始多 Agent 审查」，在任务中心查看结果。这个示例会触发不安全 YAML 加载与动态代码执行检查；它只审查提交的文本，不会执行其中的代码，也不会访问 GitHub。
 
-## 内置规则
+### 3. 组装自己的流程
 
-| Rule ID | 等级 | 检查 | 自动修复 |
-| --- | --- | --- | :---: |
-| `SEC-EVAL` | Critical | `eval()` / `exec()` | — |
-| `SEC-SUBPROCESS-SHELL` | High | `shell=True` | ✓ |
-| `SEC-HARDCODED-SECRET` | High | 硬编码凭据 | ✓ |
-| `SEC-SQL-CONCAT` | High | SQL 字符串拼接 | — |
-| `SEC-YAML-LOAD` | High | 不安全 YAML 反序列化 | ✓ |
-| `SEC-INSECURE-COOKIE` | High | 不安全 Cookie | ✓ |
-| `REL-EMPTY-EXCEPT` | Medium | 吞掉异常 | — |
-| `REL-DEBUG-PRINT` | Low | 调试输出 | ✓ |
+进入「Agent 搭建」，创建两个规则 Agent 和一个结果汇总 Agent，将两个检查结果连接到汇总节点。保存草稿后，用同一份 Diff 试运行，检查报告和交接内容，再发布版本。
 
-## 配置模型
+发布的流程可在「发起审查」中选择，也可绑定仓库，作为后续审查的默认流程。详细步骤见 [十分钟组装三个 Agent](docs/agent-workflows.md#十分钟体验自己组装三个-agent)。
 
-只支持一条活动路由。最简单的方式是使用 Provider 预设：
+### 4. 按需接入模型与 GitHub
 
-```dotenv
-EVOAGENT_LLM_PROVIDER=deepseek
-EVOAGENT_DEEPSEEK_API_KEY=...
-EVOAGENT_LLM_ALLOWED_HOSTS=api.deepseek.com
-```
-
-自定义 OpenAI-compatible 端点：
-
-```dotenv
-EVOAGENT_LLM_PROVIDER=custom
-EVOAGENT_LLM_BASE_URL=https://models.example.com/v1
-EVOAGENT_LLM_API_KEY=...
-EVOAGENT_LLM_MODEL=review-model
-EVOAGENT_LLM_ALLOWED_HOSTS=models.example.com
-```
-
-也可以使用环境变量承载密钥的单路由 TOML：
-
-```toml
-version = 1
-
-[[routes]]
-id = "primary"
-provider = "internal"
-model = "review-model"
-base_url = "https://models.example.com/v1"
-api_key_env = "MODEL_API_KEY"
-region = "eu-west"
-```
-
-仓库策略仍可限制允许的 provider、model 和 region；不匹配时请求在出站前被拒绝。
-
-## GitHub 接入
-
-生产环境开启自动评论时必须使用完整的 GitHub App 安装配置：
-
-```dotenv
-EVOAGENT_GITHUB_APP_ID=123456
-EVOAGENT_GITHUB_APP_SLUG=evoagent
-EVOAGENT_GITHUB_PRIVATE_KEY_PATH=/run/secrets/github-app.pem
-EVOAGENT_GITHUB_CLIENT_ID=Iv1.example
-EVOAGENT_GITHUB_CLIENT_SECRET=...
-EVOAGENT_GITHUB_OAUTH_CALLBACK_URL=https://review.example.com/github/oauth/callback
-EVOAGENT_GITHUB_WEBHOOK_SECRET=...
-EVOAGENT_AUTO_POST_REVIEW=true
-```
-
-在 GitHub App 中把 Setup URL 配置为
-`https://review.example.com/github/setup`，OAuth Callback URL 配置为上面的精确地址，
-并保持“Request user authorization during installation”关闭。EvoAgent 会在安装完成后发起带
-PKCE 的 OAuth 校验，只有当前 GitHub 用户可访问该 installation 时才绑定租户；用户令牌验证后
-立即丢弃。Webhook 地址为 `/webhooks/github`，服务验证 `X-Hub-Signature-256`、时间窗口、
-delivery id、载荷摘要以及 Diff/评论 URL 的仓库与 PR 绑定；启用上述 OAuth 配置后，缺失或未绑定
-installation 的 Webhook 会被拒绝，队列执行和修复发布也会在使用凭据前重新核对租户绑定。
-草稿 PR 不创建任务；`closed`/`converted_to_draft` 会原子结束会话、取消未完成任务并阻止待发
-评论，`reopened`/`ready_for_review` 会复用原会话开始新的审查轮次。
-会话同时持久化 PR 事件时间，延迟到达的旧 Webhook 只落账，不会逆转较新的生命周期状态。
-
-## API
-
-| 方法 | 路径 | 用途 |
+| 接入项 | 用途 | 配置说明 |
 | --- | --- | --- |
-| `POST` | `/v1/reviews` | 同步/异步创建审查 |
-| `GET` | `/v1/tasks/<id>` | 查询任务 |
-| `GET` | `/v1/tasks/<id>/workflow` | 租户隔离的节点状态、连线与版本摘要；不返回交接正文 |
-| `GET` | `/v1/tasks/<id>/workflow/<step>` | 按需查看实际交接输入与已提交输出；受租户与保留策略约束 |
-| `GET/POST` | `/v1/studio/agents`、`/v1/studio/workflows` | 列出定义或保存草稿；写操作需要 manage 权限 |
-| `POST` | `/v1/studio/<agents或workflows>/<id>/publish` | 发布指定草稿修订为不可变版本 |
-| `POST` | `/v1/studio/validate` | 预检流程端口、类型、依赖与环路，不执行 Agent |
-| `GET/POST` | `/v1/studio/binding` | 查询、绑定或解除仓库的自定义流程 |
-| `GET` | `/v1/tasks/<id>/report` | 获取 Markdown 报告 |
-| `POST` | `/v1/tasks/<id>/feedback` | 记录反馈 |
-| `POST` | `/v1/tasks/<id>/fix` | 创建保守修复 PR；首次返回 201，幂等重放返回 200 |
-| `POST` | `/v1/github/installations` | 发起租户绑定的 GitHub App 安装 |
-| `POST` | `/v1/proofs` | 在容器中执行修复证明 |
-| `GET/POST` | `/v1/repository-policies` | 查询/更新仓库策略 |
-| `POST` | `/v1/auth/login` | 登录获取 JWT |
-| `POST` | `/v1/auth/password` | 校验当前密码并轮换密码，立即撤销旧 JWT/OAuth state |
-| `POST` | `/v1/users` | 在当前租户创建本地成员；仅平台管理员可授予平台角色 |
-| `POST` | `/v1/users/status` | 平台管理员全局停用/恢复本地账号并撤销旧会话 |
-| `GET` | `/health` | 进程存活 |
-| `GET` | `/ready` | PostgreSQL/队列就绪状态 |
-| `GET` | `/metrics` | 平台管理员可读的全局 Prometheus 指标 |
+| 模型服务 | 在规则检查之外增加语义分析，或运行自定义提示词 Agent | [模型网关](docs/model-gateway.md)、[环境变量模板](.env.example) |
+| GitHub App | PR 提交或更新后自动审查，并将报告回写评论 | [GitHub 接入](docs/api.md#github-接入) |
+| 修复验证容器 | 验证支持的确定性修复，再创建独立修复分支与 Draft PR | [修复运行说明](docs/operations.md#repair-outcomes)、[安全边界](docs/threat-model.md) |
 
-异步创建审查时可发送最多 64 字符的 `Idempotency-Key`。同一租户用相同 key 重试相同请求会
-返回原任务及其当前持久化状态；若更换仓库、PR、Diff 或发布上下文则返回 `400`，避免客户端
-超时重试产生重复审查。首次受理返回 `202`；幂等重放返回 `200` 且 `replayed=true`。
-
-## 关键配置
-
-| 变量 | 说明 |
-| --- | --- |
-| `EVOAGENT_DATABASE_URL` | 必填 PostgreSQL URL |
-| `EVOAGENT_PG_POOL_TIMEOUT` | 连接池等待及 PostgreSQL 建连超时，默认 10 秒 |
-| `EVOAGENT_PG_STATEMENT_TIMEOUT_SECONDS` | PostgreSQL 单条语句超时，默认 120 秒 |
-| `EVOAGENT_REDIS_URL` | Redis Streams；非回环部署必填，loopback 开发可省略 |
-| `EVOAGENT_ASYNC_WORKERS` | 单进程异步 worker 数，范围 `1..256`；更高吞吐请横向扩容 |
-| `EVOAGENT_AUTH_REQUIRED` | 非回环监听必须为 `true` |
-| `EVOAGENT_AUTH_SECRET` | JWT 密钥，认证启用时至少 32 字节 |
-| `EVOAGENT_AUTH_PREVIOUS_SECRET` | 认证密钥轮换期间临时接受的上一密钥，旧会话过期后删除 |
-| `EVOAGENT_BOOTSTRAP_ADMIN_USERNAME` | 仅首次启动时创建平台管理员，成功后与密码一并删除 |
-| `EVOAGENT_GITHUB_WEBHOOK_PREVIOUS_SECRET` | Webhook 密钥轮换期间临时接受的上一密钥，切换完成后删除 |
-| `EVOAGENT_RATE_LIMIT_RPS` | 每实例、每客户端请求速率；非回环部署必须大于 `0` |
-| `EVOAGENT_MAX_INFLIGHT_HEAVY` | 每实例同步重型请求并发上限；非回环部署必须大于 `0` |
-| `EVOAGENT_MAX_HTTP_CONNECTIONS` | 每实例 HTTP 连接/处理线程上限，默认 `128` |
-| `EVOAGENT_TENANT_MAX_ACTIVE_REVIEWS` | 每租户跨副本活动审查上限；非回环部署必须大于 `0` |
-| `EVOAGENT_REPAIR_CONTAINER_IMAGE` | Proof/修复验证容器镜像 |
-| `EVOAGENT_SKILL_CONTAINER_IMAGE` | 不可信 Skill 容器镜像 |
-| `EVOAGENT_SKILL_SIGNING_KEY` | Skill 发布签名密钥，至少 32 字节；容器强制模式加载动态 Skill 时必填 |
-| `EVOAGENT_HISTORY_RETENTION_DAYS` | 历史清理天数，默认 `0`（关闭） |
-
-完整模板见 [.env.example](.env.example)。
-
-## 开发与验证
-
-```bash
-export EVOAGENT_TEST_POSTGRES_URL='postgresql://evoagent:password@127.0.0.1:5432/evoagent_test'
-python -m ruff check .
-python -m ruff format --check .
-python -m mypy
-python -m pytest -q
-```
-
-CI 会创建临时 PostgreSQL 和 Redis，并额外验证迁移、连接池、Streams 租约回收、容器 Proof、备份恢复和端到端 Outbox 投递。
-
-## 质量口径
-
-仓库包含 100 条 `synthetic-controlled` PR Diff 基准。它用于可复现回归门禁，不代表真实线上 PR 效果；报告和数据哈希见 [评测文档](docs/evaluation.md)。自动修复只覆盖可确定转换，无法证明安全时会降级为人工审查。
-
-截至 2026-08-28 的本地验证记录：
-
-| 验证项 | 实测结果 | 适用范围 |
-| --- | --- | --- |
-| Python 回归 | 912 个测试 + 827 个子测试通过，覆盖率 90.17% | 使用独立 PostgreSQL/Redis；5 项 Docker 隔离测试未在本机执行；[覆盖率排除项与详情](docs/integration-testing.md) |
-| 受控审查评测 | F1 82.5%；白名单修复 14/14 通过；全部风险样本修复 14/40（35%） | 合成 Python 样本，不是线上准确率；[评测快照](docs/evaluation-baseline.md) |
-| 两副本流程压测 | 两轮共 1,500 个任务全部成功；创建到成功事件 P99 为 67–89 ms | 纯规则短时负载，不含模型/GitHub，也不是生产 SLO；[测试条件](docs/performance.md) |
-
-这是一份阶段性工程成果，不是生产就绪声明。真实模型/GitHub 联调、目标环境隔离、独立人工标注评测和部署 SLO 仍需验收；35% 的端到端修复率也尚未达到 60% 门槛。自定义流程不会自动继承默认流程的全部证据门禁，发布者需要显式保留并验证它们。
+自动修复需要真实 PR 快照、GitHub 权限和隔离验证环境；普通 Diff 审查不需要这些配置。
 
 ## 文档
 
-- [实机演示与当前进度](docs/demo.md)
-- [架构](docs/architecture.md)
-- [可插拔 Agent、流程组装与交接协议](docs/agent-workflows.md)
-- [模型网关](docs/model-gateway.md)
-- [仓库策略](docs/repository-policies.md)
-- [事务 Outbox](docs/transactional-outbox.md)
-- [数据库迁移](docs/database-migrations.md)
-- [灾备](docs/disaster-recovery.md)
-- [运行手册](docs/operations.md)
-- [威胁模型](docs/threat-model.md)
-- [评测方法](docs/evaluation.md)
+| 想了解什么 | 从这里开始 |
+| --- | --- |
+| 看完整操作过程 | [实机演示](docs/demo.md) |
+| 定义 Agent、连接流程、理解交接 | [Workflow Studio 与交接协议](docs/agent-workflows.md)、[自定义流程示例](examples/custom_review_workflow.py) |
+| 集成自己的系统或 GitHub | [REST API 与 GitHub 接入](docs/api.md)、[模型网关](docs/model-gateway.md) |
+| 理解架构和技术取舍 | [架构分层](#运行架构)、[Agent 内部设计](#agent-内部设计)、[模块说明](docs/architecture.md)、[设计决策记录](docs/adr/) |
+| 部署、升级和排障 | [运行手册](docs/operations.md)、[数据库迁移](docs/database-migrations.md)、[灾备恢复](docs/disaster-recovery.md) |
+| 管理权限与安全策略 | [仓库策略](docs/repository-policies.md)、[威胁模型](docs/threat-model.md) |
+| 查看测试与效果数据 | [集成验证](docs/integration-testing.md)、[评测方法](docs/evaluation.md)、[评测结果](docs/evaluation-baseline.md)、[性能测试](docs/performance.md) |
+
+项目当前处于 Alpha 阶段。生产部署前请阅读 [待完成的验收项](docs/integration-testing.md#remaining-release-qualification)，并在目标环境验证。
+
+## 参与贡献
+
+欢迎通过 [Issue](https://github.com/God1007/EvoAgent/issues) 反馈问题，或提交 PR。开发环境、检查命令和提交约定见 [贡献指南](CONTRIBUTING.md)。
 
 ## License
 

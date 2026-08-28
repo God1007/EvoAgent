@@ -470,12 +470,30 @@ walkthrough, not the unexecuted authenticated, destructive, provider, GitHub,
 mobile or container acceptance cases. It does not establish that every console
 control has been exercised against a live production dependency.
 
+### First PR container run and portable transfer fixture — 2026-08-28
+
+[PR #12's first infrastructure job](https://github.com/God1007/EvoAgent/actions/runs/33146603533/job/98768926321)
+passed against commit `98ed9d92aefb25c13ac74625e0b5c4d3e360fb88`: **96 contracts
+and 126 subtests**, followed by **5 real Docker verifier tests**, all with zero
+skips. Production-image migration, readiness/Outbox delivery, graceful shutdown
+and queue-reconstruction steps also passed. This is Linux CI evidence, not a local
+Mac container or production-deployment qualification.
+
+The same run exposed a portability bug in the host-side transfer
+test: a missing source produced empty input that the local tar accepted but the
+CI tar rejected. The intended test requires successful extraction followed by a
+producer failure. Its fixture now uses the real archive producer and receiver,
+adds an explicit exit code 7 after a valid archive is complete, and asserts the
+receiver returned 0, the file was actually extracted, and the overall transfer
+returned 7. Production transfer handling and rejection criteria are unchanged.
+
 ### Remaining release qualification
 
 The architectural and handoff evidence above does not establish a production
 release. On 2026-08-28, the [main CI run](https://github.com/God1007/EvoAgent/actions/runs/33100828640)
-passed for `46927e5424379169dbe2386874d505a46fe6084c`; current uncommitted changes
-have not run there. Local container isolation checks remain unexecuted, and live
+passed for `46927e5424379169dbe2386874d505a46fe6084c`; that snapshot does not
+qualify later commits. Check each proposed release's exact commit in Actions.
+Local container isolation checks remain unexecuted, and live
 provider/GitHub behavior and deployment SLOs are not qualified. The controlled
 evaluation still fails repair-coverage and independent-data provenance gates.
 The [performance audit](performance.md) records the corrected generator timing

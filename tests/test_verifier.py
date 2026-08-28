@@ -465,6 +465,7 @@ class VerifierWorktreeTransferTests(unittest.TestCase):
 
     def test_successful_extraction_does_not_hide_a_failed_archive_producer(self):
         actual_run = verifier_module.subprocess.run
+        actual_popen = verifier_module.subprocess.Popen
         receiver_codes = []
 
         def receive(*args, **kwargs):
@@ -472,17 +473,34 @@ class VerifierWorktreeTransferTests(unittest.TestCase):
             receiver_codes.append(result.returncode)
             return result
 
+        def fail_after_complete_archive(command, **kwargs):
+            # tar implementations disagree on empty input; fail after a valid archive.
+            command = list(command)
+            if command[:3] == [sys.executable, "-I", "-c"]:
+                command[3] += "\nraise SystemExit(7)\n"
+            return actual_popen(command, **kwargs)
+
         with (
-            tempfile.TemporaryDirectory() as target,
+            tempfile.TemporaryDirectory() as temporary,
+            patch.object(
+                verifier_module.subprocess,
+                "Popen",
+                side_effect=fail_after_complete_archive,
+            ),
             patch.object(verifier_module.subprocess, "run", side_effect=receive),
         ):
+            source, target = Path(temporary, "source"), Path(temporary, "target")
+            source.mkdir()
+            target.mkdir()
+            Path(source, "example.py").write_text("pass\n")
             result = RepairVerifier()._copy_worktree(
-                os.path.join(target, "missing-source"),
-                ["tar", "-xf", "-", "--no-same-owner", "-C", target],
+                str(source),
+                ["tar", "-xf", "-", "--no-same-owner", "-C", str(target)],
                 time.monotonic() + 10,
             )
-        self.assertNotEqual(0, result)
-        self.assertEqual([0], receiver_codes)
+            self.assertEqual(7, result)
+            self.assertEqual([0], receiver_codes)
+            self.assertEqual("pass\n", Path(target, "example.py").read_text())
 
     def test_receiver_failures_reap_the_archive_producer(self):
         actual_popen = verifier_module.subprocess.Popen

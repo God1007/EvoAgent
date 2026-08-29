@@ -33,14 +33,15 @@ EvoAgent 将代码审查拆成可复用的 Agent 组件：安全检查、业务�
 
 ## 组件模型
 
-EvoAgent 的可插拔不是“把几段 Prompt 串起来”，而是把**能力、流程位置、数据交接和运行版本**分别建模：
+EvoAgent 的可插拔不是“把几段 Prompt 串起来”，而是把**能力、Agent、流程位置、数据交接和运行版本**分别建模：
 
-> `AgentSpec（可复用能力） + Step（流程实例） + Handoff（类型化交接） = Workflow（可发布流程）`
+> `Agent Skill[] + Playbook + 类型化端口 = AgentSpec`；`AgentSpec + Step + Handoff = Workflow`
 
 | 构件 | 它固定什么 | 带来的能力 |
 | --- | --- | --- |
 | `PayloadType` | 端口数据的名称、版本与校验规则 | 只有契约精确匹配的组件才能连接；跨版本需要显式转换 Agent |
-| `AgentSpec` | Agent 身份、输入输出端口、执行行为及不可变 revision | 规则、模型、汇总或受信任扩展都使用同一组件边界 |
+| `Agent Skill` | 一项带版本的证据工具或推理策略，以及它要求的输入类型 | 用户可以在 Studio 内勾选能力积木；缺少 Context、Evidence 或 findings 时不能发布 |
+| `AgentSpec` | Agent 身份、Playbook、Skill 组合、输入输出端口、执行行为及不可变 revision | 规则、模型、汇总或受信任扩展都使用同一组件边界 |
 | `Step` | 一个 Agent 在当前流程中的实例、名称和输入来源 | 同一组件可以多次复用，也可以只替换某个流程位置 |
 | `Handoff` | 任务、流程、Agent、来源、输入、幂等键和执行代次 | 下游接收可验证产物，而不是来源不明的共享状态或聊天记录 |
 | `Workflow` | Step、连线、流程输入输出和拓扑 | 发布前统一检查缺失输入、类型冲突和环路，并生成不可变版本 |
@@ -48,7 +49,8 @@ EvoAgent 的可插拔不是“把几段 Prompt 串起来”，而是把**能力�
 ```mermaid
 flowchart LR
     subgraph CONTROL[组装与发布]
-        RECIPE[配方 / 空白画布] --> SPEC[AgentSpec<br/>身份 · 行为 · 工具 · 端口]
+        RECIPE[配方 / 空白画布] --> SKILLS[选择 Agent Skills]
+        SKILLS --> SPEC[AgentSpec<br/>身份 · Playbook · Skills · 端口]
         SPEC --> STEP[Step 与连线]
         STEP --> CHECK[契约与 DAG 校验]
         CHECK --> VERSION[不可变 Workflow revision]
@@ -134,7 +136,7 @@ PostgreSQL 是持久化状态的唯一事实来源。任务与 Outbox 事件在�
 | Repository Evidence Pack | 固定 GitHub head SHA、索引规模、变更文件/符号、受影响符号及引用文件；不含原始源码 | 只有显式连接 `repository-evidence@1` 的 GitHub PR 流程；手动 Diff 显示为不可用 |
 | 节点输入 | `Handoff.inputs` 中明确连线的原始输入或上游产物；`sources` 记录真实来源 | 当前 Agent |
 | 执行控制 | 当前任务、节点、尝试次数、幂等键、执行代次、截止时间 | 执行器与 Agent 的执行函数，不作为模型自行授予的权限 |
-| 模型消息 | 按身份/目标/执行准则编译的 Playbook、服务端输出格式要求、已连线输入和预先选定工具的结果 | 通过受控模型网关发送给模型 |
+| 模型消息 | 按身份/目标/执行准则编译的 Playbook、所选 Skill 准则、服务端输出格式要求、已连线输入和证据 Skill 结果 | 通过受控模型网关发送给模型 |
 
 例如，默认 `critic` 只接收解析后的变更与候选问题；`synthesize` 只接收候选问题、质疑结论和静态验证结果，不接收原始 Diff。需要什么由端口和连线声明，而不是让每个 Agent 从全局字典中自行找数据。
 
@@ -208,13 +210,16 @@ business.findings  → merge.business  : review-findings@1
 
 | 边界 | 面向谁 | 如何扩展 | 不需要改什么 |
 | --- | --- | --- | --- |
-| 流程组件 | 审查流程设计者 | 在 Studio 定义规则、模型 Playbook、汇总逻辑和端口，或复制配方后重新连线 | Workflow 执行器、任务队列与 GitHub 接入 |
-| 审查能力 | 部署开发者 | 提供新的 `AgentSpec`，或以签名清单注册受限 Skill；不可信 Skill 在非本机部署必须进入容器 | 其他 Agent 与流程协议 |
+| Agent 内部能力 | 审查流程设计者 | 在 Studio 为模型 Agent 组合版本化 Agent Skills、Playbook 与类型化端口 | Agent 之间的连线和 Workflow 执行器 |
+| 流程组件 | 审查流程设计者 | 将 Agent 加入画布，通过 Handoff 连接端口，或复制配方后重新连线 | 任务队列与 GitHub 接入 |
+| 可执行审查插件 | 部署开发者 | 提供新的 `AgentSpec`，或以签名清单注册隔离运行的 Dynamic Skill | 其他 Agent 与流程协议 |
 | 基础设施 | 平台维护者 | 在 `ports.py` 的窄接口后替换模型、代码托管、队列或验证执行器 | Agent 业务逻辑与流程定义 |
 
-Studio 组件保存、试运行、发布不可变版本后再绑定仓库。Playbook 与模型、预选工具、端口一起进入 Agent 摘要；Context Pack 和实际需要的 Repository Evidence 进入任务快照。配方只复制成草稿，不形成可变运行依赖。
+Studio 组件保存、试运行、发布不可变版本后再绑定仓库。Playbook 与模型、Skill ID/版本、端口一起进入 Agent 摘要；Context Pack 和实际需要的 Repository Evidence 进入任务快照。配方只复制成草稿，不形成可变运行依赖。
 
-当前模型 Agent 只使用预先选择的 `local-rules`、`diff-summary` 工具结果，并由网关检查模型和仓库策略。Playbook 不能临时执行任意 Shell、导入 Python、扩权或改换下游 Agent；流程路由始终由 Workflow 控制。
+当前内置 8 个 Agent Skill：`local-rules`、`diff-summary` 提供确定性证据；`standards-alignment`、`requirement-alignment`、`repository-impact`、`regression-design` 提供上下文约束；`finding-critic`、`finding-synthesis` 处理上游结论。证据型 Skill 在模型调用前执行，推理型 Skill 由服务端编译为受信准则。两者都不能临时执行任意 Shell、导入 Python、扩权或改换下游 Agent；流程路由始终由 Workflow 控制。
+
+这里的 **Agent Skill** 是模型 Agent 内部的能力积木；已有的 **Dynamic Skill** 是部署级、可执行的完整审查插件。前者由 Studio 组合，后者由运维安装并隔离运行，两者不共用权限边界。
 
 当前是有限无环流程，支持分支、汇合和组件复用，不支持循环或人审挂起。Python handler 的截止时间与取消检查是合作式约束；不可信代码仍需走受限 Skill / 容器执行路径。
 

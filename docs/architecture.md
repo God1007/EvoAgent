@@ -139,9 +139,12 @@ apply the same bounded exponential retry backoff on both delivery backends.
   and wiring are replaceable at startup. Untrusted code remains sandboxed.
 - Studio model Agents keep their identity, objective and operating instructions
   as a structured Playbook inside the existing immutable Agent definition. The
-  same digest also covers model, tool and typed-port choices; the server, not the
-  Playbook, appends output-schema and trust-boundary instructions. Legacy Prompt
-  definitions remain byte-for-byte compatible for pinned task recovery.
+  same digest also covers model, versioned Agent Skill and typed-port choices.
+  Agent Skills are either pre-model evidence tools or server-owned reasoning
+  policies and declare their required input types; they cannot route the Workflow.
+  The server, not the Playbook, appends Skill, output-schema and trust-boundary
+  instructions. Legacy Prompt/tool definitions remain byte-for-byte compatible
+  for pinned task recovery.
 - Curated Agent recipes are server-owned draft starters, not runtime plugins.
   Selecting one copies a validated definition into the ordinary editor; no recipe
   identifier is persisted, so later catalog changes cannot mutate an Agent version,

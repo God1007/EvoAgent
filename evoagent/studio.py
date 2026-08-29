@@ -93,9 +93,112 @@ DIFF = REVIEW_INPUTS["diff"].key
 CONTEXT = REVIEW_INPUTS["context"].key
 EVIDENCE = REVIEW_INPUTS["evidence"].key
 FINDINGS = FINDINGS_TYPE.key
-TOOLS = ("local-rules", "diff-summary")
+AGENT_SKILLS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "local-rules",
+        "version": 1,
+        "name": "确定性规则证据",
+        "description": "先运行内置安全与可靠性规则，把命中结果作为模型证据。",
+        "mode": "tool",
+        "requires": (DIFF,),
+        "instructions": (
+            "Treat local-rules results as candidate evidence. Verify each result against the "
+            "connected inputs before using it; do not repeat unsupported matches."
+        ),
+    },
+    {
+        "id": "diff-summary",
+        "version": 1,
+        "name": "变更结构提取",
+        "description": "提取变更文件与新增行数量，帮助 Agent 快速确定审查范围。",
+        "mode": "tool",
+        "requires": (DIFF,),
+        "instructions": (
+            "Use the diff-summary result only to scope the review. Do not infer behavior from file "
+            "counts or names alone."
+        ),
+    },
+    {
+        "id": "standards-alignment",
+        "version": 1,
+        "name": "项目规范对齐",
+        "description": "根据 Context Pack 中的项目规范检查新增代码，不臆造仓库规则。",
+        "mode": "reasoning",
+        "requires": (CONTEXT,),
+        "instructions": (
+            "Apply the connected review-context@1 value's standards as repository-specific "
+            "requirements. If standards are empty, skip this skill. Tie every conflict to an "
+            "exact added line and quoted requirement."
+        ),
+    },
+    {
+        "id": "requirement-alignment",
+        "version": 1,
+        "name": "需求一致性",
+        "description": "对照标题与 Spec 检查遗漏、错误实现和无依据的范围膨胀。",
+        "mode": "reasoning",
+        "requires": (CONTEXT,),
+        "instructions": (
+            "Compare added behavior with the connected review-context@1 value's title and spec. "
+            "If both are empty, skip this skill. Do not turn ambiguous product language into "
+            "invented requirements."
+        ),
+    },
+    {
+        "id": "repository-impact",
+        "version": 1,
+        "name": "仓库影响分析",
+        "description": "使用 Repository Evidence 识别受影响符号、调用方和导入文件。",
+        "mode": "reasoning",
+        "requires": (EVIDENCE,),
+        "instructions": (
+            "Use repository evidence to identify affected Python symbols, callers and importing "
+            "files. Treat it as bounded static evidence, not a complete dynamic call graph."
+        ),
+    },
+    {
+        "id": "regression-design",
+        "version": 1,
+        "name": "回归验证设计",
+        "description": "检查行为变更是否具备复现信号、公共测试入口和精确回归验证。",
+        "mode": "reasoning",
+        "requires": (DIFF,),
+        "instructions": (
+            "For changed behavior, look for a credible reproduction signal, a public test seam and "
+            "a regression assertion that fails for the exact defect. Do not demand tests for docs, "
+            "generated code or simple declarations."
+        ),
+    },
+    {
+        "id": "finding-critic",
+        "version": 1,
+        "name": "结论质询",
+        "description": "质询上游问题的新增行位置、证据、严重性和修复建议。",
+        "mode": "reasoning",
+        "requires": (FINDINGS,),
+        "instructions": (
+            "Challenge every candidate finding against its added-line location, evidence, severity "
+            "and proposed fix. Discard claims that cannot be independently supported."
+        ),
+    },
+    {
+        "id": "finding-synthesis",
+        "version": 1,
+        "name": "结论综合",
+        "description": "按根因去重多路问题，保留风险最高且修复最具体的结论。",
+        "mode": "reasoning",
+        "requires": (FINDINGS,),
+        "instructions": (
+            "Merge candidate findings by root cause without weakening evidence. Keep the highest "
+            "supported severity and the most specific remediation; do not invent new findings."
+        ),
+    },
+)
+SKILLS_BY_ID: dict[str, dict[str, Any]] = {item["id"]: item for item in AGENT_SKILLS}
+TOOLS: tuple[str, ...] = tuple(item["id"] for item in AGENT_SKILLS if item["mode"] == "tool")
 LEGACY_MODEL_CONFIG = {"prompt", "model", "tools", "max_output_tokens"}
-PLAYBOOK_MODEL_CONFIG = {"playbook", "model", "tools", "max_output_tokens"}
+PLAYBOOK_TOOL_MODEL_CONFIG = {"playbook", "model", "tools", "max_output_tokens"}
+PLAYBOOK_SKILL_MODEL_CONFIG = {"playbook", "model", "skills", "max_output_tokens"}
 PLAYBOOK_FIELDS = {"identity", "objective", "instructions"}
 
 
@@ -113,19 +216,47 @@ def _playbook_prompt(config: dict[str, Any]) -> str:
     return "\n\n".join(sections)
 
 
+def _skill_references(config: dict[str, Any]) -> list[dict[str, Any]]:
+    if "skills" in config:
+        return config["skills"]
+    return [{"id": tool, "version": SKILLS_BY_ID[tool]["version"]} for tool in config["tools"]]
+
+
+def _skill_prompt(config: dict[str, Any]) -> str:
+    references = _skill_references(config)
+    if not references:
+        return ""
+    return "\n\nSelected Agent Skills:\n" + "\n".join(
+        "- %s@v%d: %s"
+        % (reference["id"], reference["version"], SKILLS_BY_ID[reference["id"]]["instructions"])
+        for reference in references
+    )
+
+
 def _context_agent_definitions(model: str) -> dict[str, dict[str, Any]]:
     common = {
         "kind": "llm",
         "inputs": {"diff": DIFF, "context": CONTEXT, "evidence": EVIDENCE},
         "outputs": {"findings": FINDINGS},
     }
-    config = {"model": model, "tools": ["diff-summary"], "max_output_tokens": 2048}
+    config: dict[str, Any] = {
+        "model": model,
+        "skills": [
+            {"id": "diff-summary", "version": 1},
+            {"id": "repository-impact", "version": 1},
+        ],
+        "max_output_tokens": 2048,
+    }
     return {
         "standards-review": {
             **common,
             "name": "规范轴审查",
             "config": {
                 **config,
+                "skills": [
+                    *config["skills"],
+                    {"id": "standards-alignment", "version": 1},
+                ],
                 "playbook": {
                     "identity": "Repository standards reviewer",
                     "objective": "Review only added lines against context.standards. Repository standards win.",
@@ -144,6 +275,10 @@ def _context_agent_definitions(model: str) -> dict[str, dict[str, Any]]:
             "name": "需求轴审查",
             "config": {
                 **config,
+                "skills": [
+                    *config["skills"],
+                    {"id": "requirement-alignment", "version": 1},
+                ],
                 "playbook": {
                     "identity": "Product requirement reviewer",
                     "objective": "Compare added lines with context.spec and context.title.",
@@ -210,7 +345,11 @@ def _agent_recipes(model: str) -> list[dict[str, Any]]:
                         ),
                     },
                     "model": model,
-                    "tools": ["diff-summary"],
+                    "skills": [
+                        {"id": "diff-summary", "version": 1},
+                        {"id": "repository-impact", "version": 1},
+                        {"id": "regression-design", "version": 1},
+                    ],
                     "max_output_tokens": 2048,
                 },
             },
@@ -398,9 +537,13 @@ def validate_agent(value: Any, *, draft: bool = False) -> dict[str, Any]:
                 "merge agents take findings ports and return findings; no config"
             )
     else:
-        if config.keys() not in (LEGACY_MODEL_CONFIG, PLAYBOOK_MODEL_CONFIG):
+        if config.keys() not in (
+            LEGACY_MODEL_CONFIG,
+            PLAYBOOK_TOOL_MODEL_CONFIG,
+            PLAYBOOK_SKILL_MODEL_CONFIG,
+        ):
             raise ClientInputError(
-                "model config requires a Playbook, model, tools and max_output_tokens"
+                "model config requires a Playbook, model, Agent Skills and max_output_tokens"
             )
         if "playbook" in config:
             playbook = config["playbook"]
@@ -413,16 +556,43 @@ def validate_agent(value: Any, *, draft: bool = False) -> dict[str, Any]:
             # Exact legacy definitions remain executable so pinned tasks can resume.
             _text(config["prompt"], "prompt", 16000, empty=draft)
         _text(config["model"], "model", 200, empty=draft)
-        tools = config["tools"]
-        if (
-            not isinstance(tools, list)
-            or len(tools) > len(TOOLS)
-            or any(not isinstance(tool, str) or tool not in TOOLS for tool in tools)
-            or len(set(tools)) != len(tools)
-        ):
-            raise ClientInputError("only the listed read-only tools may be selected")
-        if not draft and tools and value["inputs"].get("diff") != DIFF:
-            raise ClientInputError("diff tools require an explicitly connected diff input")
+        if "skills" in config:
+            references = config["skills"]
+            if not isinstance(references, list) or len(references) > len(AGENT_SKILLS):
+                raise ClientInputError("only the listed versioned Agent Skills may be selected")
+            skill_ids: list[str] = []
+            for reference in references:
+                if (
+                    not isinstance(reference, dict)
+                    or reference.keys() != {"id", "version"}
+                    or not isinstance(reference["id"], str)
+                    or reference["id"] not in SKILLS_BY_ID
+                    or type(reference["version"]) is not int
+                    or reference["version"] != SKILLS_BY_ID[reference["id"]]["version"]
+                ):
+                    raise ClientInputError("only the listed versioned Agent Skills may be selected")
+                skill_ids.append(reference["id"])
+            if len(set(skill_ids)) != len(skill_ids):
+                raise ClientInputError("Agent Skills cannot be selected more than once")
+            if not draft:
+                connected = set(value["inputs"].values())
+                if any(
+                    required not in connected
+                    for reference in references
+                    for required in SKILLS_BY_ID[reference["id"]]["requires"]
+                ):
+                    raise ClientInputError("selected Agent Skills require connected input types")
+        else:
+            tools = config["tools"]
+            if (
+                not isinstance(tools, list)
+                or len(tools) > len(TOOLS)
+                or any(not isinstance(tool, str) or tool not in TOOLS for tool in tools)
+                or len(set(tools)) != len(tools)
+            ):
+                raise ClientInputError("only the listed read-only tools may be selected")
+            if not draft and tools and value["inputs"].get("diff") != DIFF:
+                raise ClientInputError("diff tools require an explicitly connected diff input")
         if (
             not draft
             and FINDINGS in value["outputs"].values()
@@ -462,18 +632,26 @@ def draft_definition(kind: str, value: Any) -> dict:
         if not isinstance(agent_kind, str) or agent_kind not in {"rules", "llm", "merge"}:
             raise ClientInputError("agent kind must be rules, llm or merge")
         model_config = value.get("config")
-        legacy_model = (
-            agent_kind == "llm" and isinstance(model_config, dict) and "prompt" in model_config
-        )
+        legacy_prompt = isinstance(model_config, dict) and "prompt" in model_config
+        legacy_tools = isinstance(model_config, dict) and "tools" in model_config
         defaults: dict[str, dict] = {
             "rules": {"rules": [], "checks": []},
             "llm": (
-                {"prompt": "", "model": "", "tools": [], "max_output_tokens": 2048}
-                if legacy_model
+                (
+                    {"prompt": "", "model": "", "tools": [], "max_output_tokens": 2048}
+                    if legacy_prompt
+                    else {
+                        "playbook": {"identity": "", "objective": "", "instructions": ""},
+                        "model": "",
+                        "tools": [],
+                        "max_output_tokens": 2048,
+                    }
+                )
+                if legacy_prompt or legacy_tools
                 else {
                     "playbook": {"identity": "", "objective": "", "instructions": ""},
                     "model": "",
-                    "tools": [],
+                    "skills": [],
                     "max_output_tokens": 2048,
                 }
             ),
@@ -633,16 +811,25 @@ def build_agent(
         if not gateway.configured or gateway.route_info()["model"] != config["model"]:
             raise ValueError("the agent's selected model is not configured")
         evidence: dict[str, Any] = {}
-        for tool in config["tools"]:
+        for reference in _skill_references(config):
+            skill = SKILLS_BY_ID[reference["id"]]
+            if skill["mode"] != "tool":
+                continue
             handoff.check_active()
-            diff = handoff.inputs["diff"]
-            if tool == "local-rules":
-                evidence[tool] = _rules(
+            diff_port = next(
+                name for name, type_key in definition["inputs"].items() if type_key == DIFF
+            )
+            diff = handoff.inputs[diff_port]
+            if skill["id"] == "local-rules":
+                evidence[skill["id"]] = _rules(
                     {"rules": [r[0] for r in LocalRuleReviewer.RULES], "checks": []}, diff
                 )
             else:
                 parsed = parse_unified_diff(diff)
-                evidence[tool] = {"files": parsed.files, "added_lines": len(parsed.added_lines)}
+                evidence[skill["id"]] = {
+                    "files": parsed.files,
+                    "added_lines": len(parsed.added_lines),
+                }
         governance = context(handoff.task_id)
         request = ModelRequest(
             tenant_id=governance.tenant_id,
@@ -653,7 +840,10 @@ def build_agent(
                 ModelMessage(
                     "system",
                     _playbook_prompt(config)
-                    + "\nReturn a JSON object with exactly these output ports: "
+                    + _skill_prompt(config)
+                    + "\nConnected input ports and types: "
+                    + json.dumps(definition["inputs"])
+                    + ". Return a JSON object with exactly these output ports: "
                     + json.dumps(definition["outputs"])
                     + ". text@1 is a string; integer@1 an integer; boolean@1 a boolean. "
                     + 'review-findings@1 is a list of {"rule_id":"...","severity":"critical|high|medium|low",'
@@ -840,6 +1030,14 @@ class WorkflowStudio:
             "inputs": {key: value.key for key, value in REVIEW_INPUTS.items()},
             "rules": [{"id": rule[0], "title": rule[3]} for rule in LocalRuleReviewer.RULES],
             "tools": list(TOOLS),
+            "skills": [
+                {
+                    key: list(value) if key == "requires" else value
+                    for key, value in skill.items()
+                    if key != "instructions"
+                }
+                for skill in AGENT_SKILLS
+            ],
             "models": [route] if route else [],
             "agent_recipes": _agent_recipes(model if isinstance(model, str) else ""),
             "templates": templates,

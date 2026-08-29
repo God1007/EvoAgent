@@ -55,7 +55,7 @@ Diff + Context Pack + Repository Evidence ───┤              ├→ 双�
 
 手动审查和 Studio 试运行可以填写标题、需求与项目规范；GitHub Webhook 自动使用 PR 标题和正文。运行时统一形成 `review-context@1`：`origin/title/spec/standards/truncated`。API 内容超限直接拒绝；PR 正文超限时明确标记截断。若流程还显式需要 Repository Evidence，Worker 会复用固定 `head_sha` 的同一份归档补齐空白的 `standards`：读取根级 `AGENTS.md`、`CONTRIBUTING.md`、`CODING_STANDARDS.md`、`.github/CONTRIBUTING.md`，以及变更文件祖先目录中的 `AGENTS.md`，并以文件路径标题分段。其他目录、README 和任意文件名不会进入上下文；调用方显式提交的规范永不被覆盖。
 
-Repository Standards Pack 与规范字段共用 32 KiB UTF-8 上限。超长文件、截断的多字节字符、非 UTF-8、NUL 或符号链接会被有界处理并设置 `truncated`，不把不完整资料伪装成完整上下文。仓库文件仍是 PR 提交者可控的不可信数据，只提供审查依据，不能改变 Playbook、端口、模型、工具、权限或流程连线。初始 API / Webhook Context 参与受理幂等指纹；归档补充结果在执行前与 Evidence 一次原子写入任务快照，再参与 Workflow 输入摘要和恢复校验，续跑不会重新读取仓库新版本。
+Repository Standards Pack 与规范字段共用 32 KiB UTF-8 上限。超长文件、截断的多字节字符、非 UTF-8、NUL 或符号链接会被有界处理并设置 `truncated`，不把不完整资料伪装成完整上下文。仓库文件仍是 PR 提交者可控的不可信数据，只提供审查依据，不能改变 Playbook、端口、模型、Agent Skills、权限或流程连线。初始 API / Webhook Context 参与受理幂等指纹；归档补充结果在执行前与 Evidence 一次原子写入任务快照，再参与 Workflow 输入摘要和恢复校验，续跑不会重新读取仓库新版本。
 
 Repository Evidence 完全由服务端生成，API 和页面不能提交或覆盖。只有固定了 GitHub `head_sha` 且选中流程实际把 `$input.evidence` 连给节点时，Worker 才下载该 SHA 的 zipball，在一次安全遍历中同时生成 Standards Pack，并用现有 CodeGraph 建立有界 Python 影响摘要后保存 `repository-evidence@1`。摘要只包含来源、状态、固定 revision、索引文件/字节数、变更路径/符号、受影响符号、引用文件和截断标记，不保存归档或源码；`indexed_bytes` 仍只统计 Python 索引。下载、解码或建图失败会保存明确的 `unavailable` 快照并继续基础 Diff / 已有 Context 审查；手动 Diff 同样显示不可用，不冒充仓库分析。快照参与 Workflow 输入摘要、节点幂等键和恢复校验，重试不会换用仓库新版本。
 
@@ -64,19 +64,34 @@ Repository Evidence 完全由服务端生成，API 和页面不能提交或覆�
 | 类型 | 用户配置 | 交接与执行边界 |
 | --- | --- | --- |
 | 规则 Agent | 选择已安装规则，添加字面文本业务规则、风险等级、原因与建议 | 输入 `diff`，输出 `findings`；只检查新增行，不执行用户正则或代码 |
-| 模型 Agent | 名称、结构化 Playbook（身份、审查目标、执行准则）、已配置模型、输出 Token 上限、只读工具、命名输入/输出端口 | 可串接文本、整数、布尔、Context、Repository Evidence 和 findings；服务端另行生成输出格式契约，Playbook 不能把端口或权限改成文字约定。模型只能看到连入的输入；输出 findings 必须显式连接 diff，位置由代码检查 |
+| 模型 Agent | 名称、结构化 Playbook（身份、审查目标、执行准则）、版本化 Agent Skills、已配置模型、输出 Token 上限、命名输入/输出端口 | 可串接文本、整数、布尔、Context、Repository Evidence 和 findings；Skill 要求的类型必须已连接。服务端另行生成输出格式契约，Playbook 不能把端口或权限改成文字约定。模型只能看到连入的输入；输出 findings 必须显式连接 diff，位置由代码检查 |
 | 汇总 Agent | 自定义多个 findings 输入端口名称 | 全部输入就绪后合并去重；同一问题保留较高风险的完整判断，再交给下游 |
 | 内置角色 | 从组件库添加规划、审查、规范轴、需求轴、双轴汇总、质询、复现判断、综合、修复判断和验证 | 复用现有契约与实现；端口必须精确匹配；双轴模型角色仅在路由已配置时可用 |
 
 模型下拉框目前只展示部署方已配置的单个受治理路由，不接受用户提供任意 URL、API Key 或 Python 模块。未配置模型时，可先用规则和汇总跑通。模型调用仍受租户/仓库的 provider、model、region 策略及网关脱敏、输入/输出大小和网络出口约束。
 
-Playbook 不是另一种可执行 Skill：它只是模型 Agent 定义中的三段受限文本。发布时，Playbook、模型、工具、端口和 Token 上限一起进入不可变版本与 SHA-256 摘要；任务再固定整个流程 bundle。服务端按固定顺序编译三段文本并追加类型化输出格式、输入不可信和 findings 位置约束。旧版 `prompt` 定义仍按原始结构与摘要执行，以保证已发布流程和失败任务可恢复；编辑旧草稿后发布的新版本会使用结构化 Playbook，不会改写旧版本。
+Playbook 不是另一种可执行 Skill：它只是模型 Agent 定义中的三段受限文本。发布时，Playbook、模型、Skill ID/版本、端口和 Token 上限一起进入不可变版本与 SHA-256 摘要；任务再固定整个流程 bundle。服务端按固定顺序编译 Playbook、所选 Skill 准则，再追加类型化输出格式、输入不可信和 findings 位置约束。旧版 `prompt` / `tools` 定义仍按原始结构与摘要执行，以保证已发布流程和失败任务可恢复；页面再次保存时会转成当前的 Playbook / Skills 形状，不会改写旧版本。
+
+### Agent Skills：Agent 内部的能力积木
+
+| Skill | 模式 | 必需输入 | 作用 |
+| --- | --- | --- | --- |
+| `local-rules@v1` | 证据工具 | `unified-diff@1` | 运行确定性安全与可靠性规则，结果作为候选证据 |
+| `diff-summary@v1` | 证据工具 | `unified-diff@1` | 提取变更文件与新增行规模 |
+| `standards-alignment@v1` | 推理策略 | `review-context@1` | 对照项目规范检查新增代码 |
+| `requirement-alignment@v1` | 推理策略 | `review-context@1` | 对照标题与 Spec 检查需求偏差 |
+| `repository-impact@v1` | 推理策略 | `repository-evidence@1` | 使用受影响符号、调用方和导入文件证据 |
+| `regression-design@v1` | 推理策略 | `unified-diff@1` | 检查复现信号、公共测试入口和回归断言 |
+| `finding-critic@v1` | 推理策略 | `review-findings@1` | 质询上游结论的位置、证据、严重性和建议 |
+| `finding-synthesis@v1` | 推理策略 | `review-findings@1` | 按根因去重并保留证据最强的结论 |
+
+证据工具由服务端在模型调用前执行；推理策略由服务端编译为受信指令。Skill 只能读取其声明且已连接的类型，不能创建连线、改变 Workflow 或读取全局任务状态。一个 Agent 的定义摘要固定所选 Skill 版本；更新目录不会静默改变已发布 Agent。
 
 组件库提供「规范与架构审查」「需求一致性审查」「回归与验证审查」三个 Agent 配方，分别吸收了 [`code-review` / `codebase-design`、Spec 轴、`tdd` / `diagnosing-bugs`](https://github.com/vinvcn/mattpocock-skills-zh-CN) 中适合 PR Review 的纪律。点击配方只会把经过服务端校验的定义复制到一个未保存草稿，所有字段仍可编辑；保存和发布继续走现有 Agent API。版本中不保存配方 ID，也不会在运行时读取远程 Markdown，因此配方更新不会改变历史版本、流程摘要或已固定任务。未配置模型时仍可先保存配方草稿，但不能发布或执行。
 
 工作室的输入和工具结果虽封装为 JSON，模型出口仍会先解码再脱敏，避免引号转义绕过凭据规则。只修改发给模型的副本，不回写原 Diff、Agent 定义或交接产物；脱敏后还会再次检查输入预算。此能力不是完整 DLP，范围与限制见 [模型网关](model-gateway.md)。
 
-只读工具目前是内置规则扫描、Diff 文件/行数摘要；勾选后在模型调用前执行，不是允许模型无限调用工具的自主循环。自定义 findings 的字段和新增行位置会被校验，但不代表发现必然正确，也不自动获得内置七阶段流程的全部证据门禁。发布者负责保留必要门禁并验证业务效果；任意 Shell、插件上传和外部副作用均未开放。
+Agent Skill 不等于部署目录中的 Dynamic Skill。Agent Skill 是 Studio 可选的受控能力元数据与服务端实现；Dynamic Skill 是完整的 `diff → findings` 可执行审查插件，由部署者安装、签名并在要求隔离时进入容器。当前页面不支持上传任意 Skill 代码，也不是允许模型无限调用工具的自主循环。自定义 findings 的字段和新增行位置会被校验，但不代表发现必然正确，也不自动获得内置七阶段流程的全部证据门禁；发布者仍需验证业务效果。
 
 汇总不会以端口或输入列表的先后顺序裁决风险。同一文件、行号和问题指纹（规则、标题、归一化代码证据）重复时，优先保留 `critical → high → medium → low` 中较高等级的完整记录；等级相同时优先较高置信度，再用稳定的完整判断关联键打破平局，不拼接不同 Agent 的风险、建议和置信度。输出按风险、文件和位置等稳定排序。不同位置、标题或代码证据仍保留为不同问题；结果上限在去重后检查，超过 100 条会失败，不截断遗漏。各分支的原始判断仍可在「处理内容与结果」中核对，发布新版也不改写旧任务报告。
 
@@ -105,7 +120,7 @@ Playbook 不是另一种可执行 Skill：它只是模型 Agent 定义中的三�
 
 | 操作 | 接口 |
 | --- | --- |
-| 可用类型、模型、工具、内置角色、Agent 配方和流程模板 | `GET /v1/studio/catalog` |
+| 可用类型、模型、Agent Skills、内置角色、Agent 配方和流程模板 | `GET /v1/studio/catalog` |
 | 列表、保存草稿 | `GET/POST /v1/studio/agents`、`/v1/studio/workflows` |
 | 读取草稿及版本摘要 | `GET /v1/studio/{kind}/{id}` |
 | 发布草稿 | `POST /v1/studio/{kind}/{id}/publish`，正文 `{"revision": 1}` |
@@ -119,7 +134,7 @@ Playbook 不是另一种可执行 Skill：它只是模型 Agent 定义中的三�
 
 `kind` 为 `agents` 或 `workflows`。保存正文为 `{"revision":0,"definition":...}`；更新时带 `id` 和当前 revision。异步审查原有 `Idempotency-Key` 仍可使用，显式 workflow 选择和 Context Pack 都参与请求指纹；同一请求重试返回原任务，不会因草稿已修改而切换版本。
 
-新模型 Agent 的 `config` 形状为 `{"playbook":{"identity":"...","objective":"...","instructions":"..."},"model":"...","tools":[],"max_output_tokens":2048}`。端口仍位于 Agent 定义的 `inputs` / `outputs`，不复制进 Playbook。API 只为兼容已存在的不可变版本继续接受旧 `prompt` 形状；新调用方不应据此建立第二种编辑模型。
+新模型 Agent 的 `config` 形状为 `{"playbook":{"identity":"...","objective":"...","instructions":"..."},"model":"...","skills":[{"id":"diff-summary","version":1}],"max_output_tokens":2048}`。端口仍位于 Agent 定义的 `inputs` / `outputs`，不复制进 Playbook。API 只为兼容已存在的不可变版本和草稿继续接受旧 `prompt` / `tools` 形状；新调用方不应据此建立第二种编辑模型。
 
 绑定查询从未配置时返回 `{"binding":null}`，首次切换携带 `revision:0`；已配置时返回 `workflow_id`、`version`、`revision`、发布时的名称 `name` 和更新时间。解除绑定需要同时传 `workflow_id:null`、`version:null`，并携带当前修订号；返回的解绑记录保留递增的 `revision`。下一次绑定必须使用该修订号，不能再传 0。POST 返回本次事务实际写入的配置；不省略版本或隐式选择最新版本。
 
@@ -129,7 +144,7 @@ Playbook 不是另一种可执行 Skill：它只是模型 Agent 定义中的三�
 
 翻页不是数据库快照：期间被编辑的条目可能移动到第一页，需刷新重新查看；新建条目也在刷新后出现。客户端按 ID 去重，不按位置偏移翻页。版本历史摘要仍最多返回最近 100 条，但可用明确版本号读取更早的不可变版本。
 
-Studio 单份定义/发布 bundle 上限 256 KiB，最多 64 节点，自定义 Agent 每组最多 16 端口、32 条字面规则，单节点 findings 上限 100。当前没有名称搜索、删除、跨租户分享、任意 JSON Schema、自定义工具市场、条件分支、循环、人审挂起或画布自由定位。DAG 的就绪分支在单进程内有界并行；它不是跨进程的分布式工作流平台。
+Studio 单份定义/发布 bundle 上限 256 KiB，最多 64 节点，自定义 Agent 每组最多 16 端口、32 条字面规则，单节点 findings 上限 100。当前 Agent Skill 目录由部署代码提供，页面不能上传任意实现；也没有名称搜索、删除、跨租户分享、任意 JSON Schema、条件分支、循环、人审挂起或画布自由定位。DAG 的就绪分支在单进程内有界并行；它不是跨进程的分布式工作流平台。
 
 实际输入根据任务原始 Diff 和已提交上游输出重建；保留策略清理后会返回产物不存在或列出 `unavailable_inputs`，不伪造完整历史。完整诊断正文需要 `manage` 权限；普通账号可读取经过白名单过滤的页面视图，正文仍可能包含有权查看的源码。
 

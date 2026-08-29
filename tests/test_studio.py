@@ -84,7 +84,7 @@ def model_agent():
                 "instructions": "Be concise and evidence-based.",
             },
             "model": "fixture-model",
-            "tools": ["diff-summary"],
+            "skills": [{"id": "diff-summary", "version": 1}],
             "max_output_tokens": 100,
         },
     }
@@ -130,6 +130,21 @@ class AgentDefinitionTests(unittest.TestCase):
         catalog = studio.catalog()
         self.assertEqual("review-context@1", catalog["inputs"]["context"])
         self.assertEqual("repository-evidence@1", catalog["inputs"]["evidence"])
+        self.assertEqual(
+            {
+                "local-rules",
+                "diff-summary",
+                "standards-alignment",
+                "requirement-alignment",
+                "repository-impact",
+                "regression-design",
+                "finding-critic",
+                "finding-synthesis",
+            },
+            {item["id"] for item in catalog["skills"]},
+        )
+        self.assertTrue(all(item["version"] == 1 for item in catalog["skills"]))
+        self.assertNotIn("instructions", json.dumps(catalog["skills"]))
         for recipe in catalog["agent_recipes"]:
             self.assertEqual("fixture-model", recipe["definition"]["config"]["model"])
             self.assertEqual(recipe["definition"], validate_agent(recipe["definition"]))
@@ -231,6 +246,7 @@ class AgentDefinitionTests(unittest.TestCase):
             {"identity": "", "objective": "", "instructions": ""},
             model["config"]["playbook"],
         )
+        self.assertEqual([], model["config"]["skills"])
         self.assertEqual({}, model["inputs"])
         with self.assertRaises(ClientInputError):
             validate_agent(model)
@@ -263,7 +279,7 @@ class AgentDefinitionTests(unittest.TestCase):
             with self.subTest(kind=kind, fields=fields), self.assertRaises(ClientInputError):
                 draft_definition(kind, {"name": "Draft", **fields})
 
-    def test_model_receives_only_wired_inputs_and_selected_tools_under_gateway_policy(self):
+    def test_model_receives_only_wired_inputs_and_selected_skills_under_gateway_policy(self):
         provider = mock.Mock()
         provider.complete.return_value = ModelResponse(
             '{"summary":"changed"}', "fixture", "fixture-model", 10, 3, "request"
@@ -288,8 +304,35 @@ class AgentDefinitionTests(unittest.TestCase):
         self.assertIn("Identity:\nChange analyst", sent[0].content)
         self.assertIn("Describe the change.", sent[0].content)
         self.assertIn("Operating instructions:\nBe concise", sent[0].content)
+        self.assertIn("Selected Agent Skills:", sent[0].content)
+        self.assertIn("diff-summary@v1", sent[0].content)
         self.assertIn("Return a JSON object with exactly these output ports", sent[0].content)
         self.assertEqual({"diff-summary"}, json.loads(sent[1].content)["tool_results"].keys())
+        legacy = model_agent()
+        legacy["config"]["tools"] = ["diff-summary"]
+        legacy["config"].pop("skills")
+        old_agent = build_agent("legacy", legacy, gateway, context)
+        self.assertEqual(
+            {"summary": "changed"},
+            Workflow(
+                "legacy",
+                old_agent.inputs,
+                [Step("review", old_agent, {"diff": "$input.diff"})],
+                {"summary": "review.summary"},
+            ).run({"diff": DIFF_TEXT}),
+        )
+        renamed = model_agent()
+        renamed["inputs"] = {"patch": DIFF}
+        renamed_agent = build_agent("renamed", renamed, gateway, context)
+        self.assertEqual(
+            {"summary": "changed"},
+            Workflow(
+                "renamed",
+                renamed_agent.inputs,
+                [Step("review", renamed_agent, {"patch": "$input.patch"})],
+                {"summary": "review.summary"},
+            ).run({"patch": DIFF_TEXT}),
+        )
         provider.complete.return_value = ModelResponse(
             '{"summary":false}', "fixture", "fixture-model", 10, 3, "request"
         )
@@ -308,7 +351,7 @@ class AgentDefinitionTests(unittest.TestCase):
                 [Step("r", denied, {"diff": "$input.diff"})],
                 {"summary": "r.summary"},
             ).run({"diff": DIFF_TEXT})
-        self.assertEqual(2, provider.complete.call_count)
+        self.assertEqual(4, provider.complete.call_count)
 
         definition = model_agent()
         definition["outputs"] = {"findings": FINDINGS}
@@ -334,7 +377,13 @@ class AgentDefinitionTests(unittest.TestCase):
     def test_definitions_reject_executable_extensions_and_unbounded_or_unknown_fields(self):
         invalid = []
         value = model_agent()
-        value["config"]["tools"] = ["shell"]
+        value["config"]["skills"] = [{"id": "shell", "version": 1}]
+        invalid.append(value)
+        value = model_agent()
+        value["config"]["skills"] = [{"id": "diff-summary", "version": 2}]
+        invalid.append(value)
+        value = model_agent()
+        value["config"]["skills"] *= 2
         invalid.append(value)
         value = rules()
         value["config"]["module"] = "os:system"
@@ -354,7 +403,7 @@ class AgentDefinitionTests(unittest.TestCase):
         value = model_agent()
         value["inputs"] = {"summary": "text@1"}
         value["outputs"] = {"findings": FINDINGS}
-        value["config"]["tools"] = []
+        value["config"]["skills"] = []
         invalid.append(value)
         for value in invalid:
             with self.subTest(value=value), self.assertRaises(ClientInputError):
@@ -363,6 +412,14 @@ class AgentDefinitionTests(unittest.TestCase):
     def test_playbook_is_strict_and_legacy_prompt_versions_remain_immutable(self):
         structured = model_agent()
         self.assertEqual(structured, validate_agent(structured))
+        legacy_playbook = model_agent()
+        legacy_playbook["config"] = {
+            **legacy_playbook["config"],
+            "tools": ["diff-summary"],
+        }
+        legacy_playbook["config"].pop("skills")
+        self.assertEqual(legacy_playbook, validate_agent(legacy_playbook))
+        self.assertEqual(legacy_playbook, draft_definition("agents", legacy_playbook))
         legacy = model_agent()
         legacy["config"] = {
             "prompt": "Legacy pinned prompt.",
@@ -388,6 +445,20 @@ class AgentDefinitionTests(unittest.TestCase):
             invalid["config"]["playbook"] = playbook
             with self.subTest(playbook=playbook), self.assertRaises(ClientInputError):
                 validate_agent(invalid)
+
+    def test_agent_skills_require_their_typed_inputs(self):
+        definition = model_agent()
+        definition["config"]["skills"].append({"id": "standards-alignment", "version": 1})
+        with self.assertRaisesRegex(ClientInputError, "require connected input types"):
+            validate_agent(definition)
+        definition["inputs"]["context"] = CONTEXT
+        self.assertEqual(definition, validate_agent(definition))
+
+        definition["config"]["skills"] = [{"id": "finding-critic", "version": 1}]
+        with self.assertRaisesRegex(ClientInputError, "require connected input types"):
+            validate_agent(definition)
+        definition["inputs"] = {"findings": FINDINGS}
+        self.assertEqual(definition, validate_agent(definition))
 
 
 class StudioIntegrationTests(unittest.TestCase):
@@ -605,7 +676,7 @@ class StudioIntegrationTests(unittest.TestCase):
             self.assertEqual(task, self.store.get(task["id"]))
             self.assertEqual(artifact, self.studio.artifact("default", task["id"], "report"))
 
-    def test_model_egress_redacts_wired_diff_and_tools_without_rewriting_task_artifacts(self):
+    def test_model_egress_redacts_wired_diff_and_skill_evidence_without_rewriting_artifacts(self):
         self.service.close()
         self.service = ReviewService(
             replace(
@@ -622,7 +693,11 @@ class StudioIntegrationTests(unittest.TestCase):
         definition = model_agent()
         definition["inputs"] = {"diff": DIFF, "context": CONTEXT}
         definition["outputs"] = {"findings": FINDINGS}
-        definition["config"]["tools"] = ["local-rules", "diff-summary"]
+        definition["config"]["skills"] = [
+            {"id": "local-rules", "version": 1},
+            {"id": "diff-summary", "version": 1},
+            {"id": "standards-alignment", "version": 1},
+        ]
         agent, _ = self.publish("agents", definition)
         flow, _ = self.publish(
             "workflows",

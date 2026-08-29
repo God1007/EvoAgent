@@ -48,6 +48,20 @@ function studioPlaybook(config, name) {
   return { identity: name || "代码审查 Agent", objective: typeof config?.prompt === "string" ? config.prompt : "", instructions: "" };
 }
 
+function studioAgentSkills(config, catalog) {
+  const available = Array.isArray(catalog) ? catalog : [];
+  const versions = new Map(available.map((skill) => [skill.id, skill.version]));
+  const source = Array.isArray(config?.skills) ? config.skills
+    : Array.isArray(config?.tools) ? config.tools.map((id) => ({ id, version: versions.get(id) || 1 })) : [];
+  const references = [...new Map(source.map((skill) => [skill.id, { id: skill.id, version: skill.version }])).values()];
+  const selected = new Map(references.map((skill) => [skill.id, skill]));
+  const options = available.map((skill) => selected.has(skill.id) && selected.get(skill.id).version !== skill.version
+    ? { ...selected.get(skill.id), name: `${skill.id}（当前版本不可用）`, description: "保留该选择可避免草稿静默丢失；发布前请选择可用版本。", mode: "unavailable", requires: [] }
+    : skill);
+  for (const skill of references) if (!options.some((item) => item.id === skill.id)) options.push({ ...skill, name: `${skill.id}（当前不可用）`, description: "保留该选择可避免草稿静默丢失。", mode: "unavailable", requires: [] });
+  return { references, options };
+}
+
 function studioCanConnect(steps, source, target) {
   const pending = [source.split(".")[0]], seen = new Set();
   while (pending.length) {
@@ -548,7 +562,7 @@ function studioReplaceAgent(definition, id, previous, next) {
     return { name: kind === "merge" ? "报告汇总" : "我的 Agent", kind,
       inputs: kind === "merge" ? { security: findingsType, business: findingsType } : { diff: diffType },
       outputs: { findings: findingsType }, config: kind === "rules" ? { rules: [], checks: [] }
-        : kind === "llm" ? { playbook: { identity: "资深代码审查 Agent", objective: "检查新增代码中的业务风险并给出可执行结论。", instructions: "只报告有具体代码依据的问题，并提供修复建议与验证方法。" }, model: catalog.models[0]?.model || "", tools: [], max_output_tokens: 2048 } : {} };
+        : kind === "llm" ? { playbook: { identity: "资深代码审查 Agent", objective: "检查新增代码中的业务风险并给出可执行结论。", instructions: "只报告有具体代码依据的问题，并提供修复建议与验证方法。" }, model: catalog.models[0]?.model || "", skills: [], max_output_tokens: 2048 } : {} };
   }
 
   function portEditor(direction) {
@@ -556,13 +570,13 @@ function studioReplaceAgent(definition, id, previous, next) {
   }
 
   function renderEditor() {
-    const dialog = $("#studio-agent-dialog"), definition = editor.definition, config = definition.config, playbook = studioPlaybook(config, definition.name);
+    const dialog = $("#studio-agent-dialog"), definition = editor.definition, config = definition.config, playbook = studioPlaybook(config, definition.name), agentSkills = studioAgentSkills(config, catalog.skills);
     dialog.innerHTML = `<form id="studio-agent-form"><div class="panel-head"><h3 id="studio-agent-title">${editor.id ? "编辑 Agent" : "创建 Agent"}</h3><button class="link-button" type="button" id="studio-close-editor">关闭</button></div>
       <p class="workflow-note">${editor.id ? `草稿 r${editor.revision}。已发布版本不会被编辑覆盖。` : "定义它做什么、接收什么、交付什么。发布后可直接加入当前画布。"}</p>
       <div class="studio-form-row"><label>Agent 名称<input name="agent_name" value="${esc(definition.name)}" maxlength="100" required></label><label>执行方式<select name="kind">${options(Object.entries(labels), definition.kind)}</select></label></div>
       ${definition.kind === "rules" ? `<fieldset><legend>内置规则</legend><div class="studio-checks">${catalog.rules.map((rule) => `<label class="check"><input type="checkbox" name="rule" value="${esc(rule.id)}" ${config.rules.includes(rule.id) ? "checked" : ""}><span>${esc(rule.title)}</span></label>`).join("")}</div></fieldset>
         <fieldset><legend>自定义业务规则</legend><p class="workflow-note">仅匹配 Diff 新增行中的字面文本，不执行正则表达式或代码。</p><div id="studio-literal-checks">${config.checks.map((check) => `<div class="studio-literal-check">${["contains", "rule_id", "title", "explanation", "fix", "test"].map((key) => `<label>${({ contains: "匹配文本", rule_id: "规则标识", title: "问题标题", explanation: "原因", fix: "修复建议", test: "验证方法" })[key]}<input data-check-field="${key}" value="${esc(check[key])}" required></label>`).join("")}<label>严重性<select data-check-field="severity">${options([["low", "低"], ["medium", "中"], ["high", "高"], ["critical", "严重"]], check.severity)}</select></label><button type="button" class="link-button" data-remove-check>移除规则</button></div>`).join("")}</div>${button("add-check", "添加业务规则")}</fieldset>` : ""}
-      ${definition.kind === "llm" ? `<fieldset><legend>Agent Playbook</legend><p class="workflow-note">身份、目标和准则会随 Agent 版本固化；输入输出契约由下方端口生成，不能用文字绕过。</p><label>身份<input name="playbook_identity" value="${esc(playbook.identity)}" maxlength="200" required></label><label>审查目标<textarea name="playbook_objective" rows="3" maxlength="2000" required>${esc(playbook.objective)}</textarea></label><label>执行准则<textarea name="playbook_instructions" rows="7" maxlength="12000">${esc(playbook.instructions)}</textarea></label></fieldset><div class="studio-form-row"><label>模型<select name="model">${options(catalog.models.length ? catalog.models.map((model) => [model.model, `${model.provider} / ${model.model}`]) : [["", "尚未配置模型，暂不能发布或运行"]], config.model)}</select></label><label>最大输出 Token<input type="number" name="max_output_tokens" min="1" max="4096" value="${config.max_output_tokens}" required></label></div><fieldset><legend>只读工具权限</legend>${catalog.tools.map((tool) => `<label class="check"><input name="tool" type="checkbox" value="${tool}" ${config.tools.includes(tool) ? "checked" : ""}><span>${tool === "local-rules" ? "内置规则扫描" : "Diff 文件与行数摘要"}</span></label>`).join("")}<p class="workflow-note">选中的工具在调用模型前执行；不能访问未连入的 Diff，不开放 Shell 或任意网络地址。</p></fieldset>` : ""}
+      ${definition.kind === "llm" ? `<fieldset><legend>Agent Playbook</legend><p class="workflow-note">身份、目标和准则会随 Agent 版本固化；输入输出契约由下方端口生成，不能用文字绕过。</p><label>身份<input name="playbook_identity" value="${esc(playbook.identity)}" maxlength="200" required></label><label>审查目标<textarea name="playbook_objective" rows="3" maxlength="2000" required>${esc(playbook.objective)}</textarea></label><label>执行准则<textarea name="playbook_instructions" rows="7" maxlength="12000">${esc(playbook.instructions)}</textarea></label></fieldset><div class="studio-form-row"><label>模型<select name="model">${options(catalog.models.length ? catalog.models.map((model) => [model.model, `${model.provider} / ${model.model}`]) : [["", "尚未配置模型，暂不能发布或运行"]], config.model)}</select></label><label>最大输出 Token<input type="number" name="max_output_tokens" min="1" max="4096" value="${config.max_output_tokens}" required></label></div><fieldset><legend>Agent Skills · 可组合能力</legend><p class="workflow-note">勾选能力积木组成这个 Agent。每项 Skill 的版本会随 Agent 固化，只能读取下方已连接的对应内容。</p><div class="studio-skill-grid">${agentSkills.options.map((skill) => `<label class="studio-skill-option"><input name="skill" type="checkbox" value="${esc(skill.id)}" ${agentSkills.references.some((item) => item.id === skill.id) ? "checked" : ""}><span><strong>${esc(skill.name)}</strong><small>${esc(skill.id)}@v${skill.version} · ${skill.mode === "tool" ? "证据工具" : skill.mode === "reasoning" ? "推理策略" : "当前不可用"}</small><em>${esc(skill.description)}</em><small>需要：${esc((skill.requires || []).map(typeLabel).join("、") || "无额外输入")}</small></span></label>`).join("")}</div><p class="workflow-note">Skill 不开放 Shell 或任意网络；跨 Agent 的数据仍必须通过类型化 Handoff 交接。</p></fieldset>` : ""}
       ${definition.kind === "rules" ? '<p class="studio-contract">接收代码变更 → 执行所选规则 → 交付问题、位置与修复建议</p>' : definition.kind === "merge" ? `${portEditor("inputs")}<p class="studio-contract">接收各路检查结果 → 去重合并 → 交付统一的问题列表</p>` : `<details class="studio-advanced"><summary>自定义交接内容（默认接收代码变更、交付审查发现）</summary>${portEditor("inputs")}${portEditor("outputs")}</details>`}
       <p id="studio-model-note" class="workflow-note" role="status"></p><p id="studio-agent-error" class="studio-error" role="alert"></p><div class="studio-actions"><button class="button secondary" type="submit" value="save" formnovalidate>保存 Agent 草稿</button><button class="button secondary" type="submit" value="publish" aria-describedby="studio-model-note">仅发布到组件库</button><button class="button" type="submit" value="add" aria-describedby="studio-model-note">发布并加入画布</button></div></form>`;
     if (!dialog.open) dialog.showModal();
@@ -593,7 +607,7 @@ function studioReplaceAgent(definition, id, previous, next) {
           if (new Set(pairs.map(([name]) => name)).size !== pairs.length) throw new Error("端口名称不能重复。");
           value[direction] = Object.fromEntries(pairs);
         }
-        if (value.kind === "llm") value.config = { playbook: { identity: values.get("playbook_identity"), objective: values.get("playbook_objective"), instructions: values.get("playbook_instructions") }, model: values.get("model"), max_output_tokens: Number(values.get("max_output_tokens")), tools: values.getAll("tool") };
+        if (value.kind === "llm") value.config = { playbook: { identity: values.get("playbook_identity"), objective: values.get("playbook_objective"), instructions: values.get("playbook_instructions") }, model: values.get("model"), max_output_tokens: Number(values.get("max_output_tokens")), skills: values.getAll("skill").map((id) => { const skill = agentSkills.options.find((item) => item.id === id); return { id, version: skill.version }; }) };
       }
       return value;
     };

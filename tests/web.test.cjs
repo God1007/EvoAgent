@@ -47,6 +47,14 @@ test("Studio lays out dependencies and keeps every handoff wired when renaming o
     JSON.parse(JSON.stringify(context.studioPlaybook({ prompt: "legacy prompt" }, "旧 Agent"))),
     { identity: "旧 Agent", objective: "legacy prompt", instructions: "" },
   );
+  const skills = [{ id: "diff-summary", version: 2, name: "变更结构提取", mode: "tool", requires: ["unified-diff@1"] }];
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.studioAgentSkills({ tools: ["diff-summary"] }, skills).references)),
+    [{ id: "diff-summary", version: 2 }],
+  );
+  const unavailable = JSON.parse(JSON.stringify(context.studioAgentSkills({ skills: [{ id: "old-skill", version: 1 }] }, skills)));
+  assert.deepEqual(unavailable.references, [{ id: "old-skill", version: 1 }]);
+  assert.match(unavailable.options.at(-1).name, /当前不可用/);
 
   const wired = { steps: [
     { id: "scan", agent: "one", version: 1, sources: { diff: "$input.diff" } },
@@ -86,7 +94,7 @@ test("Studio preserves drafts and trials exactly the selected draft or published
     return elements.get(selector);
   };
   const flow = (id) => ({ id, revision: 1, active_version: id === "saved" ? 2 : null, definition: { name: id, steps: [], outputs: { verified: "" } } });
-  let catalogUnavailable = false, catalogDenied = false, missingStatus = 404, publicationStatus = 200, holdPublication = null, holdCatalog = null, catalogAgents = [], catalogModels = [], catalogTemplates = [], catalogAgentRecipes = [];
+  let catalogUnavailable = false, catalogDenied = false, missingStatus = 404, publicationStatus = 200, holdPublication = null, holdCatalog = null, catalogAgents = [], catalogModels = [], catalogSkills = [], catalogTemplates = [], catalogAgentRecipes = [];
   let bindingStatus = 200, binding = { workflow_id: "saved", version: 1, revision: 7, name: "original" };
   let paged = false, pageFailure = false, pageVersionFailure = false, holdPage = null, addKeys = [];
   const reads = [], writes = [], tasks = new Map(), opened = [];
@@ -144,7 +152,7 @@ test("Studio preserves drafts and trials exactly the selected draft or published
         if (holdCatalog) await holdCatalog;
         if (catalogDenied) throw Object.assign(new Error("private-role-detail"), { status: 403 });
         if (catalogUnavailable) throw new Error("catalog unavailable");
-        return { types: [], inputs: {}, rules: [], tools: [], models: catalogModels, builtins: [], agent_recipes: catalogAgentRecipes, templates: catalogTemplates };
+        return { types: [], inputs: {}, rules: [], tools: [], skills: catalogSkills, models: catalogModels, builtins: [], agent_recipes: catalogAgentRecipes, templates: catalogTemplates };
       }
       if (path === "/v1/studio/agents") return { documents: catalogAgents, next_cursor: paged ? "agent-private-cursor" : null };
       if (path === "/v1/studio/workflows") return { documents: ["saved", "other", "missing"].map((id) => ({ id, name: id })), next_cursor: paged ? "flow-private-cursor" : null };
@@ -358,14 +366,18 @@ test("Studio preserves drafts and trials exactly the selected draft or published
 
   catalogAgentRecipes = [{
     id: "feedback-loop", name: "回归与验证审查", description: "检查可信验证路径",
-    definition: { name: "回归验收 Agent", kind: "llm", inputs: { diff: "unified-diff@1" }, outputs: { findings: "review-findings@1" }, config: { playbook: { identity: "回归审查员", objective: "检查精确失败信号", instructions: "通过公共接口验证" }, model: "", tools: [], max_output_tokens: 2048 } },
+    definition: { name: "回归验收 Agent", kind: "llm", inputs: { diff: "unified-diff@1" }, outputs: { findings: "review-findings@1" }, config: { playbook: { identity: "回归审查员", objective: "检查精确失败信号", instructions: "通过公共接口验证" }, model: "", skills: [{ id: "regression-design", version: 1 }], max_output_tokens: 2048 } },
   }];
+  catalogSkills = [{ id: "regression-design", version: 1, name: "回归验证设计", description: "检查回归验证路径", mode: "reasoning", requires: ["unified-diff@1"] }];
   context.window.studio.reset();
   await context.window.studio.load();
   const writesBeforeRecipe = writes.length;
   await actionNode("use-agent-recipe-feedback-loop").events.click();
   assert.match(query("#studio-agent-dialog").innerHTML, /回归验收 Agent/);
   assert.match(query("#studio-agent-dialog").innerHTML, /检查精确失败信号/);
+  assert.match(query("#studio-agent-dialog").innerHTML, /Agent Skills · 可组合能力/);
+  assert.match(query("#studio-agent-dialog").innerHTML, /回归验证设计/);
+  assert.match(query("#studio-agent-dialog").innerHTML, /name="skill"[^>]+checked/);
   assert.equal(writes.length, writesBeforeRecipe, "using a recipe only opens an editable unsaved Agent");
 
   await actionNode("create-llm").events.click();

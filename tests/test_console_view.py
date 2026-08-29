@@ -289,6 +289,17 @@ class ConsoleViewTests(unittest.TestCase):
 
         catalog = {
             "rules": [{"id": "check", "title": "Check input", "future": "internal-rule"}],
+            "skills": [
+                {
+                    "id": "diff-summary",
+                    "version": 1,
+                    "name": "Diff summary",
+                    "description": "Summarize the connected diff",
+                    "mode": "tool",
+                    "requires": ["unified-diff@1"],
+                    "instructions": "internal-skill-instructions",
+                }
+            ],
             "builtins": [{"id": "planner", "version": 0, "revision": "internal-revision"}],
             "models": [{"model": "demo", "provider": "local", "region": "internal-region"}],
             "agent_recipes": [
@@ -311,7 +322,7 @@ class ConsoleViewTests(unittest.TestCase):
                                 "internal": "internal-playbook",
                             },
                             "model": "demo",
-                            "tools": ["diff-summary"],
+                            "skills": [{"id": "diff-summary", "version": 1}],
                             "max_output_tokens": 100,
                             "credential": "internal-credential",
                         },
@@ -344,6 +355,19 @@ class ConsoleViewTests(unittest.TestCase):
         view = console_response("GET", "/v1/studio/catalog", catalog)
         self.assertNotIn("internal-", json.dumps(view))
         self.assertEqual([{"model": "demo", "provider": "local"}], view["models"])
+        self.assertEqual(
+            [
+                {
+                    "id": "diff-summary",
+                    "version": 1,
+                    "name": "Diff summary",
+                    "description": "Summarize the connected diff",
+                    "mode": "tool",
+                    "requires": ["unified-diff@1"],
+                }
+            ],
+            view["skills"],
+        )
         self.assertEqual(
             "Check tests",
             view["agent_recipes"][0]["definition"]["config"]["playbook"]["objective"],

@@ -11,7 +11,7 @@ evaluation snapshot, not a remote CI or production qualification. Regenerate wit
 | --- | --- |
 | EvoAgent version | 0.30.0 |
 | Python | 3.12.13 |
-| Application source SHA-256 | `669786917b94d89b61769e63c7b629be8e3ae8e74604be6104c25981cff1c5a6` |
+| Application source SHA-256 | `054f11a88428ec67e6fb30fa3651c317c899df40acf321cb31f8c709077c599f` |
 | Dependencies | `requirements.lock` SHA-256 `dd3a30c26aa196e7afcc88a1d16336ee391ce408fcebcc3bd996a0f80537ac0e` |
 | Dataset | `evaluation_data/pr_diff_100.jsonl` |
 | Dataset semantic SHA-256 | `92e93bbc64c70e81ab8ef26b200ea4cbe092bf159ad78c061d6da7e704577263` |

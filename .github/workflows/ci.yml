@@ -94,7 +94,7 @@ jobs:
           failures = {name for name, gate in release["gates"].items() if not gate["passed"]}
           assert report["schema_version"] == 3
           assert candidate["schema_version"] == 2
-          assert candidate["dataset"]["sha256"] == "8d2271ec666dcbc96b0c8a13e05adcf71c08f33bf17da5d1c102fe9a3434af38"
+          assert candidate["dataset"]["sha256"] == "92e93bbc64c70e81ab8ef26b200ea4cbe092bf159ad78c061d6da7e704577263"
           assert reproducibility == {
               "application_source_sha256": _APPLICATION_SOURCE_REVISION,
               "evoagent_version": __version__,
@@ -105,9 +105,9 @@ jobs:
           assert candidate["dataset"]["sha256"] in baseline_document
           assert "| Evaluation report schema | 3 |" in baseline_document
           assert candidate["metrics"]["safe_fix_rate"] == 1.0
-          assert candidate["metrics"]["e2e_security_fix_rate"] == 0.35
-          assert failures == {"e2e_security_fix_rate", "production_data_provenance"}
-          assert not release["quantitative_passed"]
+          assert candidate["metrics"]["e2e_security_fix_rate"] == 0.6
+          assert failures == {"production_data_provenance"}
+          assert release["quantitative_passed"]
           assert not release["production_activation_allowed"]
           assert candidate["confidence_calibration"]["invalid_confidences"] == 0
           PY

@@ -1,0 +1,122 @@
+rule_files:
+  - evoagent.rules.yml
+evaluation_interval: 30s
+
+tests:
+  - name: all targets down waits two minutes and resolves on recovery
+    interval: 30s
+    input_series:
+      - series: 'up{job="evoagent", instance="one"}'
+        values: '1 0 0 0 0 0 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: EvoAgentMonitoringTargetDown
+        exp_alerts: []
+      - eval_time: 2m30s
+        alertname: EvoAgentMonitoringTargetDown
+        exp_alerts:
+          - exp_labels: {severity: page}
+            exp_annotations:
+              summary: Prometheus cannot scrape any EvoAgent instance
+              runbook_url: https://github.com/God1007/EvoAgent/blob/main/docs/operations.md#monitoring-target-down
+      - eval_time: 3m
+        alertname: EvoAgentMonitoringTargetDown
+        exp_alerts: []
+
+  - name: missing job does not silently disable monitoring alerts
+    input_series: []
+    alert_rule_test:
+      - eval_time: 1m30s
+        alertname: EvoAgentMonitoringTargetDown
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: EvoAgentMonitoringTargetDown
+        exp_alerts:
+          - exp_labels: {job: evoagent, severity: page}
+            exp_annotations:
+              summary: Prometheus cannot scrape any EvoAgent instance
+              runbook_url: https://github.com/God1007/EvoAgent/blob/main/docs/operations.md#monitoring-target-down
+
+  - name: one healthy replica prevents an all-targets-down page
+    input_series:
+      - series: 'up{job="evoagent", instance="one"}'
+        values: '0x6'
+      - series: 'up{job="evoagent", instance="two"}'
+        values: '1x6'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: EvoAgentMonitoringTargetDown
+        exp_alerts: []
+
+  - name: removed job can retain its last sample for the default five-minute lookback
+    input_series:
+      - series: 'up{job="evoagent", instance="one"}'
+        values: '1 _x15'
+    alert_rule_test:
+      - eval_time: 6m30s
+        alertname: EvoAgentMonitoringTargetDown
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: EvoAgentMonitoringTargetDown
+        exp_alerts:
+          - exp_labels: {job: evoagent, severity: page}
+            exp_annotations:
+              summary: Prometheus cannot scrape any EvoAgent instance
+              runbook_url: https://github.com/God1007/EvoAgent/blob/main/docs/operations.md#monitoring-target-down
+
+  - name: intermittent recovery resets the pending timer
+    input_series:
+      - series: 'up{job="evoagent", instance="one"}'
+        values: '1 0 0 0 1 0 0 0 1'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: EvoAgentMonitoringTargetDown
+        exp_alerts: []
+
+  - name: sustained two-percent failures page after the pending period
+    input_series:
+      - series: evoagent_http_nonprobe_requests_total
+        values: '0+100x5'
+      - series: evoagent_http_nonprobe_responses_5xx_total
+        values: '0+2x5'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: EvoAgentAvailabilityFastBurn
+        exp_alerts: []
+      - eval_time: 2m30s
+        alertname: EvoAgentAvailabilityFastBurn
+        exp_alerts:
+          - exp_labels: {severity: page}
+            exp_annotations:
+              summary: EvoAgent is rapidly consuming its availability budget
+              runbook_url: https://github.com/God1007/EvoAgent/blob/main/docs/operations.md#availability-fast-burn
+
+  - name: tiny traffic does not page solely for a high failure ratio
+    input_series:
+      - series: evoagent_http_nonprobe_requests_total
+        values: '0+1x5'
+      - series: evoagent_http_nonprobe_responses_5xx_total
+        values: '0+1x5'
+    alert_rule_test:
+      - eval_time: 2m30s
+        alertname: EvoAgentAvailabilityFastBurn
+        exp_alerts: []
+
+  - name: sustained workflow agent failures open a ticket after the sample floor
+    interval: 1m
+    input_series:
+      - series: evoagent_workflow_agent_runs_total
+        values: '0+10x35'
+      - series: evoagent_workflow_agent_failures_total
+        values: '0+1x35'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: EvoAgentWorkflowAgentFailureRateHigh
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: EvoAgentWorkflowAgentFailureRateHigh
+        exp_alerts:
+          - exp_labels: {severity: ticket}
+            exp_annotations:
+              summary: Workflow Agent failure rate is above 5%
+              runbook_url: https://github.com/God1007/EvoAgent/blob/main/docs/operations.md#workflow-agent-failures

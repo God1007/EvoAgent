@@ -228,6 +228,28 @@ class VerifierHostModeTests(unittest.TestCase):
 
 
 class VerifierContainerModeTests(unittest.TestCase):
+    def setUp(self):
+        reconcile = patch("evoagent.verifier.reconcile_sandboxes", return_value=0)
+        self.reconcile_sandboxes = reconcile.start()
+        self.addCleanup(reconcile.stop)
+
+    def test_reconciliation_failure_prevents_container_launch(self):
+        verifier = RepairVerifier(test_command="pytest", container_image="img")
+        with (
+            tempfile.TemporaryDirectory() as root,
+            patch(
+                "evoagent.verifier.reconcile_sandboxes",
+                side_effect=RuntimeError("private daemon detail"),
+            ),
+            patch.object(verifier_module.subprocess, "run") as run,
+        ):
+            result = verifier.verify_worktree(root)
+
+        self.assertEqual("error", result["status"])
+        self.assertIn("container reconciliation failed", result["checks"][0]["detail"])
+        self.assertNotIn("private daemon detail", result["checks"][0]["detail"])
+        run.assert_not_called()
+
     def test_uncertain_container_launch_still_removes_its_exact_name(self):
         for failure in ("timeout", "nonzero", "oserror"):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
@@ -272,7 +294,10 @@ class VerifierContainerModeTests(unittest.TestCase):
         def run(command, **kwargs):
             if kwargs.get("stdin") is not None:
                 kwargs["stdin"].read()
-            return SimpleNamespace(returncode=1 if command[:3] == ["docker", "rm", "-f"] else 0)
+            return SimpleNamespace(
+                returncode=1 if command[:3] == ["docker", "rm", "-f"] else 0,
+                stdout="still-present" if command[:2] == ["docker", "ps"] else "",
+            )
 
         captured = Metrics()
         with (
@@ -337,14 +362,18 @@ class VerifierContainerModeTests(unittest.TestCase):
         self.assertIn("--read-only", command)
         self.assertEqual("ALL", command[command.index("--cap-drop") + 1])
         self.assertIn("no-new-privileges", command)
-        self.assertEqual("65534:65534", command[command.index("--user") + 1])
+        self.assertEqual("65533:65533", command[command.index("--user") + 1])
         self.assertIn("python:3.12-slim", command)
         self.assertNotIn("-v", command)
         self.assertNotIn("--mount", command)
+        for proxy in ("HTTP_PROXY", "HTTPS_PROXY", "FTP_PROXY", "ALL_PROXY", "NO_PROXY"):
+            for key in (proxy, proxy.lower()):
+                self.assertEqual("--env", command[command.index(key + "=") - 1])
         self.assertFalse(any("/source" in argument for argument in command + copy))
         self.assertEqual(["docker", "exec", "-i", "--workdir", "/work"], copy[:5])
         self.assertEqual(["tar", "-xf", "-", "--no-same-owner"], copy[-4:])
-        self.assertEqual(command[command.index("--user") + 1], copy[copy.index("--user") + 1])
+        self.assertEqual("65534:65534", copy[copy.index("--user") + 1])
+        self.assertEqual("65534:65534", execute[execute.index("--user") + 1])
         self.assertEqual(["sh", "-c", "pytest -q"], execute[-3:])
         self.assertEqual(
             {
@@ -372,8 +401,10 @@ class VerifierContainerModeTests(unittest.TestCase):
                     RepairVerifier(test_command="pytest", container_image="img")
                 )
                 self.assertTrue(result["passed"])
-                for command in commands[:3]:
-                    self.assertEqual("65534:65534", command[command.index("--user") + 1])
+                for command, uid in zip(
+                    commands[:3], ("65533:65533", "65534:65534", "65534:65534"), strict=True
+                ):
+                    self.assertEqual(uid, command[command.index("--user") + 1])
                 self.assertIn(
                     "/work:rw,nosuid,nodev,size=1024m,uid=65534,gid=65534,mode=0700", commands[0]
                 )

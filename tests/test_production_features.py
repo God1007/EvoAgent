@@ -280,6 +280,30 @@ class ConfigurationBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "EVOAGENT_EFFECT_LEASE_SECONDS"):
             configured.validate_evolution()
 
+    def test_repository_evidence_archive_limit_is_positive_and_bounded(self):
+        configured = Settings(
+            host="127.0.0.1",
+            port=8080,
+            max_diff_bytes=1000,
+            max_steps=8,
+            timeout_seconds=10,
+            llm_base_url="",
+            llm_api_key="",
+            llm_model="",
+            github_webhook_secret="",
+            github_token="",
+            auto_post_review=False,
+        )
+
+        for value in (0, 1024 * 1024 * 1024 + 1):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "EVOAGENT_REPOSITORY_EVIDENCE"),
+            ):
+                configured.__class__(
+                    **{**configured.__dict__, "repository_evidence_max_bytes": value}
+                ).validate_evolution()
+
     def test_github_writes_require_complete_runtime_credentials(self):
         configured = Settings(
             host="127.0.0.1",

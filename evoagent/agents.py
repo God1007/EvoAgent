@@ -21,7 +21,7 @@ from typing import Any, TypedDict, cast
 from .diff_parser import ParsedDiff, parse_unified_diff
 from .errors import safe_exception_summary
 from .metrics import metrics
-from .models import Finding, Severity
+from .models import Finding, RepositoryEvidence, ReviewContext, Severity
 from .ports import AgentMessageStorePort
 from .reviewer import (
     MAX_REVIEWER_FINDINGS,
@@ -387,10 +387,20 @@ def _diff_payload(value: Any) -> None:
         raise ValueError("diff must be text")
 
 
+def _review_context_payload(value: Any) -> None:
+    ReviewContext.from_dict(value)
+
+
+def _repository_evidence_payload(value: Any) -> None:
+    RepositoryEvidence.from_dict(value)
+
+
 FINDINGS_TYPE = PayloadType("review-findings", 1, _findings_payload)
 REVIEW_INPUTS = {
     "diff": PayloadType("unified-diff", 1, _diff_payload),
     "parsed": PayloadType("parsed-diff", 1, ParsedDiff.from_dict),
+    "context": PayloadType("review-context", 1, _review_context_payload),
+    "evidence": PayloadType("repository-evidence", 1, _repository_evidence_payload),
 }
 _REVIEW_TYPES = {
     **REVIEW_INPUTS,
@@ -532,7 +542,9 @@ class MultiAgentCoordinator(Reviewer):
         } or {key: value.key for key, value in self.workflow.output_types.items()} != {
             "verified": FINDINGS_TYPE.key
         }:
-            raise ValueError("review workflow must accept diff/parsed and return verified findings")
+            raise ValueError(
+                "review workflow must accept diff/parsed/context/evidence and return verified findings"
+            )
 
     def workflow_agents(self) -> dict[str, AgentSpec]:
         revision = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -567,6 +579,7 @@ class MultiAgentCoordinator(Reviewer):
                 {key: _REVIEW_TYPES[key] for key in inputs},
                 {output: _REVIEW_TYPES[output]},
                 self._adapt_node(callback),
+                name,
             )
             for name, callback, inputs, output in nodes
         }
@@ -630,11 +643,50 @@ class MultiAgentCoordinator(Reviewer):
             return
         saved = self.store.load_checkpoints(task_id, "workflow").get("workflow", {})
         expected = self.workflow.execution_snapshot(
-            {"diff": diff, "parsed": parse_unified_diff(diff).to_dict()},
+            {
+                "diff": diff,
+                "parsed": parse_unified_diff(diff).to_dict(),
+                "context": self._review_context(task_id),
+                "evidence": self._repository_evidence(task_id),
+            },
             self.execution_revision(),
         )
         if saved.get("status") != "completed" or saved.get("state") != expected:
             raise HandoffError("workflow revision or original input changed; start a new task")
+
+    def _review_context(self, task_id: str) -> dict[str, Any]:
+        if not task_id or self.store is None:
+            return ReviewContext().to_dict()
+        get_task = getattr(self.store, "get", None)
+        if not callable(get_task):
+            return ReviewContext().to_dict()
+        task = get_task(task_id)
+        if not isinstance(task, dict):
+            return ReviewContext().to_dict()
+        task_input = task.get("input") or {}
+        raw = task_input.get("review_context")
+        try:
+            return (ReviewContext.from_dict(raw) if raw is not None else ReviewContext()).to_dict()
+        except ValueError:
+            raise HandoffError("review context snapshot is invalid") from None
+
+    def _repository_evidence(self, task_id: str) -> dict[str, Any]:
+        if not task_id or self.store is None:
+            return RepositoryEvidence().to_dict()
+        get_task = getattr(self.store, "get", None)
+        if not callable(get_task):
+            return RepositoryEvidence().to_dict()
+        task = get_task(task_id)
+        if not isinstance(task, dict):
+            return RepositoryEvidence().to_dict()
+        task_input = task.get("input") or {}
+        raw = task_input.get("repository_evidence")
+        try:
+            return (
+                RepositoryEvidence.from_dict(raw) if raw is not None else RepositoryEvidence()
+            ).to_dict()
+        except ValueError:
+            raise HandoffError("repository evidence snapshot is invalid") from None
 
     def review_with_context(
         self,
@@ -643,14 +695,33 @@ class MultiAgentCoordinator(Reviewer):
         parsed: ParsedDiff,
         admission_generation: int | None = None,
     ) -> list[Finding]:
-        result = self.workflow.run(
-            {"diff": diff, "parsed": parsed.to_dict()},
-            task_id=task_id,
-            store=self.store if task_id and self.checkpoint_revision else None,
-            generation=admission_generation,
-            execution_revision=self.execution_revision(),
-            timeout_seconds=self.timeout_seconds,
+        workflow_kind = (
+            self.workflow.name if self.workflow.name in {"review", "studio"} else "custom"
         )
+        metric = "workflow_%s" % workflow_kind
+        metrics.inc(metric + "_runs_total")
+        started = time.monotonic()
+        try:
+            result = self.workflow.run(
+                {
+                    "diff": diff,
+                    "parsed": parsed.to_dict(),
+                    "context": self._review_context(task_id),
+                    "evidence": self._repository_evidence(task_id),
+                },
+                task_id=task_id,
+                store=self.store if task_id and self.checkpoint_revision else None,
+                generation=admission_generation,
+                execution_revision=self.execution_revision(),
+                timeout_seconds=self.timeout_seconds,
+            )
+        except Exception:
+            metrics.inc(metric + "_failures_total")
+            raise
+        else:
+            metrics.inc(metric + "_successes_total")
+        finally:
+            metrics.observe(metric + "_duration", time.monotonic() - started)
         return [Finding.from_dict(item) for item in result["verified"]]
 
     def _emit(

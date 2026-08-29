@@ -37,6 +37,13 @@ queries one scalar per indicator/sample count using an exact-host, HTTPS,
 no-redirect, no-environment-proxy client. Insufficient samples return `no-data`
 and never claim success.
 
+The evaluator also requires a currently healthy target in the `evoagent` scrape
+job. If all targets are down or the job is missing, every objective returns
+`no-data`, preserving its observed sample count but withholding achievement and
+error-budget claims. Historical samples alone cannot prove that current
+collection is functioning. This guard does not prove complete replica discovery
+or continuous coverage over the entire evaluation window.
+
 ## Consequences
 
 - SLO definitions and alert thresholds change through code review with the

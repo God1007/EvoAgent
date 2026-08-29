@@ -31,7 +31,25 @@ The graph is incremental: :meth:`CodeGraph.update` re-parses only changed files.
 """
 
 import ast
+import posixpath
+import stat
+import zipfile
 from dataclasses import dataclass, field
+from io import BytesIO
+
+from .models import (
+    MAX_REPOSITORY_EVIDENCE_ITEM_BYTES,
+    MAX_REPOSITORY_EVIDENCE_ITEMS,
+    MAX_REVIEW_CONTEXT_SECTION_BYTES,
+    RepositoryEvidence,
+)
+
+_ROOT_STANDARD_FILES = (
+    "AGENTS.md",
+    "CONTRIBUTING.md",
+    "CODING_STANDARDS.md",
+    ".github/CONTRIBUTING.md",
+)
 
 
 def module_name_for_path(path: str) -> str:
@@ -284,3 +302,203 @@ def build_graph(sources: dict[str, str]) -> CodeGraph:
     graph = CodeGraph()
     graph.update(sources)
     return graph
+
+
+def _repository_standard_paths(changed_paths: list[str]) -> set[str]:
+    selected = set(_ROOT_STANDARD_FILES)
+    for path in changed_paths:
+        if "\x00" in path or "\\" in path or path.startswith("/"):
+            continue
+        parts = path.split("/")
+        if any(part in {"", ".", ".."} for part in parts):
+            continue
+        directory = posixpath.dirname(path)
+        while directory:
+            selected.add(posixpath.join(directory, "AGENTS.md"))
+            directory = posixpath.dirname(directory)
+    return selected
+
+
+def repository_snapshot_from_archive(
+    archive: bytes,
+    changed_paths: list[str],
+    revision: str,
+    max_source_bytes: int,
+) -> tuple[RepositoryEvidence, str, bool]:
+    """Build code evidence and a bounded standards pack from one pinned zipball."""
+    if (
+        not isinstance(archive, bytes)
+        or not archive
+        or type(max_source_bytes) is not int
+        or max_source_bytes <= 0
+        or len(archive) > max_source_bytes
+    ):
+        raise ValueError("repository evidence archive exceeds its size limit")
+    if not isinstance(changed_paths, list) or any(
+        not isinstance(path, str) for path in changed_paths
+    ):
+        raise ValueError("repository evidence changed paths are invalid")
+    changed = set(changed_paths)
+    standard_paths = _repository_standard_paths(changed_paths)
+    truncated = False
+    standards_truncated = False
+    sources: dict[str, str] = {}
+    standard_candidates = []
+    indexed_bytes = 0
+    try:
+        with zipfile.ZipFile(BytesIO(archive)) as bundle:
+            members = bundle.infolist()
+            if len(members) > 100_000:
+                raise ValueError("repository evidence archive contains too many entries")
+            candidates = []
+            seen = set()
+            for member in members:
+                name = member.filename
+                if "\x00" in name or "\\" in name or name.startswith("/"):
+                    raise ValueError("repository evidence archive contains an unsafe path")
+                parts = name.split("/")
+                if any(part in {"", ".", ".."} for part in parts[:-1]):
+                    raise ValueError("repository evidence archive contains an unsafe path")
+                path = posixpath.normpath("/".join(parts[1:])) if len(parts) > 1 else ""
+                if not path or member.is_dir():
+                    continue
+                is_source = path.endswith(".py")
+                is_standard = path in standard_paths
+                if not is_source and not is_standard:
+                    continue
+                if path.startswith("../") or path in seen:
+                    raise ValueError(
+                        "repository evidence archive contains duplicate or unsafe paths"
+                    )
+                seen.add(path)
+                mode = member.external_attr >> 16
+                if mode and stat.S_IFMT(mode) == stat.S_IFLNK:
+                    truncated = truncated or is_source
+                    standards_truncated = standards_truncated or is_standard
+                    continue
+                try:
+                    path_bytes = path.encode("utf-8")
+                except UnicodeError:
+                    truncated = True
+                    continue
+                if len(path_bytes) > MAX_REPOSITORY_EVIDENCE_ITEM_BYTES:
+                    truncated = truncated or is_source
+                    standards_truncated = standards_truncated or is_standard
+                    continue
+                if is_source:
+                    candidates.append((path not in changed, path, member))
+                if is_standard:
+                    standard_candidates.append((path, member))
+            for _unchanged, path, member in sorted(candidates, key=lambda item: item[:2]):
+                if len(sources) >= 5000 or member.file_size > max_source_bytes - indexed_bytes:
+                    truncated = True
+                    continue
+                raw = bundle.read(member)
+                if len(raw) != member.file_size or len(raw) > max_source_bytes - indexed_bytes:
+                    raise ValueError("repository evidence archive entry exceeds its size limit")
+                try:
+                    source = raw.decode("utf-8")
+                except UnicodeError:
+                    truncated = True
+                    continue
+                if "\x00" in source:
+                    truncated = True
+                    continue
+                sources[path] = source
+                indexed_bytes += len(raw)
+
+            standard_sections: list[str] = []
+            standard_bytes = 0
+            root_order = {path: index for index, path in enumerate(_ROOT_STANDARD_FILES)}
+            for path, member in sorted(
+                standard_candidates,
+                key=lambda item: (
+                    0 if item[0] in root_order else 1,
+                    root_order.get(item[0], item[0].count("/")),
+                    item[0],
+                ),
+            ):
+                prefix = ("\n\n" if standard_sections else "") + "## %s\n" % path
+                budget = (
+                    MAX_REVIEW_CONTEXT_SECTION_BYTES - standard_bytes - len(prefix.encode("utf-8"))
+                )
+                if budget <= 0:
+                    standards_truncated = True
+                    break
+                with bundle.open(member) as handle:
+                    raw = handle.read(budget + 1)
+                clipped = member.file_size > budget or len(raw) > budget
+                raw = raw[:budget]
+                if not clipped and len(raw) != member.file_size:
+                    raise ValueError("repository standards archive entry is incomplete")
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    # A bounded prefix may split only its final UTF-8 code point.
+                    if clipped and exc.end == len(raw) and len(raw) - exc.start <= 4:
+                        text = raw[: exc.start].decode("utf-8")
+                    else:
+                        standards_truncated = True
+                        continue
+                if "\x00" in text:
+                    standards_truncated = True
+                    continue
+                text = text.rstrip()
+                if text:
+                    section = prefix + text
+                    standard_sections.append(section)
+                    standard_bytes += len(section.encode("utf-8"))
+                if clipped:
+                    standards_truncated = True
+                    break
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        raise ValueError("repository evidence archive is invalid") from exc
+
+    impact = build_graph(sources).impact_of(sorted(changed))
+
+    def bounded(values: list[str]) -> tuple[str, ...]:
+        nonlocal truncated
+        valid: list[str] = []
+        for value in sorted(set(values)):
+            try:
+                fits = len(value.encode("utf-8")) <= MAX_REPOSITORY_EVIDENCE_ITEM_BYTES
+            except UnicodeError:
+                fits = False
+            if fits and len(valid) < MAX_REPOSITORY_EVIDENCE_ITEMS:
+                valid.append(value)
+            else:
+                truncated = True
+        return tuple(valid)
+
+    truncated = truncated or bool(impact["truncated"])
+    changed_files = bounded(impact["changed_files"])
+    changed_symbols = bounded(impact["changed_symbols"])
+    impacted_symbols = bounded(impact["impacted_symbols"])
+    importing_files = bounded(impact["importing_files"])
+    evidence = RepositoryEvidence(
+        origin="github-archive",
+        status="partial" if truncated else "available",
+        revision=revision,
+        indexed_files=len(sources),
+        indexed_bytes=indexed_bytes,
+        changed_paths=changed_files,
+        changed_symbols=changed_symbols,
+        impacted_symbols=impacted_symbols,
+        importing_files=importing_files,
+        truncated=truncated,
+    )
+    return (
+        RepositoryEvidence.from_dict(evidence.to_dict()),
+        "".join(standard_sections),
+        standards_truncated,
+    )
+
+
+def repository_evidence_from_archive(
+    archive: bytes,
+    changed_paths: list[str],
+    revision: str,
+    max_source_bytes: int,
+) -> RepositoryEvidence:
+    """Backward-compatible evidence-only view of a repository snapshot."""
+    return repository_snapshot_from_archive(archive, changed_paths, revision, max_source_bytes)[0]

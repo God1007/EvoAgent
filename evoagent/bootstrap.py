@@ -222,7 +222,19 @@ def _model_gateway(
 
 
 def _proof_executor(settings: Settings, container_image: str | None = None) -> ProofExecutorPort:
-    return LocalProofExecutor(lambda command: _repair_verifier(settings, command, container_image))
+    if settings.proof_executor_socket:
+        from .proof_service import SocketProofExecutor
+
+        return SocketProofExecutor(
+            settings.proof_executor_socket, settings.repair_verify_timeout_seconds
+        )
+    return LocalProofExecutor(
+        lambda command: _repair_verifier(settings, command, container_image),
+        lambda: (
+            bool(container_image)
+            and resolve_container_image(container_image or "", 0.5) == container_image
+        ),
+    )
 
 
 def _repair_verifier(

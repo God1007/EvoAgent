@@ -51,6 +51,8 @@ class ModelGatewayPort(Protocol):
 
 @runtime_checkable
 class ProofExecutorPort(Protocol):
+    def healthy(self) -> bool: ...
+
     def execute(self, files: dict[str, str], command: str) -> dict[str, Any]: ...
 
 
@@ -82,6 +84,10 @@ class TaskQueuePort(Protocol):
 @runtime_checkable
 class CodeHostPort(Protocol):
     def fetch_diff(self, url: str, max_bytes: int | None = None) -> str: ...
+
+    def fetch_compare_diff(
+        self, repository: str, base_sha: str, head_sha: str, max_bytes: int | None = None
+    ) -> str: ...
 
     def upsert_comment(
         self,
@@ -122,4 +128,6 @@ class CodeHostPort(Protocol):
         before_write: Callable[[], None] | None = None,
     ) -> dict: ...
 
-    def download_archive(self, repository: str, ref: str) -> bytes: ...
+    def download_archive(
+        self, repository: str, ref: str, max_bytes: int | None = None
+    ) -> bytes: ...

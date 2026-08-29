@@ -1,6 +1,6 @@
 # EvoAgent Baseline Evaluation Report
 
-Reproduced on 2026-08-28 against the local working tree. This is an offline
+Reproduced on 2026-08-29 against the local working tree. This is an offline
 evaluation snapshot, not a remote CI or production qualification. Regenerate with
 `python scripts/run_e2e_evaluation.py --reuse-dataset` (see
 [`evaluation.md`](evaluation.md)).
@@ -11,10 +11,11 @@ evaluation snapshot, not a remote CI or production qualification. Regenerate wit
 | --- | --- |
 | EvoAgent version | 0.30.0 |
 | Python | 3.12.13 |
-| Application source SHA-256 | `826d8bc92a4f028d36266f050694b1708d3a612e9c517861b8b326a707a6d683` |
+| Application source SHA-256 | `669786917b94d89b61769e63c7b629be8e3ae8e74604be6104c25981cff1c5a6` |
 | Dependencies | `requirements.lock` SHA-256 `dd3a30c26aa196e7afcc88a1d16336ee391ce408fcebcc3bd996a0f80537ac0e` |
 | Dataset | `evaluation_data/pr_diff_100.jsonl` |
-| Dataset semantic SHA-256 | `8d2271ec666dcbc96b0c8a13e05adcf71c08f33bf17da5d1c102fe9a3434af38` |
+| Dataset semantic SHA-256 | `92e93bbc64c70e81ab8ef26b200ea4cbe092bf159ad78c061d6da7e704577263` |
+| Controlled generator | `evoagent-e2e-v2` |
 | Corpus kind | `synthetic-controlled` (not real production PRs) |
 | Evaluation report schema | 3 |
 
@@ -35,13 +36,19 @@ evaluation snapshot, not a remote CI or production qualification. Regenerate wit
 | Clean PR accuracy | 91.7% | 91.7% | +0.0 pp |
 | Execution success | 100.0% | 100.0% | +0.0 pp |
 | Safe-fix rate | — | 100.0% | — |
-| E2E security-fix rate | — | 35.0% | — |
+| E2E security-fix rate | — | 60.0% | — |
 
 Counts: baseline TP/FP/FN = 27/5/13; candidate TP/FP/FN = 33/7/7.
-Auto-repair: the production `SafeFixer` attempted all 14 safely generic
-repairs and every one passed all five repair gates. Another 19 detected risks
-required business context and abstained; 14 of 40 total risk cases succeeded
-end-to-end. Benchmark-only semantic rewrites are not used.
+Auto-repair: the production `SafeFixer` attempted all 24 eligible repairs and
+every one passed all five repair gates. Another 9 detected risks required
+business context and abstained; 24 of 40 total risk cases succeeded end-to-end.
+Benchmark-only semantic rewrites are not used.
+
+The ten added successes come from production rules with deliberately narrow AST
+preconditions: one-argument `eval` becomes `ast.literal_eval`, a single
+`int(value)` conversion narrows `Exception` to `TypeError`/`ValueError`, and
+`assert user.is_admin` becomes an explicit `PermissionError` branch. Ambiguous
+forms abstain, and repository tests remain mandatory before GitHub publication.
 
 ## Per-split results
 
@@ -64,8 +71,8 @@ end-to-end. Benchmark-only semantic rewrites are not used.
 
 ## Release gate
 
-- Quantitative gate: **FAIL** — E2E security-fix rate is 35.0%, below the
-  declared 60.0% minimum.
+- Quantitative gate: **PASS** — E2E security-fix rate reaches the declared
+  60.0% minimum while safe-fix rate remains 100.0%.
 - Production activation: **BLOCKED** — requires a real, independently-labeled
   public-PR dataset (`production_data_provenance` fails by design on synthetic
   data).
@@ -80,7 +87,7 @@ end-to-end. Benchmark-only semantic rewrites are not used.
 | `execution_success` | PASS |
 | `confidence_validity` | PASS |
 | `safe_fix_rate` | PASS |
-| `e2e_security_fix_rate` | FAIL |
+| `e2e_security_fix_rate` | PASS |
 | `production_data_provenance` | FAIL (expected on synthetic corpus) |
 
 The provenance audit passes sample size, unique content, repository-disjoint

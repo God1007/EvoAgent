@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from itertools import islice
 from typing import cast
 
+from .container_runtime import reconcile_sandboxes, remove_sandbox, sandbox_command
 from .diff_parser import ParsedDiff
 from .json_boundary import strict_json_loads
 from .metrics import metrics
@@ -119,7 +120,7 @@ def _run_bounded(
     payload: bytes,
     cwd: str,
     env: dict[str, str],
-    timeout_seconds: int,
+    timeout_seconds: float,
 ) -> tuple[int, bytes, bytes, bool, bool]:
     """Run a Skill while bounding its output during execution, not after it."""
     with tempfile.TemporaryFile() as input_file:
@@ -148,13 +149,16 @@ def _run_bounded(
                 pass
 
         def drain(stream, target: bytearray, limit: int) -> None:
-            while chunk := stream.read(65536):
-                remaining = max(0, limit + 1 - len(target))
-                target.extend(chunk[:remaining])
-                if len(target) > limit or len(chunk) > remaining:
-                    exceeded.set()
-                    terminate()
-                    return
+            try:
+                while chunk := stream.read(65536):
+                    remaining = max(0, limit + 1 - len(target))
+                    target.extend(chunk[:remaining])
+                    if len(target) > limit or len(chunk) > remaining:
+                        exceeded.set()
+                        terminate()
+                        return
+            finally:
+                stream.close()
 
         threads = [
             threading.Thread(
@@ -188,7 +192,7 @@ def _run_bounded(
         return returncode, bytes(output), bytes(error), timed_out, exceeded.is_set()
 
 
-def resolve_container_image(image: str) -> str:
+def resolve_container_image(image: str, timeout_seconds: float = 5) -> str:
     """Resolve a preloaded Docker image reference to its immutable local ID."""
     if not image:
         return ""
@@ -199,7 +203,7 @@ def resolve_container_image(image: str) -> str:
             ["docker", "image", "inspect", "--format", "{{.Id}}", image],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            timeout=5,
+            timeout=timeout_seconds,
             text=True,
             check=False,
         )
@@ -271,6 +275,7 @@ class SandboxedSkillReviewer(Reviewer):
         }
         container_name = "evoagent-skill-%s" % uuid.uuid4().hex[:12] if self.container_image else ""
         with tempfile.TemporaryDirectory(prefix="evoagent-skill-") as workdir:
+            deadline = time.monotonic() + self.timeout_seconds
             env = {
                 key: value
                 for key, value in os.environ.items()
@@ -278,58 +283,100 @@ class SandboxedSkillReviewer(Reviewer):
             }
             env["PYTHONHASHSEED"] = "0"
             command = [sys.executable, "-I", self.runner, self.module_path]
+            startup = None
             if self.container_image:
+                # Only the trusted Docker client receives connection/configuration settings.
+                # The Python fallback and the container must not inherit operator credentials.
+                for key in (
+                    "HOME",
+                    "USERPROFILE",
+                    "DOCKER_HOST",
+                    "DOCKER_CONTEXT",
+                    "DOCKER_CONFIG",
+                    "DOCKER_CERT_PATH",
+                    "DOCKER_TLS",
+                    "DOCKER_TLS_VERIFY",
+                    "DOCKER_API_VERSION",
+                ):
+                    if key in os.environ:
+                        env[key] = os.environ[key]
+                try:
+                    reconcile_sandboxes(
+                        env,
+                        timeout_seconds=min(10.0, max(0.001, deadline - time.monotonic())),
+                    )
+                except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                    metrics.inc("skill_sandbox_failures_total")
+                    raise RuntimeError("skill container reconciliation failed") from exc
+                startup = sandbox_command(
+                    self.container_image,
+                    container_name,
+                    self.timeout_seconds,
+                    [
+                        "--pids-limit",
+                        "64",
+                        "--memory",
+                        "%dm" % self.memory_mb,
+                        "--cpus",
+                        "0.5",
+                    ],
+                )
                 command = [
                     "docker",
-                    "run",
+                    "exec",
                     "-i",
-                    "--pull",
-                    "never",
-                    "--name",
-                    container_name,
-                    "--network",
-                    "none",
-                    "--read-only",
-                    "--cap-drop",
-                    "ALL",
-                    "--security-opt",
-                    "no-new-privileges",
-                    "--pids-limit",
-                    "64",
-                    "--memory",
-                    "%dm" % self.memory_mb,
-                    "--cpus",
-                    "0.5",
                     "--user",
                     "65534:65534",
-                    self.container_image,
+                    "--workdir",
+                    "/app",
+                    container_name,
                     "python",
                     "-I",
                     "/app/evoagent/skill_runner.py",
                     "/skill/" + os.path.basename(self.module_path),
                 ]
             try:
+                if startup:
+                    try:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise subprocess.TimeoutExpired(startup, self.timeout_seconds)
+                        started = subprocess.run(
+                            startup,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=remaining,
+                            check=False,
+                            env=env,
+                        )
+                    except subprocess.TimeoutExpired as exc:
+                        metrics.inc("skill_timeouts_total")
+                        raise RuntimeError("skill %s exceeded its time limit" % self.name) from exc
+                    except OSError as exc:
+                        metrics.inc("skill_sandbox_failures_total")
+                        raise RuntimeError("skill container preparation failed") from exc
+                    if started.returncode:
+                        metrics.inc("skill_sandbox_failures_total")
+                        raise RuntimeError("skill container preparation failed")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    metrics.inc("skill_timeouts_total")
+                    raise RuntimeError("skill %s exceeded its time limit" % self.name)
                 returncode, output, error_output, timed_out, output_exceeded = _run_bounded(
                     command,
                     json.dumps(payload).encode("utf-8"),
                     workdir,
                     env,
-                    self.timeout_seconds,
+                    remaining,
                 )
             finally:
                 if container_name:
                     try:
-                        cleanup = subprocess.run(
-                            ["docker", "rm", "-f", container_name],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            timeout=10,
-                            check=False,
-                        )
+                        cleanup = remove_sandbox(container_name, env)
                     except (OSError, subprocess.TimeoutExpired) as exc:
                         metrics.inc("skill_container_cleanup_failures_total")
                         raise RuntimeError("skill container cleanup failed") from exc
-                    if cleanup.returncode:
+                    if not cleanup:
                         metrics.inc("skill_container_cleanup_failures_total")
                         raise RuntimeError("skill container cleanup failed")
         if output_exceeded:

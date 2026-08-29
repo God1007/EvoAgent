@@ -36,13 +36,15 @@ from .task_queue import PermanentTaskError, TaskQueue
 
 class ReviewService:
     def console_capabilities(self, principal: Principal) -> dict[str, Any]:
-        """Configuration hints only; never probe external services or expose credentials."""
+        """Safe capability hints; never expose credentials."""
         settings = self.settings
         return {
             "role": principal.role,
             "review": principal.can("review"),
             "manage": principal.can("manage"),
+            "audit": principal.can("audit"),
             "platform": principal.can("platform"),
+            "proof": principal.can("fix") and self._proof_status()["healthy"],
             "github_install_configured": bool(
                 settings.auth_required
                 and settings.auth_secret
@@ -54,6 +56,23 @@ class ReviewService:
                 and settings.github_oauth_callback_url
                 and settings.github_webhook_secret
             ),
+        }
+
+    def _proof_status(self) -> dict[str, Any]:
+        container = bool(getattr(self, "repair_container_image", ""))
+        socket = bool(
+            isinstance(getattr(self.settings, "proof_executor_socket", ""), str)
+            and self.settings.proof_executor_socket
+        )
+        configured = container or socket
+        try:
+            healthy = configured and self.proof_executor.healthy()
+        except Exception:
+            healthy = False
+        return {
+            "configured": configured,
+            "healthy": healthy,
+            "mode": "socket" if socket else "docker" if container else "disabled",
         }
 
     def console_fix_blocker(self, task: dict, principal: Principal) -> str:
@@ -196,12 +215,14 @@ class ReviewService:
                     effect_lease_seconds=settings.effect_lease_seconds,
                     auto_post_review=settings.auto_post_review,
                     tenant_max_active_reviews=settings.tenant_max_active_reviews,
+                    repository_evidence_max_bytes=settings.repository_evidence_max_bytes,
                 ),
                 lambda tenant_id, repository: (
                     (self.model_gateway.route_info(),) if self.model_gateway.configured else None
                 ),
                 lambda: self.review_engine.execution_revision(),
                 self.studio.select,
+                self.review_engine.requires_repository_evidence,
             )
             self.webhook_use_cases = WebhookUseCases(
                 self.store,
@@ -503,10 +524,7 @@ class ReviewService:
         test_command_configured = bool(
             str(getattr(getattr(self, "settings", None), "repair_test_command", "")).strip()
         )
-        checks["proof"] = {
-            "configured": container_configured,
-            "mode": "docker" if container_configured else "disabled",
-        }
+        checks["proof"] = self._proof_status()
         repair_configured = container_configured and test_command_configured
         checks["repair"] = {
             "configured": repair_configured,
@@ -804,9 +822,17 @@ class ReviewService:
         tenant_id: str = "default",
         actor: str = "",
         workflow_selection: dict | None = None,
+        review_context: dict | None = None,
     ) -> dict[str, Any]:
         return self.review_use_cases.create_review(
-            repository, diff, pull_request, source, tenant_id, actor, workflow_selection
+            repository,
+            diff,
+            pull_request,
+            source,
+            tenant_id,
+            actor,
+            workflow_selection,
+            review_context,
         )
 
     def enqueue_review(
@@ -821,6 +847,7 @@ class ReviewService:
         idempotency_key: str = "",
         actor: str = "",
         workflow_selection: dict | None = None,
+        review_context: dict | None = None,
     ) -> dict[str, Any]:
         return self.review_use_cases.enqueue_review(
             repository,
@@ -833,6 +860,7 @@ class ReviewService:
             idempotency_key,
             actor,
             workflow_selection,
+            review_context,
         )
 
     def _process_queued(self, payload: dict[str, Any]) -> None:
@@ -925,5 +953,12 @@ class ReviewService:
         repository: str,
         policy: dict[str, Any],
         actor: str,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
-        return self.policy_use_cases.set_repository_policy(tenant_id, repository, policy, actor)
+        return self.policy_use_cases.set_repository_policy(
+            tenant_id,
+            repository,
+            policy,
+            actor,
+            expected_version,
+        )

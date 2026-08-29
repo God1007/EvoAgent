@@ -187,11 +187,8 @@ class SafeFixer:
     @staticmethod
     def _has_import(tree: ast.Module, module: str) -> bool:
         return any(
-            isinstance(node, (ast.Import, ast.ImportFrom))
-            and (
-                (isinstance(node, ast.Import) and any(alias.name == module for alias in node.names))
-                or (isinstance(node, ast.ImportFrom) and node.module == module)
-            )
+            isinstance(node, ast.Import)
+            and any(alias.name == module and alias.asname in {None, module} for alias in node.names)
             for node in tree.body
         )
 

@@ -166,6 +166,8 @@ sample_query = "two"
         self.assertIn("evoagent_repair_container_cleanup_failures_total[15m]", rules)
         self.assertIn("EvoAgentReviewAgentBudgetTimeouts", rules)
         self.assertIn("evoagent_review_agent_budget_timeouts_total[15m]", rules)
+        self.assertIn("EvoAgentWorkflowAgentFailureRateHigh", rules)
+        self.assertIn("evoagent:ratio:workflow_agent_failure_15m", rules)
         self.assertIn("or vector(0)", rules)
         alerts = re.findall(r"^\s+- alert:", rules, re.MULTILINE)
         runbook_anchors = re.findall(
@@ -184,6 +186,7 @@ sample_query = "two"
             "metric-collection",
             "dead-letters",
             "review-failures",
+            "workflow-agent-failures",
             "repair-outcomes",
             "quality-feedback",
             "model-rollout",
@@ -204,10 +207,47 @@ sample_query = "two"
         self.assertIn("evoagent:ratio:skill_failure_15m", dashboard_text)
         self.assertIn("evoagent_review_agent_budget_timeouts_total[15m]", dashboard_text)
         self.assertIn("evoagent_review_attempts_failed_total[5m]", dashboard_text)
+        self.assertIn("evoagent_workflow_agent_failures_total", dashboard_text)
+        self.assertIn("evoagent_workflow_(review|studio|custom)_agent_", dashboard_text)
+        self.assertIn("evoagent_model_studio_input_tokens_total", dashboard_text)
         self.assertNotIn("evoagent_model_fallback_attempts_total", dashboard_text)
 
 
 class PrometheusClientTests(unittest.TestCase):
+    def test_monitoring_uses_current_targets_not_historical_up_samples(self):
+        def target(job, health):
+            return {"labels": {"job": job}, "health": health}
+
+        for targets, available in (
+            ([], False),
+            ([target("other", "up")], False),
+            ([target("evoagent", "unknown")], False),
+            ([target("evoagent", "down")], False),
+            ([target("evoagent", "down"), target("evoagent", "up")], True),
+        ):
+            with self.subTest(targets=targets):
+                body = json.dumps({"status": "success", "data": {"activeTargets": targets}})
+                opener = FakeOpener(FakeResponse(body.encode()))
+                client = PrometheusClient("http://127.0.0.1:9090", opener=opener)
+                self.assertEqual(available, client.monitoring_available())
+                self.assertTrue(opener.requests[0][0].full_url.endswith("/targets?state=active"))
+
+        for targets in (
+            None,
+            {},
+            [None],
+            [{}],
+            [{"labels": {}, "health": "invalid"}],
+            [{"labels": {}, "health": []}],
+        ):
+            with self.subTest(invalid=targets):
+                body = json.dumps({"status": "success", "data": {"activeTargets": targets}})
+                client = PrometheusClient(
+                    "http://127.0.0.1:9090", opener=FakeOpener(FakeResponse(body.encode()))
+                )
+                with self.assertRaisesRegex(SLOError, "invalid target response"):
+                    client.monitoring_available()
+
     def test_transport_limits_cannot_be_disabled(self):
         for name, value in (
             ("timeout_seconds", 0),
@@ -301,6 +341,10 @@ class EvaluationTests(unittest.TestCase):
         class Client:
             values = iter((100.0, 0.9995, 100.0, 0.98))
 
+            @staticmethod
+            def monitoring_available():
+                return True
+
             def query(self, _expression):
                 return next(self.values)
 
@@ -319,11 +363,37 @@ class EvaluationTests(unittest.TestCase):
 
         class Client:
             @staticmethod
+            def monitoring_available():
+                return True
+
+            @staticmethod
             def query(_expression):
                 return 2.0
 
         result = evaluate_slos(catalog, Client())[0]
         self.assertEqual("no-data", result.status)
+        self.assertIsNone(result.achieved)
+        self.assertIsNone(result.error_budget_remaining)
+
+    def test_missing_or_failed_scrapes_cannot_pass_using_historical_samples(self):
+        class Client:
+            @staticmethod
+            def monitoring_available():
+                return False
+
+            @staticmethod
+            def query(expression):
+                if expression == "samples":
+                    return 1000.0
+                raise AssertionError("must not evaluate success from stale indicators")
+
+        catalog = SLOCatalog(
+            1,
+            (SLOObjective("availability", "availability", 0.999, "30d", "good", "samples", 100),),
+        )
+        result = evaluate_slos(catalog, Client())[0]
+        self.assertEqual("no-data", result.status)
+        self.assertEqual(1000, result.samples)
         self.assertIsNone(result.achieved)
         self.assertIsNone(result.error_budget_remaining)
 

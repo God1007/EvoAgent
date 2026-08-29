@@ -31,8 +31,17 @@
         <button class="nav-item" data-view="tasks" data-icon="TS" aria-label="任务中心">
           <span>任务中心</span>
         </button>
+        <button class="nav-item" data-view="proof" data-icon="PF" aria-label="修复验证">
+          <span>修复验证</span>
+        </button>
         <button class="nav-item" data-view="skills" data-icon="SK" aria-label="基础能力">
           <span>基础能力</span>
+        </button>
+        <button class="nav-item hidden" data-view="governance" data-icon="GV" aria-label="仓库治理">
+          <span>仓库治理</span>
+        </button>
+        <button class="nav-item hidden" data-view="operations" data-icon="OP" aria-label="运维中心">
+          <span>运维中心</span>
         </button>
         <button class="nav-item" data-view="evolution" data-icon="EV" aria-label="演进实验室">
           <span>演进实验室</span>
@@ -144,6 +153,19 @@
               <label>Unified Diff
                 <textarea name="diff" rows="15" spellcheck="false" required placeholder="--- a/app.py&#10;+++ b/app.py&#10;@@ -1 +1 @@&#10;-old_value&#10;+new_value"></textarea>
               </label>
+              <details class="studio-advanced">
+                <summary>补充需求与项目规范 <span class="optional">双轴审查可选</span></summary>
+                <p class="workflow-note">这些内容作为不可信审查资料传入 Agent，不会改变权限、工具或流程连线。</p>
+                <label>变更标题 <span class="optional">可选</span>
+                  <input name="title" maxlength="512" placeholder="例如：为登录接口增加限流">
+                </label>
+                <label>需求 / Spec <span class="optional">可选</span>
+                  <textarea name="spec" rows="5" placeholder="这次变更应该实现什么、哪些内容不在范围内"></textarea>
+                </label>
+                <label>项目规范 <span class="optional">可选</span>
+                  <textarea name="standards" rows="5" placeholder="与本次变更相关的编码规范、架构约束或安全规则"></textarea>
+                </label>
+              </details>
               <div class="form-footer">
                 <span class="workflow-note" id="review-access-note" role="status">正在确认操作权限…</span>
                 <button class="button" type="submit" disabled aria-describedby="review-access-note">开始多 Agent 审查 <span>→</span></button>
@@ -203,12 +225,99 @@
         <div id="studio-root"><p class="workflow-note">正在读取工作室…</p></div>
       </section>
 
+      <section class="view" id="view-proof" aria-labelledby="page-title">
+        <div class="section-heading">
+          <div><h2>用执行结果验证修复</h2><p>提交修复前后的文件，用同一条命令复现问题，再运行回归测试。所有命令仅在受限容器中执行，不会修改仓库或发布 PR。</p></div>
+        </div>
+        <article class="panel form-panel">
+          <div class="panel-head"><h3>文件与验证命令</h3><button class="button secondary" id="proof-example" type="button">填入演示样例</button></div>
+          <p id="proof-access-note" class="workflow-note" role="status">正在确认执行环境与权限…</p>
+          <form id="proof-form">
+            <fieldset id="proof-fields">
+              <div id="proof-files"></div>
+              <button class="link-button" id="proof-add-file" type="button">＋ 添加文件</button>
+              <div class="field-row">
+                <label>问题复现命令<input name="reproduction_command" placeholder="python test_reproduction.py" maxlength="8192" spellcheck="false" required></label>
+                <label>回归测试命令 <span class="optional">可选</span><input name="regression_command" placeholder="python -m unittest discover" maxlength="8192" spellcheck="false"></label>
+              </div>
+              <p class="workflow-note">相对路径基于临时工作目录；未改动的测试文件可在两栏填入相同内容。仅使用容器已有依赖，不允许联网安装。关闭页面不会撤销已接收的执行。</p>
+              <button class="button" id="proof-submit" type="submit" disabled aria-describedby="proof-access-note">运行隔离验证</button>
+            </fieldset>
+          </form>
+        </article>
+        <article class="panel proof-result-panel"><div class="panel-head"><h3>验证证据</h3><span class="muted">结果只覆盖所提供的文件和命令</span></div><div id="proof-result" class="result empty" aria-live="polite">运行后展示复现、修复与回归结果。</div></article>
+      </section>
+
       <section class="view" id="view-skills" aria-labelledby="page-title">
         <div class="section-heading inline">
           <div><h2>基础能力 · Skills</h2><p>这里是服务已安装的底层能力，不是 Agent 编辑器。要自定义职责和组合流程，请进入 Agent 搭建。</p></div>
           <button class="button" data-jump="studio">创建 Agent 与搭建流程 →</button>
         </div>
         <div class="cards" id="skill-list"><div class="skill-card loading"></div><div class="skill-card loading"></div></div>
+      </section>
+
+      <section class="view" id="view-governance" aria-labelledby="page-title">
+        <div class="section-heading">
+          <div><h2>仓库治理</h2><p>为单个仓库固定审查、模型出口、评论与确定性修复边界；策略只影响后续任务，已有任务继续使用自己的快照。</p></div>
+        </div>
+        <div class="form-layout">
+          <article class="panel form-panel">
+            <form id="policy-form">
+              <div class="field-row policy-lookup">
+                <label>仓库地址<input id="policy-repository" name="repository" placeholder="owner/repository" autocomplete="off" required></label>
+                <button class="button secondary" id="policy-load" type="button">读取当前策略</button>
+              </div>
+              <p id="policy-status" class="workflow-note" role="status">输入仓库后读取当前策略。</p>
+              <fieldset id="policy-fields" disabled>
+                <div class="policy-switches">
+                  <label class="check"><input name="enabled" type="checkbox"><span><b>允许审查</b><small>关闭后，新任务、排队执行和修复都会拒绝</small></span></label>
+                  <label class="check"><input name="post_review_comments" type="checkbox"><span><b>允许回写评论</b><small>发布 GitHub 评论前会再次读取当前策略</small></span></label>
+                  <label class="check"><input name="auto_fix" type="checkbox"><span><b>允许自动修复</b><small>仍需 PR 快照、规则白名单和隔离测试全部通过</small></span></label>
+                </div>
+                <label>单次 Diff 上限（字节） <span class="optional">留空沿用全局上限</span><input name="max_diff_bytes" type="number" min="1" step="1" placeholder="例如 524288"></label>
+                <fieldset><legend>允许的审查流水线</legend><p class="workflow-note">不勾选表示允许当前已安装的全部流水线。</p><div id="policy-reviewers" class="policy-options"></div></fieldset>
+                <fieldset><legend>允许的确定性修复规则</legend><p class="workflow-note">不勾选表示允许当前已安装的全部修复规则。</p><div id="policy-fix-rules" class="policy-options"></div></fieldset>
+                <details class="studio-advanced">
+                  <summary>模型出口限制 <span class="optional">可选</span></summary>
+                  <p class="workflow-note">多个值用英文逗号分隔；空列表允许当前已配置路由。保存不会调用模型，但后续任务仍会逐次校验。</p>
+                  <label>允许的 Provider<input name="allowed_llm_providers" placeholder="例如 local, openai"></label>
+                  <label>允许的模型<input name="allowed_llm_models" placeholder="例如 gpt-5.4"></label>
+                  <label>指定区域<input name="llm_region" placeholder="例如 cn-north-1"></label>
+                </details>
+                <button class="button" id="policy-save" type="submit">保存新版本</button>
+              </fieldset>
+            </form>
+          </article>
+          <aside class="panel strategy-panel">
+            <div class="panel-head"><h3>当前策略与历史</h3><span id="policy-version" class="status status-neutral">尚未读取</span></div>
+            <div id="policy-summary" class="readiness-content">读取后展示策略来源、关键限制和版本历史，不显示原始 JSON。</div>
+            <div id="policy-history" class="task-list"></div>
+            <p id="policy-result" class="operation-result" role="status" aria-live="polite"></p>
+          </aside>
+        </div>
+      </section>
+
+      <section class="view" id="view-operations" aria-labelledby="page-title">
+        <div class="section-heading">
+          <div><h2>运维中心</h2><p>查看当前租户容量、审计事件和失败投递；页面只展示运维白名单字段，不返回任务载荷或原始错误。</p></div>
+        </div>
+        <p id="operations-note" class="workflow-note" role="status">正在确认运维权限…</p>
+        <div class="stats operations-stats" id="operations-stats" aria-live="polite">
+          <div class="stat loading"></div><div class="stat loading"></div><div class="stat loading"></div><div class="stat loading"></div>
+        </div>
+        <div class="dashboard-grid">
+          <article class="panel">
+            <div class="panel-head"><h3>审计记录</h3><span class="muted">最近 50 条</span></div>
+            <div id="audit-list" class="task-list" aria-live="polite"><div class="list-loading"></div></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><h3>失败投递</h3><span class="muted">仅管理员可处理</span></div>
+            <h4 class="history-heading">结果回写 · Outbox</h4>
+            <div id="outbox-list" class="task-list" aria-live="polite"><div class="list-loading"></div></div>
+            <h4 class="history-heading">任务执行 · Queue DLQ</h4>
+            <div id="queue-dead-list" class="task-list" aria-live="polite"><div class="list-loading"></div></div>
+          </article>
+        </div>
       </section>
 
       <section class="view" id="view-evolution" aria-labelledby="page-title">
@@ -279,5 +388,6 @@
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script src="/assets/app.js"></script>
   <script src="/assets/studio.js"></script>
+  <script src="/assets/proof.js"></script>
 </body>
 </html>

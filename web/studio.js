@@ -42,6 +42,12 @@ function studioInputSource(step, port) {
   return Object.hasOwn(step.sources, port) ? step.sources[port] : "";
 }
 
+function studioPlaybook(config, name) {
+  const value = config?.playbook;
+  if (value && [value.identity, value.objective, value.instructions].every((item) => typeof item === "string")) return value;
+  return { identity: name || "代码审查 Agent", objective: typeof config?.prompt === "string" ? config.prompt : "", instructions: "" };
+}
+
 function studioCanConnect(steps, source, target) {
   const pending = [source.split(".")[0]], seen = new Set();
   while (pending.length) {
@@ -73,16 +79,16 @@ function studioReplaceAgent(definition, id, previous, next) {
 (() => {
   const root = $("#studio-root");
   const diffType = "unified-diff@1", findingsType = "review-findings@1";
-  const labels = { rules: "规则 Agent", llm: "提示词 Agent", merge: "结果汇总" };
-  const builtinLabels = { planner: "规划", specialists: "内置审查组", critic: "质询", test: "复现判断", synthesizer: "综合", fix: "修复判断", verifier: "验证" };
-  const typeLabels = { "unified-diff@1": "代码变更", "parsed-diff@1": "文件与行号", "review-findings@1": "问题与修复建议", "review-plan@1": "审查计划", "review-critiques@1": "质询结果", "review-reproductions@1": "复现结果", "review-fix-decisions@1": "修复判断", "text@1": "文本", "integer@1": "整数", "boolean@1": "是 / 否" };
+  const labels = { rules: "规则 Agent", llm: "模型 Agent", merge: "结果汇总" };
+  const builtinLabels = { planner: "规划", specialists: "内置审查组", critic: "质询", test: "复现判断", synthesizer: "综合", fix: "修复判断", verifier: "验证", "standards-review": "规范轴审查", "spec-review": "需求轴审查", "axis-merge": "双轴结果汇总" };
+  const typeLabels = { "unified-diff@1": "代码变更", "parsed-diff@1": "文件与行号", "review-context@1": "需求与项目规范", "repository-evidence@1": "仓库影响证据", "review-findings@1": "问题与修复建议", "review-plan@1": "审查计划", "review-critiques@1": "质询结果", "review-reproductions@1": "复现结果", "review-fix-decisions@1": "修复判断", "text@1": "文本", "integer@1": "整数", "boolean@1": "是 / 否" };
   const typeLabel = (type) => Object.hasOwn(typeLabels, type) ? typeLabels[type] : "结构化内容";
   const portLabel = (port) => Object.hasOwn(portLabels, port) ? portLabels[port] : port;
   let catalog = null, documents = [], agents = [], available = [], flow = null, selected = null;
   let dirty = false, busy = false, epoch = 0, notice = "", errorNotice = false, editor = null, editorDirty = false;
   let run = null, dragAgent = null, selectedOutput = null;
   let pages = {};
-  let trial = { repository: "", diff: "", target: "draft", version: "" }, bindingRepository = "", bindingVersion = "", bindingSnapshot = null;
+  let trial = { repository: "", diff: "", title: "", spec: "", standards: "", target: "draft", version: "" }, bindingRepository = "", bindingVersion = "", bindingSnapshot = null;
   const manage = () => ["admin", "platform_admin"].includes(currentRole) || !accessToken;
   const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   // Escape quotes too: labels are rendered in both text and attribute contexts.
@@ -269,7 +275,9 @@ function studioReplaceAgent(definition, id, previous, next) {
       <p id="studio-notice" class="workflow-note ${errorNotice ? "studio-error" : ""}" role="status">${esc(notice)}</p>
       <div class="studio-workspace" id="studio-workspace" tabindex="-1"><aside class="studio-library"><h3>Agent 组件库</h3>
         <p class="workflow-note">选一个组件加入画布，或自己定义。</p>
-        <div class="studio-create-types">${[["rules", "＋ 规则检查", "勾选检查项，或定义业务规则"], ["llm", "＋ 模型分析", "选择模型、提示词和只读工具"], ["merge", "＋ 结果汇总", "接收多份结果，去重汇总"]].map(([kind, label, note]) => `<button type="button" data-studio-action="create-${kind}"><strong>${label}</strong><small>${note}</small></button>`).join("")}</div>
+        ${(catalog.templates || []).length ? `<div class="studio-create-types">${catalog.templates.map((template) => `<button type="button" data-studio-action="use-template-${esc(template.id)}" ${template.available ? "" : "disabled"}><strong>◎ ${esc(template.name)}</strong><small>${esc(template.available ? template.description : template.reason || "当前不可用")}</small></button>`).join("")}</div>` : ""}
+        ${(catalog.agent_recipes || []).length ? `<h4>Agent 配方 · 复制后可修改</h4><div class="studio-create-types">${catalog.agent_recipes.map((recipe) => `<button type="button" data-studio-action="use-agent-recipe-${esc(recipe.id)}"><strong>◇ ${esc(recipe.name)}</strong><small>${esc(recipe.description)}</small></button>`).join("")}</div>` : ""}
+        <div class="studio-create-types">${[["rules", "＋ 规则检查", "勾选检查项，或定义业务规则"], ["llm", "＋ 模型分析", "定义 Playbook、模型和只读工具"], ["merge", "＋ 结果汇总", "接收多份结果，去重汇总"]].map(([kind, label, note]) => `<button type="button" data-studio-action="create-${kind}"><strong>${label}</strong><small>${note}</small></button>`).join("")}</div>
         <h4>我的 Agent · 点击添加</h4>
         <div class="studio-agent-list">${agents.map((item) => `<div class="studio-library-item"><button type="button" class="studio-library-name" data-edit-agent="${esc(item.id)}"><strong>${esc(item.name)}</strong><small>${item.active_version ? `v${item.active_version}` : "草稿，尚未发布"}</small></button>${item.active_version ? `<button type="button" class="link-button" draggable="true" data-add-agent="${esc(item.id)}:${item.active_version}" aria-label="添加 ${esc(item.name)}">添加</button>` : ""}</div>`).join("") || '<p class="workflow-note">还没有自定义 Agent，点击“创建”开始。</p>'}</div>
         ${pages.agents ? button("more-agents", "加载更多 Agent") : '<p class="workflow-note">已显示全部 Agent</p>'}
@@ -280,7 +288,9 @@ function studioReplaceAgent(definition, id, previous, next) {
         <form id="studio-run-form"><div class="studio-form-row"><label>试运行对象<select name="target" id="studio-run-target" data-write>${options([["draft", "当前草稿"], ["published", "指定发布版本"]], trial.target)}</select></label>
           ${trial.target === "published" ? `<label>试运行版本<input name="version" type="number" min="1" max="2147483647" step="1" list="studio-versions" value="${esc(trial.version)}" placeholder="例如 1" required data-write></label>` : ""}</div>
           <p class="workflow-note">${trial.target === "published" ? "执行所选版本的不可变快照，不保存或使用当前草稿修改。" : "保存当前草稿后执行，不会发布或改变仓库配置。"}</p>
-          <label>仓库<input name="repository" value="${esc(trial.repository)}" placeholder="owner/repository" required></label><label>Unified Diff<textarea name="diff" rows="5" spellcheck="false" placeholder="粘贴要验证的变更" required>${esc(trial.diff)}</textarea></label><button class="button" type="submit" data-write>${trial.target === "published" ? "试运行此发布版本" : "保存并试运行草稿"}</button></form>
+          <label>仓库<input name="repository" value="${esc(trial.repository)}" placeholder="owner/repository" required></label><label>Unified Diff<textarea name="diff" rows="5" spellcheck="false" placeholder="粘贴要验证的变更" required>${esc(trial.diff)}</textarea></label>
+          <details class="studio-advanced"><summary>双轴审查上下文（可选）</summary><label>变更标题<input name="title" value="${esc(trial.title)}" maxlength="512"></label><label>需求 / Spec<textarea name="spec" rows="4">${esc(trial.spec)}</textarea></label><label>项目规范<textarea name="standards" rows="4">${esc(trial.standards)}</textarea></label></details>
+          <button class="button" type="submit" data-write>${trial.target === "published" ? "试运行此发布版本" : "保存并试运行草稿"}</button></form>
         ${run ? `<p class="workflow-note">最近一次试运行：${esc(run.workflow?.name || "流程")} · ${run.workflow?.version ? `发布 v${esc(run.workflow.version)}` : run.workflow?.draft_revision ? `草稿 r${esc(run.workflow.draft_revision)}` : "版本信息暂不可用"} · ${esc(run.repository)}</p>
           <div class="studio-run-status"><span>任务 ${esc(stateLabels[taskState(run)] || "已接收")}</span><button class="link-button" type="button" data-studio-action="refresh-run">刷新结果</button><button class="link-button" type="button" data-studio-action="open-run">打开交接记录</button>${run.can_resume ? button("resume-run", "从失败节点重试") : run.can_cancel ? button("cancel-run", "取消试运行") : ""}</div>
           <p class="workflow-note">结果仅对应提交时的版本、仓库和 Diff。试运行成功不代表质量评测或上线审批通过。</p>` : ""}
@@ -398,7 +408,10 @@ function studioReplaceAgent(definition, id, previous, next) {
           throw new Error("请选择试运行对象。");
         }
         const repository = values.get("repository");
-        const result = await submitReview({ repository, diff: values.get("diff"), workflow: selection }, "studio");
+        const context = Object.fromEntries(["title", "spec", "standards"].map((key) => [key, values.get(key) || ""]));
+        const requestBody = { repository, diff: values.get("diff"), workflow: selection };
+        if (Object.values(context).some(Boolean)) requestBody.context = context;
+        const result = await submitReview(requestBody, "studio");
         if (request !== epoch) return;
         run = { id: result.task_id, state: result.state, repository, workflow: { ...selection, name } };
         message(result.replayed ? "已找回原试运行任务，未重复创建；可刷新结果或打开交接记录。" : selection.version ? `已提交发布 v${selection.version} 的试运行，当前草稿和仓库配置未改变。` : "已提交草稿试运行，可刷新结果或打开逐节点交接记录。");
@@ -476,6 +489,20 @@ function studioReplaceAgent(definition, id, previous, next) {
 
   async function handleAction(name) {
     if (name === "more-agents" || name === "more-workflows") return loadMore(name.slice(5));
+    if (name.startsWith("use-agent-recipe-")) {
+      const recipe = (catalog.agent_recipes || []).find((item) => `use-agent-recipe-${item.id}` === name);
+      if (!recipe) return;
+      editor = { revision: 0, definition: structuredClone(recipe.definition) };
+      editorDirty = false; render(); return;
+    }
+    if (name.startsWith("use-template-")) {
+      const template = (catalog.templates || []).find((item) => `use-template-${item.id}` === name);
+      if (!template?.available || (dirty && !await confirmAction("用模板替换当前未保存的流程？"))) return;
+      flow = { ...newFlow(), definition: structuredClone(template.definition) };
+      selected = null; selectedOutput = null; dirty = true;
+      message("双轴模板已放入画布：规范与需求并行审查，随后质询、复现并验证。请保存后试运行。");
+      render(); return;
+    }
     if (name === "new-agent" || name.startsWith("create-")) { editor = { revision: 0, definition: defaultAgent(name === "new-agent" ? "rules" : name.slice(7)) }; editorDirty = false; render(); return; }
     if (name === "open-run") { openTask(run.id); return; }
     if (name === "remove-node") {
@@ -521,7 +548,7 @@ function studioReplaceAgent(definition, id, previous, next) {
     return { name: kind === "merge" ? "报告汇总" : "我的 Agent", kind,
       inputs: kind === "merge" ? { security: findingsType, business: findingsType } : { diff: diffType },
       outputs: { findings: findingsType }, config: kind === "rules" ? { rules: [], checks: [] }
-        : kind === "llm" ? { prompt: "检查新增代码中的业务风险，给出具体依据和修复建议。", model: catalog.models[0]?.model || "", tools: [], max_output_tokens: 2048 } : {} };
+        : kind === "llm" ? { playbook: { identity: "资深代码审查 Agent", objective: "检查新增代码中的业务风险并给出可执行结论。", instructions: "只报告有具体代码依据的问题，并提供修复建议与验证方法。" }, model: catalog.models[0]?.model || "", tools: [], max_output_tokens: 2048 } : {} };
   }
 
   function portEditor(direction) {
@@ -529,13 +556,13 @@ function studioReplaceAgent(definition, id, previous, next) {
   }
 
   function renderEditor() {
-    const dialog = $("#studio-agent-dialog"), definition = editor.definition, config = definition.config;
+    const dialog = $("#studio-agent-dialog"), definition = editor.definition, config = definition.config, playbook = studioPlaybook(config, definition.name);
     dialog.innerHTML = `<form id="studio-agent-form"><div class="panel-head"><h3 id="studio-agent-title">${editor.id ? "编辑 Agent" : "创建 Agent"}</h3><button class="link-button" type="button" id="studio-close-editor">关闭</button></div>
       <p class="workflow-note">${editor.id ? `草稿 r${editor.revision}。已发布版本不会被编辑覆盖。` : "定义它做什么、接收什么、交付什么。发布后可直接加入当前画布。"}</p>
       <div class="studio-form-row"><label>Agent 名称<input name="agent_name" value="${esc(definition.name)}" maxlength="100" required></label><label>执行方式<select name="kind">${options(Object.entries(labels), definition.kind)}</select></label></div>
       ${definition.kind === "rules" ? `<fieldset><legend>内置规则</legend><div class="studio-checks">${catalog.rules.map((rule) => `<label class="check"><input type="checkbox" name="rule" value="${esc(rule.id)}" ${config.rules.includes(rule.id) ? "checked" : ""}><span>${esc(rule.title)}</span></label>`).join("")}</div></fieldset>
         <fieldset><legend>自定义业务规则</legend><p class="workflow-note">仅匹配 Diff 新增行中的字面文本，不执行正则表达式或代码。</p><div id="studio-literal-checks">${config.checks.map((check) => `<div class="studio-literal-check">${["contains", "rule_id", "title", "explanation", "fix", "test"].map((key) => `<label>${({ contains: "匹配文本", rule_id: "规则标识", title: "问题标题", explanation: "原因", fix: "修复建议", test: "验证方法" })[key]}<input data-check-field="${key}" value="${esc(check[key])}" required></label>`).join("")}<label>严重性<select data-check-field="severity">${options([["low", "低"], ["medium", "中"], ["high", "高"], ["critical", "严重"]], check.severity)}</select></label><button type="button" class="link-button" data-remove-check>移除规则</button></div>`).join("")}</div>${button("add-check", "添加业务规则")}</fieldset>` : ""}
-      ${definition.kind === "llm" ? `<label>你希望 Agent 检查什么？<textarea name="prompt" rows="6" maxlength="16000" required>${esc(config.prompt)}</textarea></label><div class="studio-form-row"><label>模型<select name="model">${options(catalog.models.length ? catalog.models.map((model) => [model.model, `${model.provider} / ${model.model}`]) : [["", "尚未配置模型，暂不能发布或运行"]], config.model)}</select></label><label>最大输出 Token<input type="number" name="max_output_tokens" min="1" max="4096" value="${config.max_output_tokens}" required></label></div><fieldset><legend>只读工具权限</legend>${catalog.tools.map((tool) => `<label class="check"><input name="tool" type="checkbox" value="${tool}" ${config.tools.includes(tool) ? "checked" : ""}><span>${tool === "local-rules" ? "内置规则扫描" : "Diff 文件与行数摘要"}</span></label>`).join("")}<p class="workflow-note">选中的工具在调用模型前执行；不能访问未连入的 Diff，不开放 Shell 或任意网络地址。</p></fieldset>` : ""}
+      ${definition.kind === "llm" ? `<fieldset><legend>Agent Playbook</legend><p class="workflow-note">身份、目标和准则会随 Agent 版本固化；输入输出契约由下方端口生成，不能用文字绕过。</p><label>身份<input name="playbook_identity" value="${esc(playbook.identity)}" maxlength="200" required></label><label>审查目标<textarea name="playbook_objective" rows="3" maxlength="2000" required>${esc(playbook.objective)}</textarea></label><label>执行准则<textarea name="playbook_instructions" rows="7" maxlength="12000">${esc(playbook.instructions)}</textarea></label></fieldset><div class="studio-form-row"><label>模型<select name="model">${options(catalog.models.length ? catalog.models.map((model) => [model.model, `${model.provider} / ${model.model}`]) : [["", "尚未配置模型，暂不能发布或运行"]], config.model)}</select></label><label>最大输出 Token<input type="number" name="max_output_tokens" min="1" max="4096" value="${config.max_output_tokens}" required></label></div><fieldset><legend>只读工具权限</legend>${catalog.tools.map((tool) => `<label class="check"><input name="tool" type="checkbox" value="${tool}" ${config.tools.includes(tool) ? "checked" : ""}><span>${tool === "local-rules" ? "内置规则扫描" : "Diff 文件与行数摘要"}</span></label>`).join("")}<p class="workflow-note">选中的工具在调用模型前执行；不能访问未连入的 Diff，不开放 Shell 或任意网络地址。</p></fieldset>` : ""}
       ${definition.kind === "rules" ? '<p class="studio-contract">接收代码变更 → 执行所选规则 → 交付问题、位置与修复建议</p>' : definition.kind === "merge" ? `${portEditor("inputs")}<p class="studio-contract">接收各路检查结果 → 去重合并 → 交付统一的问题列表</p>` : `<details class="studio-advanced"><summary>自定义交接内容（默认接收代码变更、交付审查发现）</summary>${portEditor("inputs")}${portEditor("outputs")}</details>`}
       <p id="studio-model-note" class="workflow-note" role="status"></p><p id="studio-agent-error" class="studio-error" role="alert"></p><div class="studio-actions"><button class="button secondary" type="submit" value="save" formnovalidate>保存 Agent 草稿</button><button class="button secondary" type="submit" value="publish" aria-describedby="studio-model-note">仅发布到组件库</button><button class="button" type="submit" value="add" aria-describedby="studio-model-note">发布并加入画布</button></div></form>`;
     if (!dialog.open) dialog.showModal();
@@ -566,7 +593,7 @@ function studioReplaceAgent(definition, id, previous, next) {
           if (new Set(pairs.map(([name]) => name)).size !== pairs.length) throw new Error("端口名称不能重复。");
           value[direction] = Object.fromEntries(pairs);
         }
-        if (value.kind === "llm") value.config = { prompt: values.get("prompt"), model: values.get("model"), max_output_tokens: Number(values.get("max_output_tokens")), tools: values.getAll("tool") };
+        if (value.kind === "llm") value.config = { playbook: { identity: values.get("playbook_identity"), objective: values.get("playbook_objective"), instructions: values.get("playbook_instructions") }, model: values.get("model"), max_output_tokens: Number(values.get("max_output_tokens")), tools: values.getAll("tool") };
       }
       return value;
     };
@@ -630,6 +657,6 @@ function studioReplaceAgent(definition, id, previous, next) {
 
   window.addEventListener("resize", drawEdges);
   window.addEventListener("beforeunload", (event) => { if (dirty || editorDirty) { event.preventDefault(); event.returnValue = ""; } });
-  window.studio = { load, reset() { epoch++; $$(".studio-confirm [data-cancel]").forEach((button) => button.click()); busy = false; catalog = null; flow = null; editor = null; editorDirty = false; available = []; agents = []; documents = []; pages = {}; selected = null; selectedOutput = null; dirty = false; run = null; notice = ""; trial = { repository: "", diff: "", target: "draft", version: "" }; bindingRepository = ""; bindingVersion = ""; bindingSnapshot = null; root.innerHTML = ""; } };
+  window.studio = { load, reset() { epoch++; $$(".studio-confirm [data-cancel]").forEach((button) => button.click()); busy = false; catalog = null; flow = null; editor = null; editorDirty = false; available = []; agents = []; documents = []; pages = {}; selected = null; selectedOutput = null; dirty = false; run = null; notice = ""; trial = { repository: "", diff: "", title: "", spec: "", standards: "", target: "draft", version: "" }; bindingRepository = ""; bindingVersion = ""; bindingSnapshot = null; root.innerHTML = ""; } };
   if (location.hash === "#studio") load();
 })();

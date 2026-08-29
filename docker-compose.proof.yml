@@ -1,0 +1,49 @@
+# Explicit opt-in: the executor can control this Docker daemon. Use a dedicated
+# daemon/VM, never a shared production host. :ro does NOT make the Docker API read-only.
+services:
+  proof-executor:
+    build:
+      context: .
+      target: proof-executor
+    command:
+      - python
+      - -m
+      - evoagent.proof_service
+      - --socket
+      - /run/evoagent-proof/executor.sock
+      - --image
+      - ${EVOAGENT_PROOF_IMAGE:?preload a sandbox image and set EVOAGENT_PROOF_IMAGE}
+      - --timeout
+      - "120"
+    group_add:
+      - ${EVOAGENT_DOCKER_SOCKET_GID:?set the Docker socket group ID inside the daemon host}
+    network_mode: none
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - proof_socket:/run/evoagent-proof
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    init: true
+    # Recover after daemon crashes too; disposable job containers never restart.
+    restart: always
+    stop_grace_period: 150s
+
+  evoagent:
+    environment:
+      EVOAGENT_PROOF_EXECUTOR_SOCKET: /run/evoagent-proof/executor.sock
+    volumes:
+      - proof_socket:/run/evoagent-proof:ro
+    depends_on:
+      proof-executor:
+        condition: service_healthy
+
+volumes:
+  proof_socket:

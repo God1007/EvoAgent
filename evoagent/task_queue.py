@@ -306,6 +306,7 @@ class TaskQueue:
                 messages = self._redis.xreadgroup(
                     self.GROUP, self.consumer, {self.STREAM: ">"}, count=1, block=1000
                 )
+                self._last_worker_error = ""
                 for _stream, entries in messages:
                     for redis_id, fields in entries:
                         if self._stop.is_set():

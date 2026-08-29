@@ -495,6 +495,102 @@
       ],
       "title": "Reviewer budget timeouts",
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 80
+      },
+      "id": 19,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (series, le) (rate(label_replace({__name__=~\"evoagent_workflow_(review|studio|custom)_agent_.*_duration_bucket\"}, \"series\", \"$1\", \"__name__\", \"evoagent_workflow_(.*)_duration_bucket\")[10m:])))",
+          "legendFormat": "{{series}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Workflow Agent p95 duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 80
+      },
+      "id": 20,
+      "targets": [
+        {
+          "expr": "sum by (series) (rate(label_replace({__name__=~\"evoagent_workflow_(review|studio|custom)_agent_.*_failures_total\"}, \"series\", \"$1\", \"__name__\", \"evoagent_workflow_(.*)_failures_total\")[10m:]))",
+          "legendFormat": "{{series}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(evoagent_workflow_agent_failures_total[10m]))",
+          "legendFormat": "all Agent failures",
+          "refId": "B"
+        }
+      ],
+      "title": "Workflow Agent failures",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 89
+      },
+      "id": 21,
+      "targets": [
+        {
+          "expr": "sum(rate(evoagent_model_review_input_tokens_total[5m]) + rate(evoagent_model_review_output_tokens_total[5m]))",
+          "legendFormat": "default review tokens/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(evoagent_model_studio_input_tokens_total[5m]) + rate(evoagent_model_studio_output_tokens_total[5m]))",
+          "legendFormat": "Studio tokens/s",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(evoagent_model_evaluation_input_tokens_total[5m]) + rate(evoagent_model_evaluation_output_tokens_total[5m]))",
+          "legendFormat": "evaluation tokens/s",
+          "refId": "C"
+        }
+      ],
+      "title": "Model token usage by workflow purpose",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

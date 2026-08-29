@@ -122,15 +122,20 @@ class DependencyLockConsistencyTests(unittest.TestCase):
 
     def test_docker_base_images_are_pinned_by_digest(self):
         for dockerfile in ROOT.glob("Dockerfile*"):
-            for image in re.findall(
-                r"^FROM(?:\s+--platform=\S+)?\s+(\S+)",
+            stages = set()
+            for image, alias in re.findall(
+                r"^FROM(?:[ \t]+--platform=\S+)?[ \t]+(\S+)(?:[ \t]+AS[ \t]+(\S+))?",
                 dockerfile.read_text(encoding="utf-8"),
-                re.MULTILINE,
+                re.MULTILINE | re.IGNORECASE,
             ):
                 self.assertTrue(
-                    image == "scratch" or re.search(r"@sha256:[0-9a-f]{64}$", image),
+                    image == "scratch"
+                    or image.lower() in stages
+                    or re.search(r"@sha256:[0-9a-f]{64}$", image),
                     "%s uses mutable base image %s" % (dockerfile.name, image),
                 )
+                if alias:
+                    stages.add(alias.lower())
 
     def test_docker_python_version_matches_supported_runtime(self):
         versions = re.findall(
@@ -153,6 +158,27 @@ class DependencyLockConsistencyTests(unittest.TestCase):
                     r"@sha256:[0-9a-f]{64}$",
                     "%s uses mutable image %s" % (compose_file.name, image),
                 )
+
+    def test_perf_port_can_move_without_exposing_the_fixture(self):
+        compose = (ROOT / "docker-compose.perf.yml").read_text()
+        self.assertIn('"127.0.0.1:${EVOAGENT_PERF_PORT:-8080}:8080"', compose)
+
+    def test_proof_executor_declares_daemon_restart_policy(self):
+        compose = (ROOT / "docker-compose.proof.yml").read_text()
+        executor = compose.split("  proof-executor:\n", 1)[1].split("\n  evoagent:", 1)[0]
+        self.assertIn("\n    restart: always\n", executor)
+
+    def test_durable_compose_services_restart_after_daemon_or_vm_recovery(self):
+        compose = (ROOT / "docker-compose.yml").read_text()
+        for service, following in (
+            ("postgres", "redis"),
+            ("redis", "migrate"),
+            ("evoagent", None),
+        ):
+            block = compose.split("  %s:\n" % service, 1)[1]
+            if following:
+                block = block.split("\n  %s:\n" % following, 1)[0]
+            self.assertIn("\n    restart: always\n", block, service)
 
     def test_local_env_variants_never_enter_git_or_docker_context(self):
         for name in (".gitignore", ".dockerignore"):

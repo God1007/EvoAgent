@@ -160,14 +160,27 @@ class RepositoryPolicyResolver:
         repository: str,
         raw_policy: dict[str, Any],
         actor: str,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         if not tenant_id or len(tenant_id) > 200:
             raise ClientInputError("tenant_id is required and must be at most 200 characters")
         repository = canonical_repository(repository)
         if not actor or len(actor) > 200:
             raise ClientInputError("policy actor is required and must be at most 200 characters")
+        if expected_version is not None and (
+            type(expected_version) is not int or expected_version < 0
+        ):
+            raise ClientInputError(
+                "expected repository policy version must be a non-negative integer"
+            )
         policy = RepositoryPolicy.from_dict(raw_policy)
-        return self.store.save_repository_policy(tenant_id, repository, policy.to_dict(), actor)
+        return self.store.save_repository_policy(
+            tenant_id,
+            repository,
+            policy.to_dict(),
+            actor,
+            expected_version,
+        )
 
     @staticmethod
     def authorize_review(

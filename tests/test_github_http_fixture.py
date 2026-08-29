@@ -40,8 +40,18 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _bytes(self, status, body, content_type):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         self._record()
+        if self.path == "/repos/o/r/compare/%s...%s" % ("a" * 40, "b" * 40):
+            self._bytes(200, b"--- a/a.py\n+++ b/a.py\n", "application/vnd.github.diff")
+            return
         if self.path == "/repos/o/r/issues/1/comments?per_page=100&page=1":
             type(self).comment_reads += 1
             if type(self).comment_reads == 1:
@@ -112,6 +122,18 @@ class GitHubHttpFixtureTests(unittest.TestCase):
             self.assertEqual("2022-11-28", request["headers"]["X-Github-Api-Version"])
         payload = json.loads(_FixtureHandler.requests[-1]["body"])
         self.assertEqual("<!-- task:abc -->\nnew review", payload["body"])
+
+    def test_fixed_comparison_diff_over_http(self):
+        host, port = self.server.server_address
+        client = GitHubClient("fixture-token")
+        client._opener = _MappedHttpOpener("http://%s:%d" % (host, port))  # type: ignore[assignment]
+
+        diff = client.fetch_compare_diff("o/r", "a" * 40, "b" * 40, 1024)
+
+        self.assertEqual("--- a/a.py\n+++ b/a.py\n", diff)
+        request = _FixtureHandler.requests[0]
+        self.assertEqual("application/vnd.github.diff", request["headers"]["Accept"])
+        self.assertEqual("Bearer fixture-token", request["headers"]["Authorization"])
 
 
 if __name__ == "__main__":

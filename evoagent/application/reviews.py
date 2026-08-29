@@ -9,6 +9,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from ..codegraph import repository_snapshot_from_archive
+from ..diff_parser import parse_unified_diff
 from ..errors import (
     AccessDeniedError,
     ClientInputError,
@@ -19,7 +21,7 @@ from ..errors import (
     safe_exception_summary,
 )
 from ..metrics import metrics
-from ..models import ReviewReport, TaskState, TraceEvent
+from ..models import RepositoryEvidence, ReviewContext, ReviewReport, TaskState, TraceEvent
 from ..policy import RepositoryPolicy, RepositoryPolicyResolver
 from ..ports import (
     CodeHostPort,
@@ -37,6 +39,7 @@ from ..workflow import HandoffError
 
 _QUEUE_CONTEXT_FIELDS = (
     "diff_url",
+    "base_sha",
     "github_issue_url",
     "installation_id",
     "session_id",
@@ -58,6 +61,7 @@ class ReviewOptions:
     effect_lease_seconds: float
     auto_post_review: bool
     tenant_max_active_reviews: int = 0
+    repository_evidence_max_bytes: int = 32 * 1024 * 1024
 
 
 class ReviewUseCases:
@@ -86,6 +90,7 @@ class ReviewUseCases:
         model_routes: Callable[[str, str], tuple[dict[str, str], ...] | None] | None = None,
         reviewer_revision: Callable[[], str] | None = None,
         workflow_snapshot: Callable[[str, str, dict | None], dict | None] | None = None,
+        requires_repository_evidence: Callable[[dict], bool] | None = None,
     ):
         self.store = store
         self.policies = policies
@@ -105,6 +110,7 @@ class ReviewUseCases:
         self.workflow_snapshot = workflow_snapshot or (
             lambda _tenant, _repository, _selection: None
         )
+        self.requires_repository_evidence = requires_repository_evidence or (lambda _input: False)
 
     def validate(self, repository: str, diff: str) -> None:
         canonical_repository(repository)
@@ -183,9 +189,18 @@ class ReviewUseCases:
         idempotency_key: str = "",
         actor: str = "",
         workflow_selection: dict | None = None,
+        review_context: dict[str, Any] | None = None,
     ) -> tuple[str, bool]:
         repository = canonical_repository(repository)
         self.validate_pull_request(pull_request)
+        try:
+            context = (
+                ReviewContext.from_dict(review_context)
+                if review_context is not None
+                else ReviewContext()
+            ).to_dict()
+        except ValueError as exc:
+            raise ClientInputError(str(exc)) from None
         encoded = diff.encode("utf-8")
         diff_sha256 = hashlib.sha256(encoded).hexdigest()
         task_id = (
@@ -208,6 +223,7 @@ class ReviewUseCases:
             "diff_bytes": len(encoded),
             "diff_sha256": diff_sha256,
             "reviewer_revision": self.reviewer_revision(),
+            "review_context": context,
             **self._release_snapshot(assignment),
             "repository_policy": self.policies.snapshot(
                 policy or self.policies.resolve(tenant_id, repository)
@@ -230,6 +246,7 @@ class ReviewUseCases:
                             if workflow_selection is not None
                             else {}
                         ),
+                        "review_context": context,
                         "context": {
                             key: outbox_payload[key]
                             for key in _QUEUE_CONTEXT_FIELDS
@@ -319,6 +336,14 @@ class ReviewUseCases:
     ) -> tuple[str, dict[str, Any]]:
         """Prepare immutable task input for a caller-owned unit of work."""
         repository = canonical_repository(repository)
+        try:
+            context = (
+                ReviewContext.from_dict(payload["review_context"])
+                if "review_context" in payload
+                else ReviewContext()
+            ).to_dict()
+        except ValueError as exc:
+            raise ClientInputError(str(exc)) from None
         task_id = str(uuid.uuid4())
         assignment = self.releases.assignment(tenant_id, "llm-review", task_id)
         snapshot = self.workflow_snapshot(tenant_id, repository, None)
@@ -333,6 +358,7 @@ class ReviewUseCases:
                     policy or self.policies.resolve(tenant_id, repository)
                 ),
                 **payload,
+                "review_context": context,
                 **({"studio_workflow": snapshot} if snapshot is not None else {}),
             },
         )
@@ -364,8 +390,13 @@ class ReviewUseCases:
         tenant_id: str = "default",
         actor: str = "",
         workflow_selection: dict | None = None,
+        review_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         repository = canonical_repository(repository)
+        try:
+            context = ReviewContext.from_request(review_context).to_dict()
+        except ValueError as exc:
+            raise ClientInputError(str(exc)) from None
         policy = self.authorize_review(tenant_id, repository, diff)
         task_id, _created = self.create_task(
             repository,
@@ -376,6 +407,7 @@ class ReviewUseCases:
             policy=policy,
             actor=actor,
             workflow_selection=workflow_selection,
+            review_context=context,
         )
         try:
             with (
@@ -423,8 +455,13 @@ class ReviewUseCases:
         idempotency_key: str = "",
         actor: str = "",
         workflow_selection: dict | None = None,
+        review_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         repository = canonical_repository(repository)
+        try:
+            context = ReviewContext.from_request(review_context).to_dict()
+        except ValueError as exc:
+            raise ClientInputError(str(exc)) from None
         policy = self.authorize_review(tenant_id, repository, diff)
         task_id, created = self.create_task(
             repository,
@@ -443,6 +480,7 @@ class ReviewUseCases:
             idempotency_key,
             actor,
             workflow_selection,
+            context,
         )
         self.notify_outbox()
         if created:
@@ -544,7 +582,17 @@ class ReviewUseCases:
             return
         diff = self.store.get_task_payload(task_id)
         fetched_diff = False
-        if diff is None and trusted_payload.get("diff_url"):
+        if diff is None and trusted_payload.get("base_sha") and trusted_payload.get("head_sha"):
+            client = self.code_host_for_installation(trusted_payload.get("installation_id"))
+            client.ensure_repository_access(repository)
+            diff = client.fetch_compare_diff(
+                repository,
+                trusted_payload["base_sha"],
+                trusted_payload["head_sha"],
+                max_bytes=self.options.max_diff_bytes + 4096,
+            )
+            fetched_diff = True
+        elif diff is None and trusted_payload.get("diff_url"):
             client = self.code_host_for_installation(trusted_payload.get("installation_id"))
             client.ensure_repository_access(repository)
             diff = client.fetch_diff(
@@ -566,6 +614,13 @@ class ReviewUseCases:
                     "diff_sha256": hashlib.sha256(encoded).hexdigest(),
                 },
             )
+        self._prepare_repository_evidence(
+            task_id,
+            repository,
+            diff,
+            task_input,
+            trusted_payload.get("installation_id"),
+        )
         try:
             with (
                 self.observability.span(
@@ -610,6 +665,76 @@ class ReviewUseCases:
             report,
             policy,
         )
+
+    def _prepare_repository_evidence(
+        self,
+        task_id: str,
+        repository: str,
+        diff: str,
+        task_input: dict[str, Any],
+        installation_id: int | None,
+    ) -> None:
+        raw = task_input.get("repository_evidence")
+        if raw is not None:
+            try:
+                RepositoryEvidence.from_dict(raw)
+            except ValueError:
+                raise PermanentTaskError("task repository evidence snapshot is invalid") from None
+            return
+        if not self.requires_repository_evidence(task_input):
+            return
+        head_sha = task_input.get("head_sha")
+        evidence = RepositoryEvidence()
+        context: ReviewContext | None = None
+        if isinstance(head_sha, str) and head_sha:
+            try:
+                client = self.code_host_for_installation(installation_id)
+                client.ensure_repository_access(repository)
+                archive = client.download_archive(
+                    repository,
+                    head_sha,
+                    max_bytes=self.options.repository_evidence_max_bytes,
+                )
+                evidence, repository_standards, standards_truncated = (
+                    repository_snapshot_from_archive(
+                        archive,
+                        parse_unified_diff(diff).files,
+                        head_sha,
+                        self.options.repository_evidence_max_bytes,
+                    )
+                )
+            except (OSError, RuntimeError, ValueError):
+                metrics.inc("repository_evidence_failures_total")
+                try:
+                    evidence = RepositoryEvidence.from_dict(
+                        {
+                            **RepositoryEvidence().to_dict(),
+                            "origin": "github-archive",
+                            "revision": head_sha,
+                        }
+                    )
+                except ValueError:
+                    evidence = RepositoryEvidence()
+            else:
+                try:
+                    context = ReviewContext.from_dict(
+                        task_input.get("review_context", ReviewContext().to_dict())
+                    )
+                except ValueError:
+                    raise PermanentTaskError("task review context snapshot is invalid") from None
+                if not context.standards and (repository_standards or standards_truncated):
+                    context = ReviewContext.from_dict(
+                        {
+                            **context.to_dict(),
+                            "standards": repository_standards,
+                            "truncated": context.truncated or standards_truncated,
+                        }
+                    )
+        patch = {"repository_evidence": evidence.to_dict()}
+        if context is not None and context.to_dict() != task_input.get("review_context"):
+            patch["review_context"] = context.to_dict()
+        self.store.update_task_input(task_id, patch)
+        task_input.update(patch)
 
     @staticmethod
     def _persisted_report(task: dict[str, Any]) -> ReviewReport:
@@ -949,7 +1074,10 @@ class ReviewUseCases:
                 "delivery_already_active": result["status"] == "active",
                 "delivery_complete": result["status"] == "complete",
             }
-        if self.store.get_task_payload(task_id) is None and not task_input.get("diff_url"):
+        can_refetch = task_input.get("diff_url") or (
+            task_input.get("base_sha") and task_input.get("head_sha")
+        )
+        if self.store.get_task_payload(task_id) is None and not can_refetch:
             raise StateConflictError("task payload is no longer available")
         try:
             result = self.store.resume_review_task(

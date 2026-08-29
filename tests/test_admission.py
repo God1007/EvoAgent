@@ -957,6 +957,7 @@ class ReviewBoundaryTests(unittest.TestCase):
             tenant_id="tenant-a",
             idempotency_key="retry-1",
             actor="alice",
+            review_context=None,
         )
         self.assertEqual(202, accepted._send_json.call_args.args[0])
         accepted.service.store.audit.assert_not_called()
@@ -978,6 +979,7 @@ class ReviewBoundaryTests(unittest.TestCase):
             7,
             tenant_id="tenant-a",
             actor="alice",
+            review_context=None,
         )
         synchronous.service.store.audit.assert_not_called()
 
@@ -992,6 +994,39 @@ class ReviewBoundaryTests(unittest.TestCase):
                 self.assertEqual(400, rejected._send_json.call_args.args[0])
                 rejected.service.enqueue_review.assert_not_called()
                 rejected.service.create_review.assert_not_called()
+
+    def test_review_context_is_forwarded_without_becoming_request_metadata(self):
+        context = {
+            "title": "Bounded context",
+            "spec": "Keep both review axes separate.",
+            "standards": "Every finding needs evidence.",
+        }
+        body = json.dumps({"repository": "org/repo", "diff": "patch", "context": context}).encode()
+        handler = object.__new__(ApiHandler)
+        handler.path = "/v1/reviews"
+        handler.headers = http.client.HTTPMessage()
+        handler.headers.add_header("Content-Length", str(len(body)))
+        handler.settings = mock.Mock(max_diff_bytes=10_000)
+        handler.service = mock.Mock()
+        handler.service.create_review.return_value = {"task_id": "task-1", "state": "SUCCESS"}
+        handler._principal = mock.Mock(
+            return_value=Principal("user-1", "alice", "tenant-a", "admin")
+        )
+        handler.rfile = io.BytesIO(body)
+        handler._send_json = mock.Mock()
+        handler.close_connection = False
+
+        handler._do_POST()
+
+        handler.service.create_review.assert_called_once_with(
+            "org/repo",
+            "patch",
+            None,
+            tenant_id="tenant-a",
+            actor="alice",
+            review_context=context,
+        )
+        self.assertEqual(201, handler._send_json.call_args.args[0])
 
     def test_review_json_contract_rejects_invalid_fields(self):
         malformed = (
@@ -1076,6 +1111,36 @@ class JsonScalarBoundaryTests(unittest.TestCase):
                 handler._do_POST()
                 self.assertEqual(400, handler._send_json.call_args.args[0])
                 target.assert_not_called()
+
+    def test_repository_policy_expected_version_is_strict_and_forwarded(self):
+        for expected_version in (True, -1, "1"):
+            handler = self.handler(
+                "/v1/repository-policies",
+                {"repository": "org/repo", "policy": {}, "expected_version": expected_version},
+            )
+            with self.subTest(expected_version=expected_version):
+                handler._do_POST()
+                self.assertEqual(400, handler._send_json.call_args.args[0])
+                handler.service.set_repository_policy.assert_not_called()
+
+        handler = self.handler(
+            "/v1/repository-policies",
+            {"repository": "org/repo", "policy": {}, "expected_version": 7},
+        )
+        handler.service.set_repository_policy.return_value = {"version": 8}
+        handler._do_POST()
+        self.assertEqual(201, handler._send_json.call_args.args[0])
+        handler.service.set_repository_policy.assert_called_once_with(
+            "tenant-a", "org/repo", {}, "alice", 7
+        )
+
+        unknown = self.handler(
+            "/v1/repository-policies",
+            {"repository": "org/repo", "policy": {}, "metadata": "private"},
+        )
+        unknown._do_POST()
+        self.assertEqual(400, unknown._send_json.call_args.args[0])
+        unknown.service.set_repository_policy.assert_not_called()
 
     def test_evolution_approval_cannot_reload_or_use_the_removed_activate_endpoint(self):
         handler = self.handler(
@@ -1543,6 +1608,7 @@ class AdmissionControlTests(unittest.TestCase):
         body = json.dumps(
             {
                 "repository": "org/repo",
+                "expected_version": 0,
                 "policy": {
                     "auto_fix": True,
                     "allowed_fix_rules": ["SEC-YAML-LOAD"],
@@ -1568,6 +1634,38 @@ class AdmissionControlTests(unittest.TestCase):
         self.assertEqual("configured", fetched["source"])
         self.assertEqual(4096, fetched["policy"]["max_diff_bytes"])
         self.assertEqual([1], [item["version"] for item in fetched["history"]])
+
+        stale = json.dumps(
+            {
+                "repository": "org/repo",
+                "expected_version": 0,
+                "policy": {"enabled": False},
+            }
+        )
+        conn.request(
+            "POST",
+            "/v1/repository-policies",
+            body=stale,
+            headers={"Content-Type": "application/json", "X-EvoAgent-View": "console"},
+        )
+        conflict_response = conn.getresponse()
+        conflict = json.loads(conflict_response.read())
+        self.assertEqual(409, conflict_response.status)
+        self.assertEqual({"error_code": "policy_conflict"}, conflict)
+
+        conn.request(
+            "GET",
+            "/v1/repository-policies?repository=org%2Frepo",
+            headers={"X-EvoAgent-View": "console"},
+        )
+        projected_response = conn.getresponse()
+        projected = json.loads(projected_response.read())
+        self.assertEqual(200, projected_response.status)
+        self.assertEqual(1, projected["version"])
+        self.assertNotIn("tenant_id", projected)
+        self.assertNotIn("policy", projected["history"][0])
+        self.assertIn("available_reviewers", projected)
+        self.assertIn("available_fix_rules", projected)
 
     def test_rejected_requests_are_counted_in_metrics(self):
         host, port = self._serve(self._settings(rate_limit_rps=1, rate_limit_burst=1))
@@ -1634,6 +1732,7 @@ class AdmissionControlTests(unittest.TestCase):
                 "repository": "org/repo",
                 "diff": "--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+new\n",
                 "pull_request": 7,
+                "context": {"title": "First", "spec": "Return new", "standards": ""},
             }
         )
 
@@ -1651,6 +1750,17 @@ class AdmissionControlTests(unittest.TestCase):
         conflict_body = json.loads(conflict.read())
         self.assertEqual(400, conflict.status)
         self.assertIn("different review", conflict_body["error"])
+        changed_context = json.loads(payload)
+        changed_context["context"]["spec"] = "Return something else"
+        conn.request(
+            "POST",
+            "/v1/reviews?async=true",
+            body=json.dumps(changed_context),
+            headers=headers,
+        )
+        context_conflict = conn.getresponse()
+        self.assertEqual(400, context_conflict.status)
+        self.assertIn("different review", json.loads(context_conflict.read())["error"])
         self.assertEqual(1, len(self.service.store.list_tasks(10, "default")))
 
     def test_async_review_retry_recovers_a_committed_task_after_response_loss(self):

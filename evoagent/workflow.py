@@ -12,18 +12,22 @@ import math
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from graphlib import CycleError, TopologicalSorter
 from types import MappingProxyType
 from typing import Any, ClassVar
 
 from .errors import safe_exception_summary
+from .metrics import metrics
 from .ports import ReviewExecutionStorePort
+from .time_utils import utc_now
 
 _TOKEN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 MAX_WORKFLOW_STEPS = 64
 MAX_HANDOFF_BYTES = 8 * 1024 * 1024
+MAX_WORKFLOW_CONCURRENCY = 4
 
 
 class HandoffError(ValueError):
@@ -162,6 +166,7 @@ class AgentSpec:
     inputs: Mapping[str, PayloadType]
     outputs: Mapping[str, PayloadType]
     run: Callable[[Handoff], dict[str, Any]]
+    kind: str = "custom"
 
     def __post_init__(self) -> None:
         _token(self.agent_id)
@@ -169,6 +174,7 @@ class AgentSpec:
             raise ValueError("agent revision must be an immutable SHA-256 digest")
         if not self.outputs or not callable(self.run):
             raise ValueError("agent requires outputs and a callable handler")
+        _token(self.kind)
         object.__setattr__(self, "inputs", _ports(self.inputs))
         object.__setattr__(self, "outputs", _ports(self.outputs))
 
@@ -190,11 +196,7 @@ class Step:
 
 @dataclass(frozen=True, init=False, repr=False, eq=False)
 class Workflow:
-    """A bounded DAG; independent branches run serially, joins require every input.
-
-    ponytail: serial scheduling avoids another thread pool; add parallel scheduling
-    only if measured agent latency warrants it. Specialist agents already fan out.
-    """
+    """A bounded DAG; ready branches run concurrently, joins require every input."""
 
     name: str
     inputs: Mapping[str, PayloadType]
@@ -203,6 +205,7 @@ class Workflow:
     output_types: Mapping[str, PayloadType] = field(init=False)
     revision: str = field(init=False)
     _order: tuple[Step, ...] = field(init=False)
+    _waves: tuple[tuple[Step, ...], ...] = field(init=False)
 
     def __init__(
         self,
@@ -245,19 +248,18 @@ class Workflow:
         object.__setattr__(
             self, "output_types", _ports({key: source(ref)[1] for key, ref in self.outputs.items()})
         )
+        sorter = TopologicalSorter({key: sorted(parents) for key, parents in dependencies.items()})
         try:
-            object.__setattr__(
-                self,
-                "_order",
-                tuple(
-                    by_id[key]
-                    for key in TopologicalSorter(
-                        {key: sorted(parents) for key, parents in dependencies.items()}
-                    ).static_order()
-                ),
-            )
+            sorter.prepare()
         except CycleError:
             raise ValueError("workflow must be acyclic") from None
+        waves = []
+        while sorter.is_active():
+            ready = sorter.get_ready()
+            waves.append(tuple(by_id[key] for key in ready))
+            sorter.done(*ready)
+        object.__setattr__(self, "_waves", tuple(waves))
+        object.__setattr__(self, "_order", tuple(step for wave in waves for step in wave))
         object.__setattr__(self, "revision", _digest(self.describe()))
 
     @classmethod
@@ -389,19 +391,15 @@ class Workflow:
             return {key: values[ref.split(".")[0]][ref.split(".")[1]] for key, ref in refs.items()}
 
         last_use = {}
-        for index, step in enumerate(self._order):
-            for ref in step.sources.values():
-                last_use[ref.split(".")[0]] = index
+        for index, wave in enumerate(self._waves):
+            for step in wave:
+                for ref in step.sources.values():
+                    last_use[ref.split(".")[0]] = index
         for ref in self.outputs.values():
-            last_use[ref.split(".")[0]] = len(self._order)
+            last_use[ref.split(".")[0]] = len(self._waves)
 
-        for index, step in enumerate(self._order):
+        def execute(step: Step, incoming: dict[str, Any]) -> dict[str, Any]:
             active()
-            # Keep later consumers and final outputs; checkpoints retain the full history.
-            values = {
-                node: value for node, value in values.items() if last_use.get(node, -1) >= index
-            }
-            incoming = resolve(step.sources)
             identity = {
                 **manifest,
                 "task_id": task_id,
@@ -411,6 +409,25 @@ class Workflow:
                 "sources": dict(step.sources),
             }
             node = "workflow:%s" % step.step_id
+            workflow_kind = self.name if self.name in {"review", "studio"} else "custom"
+            agent_kind = (
+                step.agent.kind
+                if step.agent.kind
+                in {
+                    "planner",
+                    "specialists",
+                    "critic",
+                    "test",
+                    "synthesizer",
+                    "fix",
+                    "verifier",
+                    "rules",
+                    "llm",
+                    "merge",
+                }
+                else "custom"
+            )
+            metric = "workflow_%s_agent_%s" % (workflow_kind, agent_kind)
             existing = checkpoint(node)
             attempt = int(existing.get("attempt", 0)) + 1
             envelope: dict[str, Any] = {"handoff": identity, "generation": generation}
@@ -423,28 +440,24 @@ class Workflow:
                 save(node, envelope, attempt, safe_exception_summary(exc))
                 raise
 
-            def accept(
-                record: dict,
-                current_step: Step = step,
-                expected: dict = identity,
-                expected_key: str = key,
-            ) -> dict[str, Any]:
+            def accept(record: dict) -> dict[str, Any]:
                 state = record.get("state", {})
                 if (
                     record.get("status") != "completed"
                     or not isinstance(state, dict)
-                    or state.get("handoff") != expected
-                    or state.get("idempotency_key") != expected_key
+                    or state.get("handoff") != identity
+                    or state.get("idempotency_key") != key
                 ):
                     raise HandoffError("checkpoint does not match the incoming handoff")
-                output = _validate(current_step.agent.outputs, state.get("outputs"))
+                output = _validate(step.agent.outputs, state.get("outputs"))
                 if _digest(output) != state.get("output_sha256"):
                     raise HandoffError("checkpoint output digest mismatch")
                 return output
 
             if existing.get("status") == "completed":
-                values[step.step_id] = accept(existing)
-                continue
+                metrics.inc("workflow_agent_checkpoint_reuses_total")
+                metrics.inc(metric + "_checkpoint_reuses_total")
+                return accept(existing)
             handoff = Handoff(
                 task_id,
                 self.revision,
@@ -459,14 +472,31 @@ class Workflow:
                 step.sources,
                 active,
             )
+            envelope["started_at"] = utc_now()
             try:
                 if store is not None:
                     save(node, envelope, attempt, status="running")
                     dispatched = checkpoint(node)
                     if dispatched.get("status") == "completed":
-                        values[step.step_id] = accept(dispatched)
-                        continue
-                output = _validate(step.agent.outputs, step.agent.run(handoff))
+                        metrics.inc("workflow_agent_checkpoint_reuses_total")
+                        metrics.inc(metric + "_checkpoint_reuses_total")
+                        return accept(dispatched)
+                metrics.inc("workflow_agent_runs_total")
+                metrics.inc(metric + "_runs_total")
+                started = time.monotonic()
+                try:
+                    output = _validate(step.agent.outputs, step.agent.run(handoff))
+                except Exception:
+                    metrics.inc("workflow_agent_failures_total")
+                    metrics.inc(metric + "_failures_total")
+                    raise
+                else:
+                    metrics.inc("workflow_agent_successes_total")
+                    metrics.inc(metric + "_successes_total")
+                finally:
+                    duration = max(0.0, time.monotonic() - started)
+                    envelope["duration_ms"] = int(duration * 1000)
+                    metrics.observe(metric + "_duration", duration)
                 save(
                     node,
                     {
@@ -483,10 +513,40 @@ class Workflow:
                     save(node, envelope, attempt, safe_exception_summary(exc))
                     winner = checkpoint(node)
                     if winner.get("status") == "completed":
-                        values[step.step_id] = accept(winner)
-                        continue
+                        return accept(winner)
                 raise
             # First-write-wins: downstream consumes the committed winner, never a late local result.
-            values[step.step_id] = accept(checkpoint(node)) if store is not None else output
+            return accept(checkpoint(node)) if store is not None else output
+
+        pool = None
+        try:
+            for index, wave in enumerate(self._waves):
+                active()
+                # Keep later consumers and final outputs; checkpoints retain the full history.
+                values = {
+                    node: value for node, value in values.items() if last_use.get(node, -1) >= index
+                }
+                ready = [(step, resolve(step.sources)) for step in wave]
+                if len(ready) == 1:
+                    results = [execute(*ready[0])]
+                else:
+                    if pool is None:
+                        pool = ThreadPoolExecutor(
+                            max_workers=min(MAX_WORKFLOW_CONCURRENCY, max(map(len, self._waves)))
+                        )
+                    futures = [pool.submit(execute, *item) for item in ready]
+                    done, pending = wait(futures, timeout=max(0.0, deadline - time.monotonic()))
+                    if pending:
+                        for future in pending:
+                            future.cancel()
+                        raise BudgetExceeded("workflow execution budget exceeded")
+                    results = [future.result() for future in futures]
+                values.update(
+                    (step.step_id, output)
+                    for (step, _incoming), output in zip(ready, results, strict=True)
+                )
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=False, cancel_futures=True)
         active()
         return _validate(self.output_types, resolve(self.outputs))

@@ -59,12 +59,16 @@ jobs:
           node --check web/app.js
           node --check web/studio.js
           node --test tests/web.test.cjs
-      - name: Validate Prometheus recording and alert rules
+      - name: Validate and test Prometheus recording and alert rules
         run: |
           docker run --rm --entrypoint=/bin/promtool \
             -v "$PWD/ops/prometheus:/rules:ro" \
             prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996 \
             check rules /rules/evoagent.rules.yml
+          docker run --rm --entrypoint=/bin/promtool \
+            -v "$PWD/ops/prometheus:/rules:ro" \
+            prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996 \
+            test rules /rules/evoagent.test.yml
       - name: Test with coverage gate
         run: python -m pytest --cov=evoagent --cov-report=term-missing --cov-report=xml
       - name: Reproduce controlled evaluation evidence

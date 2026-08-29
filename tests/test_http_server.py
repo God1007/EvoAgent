@@ -77,6 +77,24 @@ class ReadinessTests(unittest.TestCase):
         status, _ = self._get("/health")
         self.assertEqual(200, status)  # liveness stays up during drain
 
+    def test_proof_capability_tracks_live_health_without_blocking_core_readiness(self):
+        principal = Principal("user", "user", "default", "platform_admin")
+        original = self.service.settings
+        self.service.settings = replace(original, proof_executor_socket="/run/proof.sock")
+        self.addCleanup(setattr, self.service, "settings", original)
+        for healthy in (False, True):
+            with (
+                self.subTest(healthy=healthy),
+                mock.patch.object(self.service.proof_executor, "healthy", return_value=healthy),
+            ):
+                self.assertEqual(healthy, self.service.console_capabilities(principal)["proof"])
+                ready, result = self.service._compute_readiness()
+                self.assertTrue(ready)
+                self.assertEqual(
+                    {"configured": True, "healthy": healthy, "mode": "socket"},
+                    result["checks"]["proof"],
+                )
+
     def test_console_capabilities_and_fix_blockers_are_safe_read_only_hints(self):
         headers = {"X-EvoAgent-View": "console"}
         status, raw = self._get("/api/dashboard", headers)
@@ -86,21 +104,24 @@ class ReadinessTests(unittest.TestCase):
                 role="platform_admin",
                 review=True,
                 manage=True,
+                audit=True,
                 platform=True,
+                proof=False,
                 github_install_configured=False,
             ),
             json.loads(raw)["capabilities"],
         )
-        for role, review, manage, platform in (
-            ("auditor", False, False, False),
-            ("maintainer", True, False, False),
-            ("admin", True, True, False),
-            ("platform_admin", True, True, True),
+        for role, review, manage, audit, platform in (
+            ("auditor", False, False, True, False),
+            ("maintainer", True, False, False, False),
+            ("admin", True, True, True, False),
+            ("platform_admin", True, True, True, True),
         ):
             principal = Principal("user", "user", "default", role)
             caps = self.service.console_capabilities(principal)
             self.assertEqual(
-                (review, manage, platform), tuple(caps[k] for k in ("review", "manage", "platform"))
+                (review, manage, audit, platform),
+                tuple(caps[k] for k in ("review", "manage", "audit", "platform")),
             )
         original_settings = self.service.settings
         required = dict(
@@ -168,6 +189,30 @@ class ReadinessTests(unittest.TestCase):
             self.service.console_fix_blocker(task, Principal("u", "u", "default", "auditor")),
         )
         self.assertEqual([], self.service.store.list_tasks())
+
+    def test_operational_console_reads_are_available_without_internal_payloads(self):
+        self.service.store.audit(
+            "default",
+            "alice",
+            "task.resume",
+            "task-1",
+            {"credential": "internal-secret"},
+        )
+        headers = {"X-EvoAgent-View": "console"}
+
+        responses = {}
+        for path in (
+            "/api/audit?limit=50",
+            "/api/outbox?status=dead&limit=50",
+            "/api/queue/dead-letters?limit=50",
+            "/api/tenant-review-capacity",
+        ):
+            status, raw = self._get(path, headers)
+            self.assertEqual(200, status, path)
+            responses[path] = json.loads(raw)
+
+        self.assertEqual("task.resume", responses["/api/audit?limit=50"]["events"][0]["action"])
+        self.assertNotIn("internal", json.dumps(responses))
 
     def test_unavailable_console_logging_does_not_break_http_responses(self):
         for failure in (

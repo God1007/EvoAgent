@@ -6,7 +6,7 @@ import unittest
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from evoagent.errors import ClientInputError, TenantReviewCapacityError
+from evoagent.errors import ClientInputError, StateConflictError, TenantReviewCapacityError
 from evoagent.github import GitHubClient
 from evoagent.migrations import CURRENT_SCHEMA_VERSION
 from evoagent.models import ReviewReport, TaskState, TraceEvent
@@ -1480,15 +1480,30 @@ class _StoreBehaviorContract:
             "max_diff_bytes": None,
         }
         first = self.store.save_repository_policy(
-            tenant_id, repository, first_policy, "contract-admin"
+            tenant_id, repository, first_policy, "contract-admin", 0
         )
         self.assertEqual(1, first["version"])
         self.assertTrue(self.store.repository_allowed(tenant_id, repository))
         self.assertFalse(self.store.repository_allowed(tenant_id, repository, True))
 
         second_policy = {**first_policy, "enabled": False, "auto_fix": True}
+        audit_count = len(self.store.list_audit(tenant_id, 20))
+        with self.assertRaisesRegex(StateConflictError, "reload before saving"):
+            self.store.save_repository_policy(
+                tenant_id, repository.upper(), second_policy, "stale-admin", 0
+            )
+        self.assertEqual(1, self.store.get_repository_policy(tenant_id, repository)["version"])
+        self.assertEqual(
+            [1],
+            [
+                item["version"]
+                for item in self.store.list_repository_policy_versions(tenant_id, repository)
+            ],
+        )
+        self.assertEqual(audit_count, len(self.store.list_audit(tenant_id, 20)))
+
         second = self.store.save_repository_policy(
-            tenant_id, repository.upper(), second_policy, "contract-admin"
+            tenant_id, repository.upper(), second_policy, "contract-admin", 1
         )
         self.assertEqual(2, second["version"])
         self.assertFalse(self.store.repository_allowed(tenant_id, repository))

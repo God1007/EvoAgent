@@ -37,10 +37,17 @@ DEFAULT_GITHUB_HOSTS = frozenset({"api.github.com", "github.com", "codeload.gith
 _GITHUB_SERVER_ERRORS = frozenset({500, 502, 503, 504})
 GITHUB_INSTALLATION_ID_MAX = 2**63 - 1
 _GITHUB_TOKEN = re.compile(r"[\x21-\x7e]{1,4096}")
+_GITHUB_COMMIT_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
 
 def _valid_github_token(value: str, *, allow_empty: bool = False) -> bool:
     return (allow_empty and not value) or _GITHUB_TOKEN.fullmatch(value) is not None
+
+
+def validate_commit_sha(value: object) -> str:
+    if not isinstance(value, str) or _GITHUB_COMMIT_SHA.fullmatch(value) is None:
+        raise ValueError("GitHub commit SHA must be 40 or 64 lowercase hexadecimal characters")
+    return value
 
 
 def _github_repository_url(repository: str, suffix: str = "") -> str:
@@ -232,6 +239,22 @@ class GitHubClient:
     def fetch_diff(self, url: str, max_bytes: int | None = None) -> str:
         body = self._request(
             "GET", url, accept="application/vnd.github.v3.diff", raw=True, max_bytes=max_bytes
+        )
+        return body.decode("utf-8", errors="replace")
+
+    def fetch_compare_diff(
+        self, repository: str, base_sha: str, head_sha: str, max_bytes: int | None = None
+    ) -> str:
+        path = "/compare/%s...%s" % (
+            validate_commit_sha(base_sha),
+            validate_commit_sha(head_sha),
+        )
+        body = self._request(
+            "GET",
+            _github_repository_url(repository, path),
+            accept="application/vnd.github.diff",
+            raw=True,
+            max_bytes=max_bytes,
         )
         return body.decode("utf-8", errors="replace")
 
@@ -528,13 +551,16 @@ class GitHubClient:
             before_write,
         )
 
-    def download_archive(self, repository: str, ref: str) -> bytes:
+    def download_archive(self, repository: str, ref: str, max_bytes: int | None = None) -> bytes:
+        limit = self.max_archive_bytes if max_bytes is None else max_bytes
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("archive byte limit must be a positive integer")
         return self._request(
             "GET",
             _github_repository_url(repository, "/zipball/%s" % urllib.parse.quote(ref, safe="")),
             accept="application/vnd.github+json",
             raw=True,
-            max_bytes=self.max_archive_bytes,
+            max_bytes=min(self.max_archive_bytes, limit),
         )
 
 

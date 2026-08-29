@@ -21,6 +21,7 @@ from evoagent.github import (
     GitHubInstallationOAuthClient,
     _RestrictedRedirectHandler,
     _validate_github_url,
+    validate_commit_sha,
     validate_pull_request_urls,
     verify_signature,
 )
@@ -303,6 +304,24 @@ class GitHubApiMethodTests(unittest.TestCase):
         self.assertEqual({"number": 5}, client.get_pull_request("Owner/Repo", 5))
         self.assertTrue(opener.requests[0].full_url.endswith("/repos/owner/repo/pulls/5"))
 
+    def test_compare_diff_is_bound_to_two_commit_shas(self):
+        base_sha, head_sha = "a" * 40, "b" * 40
+        client, opener = self._client([b"fixed-diff"])
+
+        self.assertEqual(
+            "fixed-diff", client.fetch_compare_diff("Owner/Repo", base_sha, head_sha, 1024)
+        )
+        request = opener.requests[0]
+        self.assertTrue(
+            request.full_url.endswith("/repos/owner/repo/compare/%s...%s" % (base_sha, head_sha))
+        )
+        self.assertEqual("application/vnd.github.diff", request.get_header("Accept"))
+        self.assertEqual("c" * 64, validate_commit_sha("c" * 64))
+
+        for value in ("main", "A" * 40, "a" * 39, "a" * 65, "../" + "a" * 40):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_commit_sha(value)
+
     def test_json_responses_reject_ambiguous_or_nonstandard_values(self):
         bodies = (
             b'{"name":"first","name":"second"}',
@@ -546,8 +565,11 @@ class GitHubApiMethodTests(unittest.TestCase):
 
         client._opener.open = _fake_open  # type: ignore[assignment]
         with self.assertRaises(RuntimeError):
-            client.download_archive("o/r", "main")
+            client.download_archive("o/r", "main", max_bytes=4)
         self.assertIn("/repos/o/r/zipball/main", self._last.full_url)
+        for limit in (0, True, 1.5):
+            with self.subTest(limit=limit), self.assertRaisesRegex(ValueError, "byte limit"):
+                client.download_archive("o/r", "main", max_bytes=limit)  # type: ignore[arg-type]
 
     def test_upsert_comment_creates_when_no_marker(self):
         client, opener = self._client([[{"body": "unrelated"}], {"id": 2}])

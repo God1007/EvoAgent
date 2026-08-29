@@ -95,9 +95,8 @@ def _risk_scenarios() -> list[dict]:
         "critical",
         "result = eval(value)",
         r"\beval\s*\(",
-        r"json\.loads",
+        r"ast\.literal_eval",
         4,
-        False,
     )
     add(
         "SEC-SUBPROCESS-SHELL",
@@ -157,9 +156,8 @@ def _risk_scenarios() -> list[dict]:
         "medium",
         "except Exception:",
         r"except Exception:",
-        r"except ValueError:",
+        r"except \(TypeError, ValueError\):",
         5,
-        False,
     )
     add(
         "REL-DEBUG-PRINT",
@@ -212,7 +210,6 @@ def _risk_scenarios() -> list[dict]:
         r"assert user\.is_admin",
         r"PermissionError",
         1,
-        False,
     )
     add(
         "SEC-INSECURE-COOKIE",
@@ -417,7 +414,7 @@ def generate_controlled_pr_cases() -> list[dict]:
                     "split": split,
                     "source": {
                         "kind": "synthetic-controlled",
-                        "generator": "evoagent-e2e-v1",
+                        "generator": "evoagent-e2e-v2",
                         "public_url": None,
                     },
                     "diff": item["diff"],

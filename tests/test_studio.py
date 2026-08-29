@@ -12,9 +12,11 @@ from dataclasses import replace
 from unittest import mock
 from urllib.parse import quote
 
+from evoagent.agents import MultiAgentCoordinator
 from evoagent.api import _make_server
 from evoagent.auth import AuthManager
 from evoagent.console_view import console_response
+from evoagent.diff_parser import parse_unified_diff
 from evoagent.errors import (
     AccessDeniedError,
     ClientInputError,
@@ -27,14 +29,18 @@ from evoagent.model_gateway import (
     ModelResponse,
     ModelRoute,
 )
-from evoagent.models import Finding, Severity
+from evoagent.models import Finding, RepositoryEvidence, ReviewContext, Severity
+from evoagent.reviewer import LocalRuleReviewer
 from evoagent.service import ReviewService
 from evoagent.studio import (
+    CONTEXT,
     DIFF,
     FINDINGS,
+    WorkflowStudio,
     _rules,
     build_agent,
     compile_workflow,
+    definition_digest,
     draft_definition,
     validate_agent,
 )
@@ -72,7 +78,11 @@ def model_agent():
         "inputs": {"diff": DIFF},
         "outputs": {"summary": "text@1"},
         "config": {
-            "prompt": "Describe the change.",
+            "playbook": {
+                "identity": "Change analyst",
+                "objective": "Describe the change.",
+                "instructions": "Be concise and evidence-based.",
+            },
             "model": "fixture-model",
             "tools": ["diff-summary"],
             "max_output_tokens": 100,
@@ -81,6 +91,73 @@ def model_agent():
 
 
 class AgentDefinitionTests(unittest.TestCase):
+    def test_dual_axis_template_is_visible_but_disabled_without_a_model_route(self):
+        coordinator = MultiAgentCoordinator([LocalRuleReviewer()])
+        studio = WorkflowStudio(
+            mock.Mock(), coordinator.workflow_agents, ModelGateway(None, None), lambda _: None
+        )
+
+        template = studio.catalog()["templates"][0]
+        recipes = studio.catalog()["agent_recipes"]
+
+        self.assertFalse(template["available"])
+        self.assertEqual("配置模型路由后可用", template["reason"])
+        self.assertNotIn("standards-review", {item["id"] for item in studio.catalog()["builtins"]})
+        self.assertEqual(
+            {"standards-and-design", "spec-alignment", "feedback-loop"},
+            {item["id"] for item in recipes},
+        )
+        for recipe in recipes:
+            self.assertEqual("", recipe["definition"]["config"]["model"])
+            self.assertEqual(recipe["definition"], validate_agent(recipe["definition"], draft=True))
+
+    def test_dual_axis_template_runs_on_the_native_typed_workflow(self):
+        provider = mock.Mock()
+        provider.complete.return_value = ModelResponse(
+            '{"findings":[]}', "fixture", "fixture-model", 10, 3, "request"
+        )
+        gateway = ModelGateway(
+            ModelRoute("fixture", "fixture-model", "http://127.0.0.1:9999/v1", "key"),
+            provider,
+        )
+
+        def governance(_task):
+            return ModelGovernanceContext("tenant", "demo/repo", ("fixture",), ("fixture-model",))
+
+        coordinator = MultiAgentCoordinator([LocalRuleReviewer()])
+        studio = WorkflowStudio(mock.Mock(), coordinator.workflow_agents, gateway, governance)
+
+        catalog = studio.catalog()
+        self.assertEqual("review-context@1", catalog["inputs"]["context"])
+        self.assertEqual("repository-evidence@1", catalog["inputs"]["evidence"])
+        for recipe in catalog["agent_recipes"]:
+            self.assertEqual("fixture-model", recipe["definition"]["config"]["model"])
+            self.assertEqual(recipe["definition"], validate_agent(recipe["definition"]))
+        template = catalog["templates"][0]
+        self.assertTrue(template["available"])
+        bundle = studio.resolve("tenant", template["definition"])
+        workflow = compile_workflow(bundle, studio._installed_agents(), gateway, governance)
+        context = ReviewContext.from_request(
+            {"title": "Avoid eval", "spec": "Do not execute input", "standards": "No eval"}
+        ).to_dict()
+
+        result = workflow.run(
+            {
+                "diff": DIFF_TEXT,
+                "parsed": parse_unified_diff(DIFF_TEXT).to_dict(),
+                "context": context,
+                "evidence": RepositoryEvidence().to_dict(),
+            }
+        )
+
+        self.assertEqual([], result["verified"])
+        self.assertEqual(2, provider.complete.call_count)
+        for call in provider.complete.call_args_list:
+            sent = json.loads(call.args[1][1].content)["inputs"]
+            self.assertEqual(context, sent["context"])
+            self.assertEqual(RepositoryEvidence().to_dict(), sent["evidence"])
+        self.assertIn(CONTEXT, catalog["types"])
+
     def test_merge_is_conservative_and_independent_of_port_or_finding_order(self):
         agent = build_agent("merge", merge(), ModelGateway(None, None), lambda _: None)
         workflow = Workflow(
@@ -150,7 +227,10 @@ class AgentDefinitionTests(unittest.TestCase):
             "agents", {"name": "Draft", "kind": "llm", "inputs": {}, "outputs": {}}
         )
         self.assertEqual("", model["config"]["model"])
-        self.assertEqual("", model["config"]["prompt"])
+        self.assertEqual(
+            {"identity": "", "objective": "", "instructions": ""},
+            model["config"]["playbook"],
+        )
         self.assertEqual({}, model["inputs"])
         with self.assertRaises(ClientInputError):
             validate_agent(model)
@@ -205,7 +285,10 @@ class AgentDefinitionTests(unittest.TestCase):
         )
         self.assertEqual({"summary": "changed"}, workflow.run({"diff": DIFF_TEXT}))
         sent = provider.complete.call_args.args[1]
+        self.assertIn("Identity:\nChange analyst", sent[0].content)
         self.assertIn("Describe the change.", sent[0].content)
+        self.assertIn("Operating instructions:\nBe concise", sent[0].content)
+        self.assertIn("Return a JSON object with exactly these output ports", sent[0].content)
         self.assertEqual({"diff-summary"}, json.loads(sent[1].content)["tool_results"].keys())
         provider.complete.return_value = ModelResponse(
             '{"summary":false}', "fixture", "fixture-model", 10, 3, "request"
@@ -276,6 +359,35 @@ class AgentDefinitionTests(unittest.TestCase):
         for value in invalid:
             with self.subTest(value=value), self.assertRaises(ClientInputError):
                 validate_agent(value)
+
+    def test_playbook_is_strict_and_legacy_prompt_versions_remain_immutable(self):
+        structured = model_agent()
+        self.assertEqual(structured, validate_agent(structured))
+        legacy = model_agent()
+        legacy["config"] = {
+            "prompt": "Legacy pinned prompt.",
+            "model": "fixture-model",
+            "tools": [],
+            "max_output_tokens": 100,
+        }
+        self.assertEqual(legacy, validate_agent(legacy))
+        self.assertEqual(legacy, draft_definition("agents", legacy))
+        original_digest = definition_digest(legacy)
+        self.assertEqual(original_digest, definition_digest(validate_agent(legacy)))
+        for playbook in (
+            {"identity": "reviewer", "objective": "review"},
+            {"identity": "", "objective": "review", "instructions": ""},
+            {"identity": "reviewer", "objective": {}, "instructions": ""},
+            {
+                "identity": "reviewer",
+                "objective": "review",
+                "instructions": "x" * 12001,
+            },
+        ):
+            invalid = model_agent()
+            invalid["config"]["playbook"] = playbook
+            with self.subTest(playbook=playbook), self.assertRaises(ClientInputError):
+                validate_agent(invalid)
 
 
 class StudioIntegrationTests(unittest.TestCase):
@@ -508,6 +620,7 @@ class StudioIntegrationTests(unittest.TestCase):
         self.addCleanup(self.service.close)
         self.studio, self.store = self.service.studio, self.service.store
         definition = model_agent()
+        definition["inputs"] = {"diff": DIFF, "context": CONTEXT}
         definition["outputs"] = {"findings": FINDINGS}
         definition["config"]["tools"] = ["local-rules", "diff-summary"]
         agent, _ = self.publish("agents", definition)
@@ -520,7 +633,7 @@ class StudioIntegrationTests(unittest.TestCase):
                         "id": "review",
                         "agent": agent["id"],
                         "version": 1,
-                        "sources": {"diff": "$input.diff"},
+                        "sources": {"diff": "$input.diff", "context": "$input.context"},
                     }
                 ],
                 "outputs": {"verified": "review.findings"},
@@ -535,13 +648,22 @@ class StudioIntegrationTests(unittest.TestCase):
             ),
         ) as provider:
             result = self.service.create_review(
-                "demo/repo", diff, workflow_selection={"id": flow["id"], "version": 1}
+                "demo/repo",
+                diff,
+                workflow_selection={"id": flow["id"], "version": 1},
+                review_context={
+                    "title": "Context-aware review",
+                    "spec": "Credentials must not be committed.",
+                    "standards": "Secrets require managed storage.",
+                },
             )
         self.assertEqual("SUCCESS", result["state"])
         provider.assert_called_once()
         sent = json.loads(provider.call_args.args[1][1].content)
         self.assertNotIn("studio-synthetic-secret", json.dumps(sent))
         self.assertIn("<redacted>", sent["inputs"]["diff"])
+        self.assertEqual("api", sent["inputs"]["context"]["origin"])
+        self.assertEqual("Credentials must not be committed.", sent["inputs"]["context"]["spec"])
         evidence = sent["tool_results"]["local-rules"]
         self.assertEqual("SEC-HARDCODED-SECRET", evidence[0]["rule_id"])
         self.assertIn("<redacted>", evidence[0]["evidence"])
@@ -549,6 +671,7 @@ class StudioIntegrationTests(unittest.TestCase):
         self.assertEqual(diff, self.store.get_task_payload(result["task_id"]))
         artifact = self.studio.artifact("default", result["task_id"], "review")
         self.assertEqual(diff, artifact["inputs"]["diff"])
+        self.assertEqual(sent["inputs"]["context"], artifact["inputs"]["context"])
         self.assertEqual({"findings": []}, artifact["outputs"])
         self.assertEqual(
             definition,
@@ -1114,7 +1237,7 @@ class StudioIntegrationTests(unittest.TestCase):
         self.assertNotIn("tenant_id", json.dumps(page))
 
         secret_agent = model_agent()
-        secret_agent["config"]["prompt"] = "PRIVATE-PROMPT-FOR-EDITOR"
+        secret_agent["config"]["playbook"]["instructions"] = "PRIVATE-PROMPT-FOR-EDITOR"
         saved_agent, _ = self.publish("agents", secret_agent)
         path = "/v1/studio/agents/" + saved_agent["id"]
         palette = request("GET", path + "/versions/1", bearer=reader, console=True)[1]
@@ -1244,8 +1367,43 @@ class StudioIntegrationTests(unittest.TestCase):
             404, request("GET", other_path + "/versions/1", bearer=reader, console=True)[0]
         )
         with mock.patch.object(self.service, "run_proof") as unexpected_write:
-            self.assertEqual(400, request("POST", "/v1/proofs", {}, token, True)[0])
+            self.assertEqual(
+                400, request("POST", "/v1/proofs", {"image": "untrusted"}, token, True)[0]
+            )
             unexpected_write.assert_not_called()
+
+        payload = {
+            "original": {"app.py": "before"},
+            "patched": {"app.py": "after"},
+            "reproduction_command": "reproduce",
+            "regression_command": "regression",
+        }
+
+        def execute(files, command):
+            passed = files["app.py"] == "after"
+            return {
+                "passed": passed,
+                "status": "passed" if passed else "failed",
+                "checks": [{"detail": "test output"}],
+                "attestation": {"test_command_sha256": "internal-fingerprint"},
+            }
+
+        with mock.patch.object(
+            self.service.repair_use_cases.proof_executor, "execute", side_effect=execute
+        ) as executor:
+            self.assertEqual(403, request("POST", "/v1/proofs", payload)[0])
+            self.assertEqual(403, request("POST", "/v1/proofs", payload, reader, True)[0])
+            executor.assert_not_called()
+            for console in (False, True):
+                status, proof = request("POST", "/v1/proofs", payload, token, console)
+                self.assertEqual(201, status)
+                self.assertEqual(4, proof["evidence_level"])
+                self.assertEqual(
+                    ["failed", "passed", "passed"], [step["status"] for step in proof["steps"]]
+                )
+                self.assertEqual(not console, "attestation" in proof["steps"][0])
+                self.assertEqual("test output", proof["steps"][0]["detail"])
+            self.assertEqual(6, executor.call_count)
 
 
 if __name__ == "__main__":

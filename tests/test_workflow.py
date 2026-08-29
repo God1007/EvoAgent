@@ -1,6 +1,7 @@
 import copy
 import http.client
 import io
+import itertools
 import json
 import tempfile
 import threading
@@ -15,8 +16,16 @@ from evoagent.api import _make_server
 from evoagent.config import Settings
 from evoagent.diff_parser import parse_unified_diff
 from evoagent.harness import ReviewHarness
+from evoagent.metrics import Metrics
 from evoagent.model_gateway import ModelGovernanceContext
-from evoagent.models import Finding, Severity, TaskState, TraceEvent
+from evoagent.models import (
+    Finding,
+    RepositoryEvidence,
+    ReviewContext,
+    Severity,
+    TaskState,
+    TraceEvent,
+)
 from evoagent.postgres_store import PostgresTaskStore
 from evoagent.reviewer import GatewayReviewer, LocalRuleReviewer
 from evoagent.service import ReviewService
@@ -78,34 +87,48 @@ class Checkpoints:
         self.messages = []
         self.on_save = None
         self.reads = []
+        self.lock = threading.RLock()
+
+    def __deepcopy__(self, memo):
+        clone = type(self)()
+        memo[id(self)] = clone
+        with self.lock:
+            for key, value in self.__dict__.items():
+                if key != "lock":
+                    setattr(clone, key, copy.deepcopy(value, memo))
+        return clone
 
     def is_cancelled(self, _task):
-        return self.cancelled
+        with self.lock:
+            return self.cancelled
 
     def review_admission_active(self, _task, generation):
-        return generation == self.generation
+        with self.lock:
+            return generation == self.generation
 
     def load_checkpoints(self, _task, node=None):
-        self.reads.append(node)
-        return copy.deepcopy(
-            {key: value for key, value in self.records.items() if node is None or key == node}
-        )
+        with self.lock:
+            self.reads.append(node)
+            return copy.deepcopy(
+                {key: value for key, value in self.records.items() if node is None or key == node}
+            )
 
     def save_checkpoint(
         self, _task, node, state, status="completed", attempt=1, error="", generation=None
     ):
-        if self.cancelled or (generation is not None and generation != self.generation):
-            return False
-        if self.on_save:
-            self.on_save(node, state, status)
-        prior = self.records.get(node, {})
-        if prior.get("status") != "completed" and (
-            status == "completed" or attempt >= prior.get("attempt", 0)
-        ):
-            self.records[node] = copy.deepcopy(
-                {"state": state, "status": status, "attempt": attempt, "error": error}
-            )
-        return True
+        with self.lock:
+            if self.cancelled or (generation is not None and generation != self.generation):
+                return False
+            if self.on_save:
+                self.on_save(node, state, status)
+            prior = self.records.get(node, {})
+            if prior.get("status") != "completed" and (
+                status == "completed" or attempt >= prior.get("attempt", 0)
+            ):
+                self.records[node] = copy.deepcopy(
+                    {"state": state, "status": status, "attempt": attempt, "error": error}
+                )
+            return True
 
     def record_agent_message(self, _task, message, _generation=None):
         self.messages.append(message)
@@ -170,7 +193,16 @@ class WorkflowTests(unittest.TestCase):
     def test_compiled_workflow_cannot_drift_from_its_revision(self):
         flow = chain()
         manifest = flow.describe()
-        for field in ("name", "steps", "inputs", "outputs", "output_types", "revision", "_order"):
+        for field in (
+            "name",
+            "steps",
+            "inputs",
+            "outputs",
+            "output_types",
+            "revision",
+            "_order",
+            "_waves",
+        ):
             with self.subTest(field=field), self.assertRaises(FrozenInstanceError):
                 setattr(flow, field, None)
         with self.assertRaises(FrozenInstanceError):
@@ -221,6 +253,86 @@ class WorkflowTests(unittest.TestCase):
             {"value": 3, "branch": 2, "original": {"items": ["original"]}}, flow.run(original)
         )
         self.assertEqual({"value": {"items": ["original"]}}, original)
+
+    def test_parallel_branch_failure_keeps_completed_sibling_for_resume(self):
+        barrier = threading.Barrier(2)
+        calls = {"left": 0, "right": 0, "join": 0}
+
+        def branch(name, increment):
+            def run(handoff):
+                calls[name] += 1
+                if calls[name] == 1:
+                    barrier.wait(timeout=1)
+                if name == "right" and calls[name] == 1:
+                    raise RuntimeError("retry right branch")
+                return {"value": handoff.inputs["value"] + increment}
+
+            return agent(name, run)
+
+        def join(handoff):
+            calls["join"] += 1
+            return {"value": handoff.inputs["left"] + handoff.inputs["right"]}
+
+        flow = Workflow(
+            "parallel-resume",
+            {"value": NUMBER},
+            (
+                Step(
+                    "join",
+                    agent("join", join, {"left": NUMBER, "right": NUMBER}),
+                    {"left": "left.value", "right": "right.value"},
+                ),
+                Step("left", branch("left", 1), {"value": "$input.value"}),
+                Step("right", branch("right", 2), {"value": "$input.value"}),
+            ),
+            {"value": "join.value"},
+        )
+        store = Checkpoints()
+        with self.assertRaisesRegex(RuntimeError, "retry right branch"):
+            durable(flow, store)
+        self.assertEqual("completed", store.records["workflow:left"]["status"])
+        self.assertEqual("failed", store.records["workflow:right"]["status"])
+        self.assertNotIn("workflow:join", store.records)
+
+        self.assertEqual({"value": 5}, durable(flow, store))
+        self.assertEqual({"left": 1, "right": 2, "join": 1}, calls)
+
+    def test_parallel_wave_stops_before_join_at_the_shared_deadline(self):
+        release = threading.Event()
+        finished = [threading.Event(), threading.Event()]
+
+        def blocked(index):
+            def run(handoff):
+                try:
+                    release.wait(timeout=1)
+                    return {"value": handoff.inputs["value"] + 1}
+                finally:
+                    finished[index].set()
+
+            return agent("blocked%d" % index, run)
+
+        join = mock.Mock(return_value={"value": 4})
+        flow = Workflow(
+            "parallel-deadline",
+            {"value": NUMBER},
+            (
+                Step("left", blocked(0), {"value": "$input.value"}),
+                Step("right", blocked(1), {"value": "$input.value"}),
+                Step(
+                    "join",
+                    agent("join", join, {"left": NUMBER, "right": NUMBER}),
+                    {"left": "left.value", "right": "right.value"},
+                ),
+            ),
+            {"value": "join.value"},
+        )
+        try:
+            with self.assertRaises(BudgetExceeded):
+                flow.run({"value": 1}, timeout_seconds=0.02)
+        finally:
+            release.set()
+            self.assertTrue(all(event.wait(timeout=1) for event in finished))
+        join.assert_not_called()
 
     def test_chain_memory_does_not_retain_consumed_outputs(self):
         text = PayloadType("text", 1, lambda value: None)
@@ -289,6 +401,7 @@ class WorkflowTests(unittest.TestCase):
         for name, value in (
             ("revision", "mutable"),
             ("agent_id", "two words"),
+            ("kind", "two words"),
             ("run", None),
             ("outputs", {}),
         ):
@@ -302,6 +415,65 @@ class WorkflowTests(unittest.TestCase):
                 chain().run({"value": 1}, timeout_seconds=timeout)
         with self.assertRaises(ValueError):
             chain().run({"value": 1}, store=Checkpoints())
+
+    def test_agent_metrics_use_bounded_kinds_and_skip_checkpoint_replays(self):
+        captured = Metrics(buckets=(1.0,))
+        flow = Workflow(
+            "studio",
+            {"value": NUMBER},
+            (Step("rule", replace(agent(), kind="rules"), {"value": "$input.value"}),),
+            {"value": "rule.value"},
+        )
+        store = Checkpoints()
+        clock = itertools.count(0.0, 0.25)
+        with (
+            mock.patch("evoagent.workflow.metrics", captured),
+            mock.patch("evoagent.workflow.time.monotonic", side_effect=lambda: next(clock)),
+        ):
+            self.assertEqual({"value": 2}, durable(flow, store))
+            self.assertEqual({"value": 2}, durable(flow, store))
+
+        output = captured.prometheus()
+        self.assertIn("evoagent_workflow_studio_agent_rules_runs_total 1.0", output)
+        self.assertIn("evoagent_workflow_studio_agent_rules_successes_total 1.0", output)
+        self.assertIn("evoagent_workflow_studio_agent_rules_duration_count 1", output)
+        self.assertIn("evoagent_workflow_studio_agent_rules_checkpoint_reuses_total 1.0", output)
+        state = store.records["workflow:rule"]["state"]
+        self.assertTrue(state["started_at"].endswith("+00:00"))
+        self.assertEqual(250, state["duration_ms"])
+
+    def test_agent_metrics_collapse_untrusted_identity_and_record_failures(self):
+        captured = Metrics()
+        broken = replace(
+            agent("tenant-specific-agent", lambda _handoff: 1 / 0), kind="tenant-specific-kind"
+        )
+        flow = Workflow(
+            "tenant-specific-workflow",
+            {"value": NUMBER},
+            (Step("tenant-specific-step", broken, {"value": "$input.value"}),),
+            {"value": "tenant-specific-step.value"},
+        )
+        with (
+            mock.patch("evoagent.workflow.metrics", captured),
+            self.assertRaises(ZeroDivisionError),
+        ):
+            flow.run({"value": 1})
+
+        output = captured.prometheus()
+        self.assertIn("evoagent_workflow_custom_agent_custom_runs_total 1.0", output)
+        self.assertIn("evoagent_workflow_custom_agent_custom_failures_total 1.0", output)
+        self.assertNotIn("tenant_specific", output)
+
+    def test_coordinator_records_workflow_outcome_and_duration(self):
+        captured = Metrics()
+        coordinator = MultiAgentCoordinator([LocalRuleReviewer()])
+        with mock.patch("evoagent.agents.metrics", captured):
+            coordinator.review(DIFF, parse_unified_diff(DIFF))
+
+        output = captured.prometheus()
+        self.assertIn("evoagent_workflow_review_runs_total 1.0", output)
+        self.assertIn("evoagent_workflow_review_successes_total 1.0", output)
+        self.assertIn("evoagent_workflow_review_duration_count 1", output)
 
     def test_invalid_output_never_reaches_receiver(self):
         downstream = mock.Mock(return_value={"value": 1})
@@ -697,6 +869,53 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertEqual(FINDINGS_TYPE.key, coordinator.workflow.output_types["verified"].key)
 
+    def test_review_context_and_repository_evidence_are_pinned_with_workflow_input(self):
+        context = ReviewContext.from_request(
+            {"title": "Review context", "spec": "Do not execute input"}
+        ).to_dict()
+        evidence = RepositoryEvidence(
+            origin="github-archive",
+            status="available",
+            revision="a" * 40,
+            indexed_files=2,
+            indexed_bytes=100,
+            changed_paths=("a.py",),
+            changed_symbols=("a.value",),
+        ).to_dict()
+        store = Checkpoints()
+        store.get = mock.Mock(
+            return_value={"input": {"review_context": context, "repository_evidence": evidence}}
+        )
+        coordinator = MultiAgentCoordinator(
+            [LocalRuleReviewer()], store=store, checkpoint_revision=REVISION
+        )
+
+        coordinator.review_with_context("task", DIFF, parse_unified_diff(DIFF), 1)
+        coordinator.validate_resume("task", DIFF)
+        store.get.return_value = {
+            "input": {
+                "review_context": ReviewContext.from_request(
+                    {"title": "Changed context", "spec": "Different requirement"}
+                ).to_dict(),
+                "repository_evidence": evidence,
+            }
+        }
+
+        with self.assertRaisesRegex(HandoffError, "original input changed"):
+            coordinator.validate_resume("task", DIFF)
+
+        store.get.return_value = {
+            "input": {
+                "review_context": context,
+                "repository_evidence": {
+                    **evidence,
+                    "revision": "b" * 40,
+                },
+            }
+        }
+        with self.assertRaisesRegex(HandoffError, "original input changed"):
+            coordinator.validate_resume("task", DIFF)
+
     def test_runnable_custom_review_example(self):
         from examples.custom_review_workflow import build_workflow, main
 
@@ -1014,10 +1233,15 @@ class WorkflowPostgresTests(unittest.TestCase):
         self.assertEqual(["completed", "failed", "pending"], [s["status"] for s in failed["steps"]])
         self.assertEqual(["second"], failed["steps"][2]["blocked_by"])
         self.assertEqual([1, 1, 0], [s["attempt"] for s in failed["steps"]])
+        self.assertTrue(all(step["started_at"] for step in failed["steps"][:2]))
+        self.assertTrue(all(type(step["duration_ms"]) is int for step in failed["steps"][:2]))
+        self.assertIsNone(failed["steps"][2]["duration_ms"])
         self.assertEqual({"value": 4}, run())
         completed = store.workflow_status(task_id, tenant_id)
         self.assertEqual(["completed"] * 3, [s["status"] for s in completed["steps"]])
         self.assertEqual([1, 2, 1], [s["attempt"] for s in completed["steps"]])
+        self.assertTrue(all(step["started_at"] for step in completed["steps"]))
+        self.assertTrue(all(type(step["duration_ms"]) is int for step in completed["steps"]))
         self.assertEqual(seen[0].idempotency_key, seen[1].idempotency_key)
         first.assert_called_once()
         for snapshot in (failed, completed):

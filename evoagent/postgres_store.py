@@ -892,7 +892,8 @@ class PostgresTaskStore:
         result: dict[str, Any] = {
             key: int(row[key] or 0) for key in ("total", "pending", "publishing", "dead")
         }
-        result["oldest_age_seconds"] = float(row["oldest_age_seconds"] or 0.0)
+        # Writers and the database can have different wall clocks, just like queue producers.
+        result["oldest_age_seconds"] = max(0.0, float(row["oldest_age_seconds"] or 0.0))
         return result
 
     def list_outbox(
@@ -2126,6 +2127,8 @@ class PostgresTaskStore:
                 "checkpoint.state_json->>'execution_revision' AS execution_revision,"
                 "checkpoint.state_json->'generation' AS generation,"
                 "checkpoint.state_json->>'idempotency_key' AS idempotency_key,"
+                "checkpoint.state_json->>'started_at' AS started_at,"
+                "checkpoint.state_json->'duration_ms' AS duration_ms,"
                 "checkpoint.state_json#>>'{handoff,input_sha256}' AS input_sha256,"
                 "checkpoint.state_json->>'output_sha256' AS output_sha256 "
                 "FROM tasks AS task LEFT JOIN checkpoints AS checkpoint "
@@ -2161,6 +2164,7 @@ class PostgresTaskStore:
         for step in definition["steps"]:
             row = by_node.get("workflow:" + step["id"], {})
             status = row.get("status", "pending")
+            duration_ms = row.get("duration_ms")
             parents = {ref.split(".")[0] for ref in step["sources"].values()} - {"$input"}
             result["steps"].append(
                 {
@@ -2176,6 +2180,12 @@ class PostgresTaskStore:
                     "idempotency_key": row.get("idempotency_key"),
                     "input_sha256": row.get("input_sha256"),
                     "output_sha256": row.get("output_sha256"),
+                    "started_at": row.get("started_at")
+                    if isinstance(row.get("started_at"), str)
+                    else None,
+                    "duration_ms": duration_ms
+                    if type(duration_ms) is int and duration_ms >= 0
+                    else None,
                     "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
                     "error": preserve_safe_summary(row["error"], "review node failed")
                     if row.get("error")
@@ -3015,7 +3025,12 @@ class PostgresTaskStore:
         repository: str,
         policy: dict[str, Any],
         actor: str,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
+        if expected_version is not None and (
+            type(expected_version) is not int or expected_version < 0
+        ):
+            raise ValueError("expected repository policy version must be a non-negative integer")
         repository = canonical_repository(repository)
         now = utc_now()
         serialized = json.dumps(policy, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -3030,7 +3045,10 @@ class PostgresTaskStore:
                 "ORDER BY version DESC,updated_at DESC LIMIT 1 FOR UPDATE",
                 (tenant_id, repository),
             ).fetchone()
-            version = int(row["version"]) + 1 if row else 1
+            current_version = int(row["version"]) if row else 0
+            if expected_version is not None and expected_version != current_version:
+                raise StateConflictError("repository policy changed; reload before saving")
+            version = current_version + 1
             stored_repository = row["repository"] if row else repository
             conn.execute(
                 "INSERT INTO repository_policies(tenant_id,repository,version,enabled,auto_fix,"

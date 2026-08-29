@@ -77,10 +77,13 @@ ERROR_CODES = {
     "an agent supports at most 32 literal checks": "invalid_checks",
     "only the listed read-only tools may be selected": "invalid_tools",
     "diff tools require an explicitly connected diff input": "diff_input_required",
+    "only the listed versioned Agent Skills may be selected": "invalid_agent_skills",
+    "Agent Skills cannot be selected more than once": "invalid_agent_skills",
+    "selected Agent Skills require connected input types": "skill_input_required",
     "model findings require a diff input to verify their locations": "diff_input_required",
     "max_output_tokens must be between 1 and 4096": "invalid_output_limit",
     "model outputs cannot impersonate source review artifacts": "invalid_model_output",
-    "model config requires a Playbook, model, tools and max_output_tokens": "invalid_playbook",
+    "model config requires a Playbook, model, Agent Skills and max_output_tokens": "invalid_playbook",
     "Playbook requires identity, objective and instructions": "invalid_playbook",
     "Playbook identity must be text of 1-200 characters": "invalid_playbook",
     "Playbook objective must be text of 1-2000 characters": "invalid_playbook",
@@ -148,7 +151,7 @@ def _agent_recipe(value: dict) -> dict:
             **pick(definition, "name", "kind", "inputs", "outputs"),
             "config": {
                 "playbook": pick(playbook, "identity", "objective", "instructions"),
-                **pick(config, "model", "tools", "max_output_tokens"),
+                **pick(config, "model", "skills", "tools", "max_output_tokens"),
             },
         },
     }
@@ -506,6 +509,10 @@ VIEWS: tuple[tuple[str, Callable[[dict], dict]], ...] = (
         lambda data: {
             **pick(data, "types", "inputs", "tools"),
             "rules": [pick(rule, "id", "title") for rule in data.get("rules", [])],
+            "skills": [
+                pick(skill, "id", "version", "name", "description", "mode", "requires")
+                for skill in data.get("skills", [])
+            ],
             "builtins": [
                 pick(agent, "id", "version", "inputs", "outputs")
                 for agent in data.get("builtins", [])

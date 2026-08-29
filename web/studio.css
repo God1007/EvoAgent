@@ -81,7 +81,16 @@
 .studio-form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .studio-checks { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .studio-dialog .check { margin-bottom: 10px; }
+.studio-skill-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.studio-skill-option { display: flex; gap: 10px; margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius-control); cursor: pointer; }
+.studio-skill-option:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.studio-skill-option input { margin-top: 3px; }
+.studio-skill-option span, .studio-skill-option strong, .studio-skill-option small, .studio-skill-option em { display: block; }
+.studio-skill-option span { min-width: 0; }
+.studio-skill-option strong { font-size: 12px; }
+.studio-skill-option small { margin-top: 4px; color: var(--muted); font-size: 10px; overflow-wrap: anywhere; }
+.studio-skill-option em { margin-top: 7px; color: var(--text); font-size: 11px; font-style: normal; line-height: 1.55; }
 .studio-literal-check { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; margin-bottom: 18px; border-bottom: 1px solid var(--line); }
 .studio-port-row { display: grid; grid-template-columns: 1fr 1.4fr auto; gap: 8px; align-items: center; margin-bottom: 10px; }
 @media (max-width: 1200px) { .studio-workspace { grid-template-columns: 170px minmax(260px, 1fr); } .studio-inspector { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line); } }
-@media (max-width: 700px) { .studio-journey, .studio-workspace, .studio-bottom, .studio-form-row, .studio-checks, .studio-literal-check { grid-template-columns: 1fr; } .studio-library { border-right: 0; border-bottom: 1px solid var(--line); } .studio-canvas { padding: 16px; } .studio-toolbar { align-items: stretch; } .studio-flow-picker, .studio-name-label { flex: 1 1 100%; max-width: none; } .studio-dialog { padding: 16px; } .studio-port-row { grid-template-columns: 1fr; } }
+@media (max-width: 700px) { .studio-journey, .studio-workspace, .studio-bottom, .studio-form-row, .studio-checks, .studio-skill-grid, .studio-literal-check { grid-template-columns: 1fr; } .studio-library { border-right: 0; border-bottom: 1px solid var(--line); } .studio-canvas { padding: 16px; } .studio-toolbar { align-items: stretch; } .studio-flow-picker, .studio-name-label { flex: 1 1 100%; max-width: none; } .studio-dialog { padding: 16px; } .studio-port-row { grid-template-columns: 1fr; } }

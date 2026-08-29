@@ -1,6 +1,6 @@
 # EvoAgent Baseline Evaluation Report
 
-Reproduced on 2026-08-29 against the local working tree. This is an offline
+Reproduced on 2026-08-30 against the local working tree. This is an offline
 evaluation snapshot, not a remote CI or production qualification. Regenerate with
 `python scripts/run_e2e_evaluation.py --reuse-dataset` (see
 [`evaluation.md`](evaluation.md)).
@@ -11,7 +11,7 @@ evaluation snapshot, not a remote CI or production qualification. Regenerate wit
 | --- | --- |
 | EvoAgent version | 0.30.0 |
 | Python | 3.12.13 |
-| Application source SHA-256 | `054f11a88428ec67e6fb30fa3651c317c899df40acf321cb31f8c709077c599f` |
+| Application source SHA-256 | `ff9b7cf21b23389d1fac3f1cde8d807a39d56ca24fd9f2a66bd17bbe5f84b8d5` |
 | Dependencies | `requirements.lock` SHA-256 `dd3a30c26aa196e7afcc88a1d16336ee391ce408fcebcc3bd996a0f80537ac0e` |
 | Dataset | `evaluation_data/pr_diff_100.jsonl` |
 | Dataset semantic SHA-256 | `92e93bbc64c70e81ab8ef26b200ea4cbe092bf159ad78c061d6da7e704577263` |

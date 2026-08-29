@@ -39,6 +39,14 @@ test("Studio lays out dependencies and keeps every handoff wired when renaming o
   assert.equal(choices.length, 1, "unavailable selections must not change the available catalog");
   for (const port of ["constructor", "toString", "diff"]) assert.equal(context.studioInputSource({ sources: {} }, port), "");
   assert.equal(context.studioInputSource({ sources: { constructor: "upstream.text" } }, "constructor"), "upstream.text");
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.studioPlaybook({ playbook: { identity: "安全审查", objective: "检查风险", instructions: "只看新增行" } }, "ignored"))),
+    { identity: "安全审查", objective: "检查风险", instructions: "只看新增行" },
+  );
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.studioPlaybook({ prompt: "legacy prompt" }, "旧 Agent"))),
+    { identity: "旧 Agent", objective: "legacy prompt", instructions: "" },
+  );
 
   const wired = { steps: [
     { id: "scan", agent: "one", version: 1, sources: { diff: "$input.diff" } },
@@ -78,19 +86,19 @@ test("Studio preserves drafts and trials exactly the selected draft or published
     return elements.get(selector);
   };
   const flow = (id) => ({ id, revision: 1, active_version: id === "saved" ? 2 : null, definition: { name: id, steps: [], outputs: { verified: "" } } });
-  let catalogUnavailable = false, catalogDenied = false, missingStatus = 404, publicationStatus = 200, holdPublication = null, holdCatalog = null, catalogAgents = [], catalogModels = [];
+  let catalogUnavailable = false, catalogDenied = false, missingStatus = 404, publicationStatus = 200, holdPublication = null, holdCatalog = null, catalogAgents = [], catalogModels = [], catalogTemplates = [], catalogAgentRecipes = [];
   let bindingStatus = 200, binding = { workflow_id: "saved", version: 1, revision: 7, name: "original" };
   let paged = false, pageFailure = false, pageVersionFailure = false, holdPage = null, addKeys = [];
   const reads = [], writes = [], tasks = new Map(), opened = [];
   const actionNode = (name) => { const item = query(`[action=${name}]`); item.dataset = { studioAction: name }; return item; };
   const addNode = (key) => { const item = query(`[add=${key}]`); item.dataset = { addAgent: key }; return item; };
   const context = vm.createContext({
-    $: query, $$: (selector) => selector === "[data-studio-action]" ? ["refresh-run", "open-run", "load-binding", "unbind", "more-agents", "more-workflows", "create-llm"].map(actionNode) : selector === "[data-add-agent]" ? addKeys.map(addNode) : [], currentRole: "admin", accessToken: "fixture",
-    escapeHtml: (value) => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"), requestAnimationFrame() {},
+    $: query, $$: (selector) => selector === "[data-studio-action]" ? ["refresh-run", "open-run", "load-binding", "unbind", "more-agents", "more-workflows", "create-llm", "use-template-dual-axis-review", "use-agent-recipe-feedback-loop"].map(actionNode) : selector === "[data-add-agent]" ? addKeys.map(addNode) : [], currentRole: "admin", accessToken: "fixture",
+    escapeHtml: (value) => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"), requestAnimationFrame() {}, structuredClone,
     window: { addEventListener() {} }, location: { hash: "" },
     document: { createElement: node, body: { appendChild() {} } },
     FormData: class { constructor(form) { return new Map(Object.entries(form.values)); } },
-    portLabels: { diff: "代码变更", findings: "发现的问题" },
+    portLabels: { diff: "代码变更", context: "审查上下文", evidence: "仓库影响证据", findings: "发现的问题" },
     stateLabels: { PENDING: "等待执行", SUCCESS: "已完成" }, openTask(id) { opened.push(id); },
     confirmConsoleAction: async (_text, current) => current(),
     taskState: (task) => task.state,
@@ -136,7 +144,7 @@ test("Studio preserves drafts and trials exactly the selected draft or published
         if (holdCatalog) await holdCatalog;
         if (catalogDenied) throw Object.assign(new Error("private-role-detail"), { status: 403 });
         if (catalogUnavailable) throw new Error("catalog unavailable");
-        return { types: [], inputs: {}, rules: [], tools: [], models: catalogModels, builtins: [] };
+        return { types: [], inputs: {}, rules: [], tools: [], models: catalogModels, builtins: [], agent_recipes: catalogAgentRecipes, templates: catalogTemplates };
       }
       if (path === "/v1/studio/agents") return { documents: catalogAgents, next_cursor: paged ? "agent-private-cursor" : null };
       if (path === "/v1/studio/workflows") return { documents: ["saved", "other", "missing"].map((id) => ({ id, name: id })), next_cursor: paged ? "flow-private-cursor" : null };
@@ -329,6 +337,37 @@ test("Studio preserves drafts and trials exactly the selected draft or published
   assert.doesNotMatch(query("#studio-root").innerHTML, /studio-agent-dialog|studio-flow-picker|private-role-detail/);
   catalogDenied = false;
   await context.window.studio.load();
+  catalogTemplates = [{
+    id: "dual-axis-review", name: "双轴 PR 审查", description: "规范与需求并行",
+    available: false, reason: "配置模型路由后可用",
+    definition: { name: "双轴测试", steps: [{ id: "standards", agent: "standards-review", version: 1, sources: { diff: "$input.diff", context: "$input.context", evidence: "$input.evidence" } }], outputs: { verified: "standards.findings" } },
+  }];
+  context.window.studio.reset();
+  await context.window.studio.load();
+  assert.match(query("#studio-root").innerHTML, /use-template-dual-axis-review" disabled.*双轴 PR 审查.*配置模型路由后可用/s);
+  const writesBeforeTemplate = writes.length;
+  await actionNode("use-template-dual-axis-review").events.click();
+  assert.doesNotMatch(query("#studio-root").innerHTML, /value="双轴测试"/);
+  catalogTemplates[0].available = true;
+  context.window.studio.reset();
+  await context.window.studio.load();
+  await actionNode("use-template-dual-axis-review").events.click();
+  assert.match(query("#studio-root").innerHTML, /value="双轴测试"/);
+  assert.match(query("#studio-root").innerHTML, /1 个节点/);
+  assert.equal(writes.length, writesBeforeTemplate, "using a template changes only the unsaved canvas");
+
+  catalogAgentRecipes = [{
+    id: "feedback-loop", name: "回归与验证审查", description: "检查可信验证路径",
+    definition: { name: "回归验收 Agent", kind: "llm", inputs: { diff: "unified-diff@1" }, outputs: { findings: "review-findings@1" }, config: { playbook: { identity: "回归审查员", objective: "检查精确失败信号", instructions: "通过公共接口验证" }, model: "", tools: [], max_output_tokens: 2048 } },
+  }];
+  context.window.studio.reset();
+  await context.window.studio.load();
+  const writesBeforeRecipe = writes.length;
+  await actionNode("use-agent-recipe-feedback-loop").events.click();
+  assert.match(query("#studio-agent-dialog").innerHTML, /回归验收 Agent/);
+  assert.match(query("#studio-agent-dialog").innerHTML, /检查精确失败信号/);
+  assert.equal(writes.length, writesBeforeRecipe, "using a recipe only opens an editable unsaved Agent");
+
   await actionNode("create-llm").events.click();
   await new Promise(setImmediate);
   for (const value of ["publish", "add"]) assert.equal(query(`button[value="${value}"]`).disabled, true);
@@ -382,11 +421,12 @@ test("readable outputs omit internal metadata, escape content and remain tied to
     return elements.get(selector);
   };
   const requests = [];
+  let transitions = 0;
   const response = (data, status = 200) => ({
     ok: status < 400, status, headers: { get: () => "application/json" }, json: async () => data,
   });
   const context = vm.createContext({
-    document: { querySelector: query, querySelectorAll: () => [], createElement: element },
+    document: { querySelector: query, querySelectorAll: () => [], createElement: element, startViewTransition(callback) { transitions += 1; callback(); } },
     localStorage: { getItem: () => "", setItem() {}, removeItem() {} },
     location: { hash: "#tasks" }, history: { replaceState() {} },
     window: { addEventListener() {}, scrollTo() {} }, setTimeout, clearTimeout,
@@ -396,6 +436,10 @@ test("readable outputs omit internal metadata, escape content and remain tied to
     },
   });
   vm.runInContext(readFileSync(join(__dirname, "../web/app.js"), "utf8"), context);
+  assert.equal(transitions, 1, "supported browsers use the native page transition");
+  context.window.matchMedia = () => ({ matches: true });
+  context.show("overview");
+  assert.equal(transitions, 1, "reduced motion skips the page transition");
   const reply = (path, data, status) => {
     const index = requests.findIndex((request) => request.path === path);
     assert.notEqual(index, -1, `request exists: ${path}`);
@@ -408,13 +452,14 @@ test("readable outputs omit internal metadata, escape content and remain tied to
       id: `step${index}`, agent_id: "<img src=x>", status, attempt: 2,
       inputs: { findings: "findings@1" }, sources: { findings: "upstream.findings" },
       outputs: { findings: "findings@1" }, blocked_by: status === "pending" ? ["step2"] : [],
+      duration_ms: index === 0 ? 1500 : null, updated_at: index === 0 ? "2026-08-29T00:00:00Z" : null,
       error: status === "failed" ? "ref <script>" : null,
       private_payload: "must not render arbitrary fields", input_sha256: "secret-digest", idempotency_key: "secret-key",
     })),
   };
   const markup = context.workflowMarkup(workflow, { workflow: { version: 2, name: "policy <script>", steps: Object.fromEntries(workflow.steps.map((step) => [step.id, "Agent <img src=x>"])) } });
   assert.match(markup, /1 \/ 4 个步骤完成/);
-  for (const expected of ["任务：已取消", "不代表 Worker 在线", "已派发", "等待上游：Agent", "发布版本 v2", "尝试 2 次", "&lt;script&gt;", "&lt;img src=x&gt;"]) {
+  for (const expected of ["任务：已取消", "不代表 Worker 在线", "已派发", "等待上游：Agent", "发布版本 v2", "尝试 2 次", "耗时 1.5 秒", "&lt;script&gt;", "&lt;img src=x&gt;"]) {
     assert.ok(markup.includes(expected), expected);
   }
   assert.doesNotMatch(markup, /<script>|<img|must not render|secret-key|secret-digest|findings@1|幂等键|输入摘要/);
@@ -443,6 +488,21 @@ test("readable outputs omit internal metadata, escape content and remain tied to
   assert.match(artifact, /交付的结果/);
   assert.match(artifact, /&lt;img src=x&gt;/);
   assert.doesNotMatch(artifact, /<img|private-|output_sha256/);
+  const contextArtifact = context.artifactValueMarkup({
+    origin: "github-webhook", title: "PR <script>", spec: "Must isolate input.", standards: "No eval.", truncated: true,
+    metadata: { token: "private-token" },
+  }, "review-context@1");
+  for (const expected of ["PR &lt;script&gt;", "来源：GitHub PR", "内容已按安全上限截断", "需求 / Spec", "项目规范", "Must isolate input.", "No eval."]) assert.ok(contextArtifact.includes(expected), expected);
+  assert.doesNotMatch(contextArtifact, /<script>|private-token|metadata/);
+  const evidenceArtifact = context.artifactValueMarkup({
+    origin: "github-archive", status: "partial", revision: "abcdef1234567890", indexed_files: 12, indexed_bytes: 4096,
+    changed_paths: ["app.py"], changed_symbols: ["app.run"], impacted_symbols: ["worker.call<script>"], importing_files: ["worker.py"], truncated: true,
+    metadata: { token: "private-token" },
+  }, "repository-evidence@1");
+  for (const expected of ["已建立部分仓库影响证据", "GitHub 固定版本归档", "abcdef123456", "12 个 Python 文件", "4,096 字节", "变更文件", "app.py", "受影响符号", "worker.call&lt;script&gt;", "已按安全上限截断"]) assert.ok(evidenceArtifact.includes(expected), expected);
+  assert.doesNotMatch(evidenceArtifact, /abcdef1234567890|<script>|private-token|metadata/);
+  const unavailableEvidence = context.artifactValueMarkup({ origin: "github-archive", status: "unavailable", revision: "abc", indexed_files: 0, indexed_bytes: 0 }, "repository-evidence@1");
+  assert.match(unavailableEvidence, /仓库影响证据不可用.*仅使用已提交的 Diff/s);
   const rewiredStep = {
     inputs: { security: "review-findings@1", business: "review-findings@1", diff: "unified-diff@1" },
     outputs: { findings: "review-findings@1" },
@@ -457,6 +517,18 @@ test("readable outputs omit internal metadata, escape content and remain tied to
   assert.doesNotMatch(rewired, /<img|scanner\.findings|general\.findings|private-|fingerprint/);
   assert.doesNotMatch(context.artifactValueMarkup({ prompt: "private-value" }, "unknown@1"), /private-value|prompt/);
   assert.match(context.evaluationMarkup({ decision: "approved", version: { version: 3, prompt: "private-prompt" }, candidate: { score: 0.8 }, baseline: { score: 0.7 } }), /等待发布审批/);
+  const auditHtml = context.auditRows([
+    { actor: "alice <img>", action: "task.resume", resource: "task <script>", created_at: "2026-08-30T00:00:00Z", detail: "private-detail" },
+    { actor: "system", action: "constructor", resource: "safe", created_at: "2026-08-30T00:00:00Z" },
+  ]);
+  for (const expected of ["续跑任务", "alice &lt;img&gt;", "task &lt;script&gt;", "系统操作", "constructor"]) assert.ok(auditHtml.includes(expected), expected);
+  assert.doesNotMatch(auditHtml, /<img>|<script>|private-detail|function Object/);
+  const outboxHtml = context.outboxRows([{ id: "review:task-1", attempts: 4, updated_at: "2026-08-30T00:00:00Z", last_error: "private-error", payload: "private-payload" }]);
+  assert.match(outboxHtml, /结果回写等待重新派发.*review:task-1.*已尝试 4 次.*重新派发/s);
+  assert.doesNotMatch(outboxHtml, /private-error|private-payload/);
+  const deadHtml = context.deadLetterRows([{ task_id: "task-1", attempt: 3, failed_at: 1, error: "private-error", payload: "private-payload" }]);
+  assert.match(deadHtml, /task-1.*第 3 次投递失败.*查看任务/s);
+  assert.doesNotMatch(deadHtml, /private-error|private-payload/);
 
   // Only public codes are displayable; old APIs/proxies must not leak their bodies.
   for (const [data, status, expected] of [
@@ -675,10 +747,12 @@ test("review submissions recover lost acknowledgements without storing Diff or c
   for (const status of [200, 401]) {
     page = boot();
     const form = page.query("#review-form"), button = page.query('button[type="submit"]');
-    form.fields = { repository: "old-account/repo", diff: "old-private-diff", workflow: `${"a".repeat(32)}:2` };
+    form.fields = { repository: "old-account/repo", diff: "old-private-diff", workflow: `${"a".repeat(32)}:2`, title: "Context title", spec: "Required behavior", standards: "No dynamic execution" };
     const oldSubmission = form.events.submit({ preventDefault() {}, currentTarget: form });
     const oldRequest = await nextRequest();
-    assert.deepEqual(JSON.parse(oldRequest.options.body).workflow, { id: "a".repeat(32), version: 2 }, "the manual form must submit the chosen immutable version");
+    const oldBody = JSON.parse(oldRequest.options.body);
+    assert.deepEqual(oldBody.workflow, { id: "a".repeat(32), version: 2 }, "the manual form must submit the chosen immutable version");
+    assert.deepEqual(oldBody.context, { title: "Context title", spec: "Required behavior", standards: "No dynamic execution" });
     await form.events.submit({ preventDefault() {}, currentTarget: form });
     assert.equal(sent.at(-1), oldRequest, "busy forms must not start another request");
     page.query("#logout").events.click();
@@ -887,7 +961,7 @@ test("the whole console clears private data and ignores reads, writes and logins
   const reply = (request, value, status = 200) => request.resolve({ ok: status < 400, status, headers: { get: () => "application/json" }, json: async () => value });
   const flush = () => new Promise(setImmediate);
   const payload = (name) => ({
-    capabilities: { role: "platform_admin", review: true, manage: true, platform: true, github_install_configured: true }, ready: true,
+    capabilities: { role: "platform_admin", review: true, manage: true, audit: true, platform: true, github_install_configured: true }, ready: true,
     stats: {}, tasks: [{ id: name, repository: name, state: "SUCCESS" }],
     skills: [{ name, description: name, version: 1 }], cases: [{ category: name }], runs: [],
     decision: "deferred", version: { version: name === "old-tenant-private" ? 17 : 29 },
@@ -899,8 +973,14 @@ test("the whole console clears private data and ignores reads, writes and logins
   assert.equal(requests.length, 1, "unknown capability state must never trigger a POST");
   const initialDashboard = take("/api/dashboard");
   const deniedDashboard = context.loadDashboard();
-  reply(take("/api/dashboard"), { capabilities: { role: "auditor", review: false, manage: false, platform: false } });
+  reply(take("/api/dashboard"), { capabilities: { role: "auditor", review: false, manage: false, audit: true, platform: false } });
   await deniedDashboard;
+  const auditOnly = context.loadOperations();
+  reply(take("/api/audit?limit=50"), { events: [{ actor: "reader", action: "task.resume", resource: "task-a", created_at: "2026-08-30T00:00:00Z" }] });
+  await auditOnly;
+  assert.match(query("#audit-list").innerHTML, /续跑任务.*reader.*task-a/s);
+  assert.match(query("#outbox-list").textContent, /仅管理员/);
+  assert.equal(requests.length, 0, "an auditor must not request capacity or delivery internals");
   reply(initialDashboard, payload("old-tenant-private"));
   await flush();
   assert.equal(query('#review-form button[type="submit"]').disabled, true, "late capabilities cannot undo newer restrictions");
@@ -930,6 +1010,15 @@ test("the whole console clears private data and ignores reads, writes and logins
   reply(take("/api/dashboard"), payload("old-tenant-private"));
   await configured;
   assert.match(query("#recent-tasks").textContent, /old-tenant-private/);
+  const operations = context.loadOperations();
+  reply(take("/api/audit?limit=50"), { events: [{ actor: "admin", action: "outbox.replay", resource: "review:task-1", created_at: "2026-08-30T00:00:00Z" }] });
+  reply(take("/api/outbox?status=dead&limit=50"), { messages: [{ id: "review:task-1", attempts: 5, updated_at: "2026-08-30T00:00:00Z" }] });
+  reply(take("/api/queue/dead-letters?limit=50"), { messages: [{ task_id: "task-2", attempt: 3, failed_at: 1 }] });
+  reply(take("/api/tenant-review-capacity"), { enabled: true, max_active_reviews: 4, active_reviews: 2, available: 2, saturated: false });
+  assert.equal(await operations, true);
+  assert.match(query("#operations-stats").innerHTML, /活跃审查.*2.*容量上限.*4.*结果回写死信.*1.*任务执行死信.*1/s);
+  assert.match(query("#outbox-list").innerHTML, /review:task-1.*重新派发/s);
+  assert.match(query("#queue-dead-list").innerHTML, /task-2.*查看任务/s);
   query("#evolution-form").fields = { skill_name: "old-skill", prompt: "old-private-prompt" };
   query("#login-form").fields = { username: "old-user", password: "old-password" };
   const ready = context.loadFailures();
@@ -943,7 +1032,7 @@ test("the whole console clears private data and ignores reads, writes and logins
   const oldReads = [context.loadDashboard(), context.loadTasks(), context.loadSkills(), context.loadFailures()];
   const oldRequests = requests.splice(0);
   query("#logout").events.click();
-  for (const key of ["#stats", "#recent-tasks", "#all-tasks", "#skill-list", "#evolution-status", "#failure-list", "#evolution-result", "#toast"]) {
+  for (const key of ["#stats", "#recent-tasks", "#all-tasks", "#skill-list", "#evolution-status", "#failure-list", "#operations-stats", "#audit-list", "#outbox-list", "#queue-dead-list", "#evolution-result", "#toast"]) {
     assert.doesNotMatch(query(key).textContent, /old-tenant-private/, `${key} clears synchronously on logout`);
   }
   assert.deepEqual(query("#evolution-form").fields, {});
@@ -1060,4 +1149,198 @@ test("the whole console clears private data and ignores reads, writes and logins
   await assert.rejects(forbidden, /权限.*策略/);
   assert.equal(stored.get("evoagent_token"), "permission-check", "permission denial is not session expiry");
   assert.equal(query(".app-shell").inert, false);
+});
+
+test("repository governance reads safe output, sends CAS versions and preserves stale edits", async (t) => {
+  const nodes = new Map(), requests = [], credentials = new Map([
+    ["evoagent_token", "admin-token"], ["evoagent_role", "platform_admin"],
+  ]);
+  let policyInputs = [];
+  const element = (key) => {
+    const classes = new Set(); let html = "";
+    return {
+      value: "", checked: false, fields: {}, events: {}, dataset: {}, disabled: false, inert: false,
+      get innerHTML() { return html; }, set innerHTML(value) { html = String(value); },
+      get textContent() { return html; }, set textContent(value) { html = String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;"); },
+      classList: { add: (name) => classes.add(name), remove: (name) => classes.delete(name), contains: (name) => classes.has(name), toggle(name, on) { if (on) classes.add(name); else classes.delete(name); } },
+      addEventListener(name, fn) { this.events[name] = fn; }, setAttribute() {}, focus() {}, reset() { this.fields = {}; },
+      querySelector: (selector) => query(`${key} ${selector}`),
+      querySelectorAll: (selector) => selector.startsWith("[data-policy-group=")
+        ? policyInputs.filter((input) => selector.includes(input.dataset.policyGroup)) : [],
+    };
+  };
+  const query = (key) => { if (!nodes.has(key)) nodes.set(key, element(key)); return nodes.get(key); };
+  const response = (value, status = 200) => ({ ok: status < 400, status, headers: { get: () => "application/json" }, json: async () => value });
+  const context = vm.createContext({
+    document: { querySelector: query, querySelectorAll: () => [], createElement: () => element("created") },
+    localStorage: { getItem: (key) => credentials.get(key) ?? "", setItem: (key, value) => credentials.set(key, value), removeItem: (key) => credentials.delete(key) },
+    sessionStorage: { removeItem() {} }, location: { hash: "#governance" }, history: { replaceState() {} },
+    window: { addEventListener() {}, scrollTo() {}, location: { assign() {} } },
+    FormData: class { constructor(form) { return new Map(Object.entries(form.fields)); } },
+    AbortSignal, setTimeout, clearTimeout,
+    fetch: (path, options) => new Promise((resolve, reject) => requests.push({ path, options, resolve, reject })),
+  });
+  vm.runInContext(readFileSync(join(__dirname, "../web/app.js"), "utf8"), context);
+  vm.runInContext("confirmConsoleAction = async (_message, current) => current()", context);
+  t.after(() => vm.runInContext("clearTimeout(toastTimer)", context));
+  const take = (path) => {
+    const index = requests.findIndex((request) => request.path === path);
+    assert.notEqual(index, -1, `pending request: ${path}`);
+    return requests.splice(index, 1)[0];
+  };
+  const reply = (request, value, status = 200) => request.resolve(response(value, status));
+  const flush = () => new Promise(setImmediate);
+  const policy = (version, enabled = true) => ({
+    repository: "org/repo", version, source: version ? "configured" : "legacy-grant",
+    policy: {
+      enabled, auto_fix: false, post_review_comments: true,
+      allowed_reviewers: ["review", "retired<img>"], allowed_fix_rules: ["SEC-YAML-LOAD"],
+      allowed_llm_providers: [], allowed_llm_models: [], llm_region: null, max_diff_bytes: 4096,
+    },
+    history: version ? [{ version, actor: "admin<script>", created_at: "2026-08-30T00:00:00Z", policy: { secret: "private-history" } }] : [],
+    available_reviewers: ["review"], available_fix_rules: ["SEC-YAML-LOAD"],
+    tenant_id: "private-tenant", metadata: { secret: "private-metadata" },
+  });
+
+  reply(take("/api/dashboard"), { capabilities: { role: "platform_admin", review: true, manage: true, audit: true, platform: true }, stats: {}, tasks: [] });
+  await flush();
+  const repository = query("#policy-repository");
+  repository.value = "ORG/Repo";
+  repository.events.input();
+  let pending = query("#policy-load").events.click();
+  reply(take("/v1/repository-policies?repository=org%2Frepo"), policy(1));
+  assert.equal(await pending, true);
+  assert.match(query("#policy-summary").innerHTML, /org\/repo.*已配置策略.*4,096 字节/s);
+  assert.match(query("#policy-reviewers").innerHTML, /retired&lt;img&gt;.*当前部署已不可用/s);
+  assert.match(query("#policy-history").innerHTML, /admin&lt;script&gt;/);
+  for (const target of ["#policy-summary", "#policy-reviewers", "#policy-history"]) {
+    assert.doesNotMatch(query(target).innerHTML, /private-|<img>|<script>|\{"/);
+  }
+
+  const form = query("#policy-form");
+  query('#policy-form [name="enabled"]').checked = false;
+  query('#policy-form [name="auto_fix"]').checked = true;
+  query('#policy-form [name="post_review_comments"]').checked = false;
+  query('#policy-form [name="max_diff_bytes"]').value = "8192";
+  query('#policy-form [name="allowed_llm_providers"]').value = "local, local, openai";
+  query('#policy-form [name="allowed_llm_models"]').value = "model-a";
+  query('#policy-form [name="llm_region"]').value = "cn-north-1";
+  policyInputs = [
+    { checked: true, dataset: { policyGroup: "allowed_reviewers", policyValue: encodeURIComponent("review") } },
+    { checked: true, dataset: { policyGroup: "allowed_fix_rules", policyValue: encodeURIComponent("SEC-YAML-LOAD") } },
+  ];
+  pending = form.events.submit({ preventDefault() {}, currentTarget: form });
+  await flush();
+  let write = take("/v1/repository-policies");
+  const body = JSON.parse(write.options.body);
+  assert.equal(body.expected_version, 1);
+  assert.deepEqual(body.policy.allowed_llm_providers, ["local", "openai"]);
+  assert.deepEqual(body.policy.allowed_reviewers, ["review"]);
+  reply(write, { error_code: "policy_conflict" }, 409);
+  await pending;
+  assert.match(query("#policy-result").textContent, /其他管理员.*(?:未|没有)保存.*重新读取/);
+  assert.equal(query("#policy-fields").disabled, true);
+  assert.equal(query('#policy-form [name="max_diff_bytes"]').value, "8192", "conflict must preserve the visible edit");
+
+  pending = query("#policy-load").events.click();
+  reply(take("/v1/repository-policies?repository=org%2Frepo"), policy(2));
+  await pending;
+  query('#policy-form [name="max_diff_bytes"]').value = "9000";
+  pending = form.events.submit({ preventDefault() {}, currentTarget: form });
+  await flush();
+  write = take("/v1/repository-policies");
+  assert.equal(JSON.parse(write.options.body).expected_version, 2);
+  reply(write, { repository: "org/repo", version: 3, policy: {} }, 201);
+  await flush();
+  reply(take("/v1/repository-policies?repository=org%2Frepo"), policy(3, false));
+  await pending;
+  assert.match(query("#policy-result").textContent, /v3 已保存/);
+  assert.match(query("#policy-summary").innerHTML, /审查<\/b><span>已关闭/);
+  assert.equal(requests.length, 0);
+
+  query("#logout").events.click();
+  assert.match(query("#policy-summary").textContent, /读取后展示/);
+  assert.doesNotMatch(query("#policy-summary").textContent, /org\/repo|private/);
+  assert.equal(query("#policy-fields").disabled, true);
+});
+
+test("Proof displays evidence stages without leaking metadata or treating incomplete results as L4", () => {
+  const escapeHtml = (value) => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+  const context = vm.createContext({ $: () => null, escapeHtml, artifactValueMarkup: escapeHtml });
+  vm.runInContext(readFileSync(join(__dirname, "../web/proof.js"), "utf8"), context);
+  const payload = context.proofPayload([
+    { path: "removed.py", original: "old", patched: null },
+    { path: "added.py", original: null, patched: "new" },
+    { path: "__proto__", original: "before", patched: "after" },
+  ], "test", "regression");
+  assert.deepEqual(JSON.parse(JSON.stringify(payload)), JSON.parse('{"original":{"removed.py":"old","__proto__":"before"},"patched":{"added.py":"new","__proto__":"after"},"reproduction_command":"test","regression_command":"regression"}'));
+  for (const files of [[], Array(33).fill({}), [{ path: "a", original: null, patched: null }], [{ path: "", original: "", patched: "" }], [{ path: "a" }, { path: "a" }]]) {
+    assert.throws(() => context.proofPayload(files, "test", ""));
+  }
+  assert.throws(() => context.proofPayload([{ path: "a", original: "", patched: "" }], " ", ""));
+  const steps = ["reproduce-on-original", "reproduce-on-patched", "regression-on-patched"].map((step, index) => ({ step, status: index ? "passed" : "failed", duration_seconds: 0.1, detail: "<script>untrusted()</script>", attestation: { request_sha256: "private-fingerprint" } }));
+  for (let level = 1; level <= 4; level++) {
+    const html = context.proofMarkup({ evidence_level: level, steps: steps.slice(0, level - 1), patch: "<img>" });
+    assert.match(html, new RegExp(`L${level}`));
+    assert.doesNotMatch(html, /<script>|<img>|private-fingerprint|attestation/);
+    if (level > 1) assert.match(html, /state-success\">测试失败/, "failing on the original is expected evidence");
+  }
+  for (const invalid of [{ evidence_level: 4, steps: [] }, { evidence_level: 1, steps: [steps[1]] }, { evidence_level: 1, steps: [{ ...steps[0], status: "passed" }, steps[1]] }]) assert.throws(() => context.proofMarkup(invalid));
+  const inconclusive = context.proofMarkup({ evidence_level: 1, steps: [{ ...steps[0], status: "error", detail: "private-diagnostic" }] });
+  assert.match(inconclusive, /无法判断/);
+  assert.doesNotMatch(inconclusive, /private-diagnostic|state-success/);
+});
+
+test("Proof submits once, invalidates edited evidence and discards results after sign-out", async () => {
+  const nodes = new Map(), requests = [];
+  const element = () => ({
+    children: [], fields: new Map(), events: {}, value: "", checked: true, disabled: false, textContent: "", innerHTML: "",
+    classList: { add() {}, remove() {} }, reset() {}, focus() {}, setAttribute() {},
+    addEventListener(name, fn) { this.events[name] = fn; },
+    appendChild(child) { this.children.push(child); }, replaceChildren() { this.children = []; },
+  });
+  const query = (key, root) => {
+    const collection = root ? root.fields : nodes;
+    if (!collection.has(key)) collection.set(key, element());
+    return collection.get(key);
+  };
+  const context = vm.createContext({
+    $: query, $$: (_key, root) => root.children, window: {}, document: { createElement: element },
+    authEpoch: 0, consoleCapabilities: { proof: true }, escapeHtml: String, artifactValueMarkup: String,
+    setButtonAvailable: (button, available) => { button.disabled = !available; }, setButtonBusy() {}, toast() {},
+    confirmConsoleAction: async (_text, current) => current(),
+    api: (path, options) => new Promise((resolve, reject) => requests.push({ path, options, resolve, reject })),
+  });
+  vm.runInContext(readFileSync(join(__dirname, "../web/proof.js"), "utf8"), context);
+  const form = query("#proof-form"), files = query("#proof-files"), output = query("#proof-result");
+  const fill = () => {
+    query("[data-proof-path]", files.children[0]).value = "app.py";
+    query('[data-proof-content="original"]', files.children[0]).value = "before";
+    query('[data-proof-content="patched"]', files.children[0]).value = "after";
+    query('[name="reproduction_command"]', form).value = "test";
+  };
+  fill();
+  let pending = form.events.submit({ preventDefault() {} });
+  await form.events.submit({ preventDefault() {} });
+  assert.equal(requests.length, 1, "double submit cannot launch a second job");
+  assert.equal(query("#proof-fields").disabled, true);
+  assert.equal(requests[0].path, "/v1/proofs");
+  assert.equal(requests[0].options.method, "POST");
+  assert.deepEqual(JSON.parse(requests[0].options.body).patched, { "app.py": "after" });
+  requests.shift().resolve({ evidence_level: 1, steps: [] }); await pending;
+  assert.match(output.innerHTML, /L1/);
+  assert.equal(query("#proof-fields").disabled, false);
+  form.events.input();
+  assert.match(output.textContent, /旧结果已清除/);
+  pending = form.events.submit({ preventDefault() {} });
+  const old = requests.shift();
+  context.authEpoch++; context.consoleCapabilities = null;
+  context.window.proof.reset();
+  const resetOutput = output.innerHTML;
+  old.resolve({ evidence_level: 1, steps: [] }); await pending;
+  assert.equal(output.innerHTML, resetOutput, "an old account cannot restore its result");
+  assert.equal(query("#proof-submit").disabled, true);
+  assert.equal(files.children.length, 1);
+  assert.equal(query("[data-proof-path]", files.children[0]).value, "");
+  assert.equal(requests.length, 0);
 });

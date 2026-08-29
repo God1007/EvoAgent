@@ -8,8 +8,9 @@ from datetime import datetime
 from typing import Any
 
 from ..errors import AccessDeniedError, ClientInputError, TenantReviewCapacityError
-from ..github import GITHUB_INSTALLATION_ID_MAX, validate_pull_request_urls
+from ..github import GITHUB_INSTALLATION_ID_MAX, validate_commit_sha, validate_pull_request_urls
 from ..metrics import metrics
+from ..models import ReviewContext
 from ..ports import TaskQueuePort, WebhookApplicationStorePort
 from ..repository import canonical_repository
 from .reviews import ReviewUseCases
@@ -161,11 +162,11 @@ class WebhookUseCases:
             }
 
         head = pull.get("head")
-        if not isinstance(head, dict):
+        base = pull.get("base")
+        if not isinstance(head, dict) or not isinstance(base, dict):
             raise ClientInputError("invalid GitHub pull_request payload")
         diff_url = pull.get("diff_url")
         issue_url = pull.get("issue_url")
-        head_sha = head.get("sha")
         if (
             not isinstance(diff_url, str)
             or not diff_url
@@ -173,17 +174,20 @@ class WebhookUseCases:
             or not isinstance(issue_url, str)
             or not issue_url
             or len(issue_url) > 4096
-            or not isinstance(head_sha, str)
-            or not head_sha
-            or len(head_sha) > 128
         ):
             raise ClientInputError("invalid GitHub pull_request payload")
         try:
+            base_sha = validate_commit_sha(base.get("sha"))
+            head_sha = validate_commit_sha(head.get("sha"))
             validate_pull_request_urls(repository, number, diff_url, issue_url)
         except ValueError:
-            raise ClientInputError(
-                "GitHub pull request URLs must match repository and number"
-            ) from None
+            raise ClientInputError("invalid GitHub pull_request comparison") from None
+        try:
+            review_context = ReviewContext.from_github(
+                pull.get("title"), pull.get("body")
+            ).to_dict()
+        except ValueError:
+            raise ClientInputError("invalid GitHub pull_request title or body") from None
         policy = self.reviews.authorize_repository(tenant_id, repository)
         task_id, task_input = self.reviews.prepare_deferred_task(
             repository,
@@ -191,8 +195,10 @@ class WebhookUseCases:
             tenant_id,
             {
                 "diff_url": diff_url,
+                "base_sha": base_sha,
                 "trigger": action,
                 "installation_id": installation_id,
+                "review_context": review_context,
             },
             policy,
         )
@@ -214,6 +220,7 @@ class WebhookUseCases:
                     "installation_id": installation_id,
                     "tenant_id": tenant_id,
                     "diff_url": diff_url,
+                    "base_sha": base_sha,
                 },
                 self.reviews.options.tenant_max_active_reviews,
                 event_at=event_at,

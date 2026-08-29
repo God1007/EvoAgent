@@ -9,6 +9,7 @@ from unittest import mock
 
 from evoagent.circuit_breaker import CircuitBreaker, CircuitOpenError
 from evoagent.errors import AccessDeniedError, ClientInputError
+from evoagent.metrics import Metrics
 from evoagent.model_gateway import (
     MAX_MODEL_ROUTE_BYTES,
     ModelGateway,
@@ -69,6 +70,24 @@ class ModelGatewayTests(unittest.TestCase):
             with self.subTest(name=name, value=value), self.assertRaisesRegex(ValueError, "limits"):
                 self.gateway(**{name: value})
 
+    def test_breaker_gauge_is_callable_and_tracks_current_state(self):
+        metrics = Metrics()
+        for gateway in (ModelGateway(None, None), self.gateway()):
+            metrics.register_gauge_source("breaker_llm_state", gateway.breaker_state_code)
+            self.assertIn("evoagent_breaker_llm_state 0.0", metrics.prometheus())
+        provider = FakeProvider()
+        provider.breaker = CircuitBreaker("llm", failure_threshold=1, reset_seconds=0)
+        gateway = self.gateway(provider)
+        metrics.register_gauge_source("breaker_llm_state", gateway.breaker_state_code)
+        provider.breaker.record_failure()
+        self.assertIn("evoagent_breaker_llm_state 2.0", metrics.prometheus())
+        provider.breaker.allow()
+        self.assertIn("evoagent_breaker_llm_state 1.0", metrics.prometheus())
+        provider.breaker.record_success()
+        output = metrics.prometheus()
+        self.assertIn("evoagent_breaker_llm_state 0.0", output)
+        self.assertIn("evoagent_metrics_gauge_scrape_failures_total 0.0", output)
+
     def test_route_metadata_and_headers_are_validated_and_immutable(self):
         defaults = {
             "provider": "test",
@@ -121,6 +140,20 @@ class ModelGatewayTests(unittest.TestCase):
         self.assertNotIn("abcdefghijk", sent)
         self.assertNotIn("secret-key", sent)
         self.assertEqual("upstream-1", response.request_id)
+
+    def test_records_actual_token_usage_by_bounded_purpose(self):
+        captured = Metrics()
+        with mock.patch("evoagent.model_gateway.metrics", captured):
+            self.gateway().complete(self.request(purpose="studio-agent"))
+            self.gateway().complete(self.request(purpose="tenant-specific-purpose"))
+
+        output = captured.prometheus()
+        self.assertIn("evoagent_model_input_tokens_total 24.0", output)
+        self.assertIn("evoagent_model_output_tokens_total 10.0", output)
+        self.assertIn("evoagent_model_studio_input_tokens_total 12.0", output)
+        self.assertIn("evoagent_model_studio_output_tokens_total 5.0", output)
+        self.assertIn("evoagent_model_other_requests_total 1.0", output)
+        self.assertNotIn("tenant_specific", output)
 
     def test_structured_messages_redact_decoded_values_without_corrupting_json(self):
         original = {

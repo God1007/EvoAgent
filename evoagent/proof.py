@@ -72,10 +72,17 @@ def unified_patch(original: dict[str, str], patched: dict[str, str]) -> str:
 class LocalProofExecutor:
     """Materialize and execute locally through an injected isolation adapter."""
 
-    def __init__(self, verifier_factory=None):
+    def __init__(self, verifier_factory=None, health_check=None):
         self._verifier_factory = verifier_factory or (
             lambda command: RepairVerifier(test_command=command)
         )
+        self._health_check = health_check or (lambda: True)
+
+    def healthy(self) -> bool:
+        try:
+            return self._health_check() is True
+        except Exception:
+            return False
 
     def execute(self, files: dict[str, str], command: str) -> dict[str, Any]:
         root = tempfile.mkdtemp(prefix="evoagent-proof-")
@@ -245,7 +252,14 @@ def _materialize(files: dict[str, str], root: str) -> None:
 
 def _proof_target(root: str, rel: str) -> str:
     root = os.path.abspath(root)
-    if not isinstance(rel, str) or not rel or "\0" in rel or os.path.isabs(rel):
+    if (
+        not isinstance(rel, str)
+        or not rel
+        or "\0" in rel
+        or "\\" in rel
+        or os.path.isabs(rel)
+        or any(part in {"", ".", ".."} for part in rel.split("/"))
+    ):
         raise ClientInputError("unsafe path in proof file set: %s" % rel)
     target = os.path.abspath(os.path.join(root, rel))
     if target == root or not target.startswith(root + os.sep):

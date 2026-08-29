@@ -202,6 +202,24 @@ class TransactionalOutboxTests(unittest.TestCase):
             dispatcher.close()
             queue.close(2)
 
+    def test_outbox_age_is_nonnegative_when_writer_clock_is_ahead_of_database(self):
+        task_id = uuid.uuid4().hex
+        _task(self.store, task_id, {"task_id": task_id})
+        for offset in (600, -600):
+            with self.subTest(writer_clock_offset=offset):
+                with self.store._connect() as conn:
+                    conn.execute(
+                        "UPDATE outbox_messages SET created_at="
+                        "CURRENT_TIMESTAMP + %s * INTERVAL '1 second' WHERE message_key=%s",
+                        (offset, task_id),
+                    )
+                stats = self.store.outbox_stats()
+                self.assertEqual(1, stats["pending"])
+                if offset > 0:
+                    self.assertEqual(0.0, stats["oldest_age_seconds"])
+                else:
+                    self.assertGreaterEqual(stats["oldest_age_seconds"], 600.0)
+
     def test_crash_after_publish_retries_without_duplicate_queue_delivery(self):
         task_id = uuid.uuid4().hex
         _task(self.store, task_id, {"task_id": task_id})

@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    restart: always
     environment:
       POSTGRES_DB: evoagent
       POSTGRES_USER: evoagent
@@ -15,6 +16,7 @@ services:
 
   redis:
     image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+    restart: always
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
@@ -35,6 +37,7 @@ services:
 
   evoagent:
     build: .
+    restart: always
     ports:
       - "127.0.0.1:${EVOAGENT_HOST_PORT:-8080}:8080"
     environment:

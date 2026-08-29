@@ -26,6 +26,17 @@ TASK_FIELDS = (
 FINDING_FIELDS = ("severity", "title", "explanation", "path", "line", "evidence", "fix", "test")
 DOCUMENT_FIELDS = ("id", "revision", "active_version", "name", "updated_at")
 VERSION_FIELDS = ("version", "draft_revision", "created_at")
+POLICY_FIELDS = (
+    "enabled",
+    "auto_fix",
+    "post_review_comments",
+    "allowed_reviewers",
+    "allowed_fix_rules",
+    "allowed_llm_providers",
+    "allowed_llm_models",
+    "llm_region",
+    "max_diff_bytes",
+)
 
 # Exact reviewed messages only. Never interpolate exception text or payloads into
 # the console response; new/unrecognized failures use the HTTP-status fallback.
@@ -44,6 +55,7 @@ ERROR_CODES = {
     "draft changed; reload before publishing": "draft_conflict",
     "draft changed; save and retry": "draft_conflict",
     "仓库配置已变化，请重新读取后再切换。": "binding_conflict",
+    "repository policy changed; reload before saving": "policy_conflict",
     "草稿结构暂不受编辑器支持，原始内容未修改。": "unsupported_draft",
     "published agent digest mismatch": "invalid_version",
     "published workflow digest mismatch": "invalid_version",
@@ -67,7 +79,12 @@ ERROR_CODES = {
     "diff tools require an explicitly connected diff input": "diff_input_required",
     "model findings require a diff input to verify their locations": "diff_input_required",
     "max_output_tokens must be between 1 and 4096": "invalid_output_limit",
-    "model outputs cannot impersonate source diff artifacts": "invalid_model_output",
+    "model outputs cannot impersonate source review artifacts": "invalid_model_output",
+    "model config requires a Playbook, model, tools and max_output_tokens": "invalid_playbook",
+    "Playbook requires identity, objective and instructions": "invalid_playbook",
+    "Playbook identity must be text of 1-200 characters": "invalid_playbook",
+    "Playbook objective must be text of 1-2000 characters": "invalid_playbook",
+    "Playbook instructions must be text of 1-12000 characters": "invalid_playbook",
     "prompt must be text of 1-16000 characters": "invalid_prompt",
     "agent name must be text of 1-100 characters": "invalid_name",
     "workflow name must be text of 1-100 characters": "invalid_name",
@@ -100,6 +117,41 @@ def console_error(status: int, value: dict) -> dict[str, str]:
 
 def pick(value: dict | None, *keys: str) -> dict:
     return {key: value[key] for key in keys if value is not None and key in value}
+
+
+def _template(value: dict) -> dict:
+    raw_definition = value.get("definition")
+    definition = raw_definition if isinstance(raw_definition, dict) else {}
+    return {
+        **pick(value, "id", "name", "description", "available", "reason"),
+        "definition": {
+            **pick(definition, "name", "outputs"),
+            "steps": [
+                pick(step, "id", "agent", "version", "sources")
+                for step in definition.get("steps", [])
+                if isinstance(step, dict)
+            ],
+        },
+    }
+
+
+def _agent_recipe(value: dict) -> dict:
+    raw_definition = value.get("definition")
+    definition = raw_definition if isinstance(raw_definition, dict) else {}
+    raw_config = definition.get("config")
+    config = raw_config if isinstance(raw_config, dict) else {}
+    raw_playbook = config.get("playbook")
+    playbook = raw_playbook if isinstance(raw_playbook, dict) else {}
+    return {
+        **pick(value, "id", "name", "description"),
+        "definition": {
+            **pick(definition, "name", "kind", "inputs", "outputs"),
+            "config": {
+                "playbook": pick(playbook, "identity", "objective", "instructions"),
+                **pick(config, "model", "tools", "max_output_tokens"),
+            },
+        },
+    }
 
 
 def _task(value: dict) -> dict:
@@ -178,6 +230,7 @@ def _workflow(value: dict) -> dict:
                 "status",
                 "blocked_by",
                 "attempt",
+                "duration_ms",
                 "updated_at",
             ),
             "error": bool(step.get("error")),
@@ -201,6 +254,22 @@ def _artifact_value(value: Any, kind: str) -> Any:
             "files": value.get("files", []),
             "added_line_count": len(value.get("added_lines", [])),
         }
+    if kind == "review-context@1" and isinstance(value, dict):
+        return pick(value, "origin", "title", "spec", "standards", "truncated")
+    if kind == "repository-evidence@1" and isinstance(value, dict):
+        return pick(
+            value,
+            "origin",
+            "status",
+            "revision",
+            "indexed_files",
+            "indexed_bytes",
+            "changed_paths",
+            "changed_symbols",
+            "impacted_symbols",
+            "importing_files",
+            "truncated",
+        )
     if kind == "review-plan@1" and isinstance(value, dict):
         return {
             **pick(value, "languages", "changed_files"),
@@ -260,6 +329,89 @@ def _evaluation(value: dict) -> dict:
     }
 
 
+def _proof(value: dict) -> dict:
+    return {
+        **pick(value, "evidence_level", "patch"),
+        "steps": [
+            {
+                **pick(step, "step", "status", "duration_seconds"),
+                # Infrastructure diagnostics are not test evidence or user-facing prose.
+                "detail": step.get("detail", "")
+                if step.get("status") in {"passed", "failed"}
+                else "",
+            }
+            for step in value.get("steps", [])
+        ],
+    }
+
+
+def _audit_events(value: dict) -> dict:
+    return {
+        "events": [
+            pick(event, "actor", "action", "resource", "created_at")
+            for event in value.get("events", [])
+            if isinstance(event, dict)
+        ]
+    }
+
+
+def _outbox_messages(value: dict) -> dict:
+    return {
+        "messages": [
+            {
+                **pick(
+                    message,
+                    "id",
+                    "status",
+                    "attempts",
+                    "available_at",
+                    "created_at",
+                    "updated_at",
+                ),
+                "error": bool(message.get("last_error")),
+            }
+            for message in value.get("messages", [])
+            if isinstance(message, dict)
+        ]
+    }
+
+
+def _dead_letters(value: dict) -> dict:
+    messages = []
+    for message in value.get("messages", []):
+        if not isinstance(message, dict):
+            continue
+        payload = message.get("payload")
+        task_id = payload.get("task_id") if isinstance(payload, dict) else None
+        messages.append(
+            {
+                **pick(message, "attempt", "failed_at"),
+                "task_id": task_id if isinstance(task_id, str) else None,
+                "error": bool(message.get("error")),
+            }
+        )
+    return {"messages": messages}
+
+
+def _repository_policy(value: dict) -> dict:
+    policy = value.get("policy")
+    return {
+        **pick(value, "repository", "version", "source", "updated_at"),
+        "policy": pick(policy, *POLICY_FIELDS) if isinstance(policy, dict) else {},
+        "history": [
+            pick(item, "version", "actor", "created_at")
+            for item in value.get("history", [])
+            if isinstance(item, dict)
+        ],
+        "available_fix_rules": [
+            item for item in value.get("available_fix_rules", []) if isinstance(item, str)
+        ],
+        "available_reviewers": [
+            item for item in value.get("available_reviewers", []) if isinstance(item, str)
+        ],
+    }
+
+
 # Only the console's actual requests have a view. This is not a second router:
 # existing handlers still own authorization, validation, queries and mutations.
 VIEWS: tuple[tuple[str, Callable[[dict], dict]], ...] = (
@@ -281,7 +433,9 @@ VIEWS: tuple[tuple[str, Callable[[dict], dict]], ...] = (
                 "role",
                 "review",
                 "manage",
+                "audit",
                 "platform",
+                "proof",
                 "github_install_configured",
             ),
         },
@@ -307,6 +461,22 @@ VIEWS: tuple[tuple[str, Callable[[dict], dict]], ...] = (
             ]
         },
     ),
+    (r"GET /api/audit", _audit_events),
+    (r"GET /api/outbox", _outbox_messages),
+    (r"GET /api/queue/dead-letters", _dead_letters),
+    (
+        r"GET /api/tenant-review-capacity",
+        lambda data: pick(
+            data,
+            "enabled",
+            "max_active_reviews",
+            "active_reviews",
+            "available",
+            "saturated",
+            "oldest_acquired_at",
+        ),
+    ),
+    (r"GET /v1/repository-policies", _repository_policy),
     (
         r"GET /v1/evolution/status",
         lambda data: pick(
@@ -341,6 +511,8 @@ VIEWS: tuple[tuple[str, Callable[[dict], dict]], ...] = (
                 for agent in data.get("builtins", [])
             ],
             "models": [pick(model, "provider", "model") for model in data.get("models", [])],
+            "agent_recipes": [_agent_recipe(recipe) for recipe in data.get("agent_recipes", [])],
+            "templates": [_template(template) for template in data.get("templates", [])],
         },
     ),
     (
@@ -362,6 +534,7 @@ VIEWS: tuple[tuple[str, Callable[[dict], dict]], ...] = (
     (r"POST /v1/auth/login", lambda data: pick(data, "access_token", "role")),
     (r"POST /v1/github/installations", lambda data: pick(data, "url")),
     (r"POST /v1/reviews", lambda data: pick(data, "task_id", "state", "replayed")),
+    (r"POST /v1/proofs", _proof),
     (
         r"POST /v1/tasks/[0-9a-f-]+/resume",
         lambda data: pick(
@@ -380,6 +553,8 @@ VIEWS: tuple[tuple[str, Callable[[dict], dict]], ...] = (
         lambda data: pick(data, "accepted", "cancel_requested", "state"),
     ),
     (r"POST /v1/tasks/[0-9a-f-]+/fix", lambda data: pick(data, "branch")),
+    (r"POST /v1/outbox/replay", lambda data: pick(data, "replayed")),
+    (r"POST /v1/repository-policies", _repository_policy),
     (r"POST /v1/evolution/(propose|auto)", _evaluation),
     (r"POST /v1/studio/(agents|workflows)", _document),
     (

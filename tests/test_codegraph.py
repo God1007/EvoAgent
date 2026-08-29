@@ -1,6 +1,24 @@
+import io
+import stat
 import unittest
+import zipfile
 
-from evoagent.codegraph import CodeGraph, build_graph, module_name_for_path
+from evoagent.codegraph import (
+    CodeGraph,
+    build_graph,
+    module_name_for_path,
+    repository_evidence_from_archive,
+    repository_snapshot_from_archive,
+)
+from evoagent.models import MAX_REVIEW_CONTEXT_SECTION_BYTES
+
+
+def _zip(files: dict[str, str | bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        for path, content in files.items():
+            bundle.writestr("repo-head/" + path, content)
+    return buffer.getvalue()
 
 
 class ModuleNameTests(unittest.TestCase):
@@ -76,6 +94,109 @@ class ImpactTests(unittest.TestCase):
         impact = graph.impact_of(["pkg/lonely.py"])
         self.assertEqual([], impact["impacted_symbols"])
         self.assertFalse(impact["truncated"])
+
+
+class RepositoryEvidenceArchiveTests(unittest.TestCase):
+    def test_archive_builds_bounded_changed_and_reverse_impact_summary(self):
+        archive = _zip(
+            {
+                "pkg/util.py": "def helper():\n    return 1\n",
+                "pkg/service.py": (
+                    "from pkg.util import helper\ndef use():\n    return helper()\n"
+                ),
+                "README.md": "ignored",
+            }
+        )
+
+        evidence = repository_evidence_from_archive(archive, ["pkg/util.py"], "abc123", 100_000)
+
+        self.assertEqual("available", evidence.status)
+        self.assertEqual(2, evidence.indexed_files)
+        self.assertIn("pkg.util.helper", evidence.changed_symbols)
+        self.assertIn("pkg.service.use", evidence.impacted_symbols)
+        self.assertIn("pkg/service.py", evidence.importing_files)
+
+    def test_archive_builds_root_and_changed_path_scoped_standards_pack(self):
+        evidence, standards, truncated = repository_snapshot_from_archive(
+            _zip(
+                {
+                    "AGENTS.md": "Root rules.",
+                    "CONTRIBUTING.md": "Contribution rules.",
+                    ".github/CONTRIBUTING.md": "GitHub rules.",
+                    "pkg/AGENTS.md": "Package rules.",
+                    "other/AGENTS.md": "Unrelated private rules.",
+                    "pkg/service.py": "def changed():\n    return 1\n",
+                }
+            ),
+            ["pkg/service.py"],
+            "abc123",
+            100_000,
+        )
+
+        self.assertEqual("available", evidence.status)
+        self.assertFalse(truncated)
+        self.assertEqual(
+            "## AGENTS.md\nRoot rules.\n\n"
+            "## CONTRIBUTING.md\nContribution rules.\n\n"
+            "## .github/CONTRIBUTING.md\nGitHub rules.\n\n"
+            "## pkg/AGENTS.md\nPackage rules.",
+            standards,
+        )
+        self.assertNotIn("Unrelated private rules", standards)
+
+    def test_repository_standards_are_utf8_bounded_without_losing_code_evidence(self):
+        evidence, standards, truncated = repository_snapshot_from_archive(
+            _zip(
+                {
+                    "AGENTS.md": "界" * MAX_REVIEW_CONTEXT_SECTION_BYTES,
+                    "a.py": "def a():\n    pass\n",
+                }
+            ),
+            ["a.py"],
+            "abc123",
+            200_000,
+        )
+
+        self.assertEqual("available", evidence.status)
+        self.assertTrue(truncated)
+        self.assertLessEqual(len(standards.encode("utf-8")), MAX_REVIEW_CONTEXT_SECTION_BYTES)
+        standards.encode("utf-8").decode("utf-8")
+
+    def test_unsafe_or_non_utf8_standard_documents_are_not_exposed(self):
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as bundle:
+            link = zipfile.ZipInfo("repo-head/AGENTS.md")
+            link.external_attr = (stat.S_IFLNK | 0o777) << 16
+            bundle.writestr(link, "private-target")
+            bundle.writestr("repo-head/CONTRIBUTING.md", b"rules-\xff")
+            bundle.writestr("repo-head/a.py", "def a():\n    pass\n")
+
+        evidence, standards, truncated = repository_snapshot_from_archive(
+            output.getvalue(), ["a.py"], "abc123", 100_000
+        )
+
+        self.assertEqual("available", evidence.status)
+        self.assertEqual("", standards)
+        self.assertTrue(truncated)
+
+    def test_non_utf8_source_is_skipped_and_marks_partial(self):
+        evidence = repository_evidence_from_archive(
+            _zip({"a.py": "def a():\n    pass\n", "broken.py": b"\xff"}),
+            ["a.py"],
+            "abc123",
+            100_000,
+        )
+
+        self.assertEqual("partial", evidence.status)
+        self.assertTrue(evidence.truncated)
+        self.assertEqual(1, evidence.indexed_files)
+
+    def test_invalid_or_oversized_archive_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "invalid"):
+            repository_evidence_from_archive(b"not-a-zip", ["a.py"], "abc123", 1000)
+        archive = _zip({"a.py": "pass\n"})
+        with self.assertRaisesRegex(ValueError, "size limit"):
+            repository_evidence_from_archive(archive, ["a.py"], "abc123", len(archive) - 1)
 
 
 class RelativeImportTests(unittest.TestCase):

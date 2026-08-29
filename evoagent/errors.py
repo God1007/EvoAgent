@@ -19,6 +19,7 @@ _SUMMARY = re.compile(
 _OPERATIONS = frozenset(
     {
         "operation failed",
+        "container reconciliation failed",
         "proof executor failed",
         "verification launch failed",
         "review agent failed",

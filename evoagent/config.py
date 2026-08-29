@@ -120,6 +120,7 @@ class Settings:
     repair_pids_limit: int = 256
     repair_cpus: float = 1.0
     repair_max_output_bytes: int = 16000
+    proof_executor_socket: str = ""
     otel_endpoint: str = ""
     otel_service_name: str = "evoagent"
     alert_failure_rate: float = 0.20
@@ -145,6 +146,7 @@ class Settings:
     outbox_lease_seconds: int = 30
     outbox_max_attempts: int = 20
     effect_lease_seconds: int = 300
+    repository_evidence_max_bytes: int = 32 * 1024 * 1024
     github_webhook_previous_secret: str = ""
     auth_previous_secret: str = ""
 
@@ -389,6 +391,13 @@ class Settings:
             raise ValueError("EVOAGENT_REPAIR_PIDS_LIMIT must be positive")
         if self.repair_max_output_bytes <= 0:
             raise ValueError("EVOAGENT_REPAIR_MAX_OUTPUT_BYTES must be positive")
+        if not isinstance(self.proof_executor_socket, str) or (
+            self.proof_executor_socket
+            and (
+                not os.path.isabs(self.proof_executor_socket) or "\0" in self.proof_executor_socket
+            )
+        ):
+            raise ValueError("EVOAGENT_PROOF_EXECUTOR_SOCKET must be an absolute path")
         if len(self.trusted_proxy_cidrs) > 64:
             raise ValueError("EVOAGENT_TRUSTED_PROXY_CIDRS accepts at most 64 networks")
         normalized_proxy_cidrs = []
@@ -443,6 +452,10 @@ class Settings:
         # renew immediately before each write/retry instead of running heartbeat threads.
         if self.effect_lease_seconds < 300:
             raise ValueError("EVOAGENT_EFFECT_LEASE_SECONDS must be at least 300")
+        if not 1 <= self.repository_evidence_max_bytes <= 1024 * 1024 * 1024:
+            raise ValueError(
+                "EVOAGENT_REPOSITORY_EVIDENCE_MAX_BYTES must be between 1 and 1073741824"
+            )
         if not math.isfinite(self.repair_cpus) or self.repair_cpus <= 0:
             raise ValueError("EVOAGENT_REPAIR_CPUS must be positive")
 
@@ -452,6 +465,9 @@ class Settings:
             host=os.getenv("EVOAGENT_HOST", "127.0.0.1"),
             port=_int("EVOAGENT_PORT", 8080),
             max_diff_bytes=_int("EVOAGENT_MAX_DIFF_BYTES", 1024 * 1024),
+            repository_evidence_max_bytes=_int(
+                "EVOAGENT_REPOSITORY_EVIDENCE_MAX_BYTES", 32 * 1024 * 1024
+            ),
             max_steps=_int("EVOAGENT_MAX_STEPS", 8),
             timeout_seconds=_int("EVOAGENT_TIMEOUT_SECONDS", 120),
             llm_base_url=os.getenv("EVOAGENT_LLM_BASE_URL", "").rstrip("/"),
@@ -512,6 +528,7 @@ class Settings:
             repair_pids_limit=_int("EVOAGENT_REPAIR_PIDS_LIMIT", 256),
             repair_cpus=_positive_float("EVOAGENT_REPAIR_CPUS", 1.0),
             repair_max_output_bytes=_int("EVOAGENT_REPAIR_MAX_OUTPUT_BYTES", 16000),
+            proof_executor_socket=os.getenv("EVOAGENT_PROOF_EXECUTOR_SOCKET", ""),
             otel_endpoint=os.getenv("EVOAGENT_OTEL_ENDPOINT", ""),
             otel_service_name=os.getenv("EVOAGENT_OTEL_SERVICE_NAME", "evoagent"),
             alert_failure_rate=float(os.getenv("EVOAGENT_ALERT_FAILURE_RATE", "0.20")),

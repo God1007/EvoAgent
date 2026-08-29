@@ -1,3 +1,4 @@
+import gc
 import hashlib
 import hmac
 import json
@@ -7,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -21,6 +23,7 @@ from evoagent.skills import (
     MAX_SKILL_DESCRIPTION_CHARS,
     MAX_SKILL_ENTRYPOINT_CHARS,
     MAX_SKILL_MANIFEST_BYTES,
+    MAX_SKILL_OUTPUT_BYTES,
     MAX_SKILL_VERSION_CHARS,
     SandboxedSkillReviewer,
     SkillRegistry,
@@ -72,6 +75,9 @@ class SkillRegistryLifecycleTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.skills_dir = Path(self.temporary.name) / "skills"
         self.skills_dir.mkdir()
+        reconcile = mock.patch("evoagent.skills.reconcile_sandboxes", return_value=0)
+        self.reconcile_sandboxes = reconcile.start()
+        self.addCleanup(reconcile.stop)
 
     def test_sandbox_resource_limits_cannot_be_disabled(self):
         for name, value in (
@@ -561,6 +567,26 @@ class SkillRegistryLifecycleTests(unittest.TestCase):
         self.assertNotEqual(0, returncode)
         self.assertLess(time.monotonic() - started, 5)
 
+    def test_bounded_runner_closes_output_pipes(self):
+        cases = (
+            ("print('ok')", 5),
+            ("import sys; sys.stdout.buffer.write(b'x' * %d)" % (MAX_SKILL_OUTPUT_BYTES + 1), 5),
+            ("import time; time.sleep(30)", 0.05),
+        )
+        for script, timeout in cases:
+            with self.subTest(script=script), tempfile.TemporaryDirectory() as directory:
+                with warnings.catch_warnings(record=True) as seen:
+                    warnings.simplefilter("always", ResourceWarning)
+                    _run_bounded(
+                        [sys.executable, "-c", script],
+                        b"",
+                        directory,
+                        dict(os.environ),
+                        timeout,
+                    )
+                    gc.collect()
+                self.assertEqual([], [item for item in seen if item.category is ResourceWarning])
+
     def test_runner_rejects_an_excessive_finding_set(self):
         reviewer = SandboxedSkillReviewer(
             "noisy-findings",
@@ -750,13 +776,103 @@ class SkillRegistryLifecycleTests(unittest.TestCase):
                 ) as rm,
             ):
                 reviewer.review(DIFF, parse_unified_diff(DIFF))
-                command = run.call_args.args[0]
+                command = rm.call_args_list[0].args[0]
                 self.assertEqual("never", command[command.index("--pull") + 1])
                 self.assertIn("--name", command)
                 self.assertNotIn("-v", command)
-                self.assertEqual("65534:65534", command[command.index("--user") + 1])
+                self.assertEqual("65533:65533", command[command.index("--user") + 1])
                 self.assertIn("sha256:" + "a" * 64, command)
+                execute = run.call_args.args[0]
+                self.assertEqual(["docker", "exec", "-i"], execute[:3])
+                self.assertEqual("65534:65534", execute[execute.index("--user") + 1])
+                self.assertEqual("/app", execute[execute.index("--workdir") + 1])
+                self.assertEqual(command[command.index("--name") + 1], execute[7])
                 self.assertEqual(["docker", "rm", "-f"], rm.call_args.args[0][:3])
+                for proxy in ("HTTP_PROXY", "HTTPS_PROXY", "FTP_PROXY", "ALL_PROXY", "NO_PROXY"):
+                    for key in (proxy, proxy.lower()):
+                        self.assertEqual("--env", command[command.index(key + "=") - 1])
+
+    def test_docker_connection_environment_is_client_only_and_shared_with_cleanup(self):
+        connection = {
+            "HOME": "/private/operator",
+            "USERPROFILE": "C:\\Users\\operator",
+            "DOCKER_HOST": "unix:///private/docker.sock",
+            "DOCKER_CONTEXT": "isolated",
+            "DOCKER_CONFIG": "/private/docker-config",
+            "DOCKER_CERT_PATH": "/private/docker-certs",
+            "DOCKER_TLS": "1",
+            "DOCKER_TLS_VERIFY": "1",
+            "DOCKER_API_VERSION": "1.45",
+        }
+        for image in ("", "sha256:" + "a" * 64):
+            reviewer = SandboxedSkillReviewer("snapshot", "skill.py", container_image=image)
+            with (
+                self.subTest(container=bool(image)),
+                mock.patch.dict(os.environ, {**connection, "EVOAGENT_HOST_SECRET": "private"}),
+                mock.patch(
+                    "evoagent.skills._run_bounded", return_value=(0, b"[]", b"", False, False)
+                ) as run,
+                mock.patch(
+                    "evoagent.skills.subprocess.run", return_value=mock.Mock(returncode=0)
+                ) as cleanup,
+            ):
+                reviewer.review(DIFF, parse_unified_diff(DIFF))
+                env = run.call_args.args[3]
+                self.assertNotIn("EVOAGENT_HOST_SECRET", env)
+                for key, value in connection.items():
+                    self.assertEqual(value if image else None, env.get(key), key)
+                if image:
+                    self.assertIs(env, cleanup.call_args.kwargs["env"])
+                    command = run.call_args.args[0]
+                    self.assertFalse(any(value in command for value in connection.values()))
+                else:
+                    cleanup.assert_not_called()
+
+    def test_uncertain_container_start_never_executes_the_skill_and_is_cleaned_up(self):
+        for failure in ("timeout", "nonzero", "oserror"):
+            reviewer = SandboxedSkillReviewer("startup", "skill.py", container_image="image")
+            containers = {"unrelated"}
+
+            def start(command, failure=failure, containers=containers, **kwargs):
+                if command[:2] == ["docker", "run"]:
+                    containers.add(command[command.index("--name") + 1])
+                    if failure == "timeout":
+                        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+                    if failure == "oserror":
+                        raise OSError("lost acknowledgement")
+                    return SimpleNamespace(returncode=125)
+                self.assertEqual(["docker", "rm", "-f"], command[:3])
+                containers.remove(command[3])
+                return SimpleNamespace(returncode=0)
+
+            with (
+                self.subTest(failure=failure),
+                mock.patch("evoagent.skills.subprocess.run", side_effect=start),
+                mock.patch("evoagent.skills._run_bounded") as execute,
+                self.assertRaises(RuntimeError),
+            ):
+                reviewer.review(DIFF, parse_unified_diff(DIFF))
+            execute.assert_not_called()
+            self.assertEqual({"unrelated"}, containers)
+
+    def test_reconciliation_failure_prevents_container_launch(self):
+        reviewer = SandboxedSkillReviewer("reconcile", "skill.py", container_image="image")
+        captured = Metrics()
+        with (
+            mock.patch("evoagent.skills.metrics", captured),
+            mock.patch(
+                "evoagent.skills.reconcile_sandboxes",
+                side_effect=RuntimeError("private daemon detail"),
+            ),
+            mock.patch("evoagent.skills.subprocess.run") as run,
+            mock.patch("evoagent.skills._run_bounded") as execute,
+            self.assertRaisesRegex(RuntimeError, "skill container reconciliation failed"),
+        ):
+            reviewer.review(DIFF, parse_unified_diff(DIFF))
+
+        run.assert_not_called()
+        execute.assert_not_called()
+        self.assertIn("evoagent_skill_sandbox_failures_total 1.0", captured.prometheus())
 
     def test_container_cleanup_failure_fails_closed_and_is_observable(self):
         reviewer = SandboxedSkillReviewer(

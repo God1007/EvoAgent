@@ -532,10 +532,9 @@ class ModelGateway:
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
-    @property
     def breaker_state_code(self) -> int:
         breaker = getattr(self.provider, "breaker", None)
-        return breaker.state_code if breaker is not None else 0
+        return breaker.state_code() if breaker is not None else 0
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         if not self.route or not self.provider:
@@ -607,6 +606,16 @@ class ModelGateway:
             > self.options.max_input_tokens
         ):
             raise ClientInputError("redacted model input exceeds the configured token limit")
+        purpose = {
+            "review": "review",
+            "studio-agent": "studio",
+            "evaluation": "evaluation",
+        }.get(request.purpose, "other")
+
+        def request_failed() -> None:
+            metrics.inc("model_requests_failed_total")
+            metrics.inc("model_%s_requests_failed_total" % purpose)
+
         if redactions:
             metrics.inc("model_redactions_total", redactions)
         try:
@@ -614,10 +623,10 @@ class ModelGateway:
                 route, messages, max_output_tokens, request.require_json_object
             )
         except (AccessDeniedError, ClientInputError, CircuitOpenError, ModelProviderError):
-            metrics.inc("model_requests_failed_total")
+            request_failed()
             raise
         except Exception as exc:
-            metrics.inc("model_requests_failed_total")
+            request_failed()
             detail, _ = _redact_text(str(exc), secrets)
             raise ModelProviderError(
                 "%s model request failed: %s" % (route.provider, detail), transient=True
@@ -634,24 +643,29 @@ class ModelGateway:
             or response.output_tokens > max_output_tokens
             or not isinstance(response.request_id, str)
         ):
-            metrics.inc("model_requests_failed_total")
+            request_failed()
             raise ModelOutputError("model provider response violates the gateway contract")
         try:
             response_bytes = response.content.encode("utf-8")
         except UnicodeEncodeError as exc:
-            metrics.inc("model_requests_failed_total")
+            request_failed()
             raise ModelOutputError("model provider response violates the gateway contract") from exc
         if len(response_bytes) > self.options.max_response_bytes:
-            metrics.inc("model_requests_failed_total")
+            request_failed()
             raise ModelOutputError("model response exceeds the configured size limit")
         if request.require_json_object:
             try:
                 output = strict_json_loads(response.content)
             except (UnicodeError, ValueError, RecursionError) as exc:
-                metrics.inc("model_requests_failed_total")
+                request_failed()
                 raise ModelOutputError("model response is not valid JSON") from exc
             if not isinstance(output, dict):
-                metrics.inc("model_requests_failed_total")
+                request_failed()
                 raise ModelOutputError("model response must be a JSON object")
         metrics.inc("model_requests_total")
+        metrics.inc("model_input_tokens_total", response.input_tokens)
+        metrics.inc("model_output_tokens_total", response.output_tokens)
+        metrics.inc("model_%s_requests_total" % purpose)
+        metrics.inc("model_%s_input_tokens_total" % purpose, response.input_tokens)
+        metrics.inc("model_%s_output_tokens_total" % purpose, response.output_tokens)
         return response

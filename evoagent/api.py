@@ -544,7 +544,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         if path == "/assets/app.js":
             self._serve_file("app.js")
             return
-        if path in {"/assets/studio.js", "/assets/studio.css"}:
+        if path in {"/assets/studio.js", "/assets/studio.css", "/assets/proof.js"}:
             self._serve_file(path.rsplit("/", 1)[1])
             return
         if path == "/health":
@@ -1022,9 +1022,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             if path == "/v1/reviews":
                 principal = self._principal("review")
                 payload = self._read_json(body)
-                if set(payload).difference({"repository", "diff", "pull_request", "workflow"}):
+                if set(payload).difference(
+                    {"repository", "diff", "pull_request", "workflow", "context"}
+                ):
                     raise ClientInputError(
-                        "review request accepts only repository, diff, pull_request and workflow"
+                        "review request accepts only repository, diff, pull_request, workflow and context"
                     )
                 repository = payload.get("repository")
                 diff = payload.get("diff")
@@ -1060,6 +1062,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                         tenant_id=principal.tenant_id,
                         idempotency_key=idempotency_key,
                         actor=principal.username,
+                        review_context=payload.get("context"),
                         **({"workflow_selection": selection} if selection is not None else {}),
                     )
                 else:
@@ -1067,6 +1070,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                         *args,
                         tenant_id=principal.tenant_id,
                         actor=principal.username,
+                        review_context=payload.get("context"),
                         **({"workflow_selection": selection} if selection is not None else {}),
                     )
                 status = 200 if async_requested and result.get("replayed") else 202
@@ -1075,16 +1079,26 @@ class ApiHandler(BaseHTTPRequestHandler):
             if path == "/v1/repository-policies":
                 principal = self._principal("manage")
                 payload = self._read_json(body)
+                if set(payload).difference({"repository", "policy", "expected_version"}):
+                    raise ClientInputError("repository policy request contains unsupported fields")
                 repository = self._string_field(payload, "repository")
                 repository = canonical_repository(repository)
                 raw_policy = payload.get("policy")
                 if not isinstance(raw_policy, dict):
                     raise ClientInputError("policy must be an object")
+                expected_version = payload.get("expected_version")
+                if expected_version is not None and (
+                    type(expected_version) is not int or expected_version < 0
+                ):
+                    raise ClientInputError(
+                        "expected_version must be a non-negative integer or null"
+                    )
                 result = self.service.set_repository_policy(
                     principal.tenant_id,
                     repository,
                     raw_policy,
                     principal.username,
+                    expected_version,
                 )
                 self._send_json(201, result)
                 return
@@ -1207,6 +1221,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             if path == "/v1/proofs":
                 principal = self._principal("fix")
                 payload = self._read_json(body)
+                if set(payload).difference(
+                    {"original", "patched", "reproduction_command", "regression_command"}
+                ):
+                    raise ClientInputError("proof request contains unsupported fields")
                 result = self.service.run_proof(
                     payload.get("original", {}),
                     payload.get("patched", {}),

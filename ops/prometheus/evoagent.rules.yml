@@ -16,6 +16,8 @@ groups:
         expr: (sum(increase(evoagent_review_admission_rejections_total[15m])) or vector(0)) / clamp_min((sum(increase(evoagent_review_admissions_total[15m])) or vector(0)) + (sum(increase(evoagent_review_admission_rejections_total[15m])) or vector(0)), 1)
       - record: evoagent:ratio:skill_failure_15m
         expr: (sum(increase(evoagent_skill_failures_total[15m])) or vector(0)) / clamp_min((sum(increase(evoagent_skill_runs_total[15m])) or vector(0)), 1)
+      - record: evoagent:ratio:workflow_agent_failure_15m
+        expr: (sum(increase(evoagent_workflow_agent_failures_total[15m])) or vector(0)) / clamp_min((sum(increase(evoagent_workflow_agent_runs_total[15m])) or vector(0)), 1)
 
   - name: evoagent-slo-alerts
     rules:
@@ -131,6 +133,13 @@ groups:
         annotations:
           summary: Reviewer pools are repeatedly exceeding their task budget
           runbook_url: https://github.com/God1007/EvoAgent/blob/main/docs/operations.md#review-failures
+      - alert: EvoAgentWorkflowAgentFailureRateHigh
+        expr: evoagent:ratio:workflow_agent_failure_15m > 0.05 and sum(increase(evoagent_workflow_agent_runs_total[15m])) > 20
+        for: 10m
+        labels: {severity: ticket}
+        annotations:
+          summary: Workflow Agent failure rate is above 5%
+          runbook_url: https://github.com/God1007/EvoAgent/blob/main/docs/operations.md#workflow-agent-failures
       - alert: EvoAgentFailureCasePersistenceFailing
         expr: sum(increase(evoagent_failure_case_persistence_failures_total[15m])) > 0
         for: 5m

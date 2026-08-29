@@ -101,6 +101,26 @@ checks bounded chain growth and preserves late branch/final-input references.
 Wide joins still retain their necessary inputs, and serialization/validation
 creates temporary copies; the 8 MiB handoff limit is not a process-memory quota.
 
+## Bounded DAG branch scheduling — 2026-08-29
+
+The workflow runner now groups topology-ready nodes into waves and uses the
+standard-library thread pool for waves wider than one node, capped at four
+concurrent nodes. Results are merged in stable topology order; a join starts only
+after every source in the prior wave has completed. Node-scoped idempotency keys,
+generation fences and first-write-wins checkpoints are unchanged. If one branch
+fails, a successfully committed sibling is reused on resume.
+
+In one local CPython 3.12/macOS smoke measurement, two independent handlers that
+each slept for 150 ms before a join completed in 0.3137 s with the serial runner
+and 0.1603 s with bounded branch scheduling. This synthetic wait benchmark only
+shows overlap; it is not a production throughput or model-latency claim.
+
+`python -m pytest -q tests/test_workflow.py` covers actual concurrent entry,
+branch failure, sibling checkpoint reuse and join completion. Trusted handlers
+remain responsible for observing `handoff.check_active()` around expensive or
+external work: Python threads cannot forcibly terminate a handler that ignores
+the shared deadline.
+
 Oversized handoffs are also rejected before constructing their complete encoded
 representation. A conservative preflight bounds traversal, followed by stdlib
 incremental JSON encoding with an exact UTF-8 byte budget. In isolated allocation
@@ -223,3 +243,73 @@ The exact Python and SQL recipe above was also executed against a fresh fixture
 repository: 750 successful reports and 2,250 completed Agent checkpoints. The
 existing load-generator/microbenchmark checks passed 13 tests and 21 subtests.
 No production implementation or default concurrency setting was changed.
+
+## Authenticated bounded-container baseline — 2026-08-28
+
+The same three-Agent fixture was exercised through an authenticated HTTP API in
+the independent Lima Docker VM. This closes a gap in the host-only baseline:
+the API had a hard **1 CPU / 512 MiB / 256 PID** cgroup limit; PostgreSQL had
+1 CPU / 512 MiB / 128 PIDs; Redis had 0.25 CPU / 128 MiB / 64 PIDs. The API used
+four queue workers, a ten-connection PostgreSQL pool, a 20 request/s edge bucket
+with burst 40, and 100 durable active reviews per tenant. All services were on
+a fresh test-only database/network and exposed only on loopback. The three Diff
+classes were 1,240 / 10,940 / 115,320 bytes (40 / 400 / 4,000 added lines),
+weighted 40% / 40% / 20%.
+
+The API image was `evoagent:local-8500af9f4a9a` (application source SHA-256
+`8500af9f4a9abd933a3bf555d426f3711604d03d6972287c5d97d812d8d3d87b`).
+The VM had 4 CPUs / 4 GiB RAM; the existing experience stack remained running
+but received no generated review load.
+
+| Phase | Offered | Accepted | 429 | HTTP scheduled→reply P99 | Created→SUCCESS-event P99 | Peak active |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| steady, 30 s @ 10/s | 300 | 300 | 0 | 30.9 ms | 132.8 ms | 2 |
+| throttle, 15 s @ 80/s | 1,200 | 339 | 861 | 65.6 ms | 1,935.6 ms | 42 |
+| recovery, 30 s @ 10/s | 300 | 300 | 0 | 32.8 ms | 128.5 ms | 2 |
+| soak, 180 s @ 10/s | 1,800 | 1,800 | 0 | 33.8 ms | 146.2 ms | 2 |
+| durable admission, 20 s @ 100/s | 2,000 | 433 | 1,567 | 106.3 ms | 6,695.6 ms | **100** |
+| restored defaults, 30 s @ 10/s | 300 | 300 | 0 | 30.1 ms | 133.9 ms | 2 |
+
+For the durable-admission phase only, edge rate limiting was raised to
+1,000/s so the existing tenant limit—not the token bucket—was the rejection
+source. The observed active count reached exactly 100; the 1,567 rejections
+matched both the admission-rejection and HTTP-rejection counters. Default
+settings were restored before the final row. An additional 80-request read
+burst verified 429 JSON responses with a positive `Retry-After` and created no
+review tasks.
+
+HTTP percentiles include both accepted and rejected attempts. Peak active work
+was observed once per second using read-only SQL; it is not continuous sampling.
+Completion timings use the server's SUCCESS event, not a browser-observed
+durable commit. The short burst's 80 HTTP replies/s must not be reported as 80
+completed reviews/s.
+
+Across the six rows, **5,900** reviews were offered, **3,472** accepted and
+**2,428** deliberately rejected. Every accepted task reached `SUCCESS`, every
+task had three completed Agent-node handoffs plus four completed outer review
+checkpoints at attempt 1, and all expected eight findings were checked by path,
+rule and line. Admission, Outbox, Redis stream and DLQ were empty after each
+drain. No transport error, client drop, 5xx, failed/cancelled task, OOM, cgroup
+memory event or container restart occurred. The API cgroup peak across the
+default phases was about 77.4 MiB (81.9 MiB in the admission phase), including
+the small diagnostic processes used to read cgroup files. After
+admission pressure, the normal-rate row returned to the earlier latency range.
+
+The original generator checks still pass **13 tests and 21 subtests**. Local
+evidence is outside Git under
+`$HOME/Library/Application Support/EvoAgent-Docker/capacity-acceptance-20260828.vaY9As`;
+it includes per-phase request/task/checkpoint/resource receipts and both initial
+fixture-script corrections. Use `EVOAGENT_PERF_PORT` to move the Compose
+fixture off an occupied loopback port. The 3,472 request payload hashes and
+10,416 Agent handoff identities/snapshot bindings were also reconciled directly
+against PostgreSQL. A custom-format dump includes all 3,492 successful tasks
+(20 are unmeasured calibration tasks); restoring it to a second disposable
+database preserved all 24,444 checkpoints and the measured bindings. The
+temporary stack and its volumes were removed after that verification; the
+approximately 34 MiB dump and receipts remain, and the 8082 experience stack was
+left healthy and unchanged. No new scheduler, cache or runtime dependency was added.
+
+This is a short controlled rule-Agent capacity envelope, not the 30-day
+production SLO. It does not cover TLS/ingress, real PR sizes/languages, model
+latency or quotas, GitHub effects, container Proof work, multiple API replicas,
+adversarial maximum-size requests, node/daemon loss, or a long soak.

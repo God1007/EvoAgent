@@ -45,7 +45,8 @@ Every script uses k6's **arrival-rate** executors (open model) and overridable
 ## 3. Full-stack rig (Postgres pool + Redis queue)
 
 ```bash
-docker compose -f docker-compose.perf.yml up --build   # app on :8080
+export EVOAGENT_PERF_PORT=8199
+docker compose -f docker-compose.perf.yml up --build
 # run the generator or k6 from the host, or the bundled k6 runner:
 docker compose -f docker-compose.perf.yml --profile k6 run --rm k6 run /perf/steady.js
 ```
@@ -56,3 +57,5 @@ docker compose -f docker-compose.perf.yml --profile k6 run --rm k6 run /perf/ste
 > it to `scripts/loadgen.py --token`. Tune queue workers/pool via `EVOAGENT_ASYNC_WORKERS`,
 > `EVOAGENT_PG_POOL_MAX`, and admission control via `EVOAGENT_RATE_LIMIT_RPS` /
 > `EVOAGENT_MAX_INFLIGHT_HEAVY`.
+> `EVOAGENT_PERF_PORT` defaults to 8080; set it when another local deployment
+> already uses that port. Host generators should use the matching `--base-url`.

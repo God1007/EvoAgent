@@ -102,8 +102,9 @@ class ProofLadderTests(unittest.TestCase):
     def test_rejects_unsafe_paths_before_calling_executor(self):
         executor = mock.Mock()
 
-        with self.assertRaisesRegex(ClientInputError, "unsafe path"):
-            ProofRunner(executor=executor).prove({"../escape.py": "BUG\n"}, {}, REPRO)
+        for path in ("../escape.py", "./app.py", "a/../app.py", "a//app.py", "a/", "a\\app.py"):
+            with self.subTest(path=path), self.assertRaisesRegex(ClientInputError, "unsafe path"):
+                ProofRunner(executor=executor).prove({path: "BUG\n", "app.py": "ok\n"}, {}, REPRO)
 
         executor.execute.assert_not_called()
 

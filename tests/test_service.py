@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest import mock
 
-from evoagent.agents import MAX_REVIEW_AGENTS, review_workflow
+from evoagent.agents import MAX_REVIEW_AGENTS, MultiAgentCoordinator, review_workflow
 from evoagent.config import Settings
 from evoagent.diff_parser import parse_unified_diff
 from evoagent.errors import ClientInputError
@@ -84,6 +84,8 @@ class ReadinessCacheTests(unittest.TestCase):
         service.llm_breaker = mock.Mock(state="half_open")
         service.review_engine = mock.Mock()
         service.review_engine.execution_revision.return_value = "reviewer-revision"
+        service.proof_executor = mock.Mock()
+        service.proof_executor.healthy.return_value = True
         service.repair_container_image = "sha256:" + "a" * 64
         service.settings = mock.Mock(repair_test_command="pytest -q")
         service.queue = mock.Mock(backend="redis")
@@ -109,7 +111,7 @@ class ReadinessCacheTests(unittest.TestCase):
         )
         self.assertEqual("reviewer-revision", detail["reviewer_revision"])
         self.assertEqual(
-            {"configured": True, "mode": "docker"},
+            {"configured": True, "healthy": True, "mode": "docker"},
             detail["checks"]["proof"],
         )
         self.assertEqual(
@@ -334,6 +336,34 @@ class OperationalMutationTests(unittest.TestCase):
 
 
 class ExecutionSourceRevisionTests(unittest.TestCase):
+    def test_repository_evidence_is_fetched_only_for_an_explicit_source_port(self):
+        engine = ReviewEngine.__new__(ReviewEngine)
+        default = mock.Mock()
+        default.reviewer = MultiAgentCoordinator([LocalRuleReviewer()])
+        engine._execution = ("revision", (), default)
+
+        self.assertFalse(engine.requires_repository_evidence({}))
+        self.assertFalse(
+            engine.requires_repository_evidence(
+                {
+                    "studio_workflow": {
+                        "bundle": {"definition": {"steps": [{"sources": {"diff": "$input.diff"}}]}}
+                    }
+                }
+            )
+        )
+        self.assertTrue(
+            engine.requires_repository_evidence(
+                {
+                    "studio_workflow": {
+                        "bundle": {
+                            "definition": {"steps": [{"sources": {"evidence": "$input.evidence"}}]}
+                        }
+                    }
+                }
+            )
+        )
+
     def test_rebuilt_flows_keep_the_startup_revision_across_execution_lanes(self):
         revision = "a" * 64
 

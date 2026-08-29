@@ -31,6 +31,7 @@ import uuid
 import zipfile
 from io import BytesIO
 
+from .container_runtime import reconcile_sandboxes, remove_sandbox, sandbox_command
 from .errors import safe_exception_summary
 from .metrics import metrics
 
@@ -267,40 +268,32 @@ class RepairVerifier:
         name = "evoagent-verify-%s" % uuid.uuid4().hex[:12]
         file_bytes = self.max_file_mb * 1024 * 1024
         deadline = time.monotonic() + self.timeout_seconds
+        try:
+            reconcile_sandboxes(timeout_seconds=min(10.0, max(0.001, deadline - time.monotonic())))
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            return "error", safe_exception_summary(exc, "container reconciliation failed")
         work_tmpfs = "/work:rw,nosuid,nodev,size=%dm,uid=65534,gid=65534,mode=0700" % self.memory_mb
-        command = [
-            "docker",
-            "run",
-            "-d",
-            "--pull",
-            "never",
-            "--name",
+        command = sandbox_command(
+            self.container_image,
             name,
-            "--network",
-            "none",
-            "--read-only",
-            "--tmpfs",
-            "/tmp:rw,nosuid,nodev,size=%dm,mode=1777" % self.memory_mb,
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--pids-limit",
-            str(self.pids_limit),
-            "--memory",
-            "%dm" % self.memory_mb,
-            "--cpus",
-            str(self.cpus),
-            "--ulimit",
-            "fsize=%d:%d" % (file_bytes, file_bytes),
-            "--ulimit",
-            "nofile=1024:1024",
-            "--workdir",
-            "/work",
-            "--user",
-            "65534:65534",
-        ]
-        command += ["--tmpfs", work_tmpfs, self.container_image, "sh", "-c", "sleep 2147483647"]
+            self.timeout_seconds,
+            [
+                "--tmpfs",
+                "/tmp:rw,nosuid,nodev,size=%dm,mode=1777" % self.memory_mb,
+                "--pids-limit",
+                str(self.pids_limit),
+                "--memory",
+                "%dm" % self.memory_mb,
+                "--cpus",
+                str(self.cpus),
+                "--ulimit",
+                "fsize=%d:%d" % (file_bytes, file_bytes),
+                "--ulimit",
+                "nofile=1024:1024",
+                "--tmpfs",
+                work_tmpfs,
+            ],
+        )
         copy = ["docker", "exec", "-i", "--workdir", "/work", "--user", "65534:65534"]
         copy += [name, "tar", "-xf", "-", "--no-same-owner"]
         cleanup_required = False
@@ -344,17 +337,11 @@ class RepairVerifier:
         finally:
             if cleanup_required:
                 try:
-                    cleanup = subprocess.run(
-                        ["docker", "rm", "-f", name],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=10,
-                        check=False,
-                    )
+                    cleanup = remove_sandbox(name)
                 except (OSError, subprocess.TimeoutExpired) as exc:
                     metrics.inc("repair_container_cleanup_failures_total")
                     raise RuntimeError("repair container cleanup failed") from exc
-                if cleanup.returncode:
+                if not cleanup:
                     metrics.inc("repair_container_cleanup_failures_total")
                     raise RuntimeError("repair container cleanup failed")
 

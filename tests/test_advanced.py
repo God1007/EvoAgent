@@ -49,9 +49,12 @@ class AdvancedFeatureTests(unittest.TestCase):
             "attr='environ', ctx=Load()), slice=Constant(value='PASSWORD'), ctx=Load())",
             ast.dump(assignment.value),
         )
-        self.assertIn("eval(user_input)", result["content"])
+        self.assertIn("ast.literal_eval(user_input)", result["content"])
         self.assertNotIn("print(result)", result["content"])
-        self.assertEqual({"SEC-HARDCODED-SECRET", "REL-DEBUG-PRINT"}, set(result["rules"]))
+        self.assertEqual(
+            {"SEC-HARDCODED-SECRET", "SEC-EVAL", "REL-DEBUG-PRINT"},
+            set(result["rules"]),
+        )
 
     def test_safe_fixer_hardens_cookie_and_yaml_load(self):
         content = (

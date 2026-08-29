@@ -1,4 +1,6 @@
+import io
 import unittest
+import zipfile
 from unittest import mock
 
 from evoagent.application import (
@@ -20,7 +22,7 @@ from evoagent.errors import (
     StateConflictError,
 )
 from evoagent.metrics import Metrics
-from evoagent.models import Finding, ReviewReport, Severity, TaskState, TraceEvent
+from evoagent.models import Finding, ReviewContext, ReviewReport, Severity, TaskState, TraceEvent
 from evoagent.observability import AlertManager, Observability
 from evoagent.policy import RepositoryPolicy, RepositoryPolicyResolver
 from evoagent.rollout import ReleaseManager
@@ -63,6 +65,35 @@ class PolicyUseCaseBoundaryTests(unittest.TestCase):
             )
 
         policies.save.assert_not_called()
+
+    def test_policy_capabilities_are_listed_and_expected_version_is_forwarded(self):
+        store = mock.Mock()
+        store.list_repository_policy_versions.return_value = []
+        policies = mock.Mock()
+        policies.resolve.return_value = RepositoryPolicy(version=4, source="configured")
+        policies.save.return_value = {"version": 5}
+        use_cases = PolicyUseCases(
+            store,
+            policies,
+            lambda: ("SEC-YAML-LOAD",),
+            lambda: ("multi-agent-collaboration",),
+        )
+
+        current = use_cases.get_repository_policy("tenant", "ORG/Repo")
+        saved = use_cases.set_repository_policy(
+            "tenant", "org/repo", {"auto_fix": True}, "alice", expected_version=4
+        )
+
+        self.assertEqual(["SEC-YAML-LOAD"], current["available_fix_rules"])
+        self.assertEqual(["multi-agent-collaboration"], current["available_reviewers"])
+        self.assertEqual({"version": 5}, saved)
+        policies.save.assert_called_once_with(
+            "tenant",
+            "org/repo",
+            RepositoryPolicy(auto_fix=True).to_dict(),
+            "alice",
+            4,
+        )
 
 
 class GitHubInstallationBindingTests(unittest.TestCase):
@@ -213,7 +244,8 @@ class GitHubInstallationBindingTests(unittest.TestCase):
         valid_pull = {
             "diff_url": "https://github.com/org/repo/pull/1.diff",
             "issue_url": "https://api.github.com/repos/org/repo/issues/1",
-            "head": {"sha": "abc"},
+            "base": {"sha": "a" * 40},
+            "head": {"sha": "b" * 40},
             "updated_at": "2026-08-23T12:00:00Z",
         }
         malformed = (
@@ -235,6 +267,8 @@ class GitHubInstallationBindingTests(unittest.TestCase):
                     "diff_url": "https://github.com/org/other/pull/1.diff",
                 },
             },
+            {"action": "opened", "pull_request": {**valid_pull, "base": {"sha": "main"}}},
+            {"action": "opened", "pull_request": {**valid_pull, "head": {"sha": "HEAD"}}},
             {"action": "opened", "pull_request": {**valid_pull, "draft": "false"}},
         )
 
@@ -447,6 +481,114 @@ class ReviewInputBoundaryTests(unittest.TestCase):
             ReviewUseCases.validate(reviews, "org/repo", "\ud800")
 
 
+class RepositoryEvidencePreparationTests(unittest.TestCase):
+    DIFF = "--- a/pkg/util.py\n+++ b/pkg/util.py\n@@ -0,0 +1,2 @@\n+def helper():\n+    return 1\n"
+
+    @staticmethod
+    def archive() -> bytes:
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as bundle:
+            bundle.writestr("repo/AGENTS.md", "Use repository vocabulary.\n")
+            bundle.writestr("repo/pkg/AGENTS.md", "Test public seams.\n")
+            bundle.writestr("repo/pkg/util.py", "def helper():\n    return 1\n")
+            bundle.writestr(
+                "repo/pkg/service.py",
+                "from pkg.util import helper\n\ndef use():\n    return helper()\n",
+            )
+        return output.getvalue()
+
+    @staticmethod
+    def reviews(client, required=True):
+        reviews = ReviewUseCases.__new__(ReviewUseCases)
+        reviews.store = mock.Mock()
+        reviews.options = ReviewOptions(10_000, 60, False, repository_evidence_max_bytes=100_000)
+        reviews.requires_repository_evidence = lambda _task_input: required
+        reviews.code_host_for_installation = lambda _installation_id: client
+        return reviews
+
+    def test_github_archive_is_bounded_pinned_and_reused_on_retry(self):
+        client = mock.Mock()
+        client.download_archive.return_value = self.archive()
+        reviews = self.reviews(client)
+        task_input = {"head_sha": "a" * 40}
+
+        reviews._prepare_repository_evidence("task-1", "org/repo", self.DIFF, task_input, 77)
+        reviews._prepare_repository_evidence("task-1", "org/repo", self.DIFF, task_input, 77)
+
+        evidence = task_input["repository_evidence"]
+        self.assertEqual("github-archive", evidence["origin"])
+        self.assertEqual("available", evidence["status"])
+        self.assertEqual("a" * 40, evidence["revision"])
+        self.assertEqual(["pkg/util.py"], evidence["changed_paths"])
+        self.assertIn("pkg.service.use", evidence["impacted_symbols"])
+        context = task_input["review_context"]
+        self.assertEqual("none", context["origin"])
+        self.assertIn("## AGENTS.md\nUse repository vocabulary.", context["standards"])
+        self.assertIn("## pkg/AGENTS.md\nTest public seams.", context["standards"])
+        self.assertFalse(context["truncated"])
+        client.ensure_repository_access.assert_called_once_with("org/repo")
+        client.download_archive.assert_called_once_with("org/repo", "a" * 40, max_bytes=100_000)
+        reviews.store.update_task_input.assert_called_once_with(
+            "task-1", {"repository_evidence": evidence, "review_context": context}
+        )
+
+    def test_explicit_standards_are_never_overwritten_by_repository_files(self):
+        client = mock.Mock()
+        client.download_archive.return_value = self.archive()
+        reviews = self.reviews(client)
+        context = ReviewContext.from_request(
+            {"standards": "Use the approved team rules."}
+        ).to_dict()
+        task_input = {"head_sha": "d" * 40, "review_context": context}
+
+        reviews._prepare_repository_evidence("task-1", "org/repo", self.DIFF, task_input, 77)
+
+        self.assertEqual(context, task_input["review_context"])
+        self.assertEqual(
+            {"repository_evidence": task_input["repository_evidence"]},
+            reviews.store.update_task_input.call_args.args[1],
+        )
+
+    def test_invalid_context_cannot_be_rewritten_during_archive_enrichment(self):
+        client = mock.Mock()
+        client.download_archive.return_value = self.archive()
+        reviews = self.reviews(client)
+        task_input = {"head_sha": "e" * 40, "review_context": {"credential": "private"}}
+
+        with self.assertRaisesRegex(PermanentTaskError, "review context snapshot is invalid"):
+            reviews._prepare_repository_evidence("task-1", "org/repo", self.DIFF, task_input, 77)
+
+        reviews.store.update_task_input.assert_not_called()
+
+    def test_archive_failure_persists_explicit_unavailable_evidence(self):
+        client = mock.Mock()
+        client.download_archive.side_effect = RuntimeError("private GitHub response")
+        reviews = self.reviews(client)
+        task_input = {"head_sha": "b" * 40}
+        captured = Metrics()
+
+        with mock.patch("evoagent.application.reviews.metrics", captured):
+            reviews._prepare_repository_evidence("task-1", "org/repo", self.DIFF, task_input, 77)
+
+        evidence = task_input["repository_evidence"]
+        self.assertEqual("github-archive", evidence["origin"])
+        self.assertEqual("unavailable", evidence["status"])
+        self.assertEqual("b" * 40, evidence["revision"])
+        self.assertNotIn("private GitHub response", str(evidence))
+        self.assertIn("evoagent_repository_evidence_failures_total 1.0", captured.prometheus())
+
+    def test_unused_evidence_does_not_download_or_persist_an_archive(self):
+        client = mock.Mock()
+        reviews = self.reviews(client, required=False)
+        task_input = {"head_sha": "c" * 40}
+
+        reviews._prepare_repository_evidence("task-1", "org/repo", self.DIFF, task_input, 77)
+
+        self.assertNotIn("repository_evidence", task_input)
+        client.download_archive.assert_not_called()
+        reviews.store.update_task_input.assert_not_called()
+
+
 class RolloutAssignmentSnapshotTests(unittest.TestCase):
     def test_shadow_failure_does_not_change_a_successful_primary_review(self):
         report = ReviewReport("org/repo", 7, "done", "low", [])
@@ -530,6 +672,16 @@ class RolloutAssignmentSnapshotTests(unittest.TestCase):
         self.assertEqual(2, task_input["release_candidate_version"])
         self.assertEqual(7, task_input["release_generation"])
         self.assertEqual("reviewer-revision", task_input["reviewer_revision"])
+        self.assertEqual(
+            {
+                "origin": "none",
+                "title": "",
+                "spec": "",
+                "standards": "",
+                "truncated": False,
+            },
+            task_input["review_context"],
+        )
 
 
 class RepairCredentialBindingTests(unittest.TestCase):
@@ -1711,7 +1863,7 @@ class QueueTaskBindingTests(unittest.TestCase):
             "tenant_id": "tenant-a",
             "repository": "org/repo",
             "pull_request": 7,
-            "input": {"diff_url": "https://api.github.com/repos/org/repo/pulls/7.diff"},
+            "input": {},
         }
         store.get_task_payload.return_value = None
         store.resume_review_task.return_value = {"status": "resumed", "generation": 2}
@@ -1732,11 +1884,18 @@ class QueueTaskBindingTests(unittest.TestCase):
             ReviewOptions(10_000, 60, True),
         )
 
-        result = reviews.resume_task("task-1", "tenant-a", "alice")
-
-        self.assertTrue(result["resumed"])
-        self.assertEqual("alice", store.resume_review_task.call_args.args[-1])
-        notify.assert_called_once_with()
+        for task_input in (
+            {"diff_url": "https://api.github.com/repos/org/repo/pulls/7.diff"},
+            {"base_sha": "a" * 40, "head_sha": "b" * 40},
+        ):
+            with self.subTest(task_input=task_input):
+                store.get.return_value["input"] = task_input
+                result = reviews.resume_task("task-1", "tenant-a", "alice")
+                self.assertTrue(result["resumed"])
+                self.assertEqual("alice", store.resume_review_task.call_args.args[-1])
+                notify.assert_called_once_with()
+                store.resume_review_task.reset_mock()
+                notify.reset_mock()
 
     def test_resume_successful_task_republishes_only_incomplete_delivery(self):
         store = mock.Mock()
@@ -2052,16 +2211,22 @@ class ApplicationUseCaseTests(unittest.TestCase):
             backend = "test"
 
         class CodeHost:
-            fetches = 0
+            compare_fetches = 0
+            legacy_fetches = 0
             comments = 0
 
             def ensure_repository_access(self, repository):
                 self.repository = repository
 
-            def fetch_diff(self, _url, max_bytes=None):
-                self.fetches += 1
+            def fetch_compare_diff(self, repository, base_sha, head_sha, max_bytes=None):
+                self.compare_fetches += 1
+                self.comparison = (repository, base_sha, head_sha)
                 self.max_bytes = max_bytes
                 return "--- a/a.py\n+++ b/a.py\n"
+
+            def fetch_diff(self, _url, max_bytes=None):
+                self.legacy_fetches += 1
+                return "--- a/legacy.py\n+++ b/legacy.py\n"
 
             def upsert_comment(self, _url, _body, _marker, before_write=None):
                 if before_write is not None:
@@ -2100,6 +2265,8 @@ class ApplicationUseCaseTests(unittest.TestCase):
             "pull_request": 7,
             "tenant_id": "tenant",
             "diff_url": "https://example.invalid/pull.diff",
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
             "github_issue_url": "https://api.example.invalid/issues/7",
         }
         task_id = reviews.create_deferred_task(
@@ -2107,7 +2274,11 @@ class ApplicationUseCaseTests(unittest.TestCase):
             7,
             "github-webhook",
             "tenant",
-            {"diff_url": payload["diff_url"]},
+            {
+                "diff_url": payload["diff_url"],
+                "base_sha": payload["base_sha"],
+                "head_sha": payload["head_sha"],
+            },
             payload,
         )
         queued = {"task_id": task_id, "admission_generation": 1, **payload}
@@ -2115,7 +2286,11 @@ class ApplicationUseCaseTests(unittest.TestCase):
         reviews.process_queued(queued)
         reviews.process_queued(queued)
 
-        self.assertEqual(1, code_host.fetches)
+        self.assertEqual(1, code_host.compare_fetches)
+        self.assertEqual(0, code_host.legacy_fetches)
+        self.assertEqual(
+            ("org/repo", payload["base_sha"], payload["head_sha"]), code_host.comparison
+        )
         self.assertEqual(1, code_host.comments)
         self.assertEqual([task_id], executions)
         self.assertEqual("org/repo", code_host.repository)
@@ -2225,9 +2400,12 @@ class ApplicationUseCaseTests(unittest.TestCase):
             "installation": {"id": 77},
             "repository": {"full_name": "org/repo"},
             "pull_request": {
+                "title": "Reject dynamic execution",
+                "body": "The patch must not call eval.",
                 "diff_url": "https://github.com/org/repo/pull/7.diff",
                 "issue_url": "https://api.github.com/repos/org/repo/issues/7",
-                "head": {"sha": "head-1"},
+                "base": {"sha": "a" * 40},
+                "head": {"sha": "b" * 40},
                 "updated_at": "2026-08-23T12:00:00Z",
             },
         }
@@ -2242,6 +2420,11 @@ class ApplicationUseCaseTests(unittest.TestCase):
         task = self.store.get(first["task_id"], "default")
         self.assertEqual(first["session_id"], task["input"]["session_id"])
         self.assertEqual(77, task["input"]["installation_id"])
+        self.assertEqual("a" * 40, task["input"]["base_sha"])
+        self.assertEqual("b" * 40, task["input"]["head_sha"])
+        self.assertEqual("github-webhook", task["input"]["review_context"]["origin"])
+        self.assertEqual("Reject dynamic execution", task["input"]["review_context"]["title"])
+        self.assertEqual("The patch must not call eval.", task["input"]["review_context"]["spec"])
         self.assertEqual(first["task_id"], self.store.get_webhook("delivery-1")["task_id"])
 
         self.store.claim_webhook("legacy-unbound", "default", "pull_request", "legacy-hash")
@@ -2255,7 +2438,7 @@ class ApplicationUseCaseTests(unittest.TestCase):
             "pull_request": {
                 **payload["pull_request"],
                 "draft": False,
-                "head": {"sha": "head-2"},
+                "head": {"sha": "c" * 40},
             },
         }
         ready = webhooks.handle_github_pull_request(ready_payload, "delivery-ready", "ready-hash")

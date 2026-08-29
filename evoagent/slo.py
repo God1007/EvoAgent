@@ -31,6 +31,8 @@ class SLOError(RuntimeError):
 class PrometheusQueryPort(Protocol):
     def query(self, expression: str) -> float: ...
 
+    def monitoring_available(self) -> bool: ...
+
 
 @dataclass(frozen=True)
 class SLOObjective:
@@ -162,12 +164,11 @@ class PrometheusClient:
             urllib.request.ProxyHandler({}), _NoRedirect()
         )
 
-    def query(self, expression: str) -> float:
-        url = self.base_url + "/api/v1/query?" + urllib.parse.urlencode({"query": expression})
+    def _get(self, path: str) -> dict[str, Any]:
         headers = {"Accept": "application/json"}
         if self.bearer_token:
             headers["Authorization"] = "Bearer " + self.bearer_token
-        request = urllib.request.Request(url, headers=headers, method="GET")
+        request = urllib.request.Request(self.base_url + path, headers=headers, method="GET")
         try:
             with self._opener.open(request, timeout=self.timeout_seconds) as response:
                 length = response.headers.get("Content-Length")
@@ -187,6 +188,30 @@ class PrometheusClient:
             if document.get("status") != "success":
                 raise SLOError("Prometheus rejected the SLO query")
             data = document["data"]
+            if not isinstance(data, dict):
+                raise SLOError("Prometheus returned an invalid SLO response")
+            return data
+        except (KeyError, TypeError, ValueError, RecursionError) as exc:
+            raise SLOError("Prometheus returned an invalid SLO response") from exc
+
+    def monitoring_available(self) -> bool:
+        # Instant `up` queries can retain a removed job throughout the lookback.
+        targets = self._get("/api/v1/targets?state=active").get("activeTargets")
+        if not isinstance(targets, list) or any(
+            not isinstance(target, dict)
+            or not isinstance(target.get("labels"), dict)
+            or target.get("health") not in ("up", "down", "unknown")
+            for target in targets
+        ):
+            raise SLOError("Prometheus returned an invalid target response")
+        return any(
+            target["labels"].get("job") == "evoagent" and target["health"] == "up"
+            for target in targets
+        )
+
+    def query(self, expression: str) -> float:
+        data = self._get("/api/v1/query?" + urllib.parse.urlencode({"query": expression}))
+        try:
             result_type = data["resultType"]
             result = data["result"]
             if result_type == "scalar":
@@ -210,13 +235,14 @@ def evaluate_slos(
 ) -> list[SLOResult]:
     if window_override and not _WINDOW.fullmatch(window_override):
         raise ValueError("SLO window override must use Prometheus duration syntax")
+    monitoring_available = client.monitoring_available()
     results = []
     for objective in catalog.objectives:
         window = window_override or objective.window
         indicator_query = objective.indicator_query.replace("$window", window)
         sample_query = objective.sample_query.replace("$window", window)
         samples = max(0, int(client.query(sample_query)))
-        if samples < objective.min_samples:
+        if not monitoring_available or samples < objective.min_samples:
             results.append(
                 SLOResult(
                     objective.objective_id,

@@ -5,8 +5,11 @@ const titles = {
   overview: "运行总览",
   review: "发起审查",
   tasks: "任务中心",
+  proof: "修复验证",
   studio: "Agent 搭建",
   skills: "基础能力",
+  governance: "仓库治理",
+  operations: "运维中心",
   evolution: "演进实验室",
   github: "GitHub App",
 };
@@ -33,7 +36,8 @@ let observedToken = accessToken, loginRequired = false;
 const reviewReceipts = { manual: "evoagent_pending_review", studio: "evoagent_pending_trial" };
 let reviewWorkflows = [], reviewWorkflowCursor = null, reviewWorkflowLoading = false;
 let consoleCapabilities = null, evolutionReady = false;
-let dashboardRequest = 0, evolutionRequest = 0;
+let dashboardRequest = 0, evolutionRequest = 0, operationsRequest = 0, policyRequest = 0;
+let policySnapshot = null;
 
 function reviewWorkflowSelection(value) {
   if (!value) return null;
@@ -107,10 +111,267 @@ function formatTime(value) {
       }).format(date);
 }
 
+function formatDuration(value) {
+  if (!Number.isInteger(value) || value < 0) return "";
+  if (value < 1000) return `${value} ms`;
+  if (value < 60000) return `${(value / 1000).toFixed(value < 10000 ? 1 : 0)} 秒`;
+  const minutes = Math.floor(value / 60000);
+  return `${minutes} 分 ${Math.round((value % 60000) / 1000)} 秒`;
+}
+
 const severityLabels = { critical: "严重", high: "高风险", medium: "中风险", low: "低风险" };
 const agentLabels = { plan: "变更规划", planner: "变更规划", specialists: "专职审查", critic: "交叉质询", test: "复现检查", synthesize: "综合结论", synthesizer: "综合结论", fix: "修复检查", verify: "最终验证", verifier: "最终验证" };
-const portLabels = { diff: "代码变更", parsed: "变更范围", findings: "发现的问题", specialist_findings: "审查发现", verified: "审查结论", plan: "审查计划", critiques: "质询结果", reproductions: "复现结果", synthesized: "综合结论", fix_ready: "修复可行性", business: "业务检查结果", security: "安全检查结果" };
+const portLabels = { diff: "代码变更", parsed: "变更范围", context: "审查上下文", evidence: "仓库影响证据", findings: "发现的问题", specialist_findings: "审查发现", verified: "审查结论", plan: "审查计划", critiques: "质询结果", reproductions: "复现结果", synthesized: "综合结论", fix_ready: "修复可行性", business: "业务检查结果", security: "安全检查结果", standards: "规范轴结果", spec: "需求轴结果" };
 const severityBadge = (value) => `<span class="status severity-${severityLabels[value] ? value : "unknown"}">${severityLabels[value] || "待评估"}</span>`;
+
+const auditActionLabels = {
+  "review.create": "创建审查",
+  "review.capacity-rejected": "审查容量拒绝",
+  "task.cancel": "取消任务",
+  "task.resume": "续跑任务",
+  "repair.create": "创建修复",
+  "proof.run": "运行修复验证",
+  "outbox.replay": "重放结果投递",
+  "studio.draft_saved": "保存 Studio 草稿",
+  "studio.published": "发布 Studio 版本",
+  "studio.repository_bound": "切换仓库流程",
+  "repository-policy.updated": "更新仓库策略",
+  "shadow.completed": "影子评测完成",
+  "shadow.failed": "影子评测失败",
+  "shadow.skipped": "影子评测跳过",
+};
+
+function auditRows(events) {
+  if (!events?.length) return '<div class="empty-state"><span><b>暂无审计记录</b>当前租户还没有可展示的操作事件</span></div>';
+  return events.map((event) => `<div class="task-row">
+    <span class="task-main"><span class="task-glyph">AU</span><span class="task-copy">
+      <span class="task-name">${escapeHtml(Object.hasOwn(auditActionLabels, event.action) ? auditActionLabels[event.action] : "系统操作")}</span>
+      <span class="task-meta"><span>${escapeHtml(event.actor || "system")}</span><span>${escapeHtml(event.resource || "未指定资源")}</span><span>${escapeHtml(event.action || "unknown")}</span><span>${escapeHtml(formatTime(event.created_at))}</span></span>
+    </span></span>
+  </div>`).join("");
+}
+
+function outboxRows(messages) {
+  if (!messages?.length) return '<div class="empty-state"><span><b>没有失败的结果回写</b>Outbox 当前无需人工处理</span></div>';
+  return messages.map((message) => `<div class="task-row">
+    <span class="task-main"><span class="task-glyph">OB</span><span class="task-copy">
+      <span class="task-name">结果回写等待重新派发</span>
+      <span class="task-meta"><span>${escapeHtml(message.id || "未知消息")}</span><span>已尝试 ${Number.isInteger(message.attempts) ? message.attempts : 0} 次</span><span>${escapeHtml(formatTime(message.updated_at || message.created_at))}</span></span>
+    </span></span>
+    <button type="button" class="button secondary" data-replay-outbox="${escapeHtml(message.id || "")}" ${message.id ? "" : "disabled"}>重新派发</button>
+  </div>`).join("");
+}
+
+function deadLetterRows(messages) {
+  if (!messages?.length) return '<div class="empty-state"><span><b>没有任务执行死信</b>Queue DLQ 当前为空</span></div>';
+  return messages.map((message) => `<button type="button" class="task-row" data-operations-task="${escapeHtml(message.task_id || "")}" ${message.task_id ? "" : "disabled"}>
+    <span class="task-main"><span class="task-glyph">DL</span><span class="task-copy">
+      <span class="task-name">${escapeHtml(message.task_id || "任务标识不可用")}</span>
+      <span class="task-meta"><span>第 ${Number.isInteger(message.attempt) ? message.attempt : 0} 次投递失败</span><span>${escapeHtml(formatTime(Number.isFinite(message.failed_at) ? message.failed_at * 1000 : null))}</span></span>
+    </span></span><span class="status state-failed">查看任务</span>
+  </button>`).join("");
+}
+
+const policyRepositoryPattern = /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/;
+
+function canonicalPolicyRepository(value) {
+  if (typeof value !== "string" || !policyRepositoryPattern.test(value)) return "";
+  if (value.split("/").some((part) => part === "." || part === "..")) return "";
+  return value.toLowerCase();
+}
+
+function policyTokens(value) {
+  return [...new Set(String(value || "").split(",").map((item) => item.trim()).filter(Boolean))];
+}
+
+function policyOptionsMarkup(group, available, selected) {
+  const selectedSet = new Set(selected);
+  const values = [...new Set([...available, ...selected])];
+  if (!values.length) return '<p class="workflow-note">当前服务没有公布可选项。</p>';
+  return values.map((value) => {
+    const unavailable = !available.includes(value);
+    return `<label class="check policy-option${unavailable ? " unavailable" : ""}"><input type="checkbox" data-policy-group="${group}" data-policy-value="${encodeURIComponent(value)}" ${selectedSet.has(value) ? "checked" : ""}><span><b>${escapeHtml(value)}</b>${unavailable ? "<small>当前部署已不可用；取消勾选后才能保存</small>" : ""}</span></label>`;
+  }).join("");
+}
+
+function policyPayload(form) {
+  const selected = (group) => $$(`[data-policy-group="${group}"]`, form)
+    .filter((input) => input.checked)
+    .map((input) => decodeURIComponent(input.dataset.policyValue));
+  const maxText = $('[name="max_diff_bytes"]', form).value.trim();
+  const maxDiff = maxText ? Number(maxText) : null;
+  if (maxDiff !== null && (!Number.isSafeInteger(maxDiff) || maxDiff <= 0)) {
+    throw new Error("单次 Diff 上限必须是正整数，或留空沿用全局限制。");
+  }
+  return {
+    enabled: $('[name="enabled"]', form).checked === true,
+    auto_fix: $('[name="auto_fix"]', form).checked === true,
+    post_review_comments: $('[name="post_review_comments"]', form).checked === true,
+    allowed_reviewers: selected("allowed_reviewers"),
+    allowed_fix_rules: selected("allowed_fix_rules"),
+    allowed_llm_providers: policyTokens($('[name="allowed_llm_providers"]', form).value),
+    allowed_llm_models: policyTokens($('[name="allowed_llm_models"]', form).value),
+    llm_region: $('[name="llm_region"]', form).value.trim() || null,
+    max_diff_bytes: maxDiff,
+  };
+}
+
+function validatePolicyResponse(data) {
+  const policy = data?.policy;
+  const listFields = ["allowed_reviewers", "allowed_fix_rules", "allowed_llm_providers", "allowed_llm_models"];
+  if (
+    !data || typeof data.repository !== "string" || !canonicalPolicyRepository(data.repository)
+    || !Number.isInteger(data.version) || data.version < 0 || !policy || typeof policy !== "object"
+    || typeof policy.enabled !== "boolean" || typeof policy.auto_fix !== "boolean"
+    || typeof policy.post_review_comments !== "boolean"
+    || listFields.some((field) => !Array.isArray(policy[field]) || policy[field].some((item) => typeof item !== "string"))
+    || !Array.isArray(data.history) || !Array.isArray(data.available_reviewers)
+    || !Array.isArray(data.available_fix_rules)
+  ) throw new Error("策略结果格式异常，请刷新或联系管理员确认前后端版本一致。");
+  return policy;
+}
+
+function policySummaryMarkup(data) {
+  const policy = data.policy;
+  const source = { configured: "已配置策略", "legacy-grant": "兼容授权", default: "默认策略" }[data.source] || "当前策略";
+  const scope = (values, empty) => values.length ? values.join("、") : empty;
+  const model = [
+    policy.allowed_llm_providers.length ? `Provider：${policy.allowed_llm_providers.join("、")}` : "Provider：当前路由",
+    policy.allowed_llm_models.length ? `模型：${policy.allowed_llm_models.join("、")}` : "模型：当前路由",
+    policy.llm_region ? `区域：${policy.llm_region}` : "区域：未限定",
+  ];
+  return `<div class="policy-summary"><p><strong>${escapeHtml(data.repository)}</strong><span>${escapeHtml(source)}</span></p><ul>
+    <li><b>审查</b><span>${policy.enabled ? "允许新任务" : "已关闭"}</span></li>
+    <li><b>评论</b><span>${policy.post_review_comments ? "允许回写" : "仅保留报告"}</span></li>
+    <li><b>修复</b><span>${policy.auto_fix ? "允许通过规则与验证后创建" : "已关闭"}</span></li>
+    <li><b>流水线</b><span>${escapeHtml(scope(policy.allowed_reviewers, "全部已安装流水线"))}</span></li>
+    <li><b>修复规则</b><span>${escapeHtml(scope(policy.allowed_fix_rules, "全部已安装规则"))}</span></li>
+    <li><b>Diff 上限</b><span>${Number.isInteger(policy.max_diff_bytes) ? `${policy.max_diff_bytes.toLocaleString("zh-CN")} 字节` : "沿用全局上限"}</span></li>
+    <li><b>模型出口</b><span>${escapeHtml(model.join(" · "))}</span></li>
+  </ul></div>`;
+}
+
+function policyHistoryMarkup(history) {
+  if (!history.length) return '<div class="empty-state"><span><b>暂无策略版本</b>当前使用兼容授权或默认策略</span></div>';
+  return history.map((item) => `<div class="task-row"><span class="task-main"><span class="task-glyph">V${Number.isInteger(item.version) ? item.version : "?"}</span><span class="task-copy"><span class="task-name">策略版本 ${Number.isInteger(item.version) ? item.version : "未知"}</span><span class="task-meta"><span>${escapeHtml(item.actor || "system")}</span><span>${escapeHtml(formatTime(item.created_at))}</span></span></span></span></div>`).join("");
+}
+
+function syncPolicyRepository() {
+  const current = canonicalPolicyRepository(String($("#policy-repository").value || "").trim());
+  const canManage = consoleCapabilities?.manage === true;
+  const usable = canManage && policySnapshot && !policySnapshot.stale && current === policySnapshot.repository;
+  $("#policy-fields").disabled = !usable;
+  setButtonAvailable($("#policy-save"), Boolean(usable));
+  if (!consoleCapabilities) $("#policy-status").textContent = "正在确认管理员权限；若一直未更新，请点击顶部刷新。";
+  else if (!canManage) $("#policy-status").textContent = "仓库策略仅管理员可读取和修改。";
+  else if (policySnapshot?.stale) $("#policy-status").textContent = "策略版本可能已经变化；当前表单未保存，请重新读取。";
+  else if (policySnapshot && current !== policySnapshot.repository) $("#policy-status").textContent = "仓库地址已变化；当前表单已锁定，请重新读取目标仓库。";
+  else if (usable) $("#policy-status").textContent = `已读取 ${policySnapshot.repository} · v${policySnapshot.version}；保存只影响后续任务。`;
+  else $("#policy-status").textContent = "输入仓库后读取当前策略。";
+}
+
+function resetPolicy() {
+  policyRequest++;
+  policySnapshot = null;
+  const form = $("#policy-form");
+  form.reset();
+  setButtonBusy($("#policy-load"), false);
+  setButtonBusy($("#policy-save"), false);
+  $("#policy-fields").disabled = true;
+  $("#policy-reviewers").textContent = "";
+  $("#policy-fix-rules").textContent = "";
+  $("#policy-status").textContent = "登录后读取仓库策略。";
+  $("#policy-version").textContent = "尚未读取";
+  $("#policy-summary").textContent = "读取后展示策略来源、关键限制和版本历史，不显示原始 JSON。";
+  $("#policy-history").textContent = "";
+  $("#policy-result").textContent = "";
+}
+
+async function loadPolicy() {
+  if (consoleCapabilities?.manage !== true) return false;
+  const input = $("#policy-repository");
+  const repository = canonicalPolicyRepository(String(input.value || "").trim());
+  if (!repository) {
+    $("#policy-status").textContent = "请按 owner/repository 格式填写仓库地址。";
+    input.focus();
+    return false;
+  }
+  const session = authEpoch, request = ++policyRequest;
+  const current = () => session === authEpoch && request === policyRequest;
+  setButtonBusy($("#policy-load"), true, "正在读取…");
+  $("#policy-fields").disabled = true;
+  setButtonAvailable($("#policy-save"), false);
+  $("#policy-status").textContent = `正在读取 ${repository}…`;
+  $("#policy-result").textContent = "";
+  try {
+    const data = await api(`/v1/repository-policies?repository=${encodeURIComponent(repository)}`);
+    if (!current()) return false;
+    const policy = validatePolicyResponse(data);
+    input.value = data.repository;
+    policySnapshot = { repository: data.repository, version: data.version, stale: false };
+    for (const name of ["enabled", "auto_fix", "post_review_comments"]) $(`[name="${name}"]`, $("#policy-form")).checked = policy[name];
+    $('[name="max_diff_bytes"]', $("#policy-form")).value = Number.isInteger(policy.max_diff_bytes) ? String(policy.max_diff_bytes) : "";
+    for (const name of ["allowed_llm_providers", "allowed_llm_models"]) $(`[name="${name}"]`, $("#policy-form")).value = policy[name].join(", ");
+    $('[name="llm_region"]', $("#policy-form")).value = policy.llm_region || "";
+    $("#policy-reviewers").innerHTML = policyOptionsMarkup("allowed_reviewers", data.available_reviewers, policy.allowed_reviewers);
+    $("#policy-fix-rules").innerHTML = policyOptionsMarkup("allowed_fix_rules", data.available_fix_rules, policy.allowed_fix_rules);
+    $("#policy-version").textContent = `v${data.version}`;
+    $("#policy-summary").innerHTML = policySummaryMarkup(data);
+    $("#policy-history").innerHTML = policyHistoryMarkup(data.history);
+    return true;
+  } catch (error) {
+    if (!current()) return false;
+    if (policySnapshot?.repository === repository) policySnapshot.stale = true;
+    $("#policy-result").textContent = error.message;
+    return false;
+  } finally {
+    if (current()) {
+      setButtonBusy($("#policy-load"), false);
+      syncPolicyRepository();
+    }
+  }
+}
+
+async function savePolicy(event) {
+  event.preventDefault();
+  const form = event.currentTarget, button = $("#policy-save");
+  const snapshot = policySnapshot;
+  if (button.disabled || consoleCapabilities?.manage !== true || !snapshot || snapshot.stale || canonicalPolicyRepository(String($("#policy-repository").value || "").trim()) !== snapshot.repository) return;
+  let policy;
+  try { policy = policyPayload(form); }
+  catch (error) { $("#policy-result").textContent = error.message; return; }
+  const session = authEpoch, request = policyRequest;
+  const current = () => session === authEpoch && request === policyRequest && policySnapshot === snapshot;
+  if (!await confirmConsoleAction(`保存 ${snapshot.repository} 的策略 v${snapshot.version + 1}？新策略只影响后续任务。`, current) || !current()) return;
+  setButtonBusy(button, true, "正在保存…");
+  $("#policy-fields").disabled = true;
+  $("#policy-result").textContent = "正在保存新版本…";
+  try {
+    const result = await api("/v1/repository-policies", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repository: snapshot.repository, expected_version: snapshot.version, policy }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!current()) return;
+    if (!Number.isInteger(result.version) || result.version !== snapshot.version + 1) throw new Error("策略保存结果无法确认，请重新读取当前版本。");
+    setButtonBusy(button, false);
+    if (await loadPolicy() && session === authEpoch && policySnapshot?.version === result.version) {
+      $("#policy-result").textContent = `策略 v${result.version} 已保存；当前执行中的任务不会被改写。`;
+      toast("仓库策略已保存");
+    }
+  } catch (error) {
+    if (current()) {
+      if (error.status === 409 || !error.status || error.status >= 500) snapshot.stale = true;
+      $("#policy-result").textContent = error.message;
+    }
+  } finally {
+    if (session === authEpoch) {
+      setButtonBusy(button, false);
+      syncPolicyRepository();
+    }
+  }
+}
 
 function findingMarkup(finding, index, compact = false) {
   return `<article class="finding-card">
@@ -156,6 +417,23 @@ function artifactValueMarkup(value, type) {
   }
   if (type === "parsed-diff@1" && value && Array.isArray(value.files)) {
     return `<p>涉及 ${value.files.length} 个文件，${value.added_line_count ?? 0} 行新增代码。</p><ul class="artifact-files">${value.files.slice(0, 30).map((path) => `<li><code>${escapeHtml(path)}</code></li>`).join("")}</ul>`;
+  }
+  if (type === "review-context@1" && value && typeof value === "object") {
+    const origin = { api: "手动提交", "github-webhook": "GitHub PR", none: "未提供" }[value.origin] || "来源未知";
+    const section = (title, text) => text ? `<details><summary>${title}</summary><pre class="evidence-code"><code>${escapeHtml(text)}</code></pre></details>` : `<p class="workflow-note">${title}：未提供</p>`;
+    return `<p><strong>${escapeHtml(value.title || "未命名变更")}</strong></p><p class="workflow-note">来源：${origin}${value.truncated ? " · 内容已按安全上限截断" : ""}</p>${section("需求 / Spec", value.spec)}${section("项目规范", value.standards)}`;
+  }
+  if (type === "repository-evidence@1" && value && typeof value === "object") {
+    const origin = { "github-archive": "GitHub 固定版本归档", none: "未接入" }[value.origin] || "来源未知";
+    const revision = typeof value.revision === "string" && value.revision ? ` · 固定版本 ${escapeHtml(value.revision.slice(0, 12))}` : "";
+    if (value.status === "unavailable") {
+      const note = value.origin === "github-archive" ? "未能建立仓库影响索引；本次流程仅使用已提交的 Diff 和审查上下文。" : "当前任务没有仓库级影响证据。";
+      return `<p><strong>仓库影响证据不可用</strong></p><p class="workflow-note">来源：${origin}${revision}</p><p>${note}</p>`;
+    }
+    const list = (title, items) => Array.isArray(items) && items.length ? `<details><summary>${title}（${items.length}）</summary><ul class="artifact-files">${items.slice(0, 64).map((item) => `<li><code>${escapeHtml(item)}</code></li>`).join("")}</ul></details>` : "";
+    const files = Number.isInteger(value.indexed_files) ? value.indexed_files : 0;
+    const bytes = Number.isInteger(value.indexed_bytes) ? value.indexed_bytes : 0;
+    return `<p><strong>${value.status === "partial" ? "已建立部分仓库影响证据" : "已建立仓库影响证据"}</strong></p><p class="workflow-note">来源：${origin}${revision} · 索引 ${files} 个 Python 文件 / ${bytes.toLocaleString("zh-CN")} 字节${value.truncated ? " · 已按安全上限截断" : ""}</p>${list("变更文件", value.changed_paths)}${list("变更符号", value.changed_symbols)}${list("受影响符号", value.impacted_symbols)}${list("引用这些变更的文件", value.importing_files)}`;
   }
   if (type === "review-plan@1" && value) {
     return `<p>审查 ${Array.isArray(value.changed_files) ? value.changed_files.length : 0} 个文件，安排 ${value.assignment_count ?? 0} 项检查。</p>${Array.isArray(value.languages) ? `<p class="workflow-note">语言：${escapeHtml(value.languages.join("、"))}</p>` : ""}`;
@@ -209,6 +487,7 @@ const consoleErrors = {
   unsupported_view: "当前服务不支持此页面操作，请联系管理员确认前后端版本一致。",
   draft_conflict: "草稿已发生变化，请先保留未保存的编辑，再重新打开最新草稿。",
   binding_conflict: "仓库配置已变化，请重新读取当前配置后再切换。",
+  policy_conflict: "仓库策略已被其他管理员更新；当前表单没有保存，请重新读取后再修改。",
   unsupported_draft: "草稿结构暂不受编辑器支持，原始内容未修改。请联系管理员处理。",
   invalid_version: "所选发布版本未通过完整性检查，请联系管理员；不要继续使用该版本。",
   model_unavailable: "所选模型当前不可用，请联系管理员配置，或选择可用模型重新发布。",
@@ -229,6 +508,7 @@ const consoleErrors = {
   diff_input_required: "此 Agent 需要代码变更输入，请添加并连接 diff 端口。",
   invalid_output_limit: "模型输出上限必须是 1～4096 的整数。",
   invalid_model_output: "模型不能生成原始代码变更或变更范围，请改用文本或问题列表输出。",
+  invalid_playbook: "请检查 Agent 身份、审查目标和执行准则；身份与目标不能为空，内容不能超过长度限制。",
   invalid_prompt: "请填写模型指令，长度为 1～16000 个字符。",
   invalid_name: "请填写名称，长度为 1～100 个字符。",
   model_required: "请选择模型；自定义模型名称最多 200 个字符。",
@@ -327,10 +607,14 @@ function resetReviewSubmission() {
 
 function resetConsole() {
   consoleCapabilities = null; evolutionReady = false;
+  operationsRequest += 1;
+  resetPolicy();
   resetReviewSubmission();
   resetTask();
   window.studio?.reset();
-  for (const selector of ["#stats", "#recent-tasks", "#all-tasks", "#skill-list", "#evolution-status", "#failure-list"]) $(selector).textContent = "登录后读取数据。";
+  window.proof?.reset();
+  for (const selector of ["#stats", "#recent-tasks", "#all-tasks", "#skill-list", "#evolution-status", "#failure-list", "#operations-stats", "#audit-list", "#outbox-list", "#queue-dead-list"]) $(selector).textContent = "登录后读取数据。";
+  $("#operations-note").textContent = "登录后读取运维状态。";
   for (const selector of ["#evolution-form", "#login-form"]) {
     const form = $(selector);
     form.reset();
@@ -413,9 +697,12 @@ function setButtonAvailable(button, available) {
 
 function applyCapabilities() {
   const caps = consoleCapabilities;
+  window.proof?.capabilities(caps);
   setButtonAvailable($('#review-form button[type="submit"]'), caps?.review === true);
   $("#review-access-note").textContent = !caps ? "正在确认操作权限；若一直未更新，请点击顶部刷新。" : caps.review ? "可提交 Diff；后台执行后可在任务中心查看结果。" : "当前账号仅可查看报告，发起审查需要维护者或管理员权限。";
   setButtonAvailable($("#install-github"), caps?.manage === true && caps.github_install_configured === true);
+  setButtonAvailable($("#policy-load"), caps?.manage === true);
+  syncPolicyRepository();
   $("#github-status").textContent = !caps ? "尚未确认接入状态，请刷新后重试。" : !caps.manage ? "安装接入需要管理员权限。" : !caps.github_install_configured ? "尚未完成 GitHub App 接入配置。管理员需配置登录认证、App 凭据、OAuth 回调和 Webhook 密钥；当前仍可手动提交 Diff。" : "接入配置已具备，点击后需在 GitHub 授权；Webhook 是否可达、仓库权限和真实 PR 审查仍需接入后验证。";
   for (const button of [$('#evolution-form button[type="submit"]'), $("#auto-evolve")]) setButtonAvailable(button, caps?.platform === true && evolutionReady);
   if (caps?.role) currentRole = caps.role;
@@ -424,29 +711,44 @@ function applyCapabilities() {
 
 function applyRole() {
   const platform = consoleCapabilities?.platform === true;
+  const governance = consoleCapabilities?.manage === true;
+  const operations = consoleCapabilities?.audit === true || consoleCapabilities?.manage === true;
   $('.nav-item[data-view="evolution"]').classList.toggle("hidden", !platform);
+  $('.nav-item[data-view="governance"]').classList.toggle("hidden", !governance);
+  $('.nav-item[data-view="operations"]').classList.toggle("hidden", !operations);
   if (consoleCapabilities && !platform && location.hash.slice(1) === "evolution") show("overview");
+  if (consoleCapabilities && !governance && location.hash.slice(1) === "governance") show("overview");
+  if (consoleCapabilities && !operations && location.hash.slice(1) === "operations") show("overview");
 }
 
 function show(view, updateHash = true) {
   if (!titles[view]) view = "overview";
-  $$(".view").forEach((element) => element.classList.remove("active"));
-  $$(".nav-item").forEach((element) => {
-    const active = element.dataset.view === view;
-    element.classList.toggle("active", active);
-    element.setAttribute("aria-current", active ? "page" : "false");
-  });
-  $(`#view-${view}`).classList.add("active");
-  $("#page-title").textContent = titles[view];
-  document.title = `${titles[view]} · EvoAgent`;
-  if (updateHash) history.replaceState(null, "", `#${view}`);
+  const render = () => {
+    $$(".view").forEach((element) => element.classList.remove("active"));
+    $$(".nav-item").forEach((element) => {
+      const active = element.dataset.view === view;
+      element.classList.toggle("active", active);
+      element.setAttribute("aria-current", active ? "page" : "false");
+    });
+    $(`#view-${view}`).classList.add("active");
+    $("#page-title").textContent = titles[view];
+    document.title = `${titles[view]} · EvoAgent`;
+    if (updateHash) history.replaceState(null, "", `#${view}`);
 
-  if (view === "tasks") loadTasks();
-  if (view === "review") loadReviewWorkflows();
-  if (view === "studio") window.studio?.load();
-  if (view === "skills") loadSkills();
-  if (view === "evolution") loadFailures();
-  window.scrollTo({ top: 0, behavior: "smooth" });
+    if (view === "tasks") loadTasks();
+    if (view === "review") loadReviewWorkflows();
+    if (view === "studio") window.studio?.load();
+    if (view === "skills") loadSkills();
+    if (view === "governance") syncPolicyRepository();
+    if (view === "operations") loadOperations();
+    if (view === "evolution") loadFailures();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+  if (typeof document.startViewTransition === "function" && !window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches) {
+    document.startViewTransition(render);
+  } else {
+    render();
+  }
 }
 
 $$(".nav-item").forEach((button) => button.addEventListener("click", () => show(button.dataset.view)));
@@ -507,7 +809,7 @@ async function loadDashboard() {
     ].join("");
     $("#recent-tasks").innerHTML = taskRows((data.tasks || []).slice(0, 5));
     bindTasks($("#recent-tasks"));
-    return true;
+    return location.hash.slice(1) === "operations" ? await loadOperations() : true;
   } catch (error) {
     if (session !== authEpoch || request !== dashboardRequest) return false;
     consoleCapabilities = null;
@@ -535,6 +837,70 @@ async function loadTasks() {
     root.innerHTML = '<div class="empty-state"><span>任务加载失败</span></div>';
     toast(error.message);
     return false;
+  }
+}
+
+async function loadOperations() {
+  const session = authEpoch, request = ++operationsRequest;
+  const canAudit = consoleCapabilities?.audit === true;
+  const canManage = consoleCapabilities?.manage === true;
+  if (!consoleCapabilities) {
+    $("#operations-note").textContent = "正在确认运维权限；若一直未更新，请点击顶部刷新。";
+    return false;
+  }
+  if (!canAudit && !canManage) return false;
+  $("#operations-note").textContent = canManage ? "可查看当前租户的审计与失败投递；重放操作需要再次确认。" : "当前账号可只读查看审计记录。";
+  for (const selector of ["#operations-stats", "#audit-list", "#outbox-list", "#queue-dead-list"]) $(selector).innerHTML = '<div class="list-loading"></div>';
+  const reads = await Promise.allSettled([
+    canAudit ? api("/api/audit?limit=50") : Promise.resolve(null),
+    canManage ? api("/api/outbox?status=dead&limit=50") : Promise.resolve(null),
+    canManage ? api("/api/queue/dead-letters?limit=50") : Promise.resolve(null),
+    canManage ? api("/api/tenant-review-capacity") : Promise.resolve(null),
+  ]);
+  if (session !== authEpoch || request !== operationsRequest) return false;
+  const value = (index) => reads[index].status === "fulfilled" ? reads[index].value : null;
+  const audit = value(0), outbox = value(1), queue = value(2), capacity = value(3);
+  $("#audit-list").innerHTML = !canAudit ? '<div class="empty-state"><span>当前账号没有审计查看权限</span></div>' : audit ? auditRows(audit.events) : '<div class="empty-state"><span>审计记录暂时无法读取</span></div>';
+  $("#outbox-list").innerHTML = !canManage ? '<div class="empty-state"><span>失败投递仅管理员可查看</span></div>' : outbox ? outboxRows(outbox.messages) : '<div class="empty-state"><span>Outbox 状态暂时无法读取</span></div>';
+  $("#queue-dead-list").innerHTML = !canManage ? '<div class="empty-state"><span>任务死信仅管理员可查看</span></div>' : queue ? deadLetterRows(queue.messages) : '<div class="empty-state"><span>Queue DLQ 状态暂时无法读取</span></div>';
+  const active = capacity && Number.isInteger(capacity.active_reviews) ? capacity.active_reviews : "—";
+  const limit = capacity?.enabled && Number.isInteger(capacity.max_active_reviews) ? capacity.max_active_reviews : capacity ? "未限额" : "—";
+  $("#operations-stats").innerHTML = [
+    statCard("活跃审查", active, "当前占用的租户槽位", capacity?.saturated ? "failed" : "success"),
+    statCard("容量上限", limit, capacity?.enabled ? `剩余 ${Number.isInteger(capacity.available) ? capacity.available : 0}` : "未启用租户限额", ""),
+    statCard("结果回写死信", outbox?.messages?.length ?? "—", "可确认后重新派发", outbox?.messages?.length ? "failed" : "success"),
+    statCard("任务执行死信", queue?.messages?.length ?? "—", "从原任务核对与续跑", queue?.messages?.length ? "failed" : "success"),
+  ].join("");
+  $$('[data-replay-outbox]', $("#outbox-list")).forEach((button) => button.addEventListener("click", () => replayOutbox(button)));
+  $$('[data-operations-task]', $("#queue-dead-list")).forEach((button) => button.addEventListener("click", () => button.dataset.operationsTask && openTask(button.dataset.operationsTask)));
+  const failures = reads.filter((result, index) => result.status === "rejected" && (canAudit || index > 0 && canManage)).length;
+  if (failures) $("#operations-note").textContent = "部分运维数据未能刷新；已显示的区域仍来自本次读取。";
+  return failures === 0;
+}
+
+async function replayOutbox(button) {
+  const messageId = button.dataset.replayOutbox;
+  const session = authEpoch, request = operationsRequest;
+  const current = () => session === authEpoch && request === operationsRequest;
+  if (!messageId || button.disabled || consoleCapabilities?.manage !== true) return;
+  setButtonBusy(button, true, "等待确认…");
+  try {
+    if (!await confirmConsoleAction(`重新派发结果回写 ${messageId}？只重试已持久化的投递，不会重新执行代码审查。`, current) || !current()) return;
+    setButtonBusy(button, true, "正在派发…");
+    const result = await api("/v1/outbox/replay", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message_id: messageId }), signal: AbortSignal.timeout(30000),
+    });
+    if (!current()) return;
+    if (result.replayed !== true) throw Object.assign(new Error("delivery changed"), { status: 404 });
+    toast("结果回写已重新派发");
+    await loadOperations();
+  } catch (error) {
+    if (current()) {
+      toast(error.status === 404 ? "该失败投递已被处理，请刷新核对。" : "无法确认是否已重新派发，请刷新运维状态后再决定是否重试。");
+      await loadOperations();
+    }
+  } finally {
+    if (current()) setButtonBusy(button, false);
   }
 }
 
@@ -569,7 +935,7 @@ function workflowMarkup(data, task = null) {
       return `<li class="handoff-step">
         <div class="handoff-heading"><div><strong>${escapeHtml(names[step.id])}</strong></div>
           <span class="status ${style}">${label}</span></div>
-        <p class="workflow-note">${step.attempt > 1 ? `尝试 ${escapeHtml(step.attempt)} 次 · ` : ""}${step.updated_at ? `更新于 ${escapeHtml(formatTime(step.updated_at))}` : "尚未执行"}</p>
+        <p class="workflow-note">${step.attempt > 1 ? `尝试 ${escapeHtml(step.attempt)} 次 · ` : ""}${formatDuration(step.duration_ms) ? `耗时 ${escapeHtml(formatDuration(step.duration_ms))} · ` : ""}${step.updated_at ? `更新于 ${escapeHtml(formatTime(step.updated_at))}` : "尚未执行"}</p>
         ${step.blocked_by?.length ? `<p class="handoff-blocked">等待上游：${escapeHtml(step.blocked_by.map((id) => names[id] || "上游步骤").join("、"))}</p>` : ""}
         ${step.error ? '<p class="handoff-error">此步骤未能完成，可重试或请管理员检查。</p>' : ""}
         <p class="handoff-source">接收自 ${Object.values(step.sources).map((source) => escapeHtml(workflowSourceName(source, names))).join("；") || "流程输入"}</p>
@@ -786,6 +1152,10 @@ async function loadFailures() {
   }
 }
 
+$("#policy-load").addEventListener("click", loadPolicy);
+$("#policy-repository").addEventListener("input", syncPolicyRepository);
+$("#policy-form").addEventListener("submit", savePolicy);
+
 $("#review-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
@@ -795,6 +1165,8 @@ $("#review-form").addEventListener("submit", async (event) => {
   const values = new FormData(form);
   const body = { repository: values.get("repository"), diff: values.get("diff") };
   if (values.get("pull_request")) body.pull_request = Number(values.get("pull_request"));
+  const context = Object.fromEntries(["title", "spec", "standards"].map((key) => [key, values.get(key) || ""]));
+  if (Object.values(context).some(Boolean)) body.context = context;
   const output = $("#review-result");
   output.classList.remove("empty");
   output.textContent = "正在提交审查任务…";
@@ -924,6 +1296,8 @@ $("#refresh").addEventListener("click", async () => {
     refreshed = results.every(Boolean);
   } else if (view === "review") refreshed = await loadReviewWorkflows();
   else if (view === "skills") refreshed = await loadSkills();
+  else if (view === "governance") refreshed = String($("#policy-repository").value || "").trim() ? await loadPolicy() : true;
+  else if (view === "operations") refreshed = true; // loadDashboard refreshed this permissioned view.
   else if (view === "studio") { await window.studio?.load(); return; }
   else if (view === "evolution") refreshed = await loadFailures();
   else refreshed = await loadDashboard();

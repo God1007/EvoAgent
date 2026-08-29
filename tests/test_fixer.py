@@ -51,6 +51,67 @@ class ProposeLineTests(unittest.TestCase):
 
 
 class ApplyTests(unittest.TestCase):
+    def test_python_ast_path_replaces_only_simple_eval(self):
+        content = "value = eval(payload)\nkept = eval(payload, {})\n"
+        result = SafeFixer().apply(
+            content, [{"path": "a.py", "line": 1, "rule_id": "SEC-EVAL"}], "a.py"
+        )
+        self.assertIn("import ast", result["content"])
+        self.assertIn("ast.literal_eval(payload)", result["content"])
+        self.assertIn("eval(payload, {})", result["content"])
+        self.assertEqual(["SEC-EVAL"], result["rules"])
+
+    def test_python_ast_path_narrows_only_known_int_conversion(self):
+        content = (
+            "def parse(value):\n"
+            "    try:\n"
+            "        return int(value)\n"
+            "    except Exception:\n"
+            "        return None\n"
+            "\n"
+            "def unknown(value):\n"
+            "    try:\n"
+            "        return load(value)\n"
+            "    except Exception:\n"
+            "        return None\n"
+        )
+        result = SafeFixer().apply(
+            content,
+            [
+                {"path": "a.py", "line": 4, "rule_id": "REL-EMPTY-EXCEPT"},
+                {"path": "a.py", "line": 10, "rule_id": "REL-EMPTY-EXCEPT"},
+            ],
+            "a.py",
+        )
+        self.assertIn("except (TypeError, ValueError):", result["content"])
+        self.assertEqual(1, result["content"].count("except Exception:"))
+        self.assertEqual(["REL-EMPTY-EXCEPT"], result["rules"])
+
+    def test_python_ast_path_replaces_only_explicit_admin_assert(self):
+        content = "assert user.is_admin\nassert user.is_staff\n"
+        result = SafeFixer().apply(
+            content,
+            [
+                {"path": "a.py", "line": 1, "rule_id": "SEC-ASSERT-AUTH"},
+                {"path": "a.py", "line": 2, "rule_id": "SEC-ASSERT-AUTH"},
+            ],
+            "a.py",
+        )
+        self.assertIn("if not user.is_admin:", result["content"])
+        self.assertIn("raise PermissionError", result["content"])
+        self.assertIn("assert user.is_staff", result["content"])
+        self.assertEqual(["SEC-ASSERT-AUTH"], result["rules"])
+
+    def test_module_import_alias_does_not_hide_required_plain_binding(self):
+        content = "from os import environ\ntoken = 'secret'\n"
+        result = SafeFixer().apply(
+            content,
+            [{"path": "a.py", "line": 2, "rule_id": "SEC-HARDCODED-SECRET"}],
+            "a.py",
+        )
+        self.assertIn("import os", result["content"])
+        compile(result["content"], "a.py", "exec")
+
     def test_non_python_file_uses_line_path(self):
         content = "run(cmd, shell=True)\n"
         result = SafeFixer().apply(content, [{"path": "a.sh", "line": 1, "rule_id": "X"}], "a.sh")

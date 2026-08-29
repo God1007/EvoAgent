@@ -8,9 +8,11 @@
   dependency check. An open downstream circuit does not eject every healthy
   replica, so intake can remain available while affected work fails fast.
 - `/ready` separately reports optional Docker-backed Proof and Repair capability
-  state. Repair is configured only when both the immutable container image and
-  repository test command are present; a disabled optional capability does not
-  eject review replicas.
+  state. Proof includes `configured`, `mode` and `healthy`; socket mode performs
+  a bounded exchange with the pinned executor, while direct Docker mode verifies
+  the immutable image remains reachable. Repair is configured only when both the
+  image and repository test command are present. An unhealthy optional capability
+  does not eject otherwise healthy review replicas.
 - Startup fails when `EVOAGENT_SKILLS_DIR` is missing; use an existing empty
   directory when dynamic Skills are intentionally disabled.
 - Non-loopback startup requires `EVOAGENT_SKILL_REQUIRE_CONTAINER=true`; an
@@ -54,6 +56,66 @@ The bundled rules expect the Prometheus scrape job to be named `evoagent`.
 If every target is down or the job disappears, check service discovery and
 scrape authentication first, then instance liveness and `/ready`. Restore at
 least one healthy target before trusting any application-derived SLO or alert.
+`evoagent-slo` returns `no-data` (exit 2 by default) while all targets are down or
+the job is absent, even if historical samples exceed the minimum. Do not use
+`--allow-no-data` for release qualification. A current healthy target is only a
+minimum collection check; verify replica discovery and the entire observation
+window separately.
+The CLI reads the [current target list](https://prometheus.io/docs/prometheus/latest/querying/api/#targets)
+instead of trusting a historical `up=1`. The PromQL alert remains subject to
+[series staleness](https://prometheus.io/docs/prometheus/latest/querying/basics/#staleness):
+after removing a job, its last sample may remain visible for the default
+five-minute lookback, followed by the alert's two-minute pending period.
+Do not promise a two-minute page from the moment a scrape job is deleted.
+
+Configure the existing authenticated endpoint with Prometheus's native
+[`authorization.credentials_file`](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#http_config).
+For a private Compose network (use HTTPS with certificate verification outside
+the isolated local network):
+
+```yaml
+global:
+  scrape_interval: 15s
+  scrape_timeout: 5s
+  evaluation_interval: 15s
+rule_files:
+  - /etc/prometheus/evoagent.rules.yml
+scrape_configs:
+  - job_name: evoagent
+    metrics_path: /metrics
+    follow_redirects: false
+    authorization:
+      type: Bearer
+      credentials_file: /run/secrets/evoagent-metrics-token
+    static_configs:
+      - targets: [evoagent:8080]
+```
+
+Provision a platform administrator's session token through your secret-management
+system, readable only by the scraper identity. It has platform privileges, not a
+metrics-only scope: do not commit it, embed it in an image, expose it in command
+arguments or use it for untrusted PR code. Renew it before `expires_in`, atomically
+replace the file in its parent directory, then verify the target's `up` value and
+`lastError`. A file-only bind mount may retain the old inode after replacement;
+mount the credential directory read-only for the scraper instead. Native file
+rotation does not require restarting Prometheus. A configuration change requires
+a [SIGHUP reload](https://prometheus.io/docs/prometheus/latest/configuration/configuration/).
+Authentication failures consume the client rate limit; increasing the rate limit
+does not repair expired credentials.
+
+Run the native alert behavior checks alongside rule syntax validation:
+
+```sh
+promtool check rules ops/prometheus/evoagent.rules.yml
+promtool test rules ops/prometheus/evoagent.test.yml
+```
+
+CI uses the pinned Prometheus 3.5.0 image. These tests check the two-minute
+pending period, target recovery, a missing scrape job, partial replica failure,
+flapping and the fast-burn sample floor. They test expressions and timing, not
+Alertmanager routing or delivery to an on-call person.
+
+## Container verification prerequisites
 
 Preload configured Skill and repair images in the Docker daemon available to
 the EvoAgent process. Request execution never pulls images; configured images
@@ -74,7 +136,7 @@ execution and enter the existing container cleanup path.
 Producer teardown has a separate five-second bound; container removal retains
 its separate ten-second bound.
 
-All Linux sandbox containers, including Skills, explicitly use UID/GID
+All untrusted Linux sandbox commands, including Skills, explicitly use UID/GID
 `65534:65534`, regardless of the Docker client's OS, host UID/GID or image `USER`.
 Repair/Proof gives `/work` the same ownership and mode `0700`; extraction and test
 execution use that identity too. Images and test dependencies must be readable
@@ -86,9 +148,60 @@ This follows Docker's documented [tar-stream workaround](https://docs.docker.com
 for mounts such as tmpfs while retaining the read-only root filesystem. The
 shared-path dependency is removed in code, but actual Docker and remote/nested
 deployment compatibility still require the container contracts on the target
-runtime; local tar-process checks do not prove container isolation. Operators
-must provision the Docker client, authorized daemon connection and preloaded
-image; this change does not install them or expose a daemon socket to PR code.
+runtime; local tar-process checks do not prove container isolation. For the direct
+adapter, operators must provision the Docker client, authorized daemon connection
+and preloaded image. The optional dedicated executor below includes its own CLI;
+neither approach exposes a daemon socket to PR code.
+
+### Sandbox owner loss
+
+Skill and Repair/Proof launches share `container_runtime.py`. Both use a detached
+container with the trusted image's **`/bin/sleep` as PID 1**, a lifetime of the
+configured command timeout plus 15 seconds, and
+[Docker automatic removal](https://docs.docker.com/reference/cli/docker/container/run/#clean-up---rm).
+The extra 15 seconds cover the existing producer/cleanup budgets; they do not
+extend the caller's command deadline. The image must provide `/bin/sleep`.
+Untrusted code runs through `docker exec`, never as the deadline process.
+Daemon-default init injection and image health checks are explicitly disabled.
+The deadline runs as a separate non-root UID/GID `65533:65533` with working
+directory `/`; test/Skill commands remain `65534:65534`. Dropped capabilities
+and separate UIDs deny signals, ptrace and process-memory access to the deadline,
+without assuming the host enables stricter
+[Yama ptrace policy](https://docs.kernel.org/admin-guide/LSM/Yama.html).
+
+When PID 1 exits, Linux terminates the remaining PID namespace. Members of that
+namespace cannot send it unhandled signals, including stopping/killing the sleep
+process from repository code; see
+[Linux PID namespace semantics](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html).
+This makes expiration independent of the API/Skill worker surviving. It does
+not rely on untrusted Python resource limits or an additional reaper service.
+
+Normal completion still immediately removes the exact generated container name.
+If Docker has already auto-removed it, a successful name-filtered daemon query
+must confirm absence; a failed query, transport error or surviving match is not
+treated as cleanup success. The query never supplies additional deletion targets.
+Removal and confirmation share the existing ten-second cleanup budget, and use
+the same Docker connection environment as execution. Skill startup and execution
+also share one command deadline; an uncertain launch never runs the Skill.
+
+Each new sandbox also receives an absolute wall-clock expiry label. Before a new
+Skill or Repair/Proof job is admitted, the owner lists only containers carrying
+that label, accepts only exact generated names and numeric deadlines, and removes
+only entries whose deadline has passed. Inventory is capped at 64; daemon errors,
+malformed entries, excess inventory or cleanup failure reject the new job. This
+pre-admission reconciliation handles a container whose monotonic sleep was frozen
+by `docker pause`: after the runtime resumes, the next job removes the expired
+container before starting. It does not run a daemon thread or prune by prefix.
+
+The lifetime depends on a running kernel, not a surviving Docker daemon. In the
+qualified daemon-loss drill, containerd reported the task stopped at its deadline;
+Docker removed the remaining container metadata after recovery. Removal still
+requires the daemon. Hypervisor suspension or runtime loss still prevents cleanup
+while unavailable; pre-admission reconciliation starts only after Docker returns.
+Containers launched by older releases do not have the expiry label and therefore
+do not gain this behavior retroactively. Restore the runtime, inspect exact known
+old-version leftovers, and never replace that inspection with a broad container
+prune.
 
 Every response carries `X-Request-ID`. Unexpected HTTP errors return a generic
 message; correlate the identifier with structured logs. Persisted operational
@@ -151,13 +264,23 @@ publishes only the missing delivery effect and never recomputes the review.
 Repeated delivery resumes coalesce while that Outbox/queue attempt is active;
 an Outbox `dead` row or queue DLQ transition reopens the task for an operator retry.
 
-Task Center exposes these same operations to users with `review` permission
+Task Center exposes task-level operations to users with `review` permission
 (maintainer, admin or platform admin), including after a Studio tab is closed.
 Select **从失败节点续跑** for a failed execution, **取消任务** for pending/running
 work, or **重试结果回写** when the review succeeded but session/GitHub delivery has
 not been confirmed complete. State hints do not authorize an operation: the API
-still checks the current tenant, role and durable state. The page does not expose
-Outbox identifiers or delivery credentials.
+still checks the current tenant, role and durable state. Task Center does not
+expose Outbox identifiers or delivery credentials.
+
+The browser **运维中心** provides the tenant-scoped operator view. Auditors can
+read the latest audit actor, action, resource and time; admins can additionally
+read admission capacity, dead Queue task IDs and dead Outbox identifiers. It does
+not transport audit detail, queue/Outbox payloads or stored error text. Replaying
+an Outbox entry requires a second confirmation, updates only a row still in
+`dead`, uses the existing transaction/audit path and refreshes the page afterward.
+A missing entry means another operator or recovery path already changed it; refresh
+before taking another action. Queue DLQ entries link back to Task Center, where
+the existing task resume contract remains the only execution retry path.
 
 The task list, details and Studio distinguish a delivery-managed retry from a
 terminal failure, and show cancellation-in-progress until the worker records the
@@ -314,6 +437,44 @@ exceeded the task deadline; reduce or speed up Skills before increasing the budg
 15 minutes; correlate the panel with Skill failures before changing the task budget.
 `evoagent_review_agent_output_limit_rejections_total` means the combined specialist
 output exceeded the bounded review size and was stopped before downstream work.
+`evoagent_repository_evidence_failures_total` means a workflow requested repository
+evidence but its pinned GitHub archive could not be fetched or indexed. The review
+continues with Diff and the already accepted Context Pack and stores an explicit
+unavailable snapshot; repository standards are therefore not auto-filled for that task.
+Successful archive processing uses the same read to populate an empty standards section
+from the bounded allowlist; malformed individual standards files are skipped and mark the
+Context Pack truncated without discarding otherwise valid Python impact evidence.
+check installation access, the pinned revision and archive-size setting before submitting
+a new review. Retrying the same task deliberately reuses its unavailable snapshot.
+Do not raise `EVOAGENT_REPOSITORY_EVIDENCE_MAX_BYTES` above the measured repository
+need merely to hide repeated failures; the setting bounds both download and indexed
+Python source bytes and is capped at 1 GiB.
+
+## Workflow agent failures
+
+`evoagent_workflow_agent_runs_total`, `successes_total` and `failures_total` are the
+global execution totals. Per-class families such as
+`evoagent_workflow_review_agent_planner_duration` and
+`evoagent_workflow_studio_agent_llm_failures_total` identify the slow or failing
+part of the graph. Workflow classes are bounded to `review`, `studio` and `custom`;
+Agent classes are the installed default roles, Studio `rules`/`llm`/`merge`, or
+`custom`. User names, tenant IDs, repositories, task IDs and revision hashes never
+become Prometheus series.
+
+`EvoAgentWorkflowAgentFailureRateHigh` opens a ticket when more than 5% of at least
+20 executions fail over 15 minutes. Start with the Agent latency/failure panels,
+then use `GET /v1/tasks/<task-id>/workflow` to inspect the exact step, immutable
+Agent revision, current-attempt `duration_ms`, attempt count and safe error reference.
+The duration covers the Agent callback and output-contract validation, not queue
+wait, upstream wait or checkpoint persistence. Checkpoint replays have their own
+counter and are not counted as new Agent executions.
+
+Actual provider-reported token counters split default review, Studio, evaluation
+and other purposes (`evoagent_model_<purpose>_input_tokens_total` and
+`output_tokens_total`). Use them to locate the workflow class consuming budget;
+use the task's pinned workflow snapshot for the exact revision. This two-level
+drill-down avoids an unbounded series for every published workflow version.
+
 Use `evoagent_skill_runs_total`, `evoagent_skill_failures_total`,
 `evoagent_skill_timeouts_total`, `evoagent_skill_sandbox_failures_total`,
 `evoagent_skill_output_rejections_total`,
@@ -368,10 +529,120 @@ reporting an internal service failure after that cancellation wins.
 The cancellation endpoint also returns `409` with the current durable state when
 the task already reached a non-cancelled terminal state.
 
+## Dedicated Proof executor
+
+The console's **修复验证** page submits text files for the original/patched
+versions and reproduction/regression commands to the existing `POST /v1/proofs`
+endpoint. It requires the `fix` permission. Output is three readable evidence
+stages; test output and the patch are expandable. Infrastructure diagnostics,
+internal hashes and raw result JSON are not rendered. Editing the input or
+signing out clears the displayed evidence. L4 means only that the supplied
+reproduction and regression commands passed on the supplied patch, not that
+the whole repository is safe. Closing the page does **not** cancel an admitted
+command; execution remains bounded by the executor's deadline. No automatic retry.
+
+For a containerized Web/API, use the explicit `docker-compose.proof.yml` overlay
+on a **dedicated Docker daemon/VM**. It adds a trusted `proof-executor` service:
+
+```text
+Browser → authenticated API / ProofRunner
+        → private Unix socket / ProofExecutorPort
+        → trusted executor → short-lived restricted test containers
+```
+
+The API mounts only the Proof socket volume, read-only, and has neither a Docker
+client nor daemon socket. The executor has no network, no application credentials,
+a read-only root, a bounded tmpfs, dropped capabilities and bounded concurrency.
+Its Docker-socket access is nevertheless **daemon-admin authority**: `:ro` does
+not make Docker API operations read-only. Never use a shared production daemon.
+The execution containers do not receive either socket, host files or host secrets;
+untrusted commands retain UID 65534, no-network, read-only-root and tmpfs policy,
+with the separate UID 65533 deadline described above.
+
+Preload a trusted image with the required test dependencies, build the application's
+default target and the `proof-executor` target, then set `EVOAGENT_PROOF_IMAGE`
+and `EVOAGENT_DOCKER_SOCKET_GID` to the socket's numeric group **on the daemon host**.
+Start Compose with both files. The overlay sets `EVOAGENT_PROOF_EXECUTOR_SOCKET`
+for the API and waits for the executor's health check. See the
+[local deployment commands](local-docker.md) for the isolated macOS environment.
+Default Compose without this overlay still has no executable Proof capability.
+
+The trusted executor uses Docker's native `restart: always`; disposable job
+containers remain `--rm` with **no restart policy**. On the qualified Docker
+29.7.2 runtime without live restore, `unless-stopped` recovered after VM power-off
+but did not recover after a daemon crash: daemon restoration stopped the
+surviving executor. The engine's
+[restore path](https://github.com/moby/moby/blob/6a43e3d/daemon/daemon.go) and
+[signal handler](https://github.com/moby/moby/blob/6a43e3d/daemon/kill.go) explain
+this as the manual-stop flag being set during restoration. `always` passed
+both actual fault drills, not only configuration inspection.
+
+With [Docker restart semantics](https://docs.docker.com/engine/containers/start-containers-automatically/),
+manually stopping the executor keeps it stopped **until the next daemon restart**.
+For persistent disablement, stop Proof admission and remove only the stopped
+executor service container with Compose, preserving its socket volume; omit the
+overlay on later starts. The policy does not enable VM boot-at-login, change the
+base API/database/queue restart policies, retry an interrupted Proof command,
+or replay an unfinished review. Use the full Compose startup procedure for the
+whole application, and the disaster-recovery runbook for durable review state.
+
+After a daemon/VM incident, confirm daemon reachability, executor health and
+absence of exact known sandbox IDs before running a fresh bounded proof.
+An interrupted first reproduction remains L1/error; restarting a worker does
+not promote it. The owned stale socket can be recovered, and an existing API
+client can reconnect when the immutable image is unchanged. See the
+[fault-acceptance boundary](integration-testing.md#daemon-and-vm-fault-acceptance);
+the short test's recovery time is not a production RTO.
+
+The private socket directory is mode `0700`; the socket is `0600`, owned by the
+application UID. Protocol v1 accepts only text files and a command, not image,
+mounts, environment variables or resource settings. Frames have a 16 MiB request
+and 256 KiB response ceiling and a five-second transport deadline; commands are
+limited to 8 KiB. Paths must be canonical relative paths with no dot-segments or
+backslashes, so serialization cannot change which duplicate alias wins. The
+page limits editing to 32 files; the existing API ceiling remains 5,000 distinct
+paths and its HTTP/body limits still apply. The executor permits two concurrent
+jobs by default and rejects excess connections instead of growing a work queue.
+
+The API pins the executor's immutable image ID at startup. Replies must match
+the request digest, command digest and that image. Malformed replies, overload,
+lost connections, timeouts or an unavailable Docker daemon are inconclusive,
+never a reproduced bug or host fallback. `proof.run` audit events retain these
+bounded attestations, not source files/commands. The digest binds a reply within
+the trusted socket boundary; it is not hardware attestation or proof against a
+compromised executor/daemon. `/ready` performs a bounded live health exchange and
+the console disables Proof when that check fails; it does not execute repository
+code as a probe. A changed executor image requires an API restart too.
+
+Set limits on the executor's CLI (`--timeout`, `--memory-mb`, `--pids-limit`,
+`--cpus`, `--workers`); the bundled overlay uses a 120-second command deadline.
+Keep the API's `EVOAGENT_REPAIR_VERIFY_TIMEOUT_SECONDS` aligned with that deadline.
+An entire L4 request may take three command deadlines plus bounded cleanup.
+The executor drains on SIGTERM; the overlay allows 150 seconds before SIGKILL.
+An owned stale socket is recovered on restart; regular files and live listeners
+are never replaced. SIGKILL of the executor is covered by the independent
+[sandbox lifetime](#sandbox-owner-loss); after VM/daemon recovery, the next job
+reconciles expired labelled sandboxes before launch. Executor-side verifier metrics
+are currently local to that process, not automatically exported through the API's `/metrics`;
+API Proof latency/evidence/inconclusive counters remain available there.
+
+This adapter only serves manually submitted Proof jobs. It does not enable
+automatic GitHub repair publication, remote Skills, or a new Workflow Studio
+node. Those integrations retain their separate existing security gates.
+
 ## Repair outcomes
 
 Inspect the container image, command, timeout and resource limits. A verifier
 abstention is safer than publishing an unproven edit.
+The default repair registry includes three AST-only rules with narrow semantic
+preconditions: `SEC-EVAL` accepts only a one-argument builtin `eval`,
+`REL-EMPTY-EXCEPT` accepts only a single `int(value)` conversion returning
+`None`, and `SEC-ASSERT-AUTH` accepts only `assert user.is_admin`. Qualified
+forms become `ast.literal_eval`, an explicit `TypeError`/`ValueError` handler,
+and an explicit `PermissionError` branch respectively. Syntax errors, aliases,
+extra arguments and other lookalikes receive no line-based fallback. The
+existing YAML, Cookie, shell, secret and debug-output rules retain their own
+independent preconditions.
 Completed verification results retain the execution mode, resolved container
 image and SHA-256 of the exact test command without persisting the command itself.
 The same bounded attestation and verdict are included in `repair.create` audit
@@ -473,15 +744,65 @@ Both queue backends retain approximately the newest 10,000 DLQ entries as a boun
 incident buffer; resumable task state remains in PostgreSQL rather than depending on it.
 Queue envelopes carry metadata only and are capped at 256 KiB before JSON parsing;
 large Diff payloads remain in PostgreSQL.
-Deferred GitHub tasks refetch the diff from their snapshotted URL when the first
-fetch never completed.
+Deferred GitHub tasks refetch the diff from their snapshotted
+`base_sha...head_sha` comparison when the first fetch never completed. A pinned
+comparison failure is retried or failed without substituting the current PR.
+Only legacy tasks without `base_sha` retain the stored PR URL compatibility path.
 Offline reconstruction also restores a successful task whose explicit comment
 redelivery was published to Redis but never completed; ordinary successful
 tasks remain terminal and are not replayed.
 
+A Docker/VM restart can recover the services while still losing the newest Redis
+AOF entries. PostgreSQL may then contain `published` Outbox rows for tasks whose
+stream messages no longer exist; ordinary dispatcher restart intentionally does
+not republish that ambiguous history. If non-terminal tasks remain while queue
+depth, lag and pending entries are all zero, keep intake stopped and use the
+offline recovery boundary:
+
+1. Stop every API, Outbox dispatcher and worker connected to the restored
+   PostgreSQL database. Do not run recovery against a live deployment.
+2. Provision a new empty Redis logical database or cluster. It must not contain
+   application keys; do not flush the old target as a shortcut.
+3. Set `EVOAGENT_DATABASE_URL` to the restored PostgreSQL database and
+   `EVOAGENT_REDIS_URL` to the empty target. Generate a new canonical UUID, then
+   review a dry-run plan:
+
+   ```bash
+   python -m evoagent.recovery \
+     --recovery-id <new-uuid> \
+     --confirm-database <database-name> \
+     --max-tasks 10000
+   ```
+
+4. Confirm the candidate/recoverable/unrecoverable counts and retain the
+   returned `plan_sha256`. Applying a changed plan is rejected:
+
+   ```bash
+   python -m evoagent.recovery \
+     --recovery-id <same-uuid> \
+     --confirm-database <database-name> \
+     --max-tasks 10000 \
+     --apply \
+     --expect-plan-sha256 <reviewed-plan-sha256>
+   ```
+
+5. Point the application at that reserved Redis target; start the Outbox
+   dispatcher and workers before external effects and ingress. Reconcile task
+   terminal states, Outbox status, active admissions, Redis lag/pending and the
+   `recovery.queue.stage` audit row. Preserve the old Redis target for incident
+   evidence until reconciliation finishes.
+
+The command never copies raw Diffs into its report. Any unrecoverable candidate
+fails closed unless the operator explicitly accepts it for incident handling;
+that flag is not a substitute for restoring missing task intent.
+
 ## Deployments
 
 Run one EvoAgent process per container and scale containers horizontally.
+The bundled Compose file gives PostgreSQL, Redis and EvoAgent
+`restart: always`; the one-shot migration job does not restart. This restores
+containers after a Docker daemon or VM restart, but does not replace the queue
+reconciliation above, backups, an orchestrator or production RPO/RTO testing.
 PostgreSQL pools are capped at 256 connections per process; increase replicas
 rather than removing this database protection.
 Budget the **sum** of replica pool maxima, plus migration/backup/monitoring

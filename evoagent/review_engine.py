@@ -136,6 +136,26 @@ class ReviewEngine:
     def execution_revision(self) -> str:
         return self.execution_snapshot()[0]
 
+    def requires_repository_evidence(self, task_input: dict) -> bool:
+        snapshot = task_input.get("studio_workflow")
+        if isinstance(snapshot, dict):
+            bundle = snapshot.get("bundle")
+            definition = bundle.get("definition") if isinstance(bundle, dict) else None
+            steps = definition.get("steps") if isinstance(definition, dict) else None
+            return bool(
+                isinstance(steps, list)
+                and any(
+                    isinstance(step, dict)
+                    and isinstance(step.get("sources"), dict)
+                    and "$input.evidence" in step["sources"].values()
+                    for step in steps
+                )
+            )
+        coordinator = cast(MultiAgentCoordinator, self.execution_snapshot()[2].reviewer)
+        return any(
+            "$input.evidence" in step.sources.values() for step in coordinator.workflow.steps
+        )
+
     def build_studio_harness(self, snapshot: dict) -> ReviewHarness:
         bundle = snapshot.get("bundle")
         if not isinstance(bundle, dict) or definition_digest(bundle) != snapshot.get("digest"):

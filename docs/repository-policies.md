@@ -92,6 +92,7 @@ curl -X POST http://127.0.0.1:8080/v1/repository-policies \
   -H 'Content-Type: application/json' \
   -d '{
     "repository": "acme/payments",
+    "expected_version": 0,
     "policy": {
       "enabled": true,
       "auto_fix": false,
@@ -107,5 +108,28 @@ curl 'http://127.0.0.1:8080/v1/repository-policies?repository=acme%2Fpayments' \
 
 The read response contains the effective source (`configured` or
 `legacy-grant`), current normalized document, and bounded newest-first version
-history. Policy updates do not expose a delete operation: disable explicitly or
-publish a new version so the audit trail remains intact.
+history. Use its `version` as the next write's `expected_version`; `0` means no
+versioned policy exists yet. The store compares that value after acquiring the
+tenant/repository policy lock. A stale write returns HTTP `409` without changing
+the current row, version history or audit log. Omitting `expected_version`
+retains compatibility with older API clients, but interactive and automated
+administration should always send it.
+
+Policy updates do not expose a delete operation: disable explicitly or publish
+a new version so the audit trail remains intact. Unknown top-level request
+fields are rejected.
+
+## Browser governance
+
+Administrators can open **仓库治理** in the console, enter an `owner/repository`
+name and read the effective policy before editing. The page uses the same API
+and always sends the version it read. If another administrator saves first, the
+stale form remains visible but locked; the user must read the new version before
+another write. A successful save reads the persisted version back before it is
+reported as complete.
+
+The console response is a separate allowlisted projection. It includes the
+effective fields, available reviewer/fix-rule identifiers, and version/actor/time
+history needed by the page. Tenant identifiers, historical policy bodies,
+arbitrary metadata and audit detail remain outside the browser response. The UI
+renders summaries, toggles and version rows rather than raw JSON.

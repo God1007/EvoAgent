@@ -1,6 +1,14 @@
 import unittest
 
-from evoagent.models import FINDING_TEXT_LIMITS, Finding, ReviewReport, Severity
+from evoagent.models import (
+    FINDING_TEXT_LIMITS,
+    MAX_REVIEW_CONTEXT_SECTION_BYTES,
+    Finding,
+    RepositoryEvidence,
+    ReviewContext,
+    ReviewReport,
+    Severity,
+)
 
 
 def _finding(**overrides):
@@ -17,6 +25,78 @@ def _finding(**overrides):
     )
     base.update(overrides)
     return Finding(**base)
+
+
+class ReviewContextTests(unittest.TestCase):
+    def test_request_is_normalized_and_round_trips(self):
+        context = ReviewContext.from_request({"title": "PR", "spec": "must work"})
+
+        self.assertEqual("api", context.origin)
+        self.assertEqual("", context.standards)
+        self.assertEqual(context, ReviewContext.from_dict(context.to_dict()))
+
+    def test_request_rejects_unknown_or_oversized_content(self):
+        with self.assertRaisesRegex(ValueError, "only title, spec and standards"):
+            ReviewContext.from_request({"metadata": "hidden"})
+        with self.assertRaisesRegex(ValueError, "spec exceeds"):
+            ReviewContext.from_request({"spec": "界" * MAX_REVIEW_CONTEXT_SECTION_BYTES})
+
+    def test_github_body_is_utf8_bounded_and_marks_truncation(self):
+        context = ReviewContext.from_github("PR", "界" * MAX_REVIEW_CONTEXT_SECTION_BYTES)
+
+        self.assertTrue(context.truncated)
+        self.assertLessEqual(len(context.spec.encode("utf-8")), MAX_REVIEW_CONTEXT_SECTION_BYTES)
+        self.assertEqual("github-webhook", context.origin)
+
+    def test_stored_contract_rejects_spoofed_origin_and_shape(self):
+        valid = ReviewContext().to_dict()
+        with self.assertRaisesRegex(ValueError, "origin"):
+            ReviewContext.from_dict({**valid, "origin": "pull-request-body"})
+        with self.assertRaisesRegex(ValueError, "invalid fields"):
+            ReviewContext.from_dict({**valid, "metadata": {"token": "secret"}})
+
+
+class RepositoryEvidenceTests(unittest.TestCase):
+    def test_available_summary_round_trips(self):
+        evidence = RepositoryEvidence(
+            origin="github-archive",
+            status="available",
+            revision="abc123",
+            indexed_files=2,
+            indexed_bytes=100,
+            changed_paths=("pkg/util.py",),
+            changed_symbols=("pkg.util.helper",),
+            impacted_symbols=("pkg.service.use",),
+            importing_files=("pkg/service.py",),
+        )
+
+        self.assertEqual(evidence, RepositoryEvidence.from_dict(evidence.to_dict()))
+        self.assertEqual(
+            RepositoryEvidence(), RepositoryEvidence.from_dict(RepositoryEvidence().to_dict())
+        )
+
+    def test_stored_contract_rejects_spoofed_or_inconsistent_data(self):
+        valid = RepositoryEvidence().to_dict()
+        with self.assertRaisesRegex(ValueError, "invalid fields"):
+            RepositoryEvidence.from_dict({**valid, "metadata": {"token": "secret"}})
+        with self.assertRaisesRegex(ValueError, "sorted and unique"):
+            RepositoryEvidence.from_dict(
+                {
+                    **valid,
+                    "origin": "github-archive",
+                    "revision": "abc123",
+                    "changed_paths": ["b.py", "a.py"],
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "partial status"):
+            RepositoryEvidence.from_dict(
+                {
+                    **valid,
+                    "origin": "github-archive",
+                    "revision": "abc123",
+                    "status": "partial",
+                }
+            )
 
 
 class FindingFingerprintTests(unittest.TestCase):

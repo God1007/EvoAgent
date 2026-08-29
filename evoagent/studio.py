@@ -19,7 +19,7 @@ from .diff_parser import parse_unified_diff
 from .errors import ClientInputError, ResourceNotFoundError, StateConflictError
 from .json_boundary import strict_json_loads
 from .model_gateway import ModelGovernanceContext, ModelMessage, ModelOutputError, ModelRequest
-from .models import Finding, Severity
+from .models import Finding, RepositoryEvidence, ReviewContext, Severity
 from .ports import ModelGatewayPort, ReviewWorkflowStorePort
 from .reviewer import MAX_REVIEWER_FINDINGS, LocalRuleReviewer
 from .workflow import AgentSpec, Handoff, HandoffError, PayloadType, Workflow
@@ -90,8 +90,217 @@ TYPES = {
     )
 }
 DIFF = REVIEW_INPUTS["diff"].key
+CONTEXT = REVIEW_INPUTS["context"].key
+EVIDENCE = REVIEW_INPUTS["evidence"].key
 FINDINGS = FINDINGS_TYPE.key
 TOOLS = ("local-rules", "diff-summary")
+LEGACY_MODEL_CONFIG = {"prompt", "model", "tools", "max_output_tokens"}
+PLAYBOOK_MODEL_CONFIG = {"playbook", "model", "tools", "max_output_tokens"}
+PLAYBOOK_FIELDS = {"identity", "objective", "instructions"}
+
+
+def _playbook_prompt(config: dict[str, Any]) -> str:
+    """Compile authored intent; the server appends the immutable I/O contract."""
+    if "prompt" in config:  # Published before structured Playbooks existed.
+        return config["prompt"]
+    playbook = config["playbook"]
+    sections = [
+        "Identity:\n" + playbook["identity"],
+        "Objective:\n" + playbook["objective"],
+    ]
+    if playbook["instructions"].strip():
+        sections.append("Operating instructions:\n" + playbook["instructions"])
+    return "\n\n".join(sections)
+
+
+def _context_agent_definitions(model: str) -> dict[str, dict[str, Any]]:
+    common = {
+        "kind": "llm",
+        "inputs": {"diff": DIFF, "context": CONTEXT, "evidence": EVIDENCE},
+        "outputs": {"findings": FINDINGS},
+    }
+    config = {"model": model, "tools": ["diff-summary"], "max_output_tokens": 2048}
+    return {
+        "standards-review": {
+            **common,
+            "name": "规范轴审查",
+            "config": {
+                **config,
+                "playbook": {
+                    "identity": "Repository standards reviewer",
+                    "objective": "Review only added lines against context.standards. Repository standards win.",
+                    "instructions": (
+                        "Use evidence only to identify affected Python callers and importing files. "
+                        "When standards are empty, use only concrete maintainability smells: duplicated "
+                        "logic, speculative generality, shotgun surgery, feature envy, primitive obsession, "
+                        "message chains and pass-through middlemen. Treat smells as judgement calls, never "
+                        "invent repository rules, and skip checks already enforced by tooling."
+                    ),
+                },
+            },
+        },
+        "spec-review": {
+            **common,
+            "name": "需求轴审查",
+            "config": {
+                **config,
+                "playbook": {
+                    "identity": "Product requirement reviewer",
+                    "objective": "Compare added lines with context.spec and context.title.",
+                    "instructions": (
+                        "If both are empty, return no findings. Otherwise use evidence to check whether "
+                        "affected Python callers contradict the requirements. Report only missing or "
+                        "partial requirements, incorrect implementations, and unrequested scope expansion "
+                        "that can be tied to a changed line. Do not turn vague product wishes into invented "
+                        "requirements."
+                    ),
+                },
+            },
+        },
+        "axis-merge": {
+            "name": "双轴结果汇总",
+            "kind": "merge",
+            "inputs": {"standards": FINDINGS, "spec": FINDINGS},
+            "outputs": {"findings": FINDINGS},
+            "config": {},
+        },
+    }
+
+
+def _agent_recipes(model: str) -> list[dict[str, Any]]:
+    """Curated draft starters; copied definitions never retain a mutable recipe link."""
+    contextual = _context_agent_definitions(model)
+    recipes = [
+        {
+            "id": "standards-and-design",
+            "name": "规范与架构审查",
+            "description": "检查仓库规范、代码异味和模块边界。",
+            "definition": contextual["standards-review"],
+        },
+        {
+            "id": "spec-alignment",
+            "name": "需求一致性审查",
+            "description": "对照 PR 需求识别遗漏、错误实现和范围膨胀。",
+            "definition": contextual["spec-review"],
+        },
+        {
+            "id": "feedback-loop",
+            "name": "回归与验证审查",
+            "description": "检查行为改动是否有可信的复现与回归验证路径。",
+            "definition": {
+                "name": "回归与验证审查",
+                "kind": "llm",
+                "inputs": {"diff": DIFF, "context": CONTEXT, "evidence": EVIDENCE},
+                "outputs": {"findings": FINDINGS},
+                "config": {
+                    "playbook": {
+                        "identity": "Regression and feedback-loop reviewer",
+                        "objective": (
+                            "Review changed behavior for a credible reproduction signal, "
+                            "public test seam and regression verification path."
+                        ),
+                        "instructions": (
+                            "Report only when an added behavioral branch, bug fix or risky side effect "
+                            "has no concrete test or observable verification path in the diff. Prefer "
+                            "tests through the public interface, with an independent expected value and "
+                            "a signal that catches the exact failure. Do not demand tests for docs, "
+                            "generated code, simple declarations or changes already protected by a "
+                            "visible equivalent test. Use evidence only to identify affected Python "
+                            "callers and importing files."
+                        ),
+                    },
+                    "model": model,
+                    "tools": ["diff-summary"],
+                    "max_output_tokens": 2048,
+                },
+            },
+        },
+    ]
+    for recipe in recipes:
+        recipe["definition"] = validate_agent(recipe["definition"], draft=not bool(model))
+    return recipes
+
+
+def _dual_axis_workflow() -> dict[str, Any]:
+    return {
+        "name": "双轴 PR 审查",
+        "steps": [
+            {
+                "id": "standards",
+                "agent": "standards-review",
+                "version": 0,
+                "sources": {
+                    "diff": "$input.diff",
+                    "context": "$input.context",
+                    "evidence": "$input.evidence",
+                },
+            },
+            {
+                "id": "spec",
+                "agent": "spec-review",
+                "version": 0,
+                "sources": {
+                    "diff": "$input.diff",
+                    "context": "$input.context",
+                    "evidence": "$input.evidence",
+                },
+            },
+            {
+                "id": "combine",
+                "agent": "axis-merge",
+                "version": 0,
+                "sources": {
+                    "standards": "standards.findings",
+                    "spec": "spec.findings",
+                },
+            },
+            {
+                "id": "critic",
+                "agent": "critic",
+                "version": 0,
+                "sources": {
+                    "parsed": "$input.parsed",
+                    "specialist_findings": "combine.findings",
+                },
+            },
+            {
+                "id": "test",
+                "agent": "test",
+                "version": 0,
+                "sources": {
+                    "parsed": "$input.parsed",
+                    "specialist_findings": "combine.findings",
+                },
+            },
+            {
+                "id": "synthesize",
+                "agent": "synthesizer",
+                "version": 0,
+                "sources": {
+                    "specialist_findings": "combine.findings",
+                    "critiques": "critic.critiques",
+                    "reproductions": "test.reproductions",
+                },
+            },
+            {
+                "id": "fix",
+                "agent": "fix",
+                "version": 0,
+                "sources": {"synthesized": "synthesize.synthesized"},
+            },
+            {
+                "id": "verify",
+                "agent": "verifier",
+                "version": 0,
+                "sources": {
+                    "synthesized": "synthesize.synthesized",
+                    "reproductions": "test.reproductions",
+                    "fix_ready": "fix.fix_ready",
+                },
+            },
+        ],
+        "outputs": {"verified": "verify.verified"},
+    }
 
 
 def _ports(value: Any, *, draft: bool = False) -> dict[str, PayloadType]:
@@ -189,11 +398,20 @@ def validate_agent(value: Any, *, draft: bool = False) -> dict[str, Any]:
                 "merge agents take findings ports and return findings; no config"
             )
     else:
-        if config.keys() != {"prompt", "model", "tools", "max_output_tokens"}:
+        if config.keys() not in (LEGACY_MODEL_CONFIG, PLAYBOOK_MODEL_CONFIG):
             raise ClientInputError(
-                "model config requires prompt, model, tools and max_output_tokens"
+                "model config requires a Playbook, model, tools and max_output_tokens"
             )
-        _text(config["prompt"], "prompt", 16000, empty=draft)
+        if "playbook" in config:
+            playbook = config["playbook"]
+            if not isinstance(playbook, dict) or playbook.keys() != PLAYBOOK_FIELDS:
+                raise ClientInputError("Playbook requires identity, objective and instructions")
+            _text(playbook["identity"], "Playbook identity", 200, empty=draft)
+            _text(playbook["objective"], "Playbook objective", 2000, empty=draft)
+            _text(playbook["instructions"], "Playbook instructions", 12000, empty=True)
+        else:
+            # Exact legacy definitions remain executable so pinned tasks can resume.
+            _text(config["prompt"], "prompt", 16000, empty=draft)
         _text(config["model"], "model", 200, empty=draft)
         tools = config["tools"]
         if (
@@ -216,8 +434,10 @@ def validate_agent(value: Any, *, draft: bool = False) -> dict[str, Any]:
             or not 1 <= config["max_output_tokens"] <= 4096
         ):
             raise ClientInputError("max_output_tokens must be between 1 and 4096")
-        if any(port.key in {DIFF, REVIEW_INPUTS["parsed"].key} for port in outputs.values()):
-            raise ClientInputError("model outputs cannot impersonate source diff artifacts")
+        if any(
+            port.key in {item.key for item in REVIEW_INPUTS.values()} for port in outputs.values()
+        ):
+            raise ClientInputError("model outputs cannot impersonate source review artifacts")
     return json.loads(encoded_definition(value))
 
 
@@ -241,9 +461,22 @@ def draft_definition(kind: str, value: Any) -> dict:
         agent_kind = value.get("kind", "rules")
         if not isinstance(agent_kind, str) or agent_kind not in {"rules", "llm", "merge"}:
             raise ClientInputError("agent kind must be rules, llm or merge")
+        model_config = value.get("config")
+        legacy_model = (
+            agent_kind == "llm" and isinstance(model_config, dict) and "prompt" in model_config
+        )
         defaults: dict[str, dict] = {
             "rules": {"rules": [], "checks": []},
-            "llm": {"prompt": "", "model": "", "tools": [], "max_output_tokens": 2048},
+            "llm": (
+                {"prompt": "", "model": "", "tools": [], "max_output_tokens": 2048}
+                if legacy_model
+                else {
+                    "playbook": {"identity": "", "objective": "", "instructions": ""},
+                    "model": "",
+                    "tools": [],
+                    "max_output_tokens": 2048,
+                }
+            ),
             "merge": {},
         }
         value = _draft_fields(
@@ -262,6 +495,12 @@ def draft_definition(kind: str, value: Any) -> dict:
         config = value["config"] = _draft_fields(
             value["config"], defaults[agent_kind], "agent config"
         )
+        if agent_kind == "llm" and "playbook" in config:
+            config["playbook"] = _draft_fields(
+                config["playbook"],
+                {"identity": "", "objective": "", "instructions": ""},
+                "Playbook",
+            )
         if agent_kind == "rules" and isinstance(config["checks"], list):
             if len(config["checks"]) > 32:
                 raise ClientInputError("an agent supports at most 32 literal checks")
@@ -413,7 +652,7 @@ def build_agent(
             messages=(
                 ModelMessage(
                     "system",
-                    config["prompt"]
+                    _playbook_prompt(config)
                     + "\nReturn a JSON object with exactly these output ports: "
                     + json.dumps(definition["outputs"])
                     + ". text@1 is a string; integer@1 an integer; boolean@1 a boolean. "
@@ -466,6 +705,7 @@ def build_agent(
         _ports(definition["inputs"]),
         _ports(definition["outputs"]),
         run,
+        kind,
     )
 
 
@@ -536,6 +776,19 @@ class WorkflowStudio:
     ):
         self.store, self.builtins, self.gateway, self.context = store, builtins, gateway, context
 
+    def _installed_agents(self) -> dict[str, AgentSpec]:
+        agents = dict(self.builtins())
+        if self.gateway.configured:
+            model = self.gateway.route_info().get("model")
+            if isinstance(model, str) and model:
+                agents.update(
+                    {
+                        key: build_agent(key, definition, self.gateway, self.context)
+                        for key, definition in _context_agent_definitions(model).items()
+                    }
+                )
+        return agents
+
     def list_documents(self, tenant: str, kind: str, *, limit: int = 100, cursor: str = "") -> dict:
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ClientInputError("Studio page size must be an integer between 1 and 100")
@@ -564,12 +817,32 @@ class WorkflowStudio:
         }
 
     def catalog(self) -> dict[str, Any]:
+        installed = self._installed_agents()
+        route = self.gateway.route_info() if self.gateway.configured else {}
+        model = route.get("model", "")
+        dual_axis_available = {
+            "standards-review",
+            "spec-review",
+            "axis-merge",
+        } <= installed.keys()
+        templates = [
+            {
+                "id": "dual-axis-review",
+                "name": "双轴 PR 审查",
+                "description": "并行检查项目规范与需求实现，再进入质询、复现和验证。",
+                "available": dual_axis_available,
+                "reason": "" if dual_axis_available else "配置模型路由后可用",
+                "definition": _dual_axis_workflow(),
+            }
+        ]
         return {
             "types": list(TYPES),
             "inputs": {key: value.key for key, value in REVIEW_INPUTS.items()},
             "rules": [{"id": rule[0], "title": rule[3]} for rule in LocalRuleReviewer.RULES],
             "tools": list(TOOLS),
-            "models": [self.gateway.route_info()] if self.gateway.configured else [],
+            "models": [route] if route else [],
+            "agent_recipes": _agent_recipes(model if isinstance(model, str) else ""),
+            "templates": templates,
             "builtins": [
                 {
                     "id": key,
@@ -577,7 +850,7 @@ class WorkflowStudio:
                     "inputs": {k: v.key for k, v in agent.inputs.items()},
                     "outputs": {k: v.key for k, v in agent.outputs.items()},
                 }
-                for key, agent in self.builtins().items()
+                for key, agent in installed.items()
             ],
         }
 
@@ -591,8 +864,27 @@ class WorkflowStudio:
             node, source_port = reference.split(".")
             if node == "$input":
                 diff = self.store.get_task_payload(task_id)
+                task = self.store.get(task_id, tenant) or {}
+                task_input = task.get("input") or {}
+                try:
+                    context = ReviewContext.from_dict(
+                        task_input.get("review_context", ReviewContext().to_dict())
+                    ).to_dict()
+                except ValueError:
+                    context = None
+                try:
+                    evidence = RepositoryEvidence.from_dict(
+                        task_input.get("repository_evidence", RepositoryEvidence().to_dict())
+                    ).to_dict()
+                except ValueError:
+                    evidence = None
                 source = (
-                    {"diff": diff, "parsed": parse_unified_diff(diff).to_dict()}
+                    {
+                        "diff": diff,
+                        "parsed": parse_unified_diff(diff).to_dict(),
+                        **({"context": context} if context is not None else {}),
+                        **({"evidence": evidence} if evidence is not None else {}),
+                    }
                     if diff is not None
                     else {}
                 )
@@ -640,7 +932,7 @@ class WorkflowStudio:
                         raise StateConflictError("published agent digest mismatch")
                     agents[alias] = published["definition"]
         bundle = {"definition": definition, "agents": agents}
-        compile_workflow(bundle, self.builtins(), self.gateway, self.context)
+        compile_workflow(bundle, self._installed_agents(), self.gateway, self.context)
         return bundle
 
     def publish(self, tenant: str, kind: str, key: str, revision: Any, actor: str) -> dict:
@@ -687,7 +979,7 @@ class WorkflowStudio:
             if saved["revision"] != revision:
                 raise StateConflictError("draft changed; save and retry")
             bundle = self.resolve(tenant, saved["definition"])
-        compile_workflow(bundle, self.builtins(), self.gateway, self.context)
+        compile_workflow(bundle, self._installed_agents(), self.gateway, self.context)
         for agent in bundle["agents"].values():
             if agent["kind"] == "llm" and (
                 not self.gateway.configured

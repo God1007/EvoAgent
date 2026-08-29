@@ -34,6 +34,10 @@ class PolicyUseCases:
             "source": policy.source,
             "policy": policy.to_dict(),
             "history": self.store.list_repository_policy_versions(tenant_id, repository, 50),
+            "available_fix_rules": list(self.available_fix_rules()),
+            "available_reviewers": list(
+                self.available_reviewers() if self.available_reviewers is not None else ()
+            ),
         }
 
     def set_repository_policy(
@@ -42,6 +46,7 @@ class PolicyUseCases:
         repository: str,
         policy: dict[str, Any],
         actor: str,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         repository = canonical_repository(repository)
         try:
@@ -64,4 +69,10 @@ class PolicyUseCases:
                 "repository policy references unavailable reviewers: %s"
                 % ", ".join(sorted(unknown_reviewers))
             )
-        return self.policies.save(tenant_id, repository, parsed.to_dict(), actor)
+        return self.policies.save(
+            tenant_id,
+            repository,
+            parsed.to_dict(),
+            actor,
+            expected_version,
+        )

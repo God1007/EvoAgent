@@ -9,6 +9,177 @@ from evoagent.errors import ClientInputError
 
 
 class ConsoleViewTests(unittest.TestCase):
+    def test_repository_policy_view_is_human_safe_and_field_allowlisted(self):
+        payload = {
+            "tenant_id": "internal-tenant",
+            "repository": "org/repo",
+            "version": 3,
+            "source": "configured",
+            "updated_at": "2026-08-30T00:00:00+00:00",
+            "policy": {
+                "enabled": True,
+                "auto_fix": False,
+                "post_review_comments": True,
+                "allowed_reviewers": ["review"],
+                "allowed_fix_rules": ["SEC-YAML-LOAD"],
+                "allowed_llm_providers": [],
+                "allowed_llm_models": [],
+                "llm_region": None,
+                "max_diff_bytes": 4096,
+                "credential": "internal-policy-secret",
+            },
+            "history": [
+                {
+                    "tenant_id": "internal-tenant",
+                    "version": 3,
+                    "actor": "alice",
+                    "created_at": "2026-08-30T00:00:00+00:00",
+                    "policy": {"credential": "internal-history-secret"},
+                }
+            ],
+            "available_reviewers": ["review", {"credential": "internal"}],
+            "available_fix_rules": ["SEC-YAML-LOAD", None],
+        }
+
+        for method in ("GET", "POST"):
+            with self.subTest(method=method):
+                view = console_response(method, "/v1/repository-policies", payload)
+                self.assertEqual("org/repo", view["repository"])
+                self.assertEqual(["review"], view["available_reviewers"])
+                self.assertEqual(["SEC-YAML-LOAD"], view["available_fix_rules"])
+                self.assertEqual(
+                    {"version": 3, "actor": "alice", "created_at": "2026-08-30T00:00:00+00:00"},
+                    view["history"][0],
+                )
+                self.assertNotIn("internal", json.dumps(view))
+
+    def test_operational_views_expose_actions_without_payloads_or_error_text(self):
+        audit = console_response(
+            "GET",
+            "/api/audit",
+            {
+                "events": [
+                    {
+                        "actor": "alice",
+                        "action": "task.resume",
+                        "resource": "task-1",
+                        "created_at": "2026-08-30T00:00:00+00:00",
+                        "detail": {"credential": "internal-secret"},
+                    }
+                ]
+            },
+        )
+        outbox = console_response(
+            "GET",
+            "/api/outbox",
+            {
+                "messages": [
+                    {
+                        "id": "review:task-1",
+                        "status": "dead",
+                        "attempts": 5,
+                        "updated_at": "2026-08-30T00:00:00+00:00",
+                        "last_error": "operation [type=network; ref=internal-ref]",
+                        "payload": {"token": "internal-token"},
+                    }
+                ]
+            },
+        )
+        dead = console_response(
+            "GET",
+            "/api/queue/dead-letters",
+            {
+                "messages": [
+                    {
+                        "message_id": "internal-message",
+                        "attempt": 3,
+                        "failed_at": 1.5,
+                        "error": "operation [type=contract; ref=internal-ref]",
+                        "payload": {"task_id": "task-1", "credential": "internal-token"},
+                    }
+                ]
+            },
+        )
+        capacity = console_response(
+            "GET",
+            "/api/tenant-review-capacity",
+            {
+                "tenant_id": "internal-tenant",
+                "enabled": True,
+                "max_active_reviews": 4,
+                "active_reviews": 2,
+                "available": 2,
+                "saturated": False,
+                "oldest_acquired_at": None,
+            },
+        )
+
+        self.assertEqual("task.resume", audit["events"][0]["action"])
+        self.assertEqual(True, outbox["messages"][0]["error"])
+        self.assertEqual("task-1", dead["messages"][0]["task_id"])
+        self.assertEqual(2, capacity["available"])
+        self.assertTrue(
+            all("internal" not in json.dumps(view) for view in (audit, outbox, dead, capacity))
+        )
+        self.assertEqual(
+            {"replayed": True},
+            console_response(
+                "POST", "/v1/outbox/replay", {"replayed": True, "payload": "internal"}
+            ),
+        )
+
+    def test_workflow_view_exposes_readable_duration_without_internal_timing_metadata(self):
+        payload = {
+            "availability": "recorded",
+            "task_state": "SUCCESS",
+            "workflow": {"name": "review", "revision": "internal-revision"},
+            "steps": [
+                {
+                    "id": "review",
+                    "inputs": {},
+                    "outputs": {},
+                    "sources": {},
+                    "status": "completed",
+                    "blocked_by": [],
+                    "attempt": 1,
+                    "started_at": "internal-start",
+                    "duration_ms": 1250,
+                    "updated_at": "2026-08-29T00:00:00+00:00",
+                    "input_sha256": "internal-input",
+                }
+            ],
+        }
+
+        view = console_response("GET", "/v1/tasks/abc/workflow", payload)
+
+        self.assertEqual(1250, view["steps"][0]["duration_ms"])
+        self.assertNotIn("started_at", view["steps"][0])
+        self.assertNotIn("internal", json.dumps(view))
+
+    def test_proof_view_keeps_evidence_but_omits_attestations_and_infrastructure_detail(self):
+        result = {
+            "evidence_level": 2,
+            "evidence_label": "L2-reproduced",
+            "note": "internal note",
+            "patch": "-old\n+new",
+            "steps": [
+                {
+                    "step": "reproduce-on-original",
+                    "status": "failed",
+                    "detail": "assertion",
+                    "duration_seconds": 1,
+                    "attestation": {"request_sha256": "internal-hash"},
+                },
+                {"step": "reproduce-on-patched", "status": "error", "detail": "internal-ref"},
+            ],
+        }
+        view = console_response("POST", "/v1/proofs", result)
+        self.assertEqual(2, view["evidence_level"])
+        self.assertEqual("-old\n+new", view["patch"])
+        self.assertEqual("assertion", view["steps"][0]["detail"])
+        self.assertEqual("", view["steps"][1]["detail"])
+        self.assertNotIn("internal", json.dumps(view))
+
     def test_error_projection_never_copies_arbitrary_fields_or_unknown_messages(self):
         for message, code in ERROR_CODES.items():
             self.assertEqual({"error_code": code}, console_error(400, {"error": message}))
@@ -120,10 +291,66 @@ class ConsoleViewTests(unittest.TestCase):
             "rules": [{"id": "check", "title": "Check input", "future": "internal-rule"}],
             "builtins": [{"id": "planner", "version": 0, "revision": "internal-revision"}],
             "models": [{"model": "demo", "provider": "local", "region": "internal-region"}],
+            "agent_recipes": [
+                {
+                    "id": "feedback-loop",
+                    "name": "Regression",
+                    "description": "Find missing verification",
+                    "internal": "internal-recipe",
+                    "definition": {
+                        "name": "Regression",
+                        "kind": "llm",
+                        "inputs": {"diff": "unified-diff@1"},
+                        "outputs": {"findings": "review-findings@1"},
+                        "internal": "internal-definition",
+                        "config": {
+                            "playbook": {
+                                "identity": "Reviewer",
+                                "objective": "Check tests",
+                                "instructions": "Use public seams",
+                                "internal": "internal-playbook",
+                            },
+                            "model": "demo",
+                            "tools": ["diff-summary"],
+                            "max_output_tokens": 100,
+                            "credential": "internal-credential",
+                        },
+                    },
+                }
+            ],
+            "templates": [
+                {
+                    "id": "dual-axis-review",
+                    "name": "Dual axis",
+                    "description": "Standards and spec",
+                    "internal": "internal-template",
+                    "definition": {
+                        "name": "Dual axis",
+                        "steps": [
+                            {
+                                "id": "spec",
+                                "agent": "spec-review",
+                                "version": 0,
+                                "sources": {"context": "$input.context"},
+                                "prompt": "internal-prompt",
+                            }
+                        ],
+                        "outputs": {"verified": "spec.findings"},
+                        "digest": "internal-digest",
+                    },
+                }
+            ],
         }
         view = console_response("GET", "/v1/studio/catalog", catalog)
         self.assertNotIn("internal-", json.dumps(view))
         self.assertEqual([{"model": "demo", "provider": "local"}], view["models"])
+        self.assertEqual(
+            "Check tests",
+            view["agent_recipes"][0]["definition"]["config"]["playbook"]["objective"],
+        )
+        self.assertEqual(
+            "$input.context", view["templates"][0]["definition"]["steps"][0]["sources"]["context"]
+        )
 
     def test_artifact_types_are_explicit_and_never_dump_unknown_structures(self):
         values = {
@@ -149,6 +376,33 @@ class ConsoleViewTests(unittest.TestCase):
             "text": ("text@1", "human summary"),
             "integer": ("integer@1", 3),
             "bool": ("boolean@1", True),
+            "context": (
+                "review-context@1",
+                {
+                    "origin": "api",
+                    "title": "Review",
+                    "spec": "Expected behavior",
+                    "standards": "Project rules",
+                    "truncated": False,
+                    "internal-metadata": "private",
+                },
+            ),
+            "evidence": (
+                "repository-evidence@1",
+                {
+                    "origin": "github-archive",
+                    "status": "available",
+                    "revision": "a" * 40,
+                    "indexed_files": 2,
+                    "indexed_bytes": 100,
+                    "changed_paths": ["app.py"],
+                    "changed_symbols": ["app.run"],
+                    "impacted_symbols": ["worker.call"],
+                    "importing_files": ["worker.py"],
+                    "truncated": False,
+                    "internal-metadata": "private",
+                },
+            ),
             "unknown": ("private-schema@1", {"internal-prompt": "private"}),
             "findings": (
                 "review-findings@1",
@@ -181,6 +435,31 @@ class ConsoleViewTests(unittest.TestCase):
         self.assertEqual({"checked": 1, "accepted": 1}, view["outputs"]["fix"])
         self.assertEqual(1, view["outputs"]["parsed"]["added_line_count"])
         self.assertEqual(1, view["outputs"]["plan"]["assignment_count"])
+        self.assertEqual(
+            {
+                "origin": "api",
+                "title": "Review",
+                "spec": "Expected behavior",
+                "standards": "Project rules",
+                "truncated": False,
+            },
+            view["outputs"]["context"],
+        )
+        self.assertEqual(
+            {
+                "origin": "github-archive",
+                "status": "available",
+                "revision": "a" * 40,
+                "indexed_files": 2,
+                "indexed_bytes": 100,
+                "changed_paths": ["app.py"],
+                "changed_symbols": ["app.run"],
+                "impacted_symbols": ["worker.call"],
+                "importing_files": ["worker.py"],
+                "truncated": False,
+            },
+            view["outputs"]["evidence"],
+        )
         self.assertEqual(before, payload)
         payload["status"] = "failed"
         self.assertEqual(

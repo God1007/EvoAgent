@@ -59,12 +59,16 @@ jobs:
           node --check web/app.js
           node --check web/studio.js
           node --test tests/web.test.cjs
-      - name: Validate Prometheus recording and alert rules
+      - name: Validate and test Prometheus recording and alert rules
         run: |
           docker run --rm --entrypoint=/bin/promtool \
             -v "$PWD/ops/prometheus:/rules:ro" \
             prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996 \
             check rules /rules/evoagent.rules.yml
+          docker run --rm --entrypoint=/bin/promtool \
+            -v "$PWD/ops/prometheus:/rules:ro" \
+            prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996 \
+            test rules /rules/evoagent.test.yml
       - name: Test with coverage gate
         run: python -m pytest --cov=evoagent --cov-report=term-missing --cov-report=xml
       - name: Reproduce controlled evaluation evidence
@@ -90,7 +94,7 @@ jobs:
           failures = {name for name, gate in release["gates"].items() if not gate["passed"]}
           assert report["schema_version"] == 3
           assert candidate["schema_version"] == 2
-          assert candidate["dataset"]["sha256"] == "8d2271ec666dcbc96b0c8a13e05adcf71c08f33bf17da5d1c102fe9a3434af38"
+          assert candidate["dataset"]["sha256"] == "92e93bbc64c70e81ab8ef26b200ea4cbe092bf159ad78c061d6da7e704577263"
           assert reproducibility == {
               "application_source_sha256": _APPLICATION_SOURCE_REVISION,
               "evoagent_version": __version__,
@@ -101,9 +105,9 @@ jobs:
           assert candidate["dataset"]["sha256"] in baseline_document
           assert "| Evaluation report schema | 3 |" in baseline_document
           assert candidate["metrics"]["safe_fix_rate"] == 1.0
-          assert candidate["metrics"]["e2e_security_fix_rate"] == 0.35
-          assert failures == {"e2e_security_fix_rate", "production_data_provenance"}
-          assert not release["quantitative_passed"]
+          assert candidate["metrics"]["e2e_security_fix_rate"] == 0.6
+          assert failures == {"production_data_provenance"}
+          assert release["quantitative_passed"]
           assert not release["production_activation_allowed"]
           assert candidate["confidence_calibration"]["invalid_confidences"] == 0
           PY
